@@ -320,6 +320,10 @@ mod tests {
             successful_executions: 0,
             total_volume: 0,
             total_roi: 0,
+            category: crate::categories::SignalCategory::SwingTrade,
+            risk_level: crate::categories::RiskLevel::Medium,
+            is_collaborative: false,
+            tags: soroban_sdk::Vec::new(env),
         }
     }
 

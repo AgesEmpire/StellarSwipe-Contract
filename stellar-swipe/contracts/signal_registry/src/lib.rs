@@ -2,17 +2,11 @@
 
 mod admin;
 mod analytics;
- feature/signal-categorization-tagging
 mod categories;
-=======
- main
 mod collaboration;
 mod errors;
-#[allow(deprecated)]
 mod events;
-#[allow(dead_code)]
 mod expiry;
-#[allow(dead_code)]
 mod fees;
 mod import;
 mod leaderboard;
@@ -21,22 +15,24 @@ mod query;
 mod social;
 mod stake;
 mod submission;
-pub mod templates;
+mod templates;
 mod types;
+mod scheduling;
 
-use admin::
-    get_admin, get_admin_config, get_pause_info, init_admin, is_trading_paused, require_not_paused,
+use admin::{
+    get_admin, get_admin_config, init_admin, is_trading_paused, require_not_paused,
     AdminConfig, PauseInfo,
 };
 use categories::{RiskLevel, SignalCategory};
 use errors::{AdminError, TemplateError};
-pub use leaderboard::{get_leaderboard, LeaderboardMetric, ProviderLeaderboard};
+pub use leaderboard::{get_leaderboard as get_leaderboard_internal, LeaderboardMetric, ProviderLeaderboard};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
-use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
+use stellarswipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
 use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
 use types::{
     Asset, FeeBreakdown, ImportResultView, ProviderPerformance, Signal, SignalAction,
     SignalPerformanceView, SignalStatus, SignalSummary, SortOption, TradeExecution,
+    SignalData, RecurrencePattern,
 };
 
 const MAX_EXPIRY_SECONDS: u64 = 30 * 24 * 60 * 60;
@@ -104,6 +100,24 @@ impl SignalRegistry {
         get_admin(&env)
     }
 
+   pub fn schedule(
+        env: Env,
+        provider: Address,
+        signal_data: SignalData,
+        publish_at: u64,
+        recurrence: RecurrencePattern,
+    ) -> Result<u64, AdminError> {
+        scheduling::schedule_signal(env, provider, signal_data, publish_at, recurrence)
+    }
+
+    pub fn trigger_scheduled_publications(env: Env) -> Vec<u64> {
+        scheduling::publish_scheduled_signals(env)
+    }
+
+    pub fn cancel_schedule(env: Env, provider: Address, schedule_id: u64) -> Result<(), AdminError> {
+        scheduling::cancel_scheduled_signal(env, provider, schedule_id)
+    }
+
     pub fn get_config(env: Env) -> AdminConfig {
         get_admin_config(&env)
     }
@@ -113,7 +127,7 @@ impl SignalRegistry {
     }
 
     pub fn get_pause_info(env: Env) -> PauseInfo {
-        get_pause_info(&env)
+        admin::get_pause_info(&env)
     }
 
     // Multi-sig functions
@@ -415,8 +429,7 @@ impl SignalRegistry {
         let tags = Vec::new(&env);
         let risk_level = RiskLevel::Medium;
 
-        let signal_id = Self::create_signal_internal(
- feature/signal-categorization-tagging
+       let signal_id = Self::create_signal_internal(
             &env,
             submitter,
             asset_pair,
@@ -427,9 +440,6 @@ impl SignalRegistry {
             category,
             tags,
             risk_level,
-=======
-            &env, submitter, asset_pair, action, price, rationale, expiry,
- main
         )
         .map_err(|_| TemplateError::InvalidTemplate)?;
 
@@ -577,7 +587,7 @@ impl SignalRegistry {
         limit: u32,
     ) -> Vec<ProviderLeaderboard> {
         let stats_map = Self::get_provider_stats_map(&env);
-        get_leaderboard(&env, &stats_map, metric, limit)
+        get_leaderboard_internal(&env, &stats_map, metric, limit)
     }
 
     /// Get top providers sorted by success rate
@@ -736,14 +746,8 @@ impl SignalRegistry {
         expiry::count_signals_pending_expiry(&env, &signals)
     }
 
-    /* =========================
- feature/signal-categorization-tagging
- feature/signal-categorization-tagging
-=======
- feature/analytics-system
- main
-       ANALYTICS FUNCTIONS
-    ========================== */
+
+     //  ANALYTICS FUNCTIONS
 
     /// Get provider analytics (requires min 10 signals)
     pub fn get_provider_analytics(
@@ -764,7 +768,6 @@ impl SignalRegistry {
     pub fn get_global_analytics(env: Env) -> analytics::GlobalAnalytics {
         let signals = Self::get_signals_map(&env);
         analytics::calculate_global_analytics(&env, &signals)
- feature/signal-categorization-tagging
     }
     
     /* =========================
@@ -917,9 +920,9 @@ impl SignalRegistry {
     /// Auto-suggest tags based on signal rationale
     pub fn suggest_tags(env: Env, rationale: String) -> Vec<String> {
         categories::auto_suggest_tags(&env, &rationale)
-=======
- main
-=======
+    }
+
+    /* =======
        SIGNAL IMPORT FUNCTIONS
     ========================== */
 
@@ -966,7 +969,6 @@ impl SignalRegistry {
         external_id: String,
     ) -> Option<u64> {
         import::get_signal_by_external_id(&env, &provider, &external_id)
- main
     }
 
     /* =========================
@@ -983,11 +985,12 @@ impl SignalRegistry {
         price: i128,
         rationale: String,
         expiry: u64,
-        category: SignalCategory,
-        tags: Vec<String>,
-        risk_level: RiskLevel,
     ) -> Result<u64, AdminError> {
         primary_author.require_auth();
+
+        let category = SignalCategory::SwingTrade;
+        let tags = Vec::new(&env);
+        let risk_level = RiskLevel::Medium;
 
         let signal_id = Self::create_signal_internal(
             &env,
@@ -1055,17 +1058,11 @@ impl SignalRegistry {
     }
 }
 
-mod test;
- feature/signal-categorization-tagging
- feature/signal-categorization-tagging
+/*mod test;
 mod test_analytics;
 mod test_categories;
-=======
- feature/analytics-system
 mod test_analytics;
- main
-=======
 mod test_import;
- main
 mod test_performance;
-mod test_collaboration;
+mod test_collaboration; */
+mod test_scheduling;

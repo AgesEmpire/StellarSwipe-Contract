@@ -29,8 +29,8 @@ pub enum SignalStatus {
     Active,
     Executed,
     Expired,
-    Successful, // Signal met success criteria (avg ROI > 2%)
-    Failed,     // Signal met failure criteria (avg ROI < -5% or expired with no executions)
+    Successful,
+    Failed,
 }
 
 #[contracttype]
@@ -45,41 +45,33 @@ pub enum SignalAction {
 pub struct Signal {
     pub id: u64,
     pub provider: Address,
-    pub asset_pair: String, // e.g. "XLM/USDC"
+    pub asset_pair: String,
     pub action: SignalAction,
     pub price: i128,
     pub rationale: String,
     pub timestamp: u64,
     pub expiry: u64,
     pub status: SignalStatus,
-    // Performance tracking fields
-    pub executions: u32,            // Number of trade executions for this signal
-    pub successful_executions: u32, // Number of successful trade executions
- feature/signal-categorization-tagging
-    pub total_volume: i128, // Cumulative volume across all executions
-    pub total_roi: i128,    // Cumulative ROI in basis points (10000 = 100%)
-    // Categorization fields
+    pub executions: u32,
+    pub successful_executions: u32,
+    pub total_volume: i128,
+    pub total_roi: i128,
     pub category: SignalCategory,
-    pub tags: Vec<String>,  // Max 10 tags
+    pub tags: Vec<String>,
     pub risk_level: RiskLevel,
-=======
-    pub total_volume: i128,         // Cumulative volume across all executions
-    pub total_roi: i128,            // Cumulative ROI in basis points (10000 = 100%)
- main
-    // Collaboration fields
     pub is_collaborative: bool,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Default)]
 pub struct ProviderPerformance {
-    pub total_signals: u32,      // Total number of signals provided
-    pub successful_signals: u32, // Signals marked as successful
-    pub failed_signals: u32,     // Signals marked as failed
-    pub total_copies: u64,       // Legacy field: total times signals were copied
-    pub success_rate: u32,       // Success rate in basis points (10000 = 100%)
-    pub avg_return: i128,        // Average return in basis points
-    pub total_volume: i128,      // Cumulative volume across all signals
+    pub total_signals: u32,
+    pub successful_signals: u32,
+    pub failed_signals: u32,
+    pub total_copies: u64,
+    pub success_rate: u32,
+    pub avg_return: i128,
+    pub total_volume: i128,
 }
 
 #[contracttype]
@@ -106,7 +98,6 @@ pub struct Asset {
     pub contract: Address,
 }
 
-/// Record of a single trade execution for a signal
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct TradeExecution {
@@ -115,22 +106,20 @@ pub struct TradeExecution {
     pub entry_price: i128,
     pub exit_price: i128,
     pub volume: i128,
-    pub roi: i128, // ROI in basis points (10000 = 100%)
+    pub roi: i128,
     pub timestamp: u64,
 }
 
-/// View struct for signal performance queries
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignalPerformanceView {
     pub signal_id: u64,
     pub executions: u32,
     pub total_volume: i128,
-    pub average_roi: i128, // In basis points
+    pub average_roi: i128,
     pub status: SignalStatus,
 }
 
-// Type alias for backward compatibility
 #[allow(dead_code)]
 pub type SignalStats = ProviderPerformance;
 
@@ -158,4 +147,45 @@ pub struct ImportResultView {
     pub success_count: u32,
     pub error_count: u32,
     pub signal_ids: soroban_sdk::Vec<u64>,
+}
+
+// ==========================================
+// NEW SCHEDULING TYPES (Issue #42)
+// ==========================================
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalData {
+    pub asset_pair: String,
+    pub action: SignalAction,
+    pub price: i128,
+    pub rationale: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScheduleStatus {
+    Pending = 0,
+    Published = 1,
+    Cancelled = 2,
+    Failed = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecurrencePattern {
+    pub is_recurring: bool,
+    pub interval_seconds: u64,
+    pub repeat_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ScheduledSignal {
+    pub id: u64,
+    pub provider: Address,
+    pub signal_data: SignalData,
+    pub publish_at: u64,
+    pub recurrence: RecurrencePattern,
+    pub status: ScheduleStatus,
 }
