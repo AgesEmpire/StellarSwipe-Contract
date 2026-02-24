@@ -598,6 +598,34 @@ fn fetch_sdex_orderbook(env: &Env, pair: &AssetPair) -> Result<OrderBook, Oracle
     unimplemented!("SDEX Orderbook Host Interface");
 }
 
+pub fn get_safe_price(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
+    let level = staleness::check_staleness(&env, pair.clone());
+    
+    if level == StalenessLevel::Critical {
+        return Err(OracleError::CircuitBreakerTripped);
+    }
+    
+    if level == StalenessLevel::Stale {
+        return Err(OracleError::PriceStaleTradeBlocked);
+    }
+
+    storage::get_price(&env, &pair)
+}
+
+pub fn on_price_update(env: &Env, pair: AssetPair) {
+    let mut metadata = staleness::get_metadata(env, &pair);
+    
+    // Auto-recovery
+    if metadata.is_paused {
+        metadata.is_paused = false;
+        env.events().publish((symbol_short!("RECOVER"), pair.clone()), env.ledger().timestamp());
+    }
+    
+    metadata.last_update = env.ledger().timestamp();
+    metadata.update_count_24h += 1;
+    staleness::set_metadata(env, &pair, metadata);
+}
+
 #[cfg(test)]
 mod test;
  main

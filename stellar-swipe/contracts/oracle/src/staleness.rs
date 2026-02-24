@@ -20,3 +20,16 @@ pub struct PriceMetadata {
     pub staleness_level: StalenessLevel,
     pub is_paused: bool,
 }
+
+pub fn check_staleness(pair: AssetPair, current_time: u64) -> StalenessLevel {
+    let metadata = get_price_metadata(pair);
+    let age = current_time.saturating_sub(metadata.last_update);
+
+    // thresholds can be pulled from a PairConfig
+    match age {
+        0..=120 => StalenessLevel::Fresh,
+        121..=300 => StalenessLevel::Aging,
+        301..=900 => StalenessLevel::Stale,
+        _ => StalenessLevel::Critical,
+    }
+}
