@@ -10,6 +10,7 @@ mod portfolio;
 mod risk;
 mod sdex;
 mod storage;
+mod strategies;
 
 use crate::storage::DataKey;
 use errors::AutoTradeError;
@@ -287,6 +288,123 @@ impl AutoTradeContract {
     /// Get authorization config
     pub fn get_auth_config(env: Env, user: Address) -> Option<auth::AuthConfig> {
         auth::get_auth_config(&env, &user)
+    }
+
+    pub fn set_stat_arb_price_history(
+        env: Env,
+        asset_id: u32,
+        prices: soroban_sdk::Vec<i128>,
+    ) -> Result<(), AutoTradeError> {
+        strategies::stat_arb::set_price_history(&env, asset_id, prices)
+    }
+
+    pub fn get_stat_arb_price_history(env: Env, asset_id: u32) -> soroban_sdk::Vec<i128> {
+        strategies::stat_arb::get_price_history(&env, asset_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn configure_stat_arb_strategy(
+        env: Env,
+        user: Address,
+        asset_basket: soroban_sdk::Vec<u32>,
+        lookback_period_days: u32,
+        cointegration_threshold: i128,
+        entry_z_score: i128,
+        exit_z_score: i128,
+        rebalance_frequency_hours: u32,
+    ) -> Result<strategies::stat_arb::StatArbStrategy, AutoTradeError> {
+        user.require_auth();
+        let strategy = strategies::stat_arb::configure_strategy(
+            &env,
+            &user,
+            asset_basket,
+            lookback_period_days,
+            cointegration_threshold,
+            entry_z_score,
+            exit_z_score,
+            rebalance_frequency_hours,
+        )?;
+        strategies::stat_arb::emit_strategy_configured(&env, &user, &strategy);
+        Ok(strategy)
+    }
+
+    pub fn get_stat_arb_strategy(
+        env: Env,
+        user: Address,
+    ) -> Option<strategies::stat_arb::StatArbStrategy> {
+        strategies::stat_arb::get_strategy(&env, &user)
+    }
+
+    pub fn test_stat_arb_cointegration(
+        env: Env,
+        asset_basket: soroban_sdk::Vec<u32>,
+        lookback_period_days: u32,
+        cointegration_threshold: i128,
+    ) -> Result<strategies::stat_arb::CointegrationTest, AutoTradeError> {
+        strategies::stat_arb::test_cointegration_for_assets(
+            &env,
+            asset_basket,
+            lookback_period_days,
+            cointegration_threshold,
+        )
+    }
+
+    pub fn check_stat_arb_signal(
+        env: Env,
+        user: Address,
+    ) -> Result<strategies::stat_arb::StatArbSignal, AutoTradeError> {
+        strategies::stat_arb::check_stat_arb_signal(&env, &user)
+    }
+
+    pub fn execute_stat_arb_trade(
+        env: Env,
+        user: Address,
+        total_value: i128,
+    ) -> Result<strategies::stat_arb::StatArbPortfolio, AutoTradeError> {
+        user.require_auth();
+        let portfolio = strategies::stat_arb::execute_stat_arb_trade(&env, &user, total_value)?;
+        strategies::stat_arb::emit_trade_opened(&env, &user, &portfolio);
+        Ok(portfolio)
+    }
+
+    pub fn get_active_stat_arb_portfolio(
+        env: Env,
+        user: Address,
+    ) -> Option<strategies::stat_arb::StatArbPortfolio> {
+        strategies::stat_arb::get_active_portfolio(&env, &user)
+    }
+
+    pub fn rebalance_stat_arb_portfolio(
+        env: Env,
+        user: Address,
+    ) -> Result<strategies::stat_arb::StatArbPortfolio, AutoTradeError> {
+        user.require_auth();
+        let portfolio = strategies::stat_arb::rebalance_stat_arb_portfolio(&env, &user)?;
+        strategies::stat_arb::emit_rebalanced(&env, &user, &portfolio);
+        Ok(portfolio)
+    }
+
+    pub fn check_stat_arb_exit(
+        env: Env,
+        user: Address,
+    ) -> Result<strategies::stat_arb::StatArbExitCheck, AutoTradeError> {
+        strategies::stat_arb::check_stat_arb_exit(&env, &user)
+    }
+
+    pub fn close_stat_arb_portfolio(
+        env: Env,
+        user: Address,
+    ) -> Result<strategies::stat_arb::StatArbPortfolio, AutoTradeError> {
+        user.require_auth();
+        let exit_check = strategies::stat_arb::check_stat_arb_exit(&env, &user)?;
+        let reason = if exit_check.reason == strategies::stat_arb::StatArbExitReason::None {
+            strategies::stat_arb::StatArbExitReason::Converged
+        } else {
+            exit_check.reason.clone()
+        };
+        let portfolio = strategies::stat_arb::close_stat_arb_portfolio(&env, &user)?;
+        strategies::stat_arb::emit_closed(&env, &user, &portfolio, reason);
+        Ok(portfolio)
     }
 }
 

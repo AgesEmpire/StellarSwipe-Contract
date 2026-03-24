@@ -114,7 +114,11 @@ pub fn emit_collaborative_signal_created(env: &Env, signal_id: u64, authors: Vec
 }
 
 pub fn emit_collaborative_signal_approved(env: &Env, signal_id: u64, approver: Address) {
-    let topics = (Symbol::new(env, "collab_signal_approved"), signal_id, approver);
+    let topics = (
+        Symbol::new(env, "collab_signal_approved"),
+        signal_id,
+        approver,
+    );
     env.events().publish(topics, ());
 }
 

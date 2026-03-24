@@ -2,26 +2,26 @@
 
 mod conversion;
 mod errors;
-mod history;
-mod types;
-mod multi_hop;
-mod storage;
-mod sdex;
-mod staleness;
-mod reputation;
 mod events;
 mod external_adapter;
+mod history;
+mod multi_hop;
+mod reputation;
+mod sdex;
+mod staleness;
+mod storage;
+mod types;
 
-use soroban_sdk::{contract, contractimpl, Address, Env, symbol_short, vec};
 use common::{Asset, AssetPair};
 use errors::OracleError;
-use types::{StorageKey, OracleReputation, PriceSubmission, ConsensusPriceData, ExternalPrice};
+use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, Env};
+use types::{ConsensusPriceData, ExternalPrice, OracleReputation, PriceSubmission, StorageKey};
 
-pub use multi_hop::{LiquidityPath, find_optimal_path, calculate_multi_hop_price};
+pub use multi_hop::{calculate_multi_hop_price, find_optimal_path, LiquidityPath};
 
 pub use conversion::{convert_to_base, ConversionPath};
-pub use storage::{get_base_currency, set_base_currency, get_price, set_price};
-pub use history::{store_price, get_historical_price, calculate_twap, get_twap_deviation};
+pub use history::{calculate_twap, get_historical_price, get_twap_deviation, store_price};
+pub use storage::{get_base_currency, get_price, set_base_currency, set_price};
 
 #[contract]
 pub struct OracleContract;
@@ -54,24 +54,26 @@ impl OracleContract {
         // Check cache first
         let base = storage::get_base_currency(&env);
         if let Some(cached) = storage::get_cached_conversion(&env, &asset, &base) {
-            return Ok(amount.checked_mul(cached.rate)
+            return Ok(amount
+                .checked_mul(cached.rate)
                 .and_then(|v| v.checked_div(10_000_000))
                 .ok_or(OracleError::ConversionOverflow)?);
         }
 
         // Perform conversion
         let result = conversion::convert_to_base(&env, amount, asset.clone())?;
-        
+
         // Cache the rate
         if amount > 0 {
-            let rate = result.checked_mul(10_000_000)
+            let rate = result
+                .checked_mul(10_000_000)
                 .and_then(|v| v.checked_div(amount))
                 .unwrap_or(0);
             if rate > 0 {
                 storage::set_cached_conversion(&env, &asset, &base, rate);
             }
         }
-        
+
         Ok(result)
     }
 
@@ -111,12 +113,22 @@ impl OracleContract {
     }
 
     /// Get price deviation from TWAP
-    pub fn get_price_deviation(env: Env, pair: AssetPair, current_price: i128, window: u64) -> Result<i128, OracleError> {
+    pub fn get_price_deviation(
+        env: Env,
+        pair: AssetPair,
+        current_price: i128,
+        window: u64,
+    ) -> Result<i128, OracleError> {
         history::get_twap_deviation(&env, &pair, current_price, window)
     }
 
     /// Find optimal path between assets
-    pub fn find_optimal_path(env: Env, from: Asset, to: Asset, amount: i128) -> Result<LiquidityPath, OracleError> {
+    pub fn find_optimal_path(
+        env: Env,
+        from: Asset,
+        to: Asset,
+        amount: i128,
+    ) -> Result<LiquidityPath, OracleError> {
         multi_hop::find_optimal_path(&env, from, to, amount)
     }
 
@@ -174,7 +186,7 @@ mod tests {
             base: usdc(&env),
             quote: xlm(&env),
         };
-        
+
         client.set_price(&pair, &10_000_000); // 1 USDC = 1 XLM
         let price = client.get_price(&pair).unwrap();
         assert_eq!(price, 10_000_000);
@@ -229,10 +241,16 @@ mod tests {
         let usdc = usdc(&env);
 
         client.initialize(&admin, &xlm);
-        assert_eq!(client.get_base_currency().code, String::from_str(&env, "XLM"));
+        assert_eq!(
+            client.get_base_currency().code,
+            String::from_str(&env, "XLM")
+        );
 
         client.set_base_currency(&usdc);
-        assert_eq!(client.get_base_currency().code, String::from_str(&env, "USDC"));
+        assert_eq!(
+            client.get_base_currency().code,
+            String::from_str(&env, "USDC")
+        );
     }
 
     #[test]
@@ -550,9 +568,16 @@ impl OracleContract {
         Ok(price)
     }
 
-    pub fn get_price_with_confidence(env: Env, pair: AssetPair) -> Result<(i128, u32), OracleError> {
+    pub fn get_price_with_confidence(
+        env: Env,
+        pair: AssetPair,
+    ) -> Result<(i128, u32), OracleError> {
         let key = StorageKey::PriceMap(pair.clone());
-        let prices: Vec<PriceData> = env.storage().temporary().get(&key).ok_or(OracleError::PriceNotFound)?;
+        let prices: Vec<PriceData> = env
+            .storage()
+            .temporary()
+            .get(&key)
+            .ok_or(OracleError::PriceNotFound)?;
 
         let current_time = env.ledger().timestamp();
         let mut fresh_prices: Vec<PriceData> = Vec::new(&env);
@@ -583,36 +608,59 @@ impl OracleContract {
         }
 
         let median_data = sorted.get(len / 2).unwrap();
-        
+
         // 3. Check for 10% deviation (Edge Case)
         let min_p = sorted.get(0).unwrap().price;
         let max_p = sorted.get(len - 1).unwrap().price;
         if (max_p - min_p) * 100 / min_p > 10 {
             // Price sources disagree by > 10%
-            return Err(OracleError::UnreliablePrice); 
+            return Err(OracleError::UnreliablePrice);
         }
 
         Ok((median_data.price, median_data.confidence))
     }
 
-    pub fn add_price_source(env: Env, admin: Address, source: Address, weight: u32) -> Result<(), OracleError> {
+    pub fn add_price_source(
+        env: Env,
+        admin: Address,
+        source: Address,
+        weight: u32,
+    ) -> Result<(), OracleError> {
         admin.require_auth();
         // Check if caller is admin (logic from your existing lib.rs)
         Self::is_admin(&env, &admin)?;
-        
-        env.storage().persistent().set(&StorageKey::OracleWeight(source), &weight);
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::OracleWeight(source), &weight);
         Ok(())
     }
 
-    pub fn submit_price(env: Env, source: Address, pair: AssetPair, price: i128, confidence: u32) -> Result<(), OracleError> {
+    pub fn submit_price(
+        env: Env,
+        source: Address,
+        pair: AssetPair,
+        price: i128,
+        confidence: u32,
+    ) -> Result<(), OracleError> {
         source.require_auth();
-        
+
         // Ensure source is a registered oracle
-        let weight: u32 = env.storage().persistent().get(&StorageKey::OracleWeight(source.clone())).unwrap_or(0);
-        if weight == 0 { return Err(OracleError::Unauthorized); }
+        let weight: u32 = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::OracleWeight(source.clone()))
+            .unwrap_or(0);
+        if weight == 0 {
+            return Err(OracleError::Unauthorized);
+        }
 
         let key = StorageKey::PriceMap(pair.clone());
-        let mut prices: Vec<PriceData> = env.storage().temporary().get(&key).unwrap_or(Vec::new(&env));
+        let mut prices: Vec<PriceData> = env
+            .storage()
+            .temporary()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
 
         let new_entry = PriceData {
             asset_pair: pair,
@@ -623,16 +671,16 @@ impl OracleContract {
         };
 
         prices.push_back(new_entry);
-        
+
         // Cache management: Keep prices for 5 mins
         env.storage().temporary().set(&key, &prices);
-        env.storage().temporary().extend_ttl(&key, 60, 60); 
-        
+        env.storage().temporary().extend_ttl(&key, 60, 60);
+
         Ok(())
     }
 
     pub fn refresh_from_sdex(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
-        // 1. In a real Soroban scenario, you would interface with the 
+        // 1. In a real Soroban scenario, you would interface with the
         // Liquidity Pool or a specialized SDEX oracle contract.
         // For this issue, we assume we fetch the orderbook.
         let orderbook = fetch_sdex_orderbook(&env, &pair)?;
@@ -647,7 +695,10 @@ impl OracleContract {
         Ok(price)
     }
 
-    pub fn update_with_external_data(env: Env, prices: Vec<ExternalPrice>) -> Result<i128, OracleError> {
+    pub fn update_with_external_data(
+        env: Env,
+        prices: Vec<ExternalPrice>,
+    ) -> Result<i128, OracleError> {
         // Process the external prices using our new adapter
         let consensus_price = crate::external_adapter::process_external_prices(&env, prices)?;
 
@@ -659,11 +710,12 @@ impl OracleContract {
 
         Ok(consensus_price)
     }
+}
 
 // Internal helper to represent the SDEX query
 fn fetch_sdex_orderbook(env: &Env, pair: &AssetPair) -> Result<OrderBook, OracleError> {
-    // Note: Actual Soroban host functions for SDEX are currently limited 
-    // to Liquidity Pool swaps. For Order Books, one typically uses 
+    // Note: Actual Soroban host functions for SDEX are currently limited
+    // to Liquidity Pool swaps. For Order Books, one typically uses
     // a Cross-Chain/Bridge approach or a Trusted Observer.
     // Here we implement the interface logic.
     unimplemented!("SDEX Orderbook Host Interface");
@@ -671,11 +723,11 @@ fn fetch_sdex_orderbook(env: &Env, pair: &AssetPair) -> Result<OrderBook, Oracle
 
 pub fn get_safe_price(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
     let level = staleness::check_staleness(&env, pair.clone());
-    
+
     if level == StalenessLevel::Critical {
         return Err(OracleError::CircuitBreakerTripped);
     }
-    
+
     if level == StalenessLevel::Stale {
         return Err(OracleError::PriceStaleTradeBlocked);
     }
@@ -685,13 +737,16 @@ pub fn get_safe_price(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
 
 pub fn on_price_update(env: &Env, pair: AssetPair) {
     let mut metadata = staleness::get_metadata(env, &pair);
-    
+
     // Auto-recovery
     if metadata.is_paused {
         metadata.is_paused = false;
-        env.events().publish((symbol_short!("RECOVER"), pair.clone()), env.ledger().timestamp());
+        env.events().publish(
+            (symbol_short!("RECOVER"), pair.clone()),
+            env.ledger().timestamp(),
+        );
     }
-    
+
     metadata.last_update = env.ledger().timestamp();
     metadata.update_count_24h += 1;
     staleness::set_metadata(env, &pair, metadata);

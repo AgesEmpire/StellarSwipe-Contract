@@ -1,9 +1,12 @@
 #![cfg(test)]
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, String};
-use crate::versioning::{SignalVersion, CopyRecord};
-use crate::types::{Signal, SignalAction, SignalStatus};
 use crate::categories::{RiskLevel, SignalCategory};
+use crate::types::{Signal, SignalAction, SignalStatus};
+use crate::versioning::{CopyRecord, SignalVersion};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env, String,
+};
 
 fn create_test_signal(env: &Env, provider: Address, signal_id: u64) -> Signal {
     Signal {
@@ -118,15 +121,42 @@ fn test_multiple_updates() {
 
     // First update
     env.ledger().with_mut(|li| li.timestamp += 3700); // Past cooldown
-    versioning::update_signal(&env, signal_id, &provider, Some(150), None, None, &mut signal).unwrap();
+    versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(150),
+        None,
+        None,
+        &mut signal,
+    )
+    .unwrap();
 
     // Second update
     env.ledger().with_mut(|li| li.timestamp += 3700);
-    versioning::update_signal(&env, signal_id, &provider, Some(200), None, None, &mut signal).unwrap();
+    versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(200),
+        None,
+        None,
+        &mut signal,
+    )
+    .unwrap();
 
     // Third update
     env.ledger().with_mut(|li| li.timestamp += 3700);
-    let version = versioning::update_signal(&env, signal_id, &provider, Some(250), None, None, &mut signal).unwrap();
+    let version = versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(250),
+        None,
+        None,
+        &mut signal,
+    )
+    .unwrap();
 
     assert_eq!(version, 4);
     assert_eq!(signal.price, 250);
@@ -145,10 +175,27 @@ fn test_update_cooldown() {
     let mut signal = create_test_signal(&env, provider.clone(), signal_id);
 
     // First update
-    versioning::update_signal(&env, signal_id, &provider, Some(150), None, None, &mut signal).unwrap();
+    versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(150),
+        None,
+        None,
+        &mut signal,
+    )
+    .unwrap();
 
     // Try immediate second update (should fail)
-    let result = versioning::update_signal(&env, signal_id, &provider, Some(200), None, None, &mut signal);
+    let result = versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(200),
+        None,
+        None,
+        &mut signal,
+    );
     assert_eq!(result, Err(crate::errors::VersioningError::UpdateCooldown));
 }
 
@@ -164,13 +211,33 @@ fn test_max_updates_limit() {
     // Perform 5 updates (max allowed)
     for i in 0..5 {
         env.ledger().with_mut(|li| li.timestamp += 3700);
-        versioning::update_signal(&env, signal_id, &provider, Some(100 + (i * 10) as i128), None, None, &mut signal).unwrap();
+        versioning::update_signal(
+            &env,
+            signal_id,
+            &provider,
+            Some(100 + (i * 10) as i128),
+            None,
+            None,
+            &mut signal,
+        )
+        .unwrap();
     }
 
     // Try 6th update (should fail)
     env.ledger().with_mut(|li| li.timestamp += 3700);
-    let result = versioning::update_signal(&env, signal_id, &provider, Some(200), None, None, &mut signal);
-    assert_eq!(result, Err(crate::errors::VersioningError::MaxUpdatesReached));
+    let result = versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(200),
+        None,
+        None,
+        &mut signal,
+    );
+    assert_eq!(
+        result,
+        Err(crate::errors::VersioningError::MaxUpdatesReached)
+    );
 }
 
 #[test]
@@ -183,7 +250,15 @@ fn test_update_not_owner() {
     let signal_id = 1;
     let mut signal = create_test_signal(&env, provider.clone(), signal_id);
 
-    let result = versioning::update_signal(&env, signal_id, &other_user, Some(150), None, None, &mut signal);
+    let result = versioning::update_signal(
+        &env,
+        signal_id,
+        &other_user,
+        Some(150),
+        None,
+        None,
+        &mut signal,
+    );
     assert_eq!(result, Err(crate::errors::VersioningError::NotSignalOwner));
 }
 
@@ -197,8 +272,19 @@ fn test_update_inactive_signal() {
     let mut signal = create_test_signal(&env, provider.clone(), signal_id);
     signal.status = SignalStatus::Expired;
 
-    let result = versioning::update_signal(&env, signal_id, &provider, Some(150), None, None, &mut signal);
-    assert_eq!(result, Err(crate::errors::VersioningError::CannotUpdateInactive));
+    let result = versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(150),
+        None,
+        None,
+        &mut signal,
+    );
+    assert_eq!(
+        result,
+        Err(crate::errors::VersioningError::CannotUpdateInactive)
+    );
 }
 
 #[test]
@@ -209,11 +295,19 @@ fn test_update_expired_signal() {
     let provider = Address::generate(&env);
     let signal_id = 1;
     let mut signal = create_test_signal(&env, provider.clone(), signal_id);
-    
+
     // Fast forward past expiry
     env.ledger().with_mut(|li| li.timestamp = signal.expiry + 1);
 
-    let result = versioning::update_signal(&env, signal_id, &provider, Some(150), None, None, &mut signal);
+    let result = versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(150),
+        None,
+        None,
+        &mut signal,
+    );
     assert_eq!(result, Err(crate::errors::VersioningError::SignalExpired));
 }
 
@@ -226,10 +320,19 @@ fn test_invalid_price_update() {
     let signal_id = 1;
     let mut signal = create_test_signal(&env, provider.clone(), signal_id);
 
-    let result = versioning::update_signal(&env, signal_id, &provider, Some(0), None, None, &mut signal);
+    let result =
+        versioning::update_signal(&env, signal_id, &provider, Some(0), None, None, &mut signal);
     assert_eq!(result, Err(crate::errors::VersioningError::InvalidPrice));
 
-    let result = versioning::update_signal(&env, signal_id, &provider, Some(-100), None, None, &mut signal);
+    let result = versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(-100),
+        None,
+        None,
+        &mut signal,
+    );
     assert_eq!(result, Err(crate::errors::VersioningError::InvalidPrice));
 }
 
@@ -243,7 +346,15 @@ fn test_invalid_expiry_update() {
     let mut signal = create_test_signal(&env, provider.clone(), signal_id);
 
     let past_time = env.ledger().timestamp() - 1000;
-    let result = versioning::update_signal(&env, signal_id, &provider, None, None, Some(past_time), &mut signal);
+    let result = versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        None,
+        None,
+        Some(past_time),
+        &mut signal,
+    );
     assert_eq!(result, Err(crate::errors::VersioningError::InvalidExpiry));
 }
 
@@ -278,10 +389,28 @@ fn test_pending_updates() {
 
     // Provider makes 2 updates
     env.ledger().with_mut(|li| li.timestamp += 3700);
-    versioning::update_signal(&env, signal_id, &provider, Some(150), None, None, &mut signal).unwrap();
-    
+    versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(150),
+        None,
+        None,
+        &mut signal,
+    )
+    .unwrap();
+
     env.ledger().with_mut(|li| li.timestamp += 3700);
-    versioning::update_signal(&env, signal_id, &provider, Some(200), None, None, &mut signal).unwrap();
+    versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(200),
+        None,
+        None,
+        &mut signal,
+    )
+    .unwrap();
 
     // Check pending updates
     let pending = versioning::get_pending_updates(&env, &user, signal_id);
@@ -303,7 +432,16 @@ fn test_mark_notified() {
     versioning::record_copy(&env, &user, signal_id, 1);
 
     env.ledger().with_mut(|li| li.timestamp += 3700);
-    versioning::update_signal(&env, signal_id, &provider, Some(150), None, None, &mut signal).unwrap();
+    versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(150),
+        None,
+        None,
+        &mut signal,
+    )
+    .unwrap();
 
     // Mark as notified
     versioning::mark_notified(&env, &user, signal_id, 2);
@@ -326,12 +464,21 @@ fn test_version_history_order() {
     let prices = [150, 200, 250];
     for (i, &price) in prices.iter().enumerate() {
         env.ledger().with_mut(|li| li.timestamp += 3700);
-        versioning::update_signal(&env, signal_id, &provider, Some(price), None, None, &mut signal).unwrap();
+        versioning::update_signal(
+            &env,
+            signal_id,
+            &provider,
+            Some(price),
+            None,
+            None,
+            &mut signal,
+        )
+        .unwrap();
     }
 
     let history = versioning::get_signal_history(&env, signal_id);
     assert_eq!(history.len(), 3);
-    
+
     // Verify versions are in order
     for (i, version_record) in history.iter().enumerate() {
         assert_eq!(version_record.version, (i + 1) as u32);
@@ -352,7 +499,16 @@ fn test_get_latest_version() {
 
     // After update
     env.ledger().with_mut(|li| li.timestamp += 3700);
-    versioning::update_signal(&env, signal_id, &provider, Some(150), None, None, &mut signal).unwrap();
+    versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(150),
+        None,
+        None,
+        &mut signal,
+    )
+    .unwrap();
     assert_eq!(versioning::get_latest_version(&env, signal_id), 2);
 }
 
@@ -368,10 +524,28 @@ fn test_get_update_count() {
     assert_eq!(versioning::get_update_count(&env, signal_id), 0);
 
     env.ledger().with_mut(|li| li.timestamp += 3700);
-    versioning::update_signal(&env, signal_id, &provider, Some(150), None, None, &mut signal).unwrap();
+    versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(150),
+        None,
+        None,
+        &mut signal,
+    )
+    .unwrap();
     assert_eq!(versioning::get_update_count(&env, signal_id), 1);
 
     env.ledger().with_mut(|li| li.timestamp += 3700);
-    versioning::update_signal(&env, signal_id, &provider, Some(200), None, None, &mut signal).unwrap();
+    versioning::update_signal(
+        &env,
+        signal_id,
+        &provider,
+        Some(200),
+        None,
+        None,
+        &mut signal,
+    )
+    .unwrap();
     assert_eq!(versioning::get_update_count(&env, signal_id), 2);
 }

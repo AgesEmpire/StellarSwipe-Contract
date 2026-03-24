@@ -1,8 +1,11 @@
 #![cfg(test)]
 
+use crate::types::{RecurrencePattern, SignalAction, SignalData};
 use crate::{SignalRegistry, SignalRegistryClient};
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, String};
-use crate::types::{SignalAction, SignalData, RecurrencePattern};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env, String,
+};
 
 #[test]
 fn test_schedule_and_publish() {
@@ -13,7 +16,7 @@ fn test_schedule_and_publish() {
     let client = SignalRegistryClient::new(&env, &contract_id);
 
     let provider = Address::generate(&env);
-    
+
     let signal_data = SignalData {
         asset_pair: String::from_str(&env, "BTC/USD"),
         action: SignalAction::Buy,
@@ -52,7 +55,7 @@ fn test_cancel_schedule() {
     let client = SignalRegistryClient::new(&env, &contract_id);
 
     let provider = Address::generate(&env);
-    
+
     let signal_data = SignalData {
         asset_pair: String::from_str(&env, "ETH/USD"),
         action: SignalAction::Sell,
@@ -70,13 +73,13 @@ fn test_cancel_schedule() {
     };
 
     let schedule_id = client.schedule(&provider, &signal_data, &publish_at, &recurrence);
-    
+
     // Cancel
     client.cancel_schedule(&provider, &schedule_id);
 
     // Fast forward and attempt publish
     env.ledger().set_timestamp(publish_at + 1);
     let published_ids = client.trigger_scheduled_publications();
-    
+
     assert_eq!(published_ids.len(), 0);
 }

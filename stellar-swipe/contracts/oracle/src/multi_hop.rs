@@ -1,8 +1,8 @@
-use soroban_sdk::{Env, Vec, Map, vec};
-use common::{Asset, AssetPair};
 use crate::errors::OracleError;
-use crate::storage;
 use crate::sdex;
+use crate::storage;
+use common::{Asset, AssetPair};
+use soroban_sdk::{vec, Env, Map, Vec};
 
 const PRECISION: i128 = 10_000_000;
 const MAX_HOPS: u32 = 3;
@@ -22,7 +22,7 @@ pub fn find_optimal_path(
     env: &Env,
     from: Asset,
     to: Asset,
-    amount: i128
+    amount: i128,
 ) -> Result<LiquidityPath, OracleError> {
     // 1. Check cache first (5 minutes)
     if let Some(cached_path) = get_cached_path(env, &from, &to) {
@@ -58,22 +58,20 @@ pub fn find_optimal_path(
 }
 
 /// Calculate effective price through multiple hops.
-pub fn calculate_multi_hop_price(
-    env: &Env,
-    path: LiquidityPath,
-    amount: i128
-) -> i128 {
+pub fn calculate_multi_hop_price(env: &Env, path: LiquidityPath, amount: i128) -> i128 {
     let mut current_amount = amount;
 
     for hop in path.hops.iter() {
         let (price, slippage) = get_price_with_slippage(env, hop, current_amount);
-        
+
         // current_amount = (current_amount * price / PRECISION) * (10000 - slippage) / 10000;
-        let price_impact = current_amount.checked_mul(price)
+        let price_impact = current_amount
+            .checked_mul(price)
             .and_then(|v| v.checked_div(PRECISION))
             .unwrap_or(0);
-        
-        current_amount = price_impact.checked_mul(10000 - slippage as i128)
+
+        current_amount = price_impact
+            .checked_mul(10000 - slippage as i128)
             .and_then(|v| v.checked_div(10000))
             .unwrap_or(0);
     }
@@ -82,16 +80,12 @@ pub fn calculate_multi_hop_price(
 }
 
 /// Estimate price and slippage for a single hop.
-pub fn get_price_with_slippage(
-    env: &Env,
-    pair: AssetPair,
-    amount: i128
-) -> (i128, u32) {
+pub fn get_price_with_slippage(env: &Env, pair: AssetPair, amount: i128) -> (i128, u32) {
     // In a real implementation, this would query the order book.
     // For now, we try to get the price from storage and estimate slippage.
-    
+
     let spot_price = storage::get_price(env, &pair).unwrap_or(PRECISION);
-    
+
     // Simple slippage model based on trade size vs "virtual" liquidity.
     // In real scenario, we'd use sdex::calculate_vwap if we had orderbook data.
     // Here we assume a 0.1% slippage for every 10,000 units of amount beyond 1000.
@@ -103,7 +97,7 @@ pub fn get_price_with_slippage(
     };
 
     let total_slippage = base_slippage + volume_slippage;
-    
+
     (spot_price, total_slippage)
 }
 
@@ -123,14 +117,23 @@ fn find_all_paths(
     graph: &Vec<AssetPair>,
     from: &Asset,
     to: &Asset,
-    max_hops: u32
+    max_hops: u32,
 ) -> Vec<Vec<AssetPair>> {
     let mut result = Vec::new(env);
     let mut current_path = Vec::new(env);
     let mut visited = Map::new(env);
     visited.set(from.clone(), true);
-    
-    dfs(env, graph, from, to, max_hops, &mut current_path, &mut visited, &mut result);
+
+    dfs(
+        env,
+        graph,
+        from,
+        to,
+        max_hops,
+        &mut current_path,
+        &mut visited,
+        &mut result,
+    );
     result
 }
 
@@ -142,12 +145,12 @@ fn dfs(
     remaining_hops: u32,
     current_path: &mut Vec<AssetPair>,
     visited: &mut Map<Asset, bool>,
-    results: &mut Vec<Vec<AssetPair>>
+    results: &mut Vec<Vec<AssetPair>>,
 ) {
     if remaining_hops == 0 {
         return;
     }
-    
+
     for pair in graph.iter() {
         let next = if pair.base == *current {
             Some(pair.quote.clone())
@@ -156,28 +159,37 @@ fn dfs(
         } else {
             None
         };
-        
+
         if let Some(next_asset) = next {
             if visited.contains_key(next_asset.clone()) {
                 continue;
             }
-            
+
             // Represent hop in direction of trade
             let hop = AssetPair {
                 base: current.clone(),
                 quote: next_asset.clone(),
             };
-            
+
             current_path.push_back(hop);
-            
+
             if next_asset == *target {
                 results.push_back(current_path.clone());
             } else {
                 visited.set(next_asset.clone(), true);
-                dfs(env, graph, &next_asset, target, remaining_hops - 1, current_path, visited, results);
+                dfs(
+                    env,
+                    graph,
+                    &next_asset,
+                    target,
+                    remaining_hops - 1,
+                    current_path,
+                    visited,
+                    results,
+                );
                 visited.remove(next_asset.clone()); // Backtrack
             }
-            
+
             current_path.remove(current_path.len() - 1);
         }
     }
@@ -186,7 +198,7 @@ fn dfs(
 fn calculate_path_cost(
     env: &Env,
     path: Vec<AssetPair>,
-    amount: i128
+    amount: i128,
 ) -> Result<LiquidityPath, OracleError> {
     let mut current_amount = amount;
     let mut total_slippage: u32 = 0;
@@ -200,15 +212,14 @@ fn calculate_path_cost(
 
         let (price, slippage) = get_price_with_slippage(env, hop, current_amount);
         total_slippage += slippage;
-        
+
         // Mock liquidity as 1M units for now
         let liquidity = 1_000_000 * PRECISION;
         if liquidity < min_liquidity {
             min_liquidity = liquidity;
         }
 
-        current_amount = (current_amount * price / PRECISION)
-            * (10000 - slippage as i128) / 10000;
+        current_amount = (current_amount * price / PRECISION) * (10000 - slippage as i128) / 10000;
     }
 
     if total_slippage > SLIPPAGE_TOLERANCE_BPS {
@@ -245,8 +256,8 @@ fn cache_path(env: &Env, from: &Asset, to: &Asset, path: &LiquidityPath) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, String, Address};
-    use crate::storage::{set_base_currency, set_price, add_available_pair};
+    use crate::storage::{add_available_pair, set_base_currency, set_price};
+    use soroban_sdk::{testutils::Address as _, Address, String};
 
     fn create_asset(env: &Env, code: &str) -> Asset {
         Asset {
@@ -270,28 +281,35 @@ mod tests {
         let token_b = create_asset(&env, "TOKENB");
 
         // Set up pairs: TOKENA/XLM and XLM/TOKENB
-        let pair1 = AssetPair { base: token_a.clone(), quote: xlm.clone() };
-        let pair2 = AssetPair { base: xlm.clone(), quote: token_b.clone() };
+        let pair1 = AssetPair {
+            base: token_a.clone(),
+            quote: xlm.clone(),
+        };
+        let pair2 = AssetPair {
+            base: xlm.clone(),
+            quote: token_b.clone(),
+        };
 
         set_price(&env, &pair1, 10 * PRECISION); // 1 TOKENA = 10 XLM
-        set_price(&env, &pair2, 2 * PRECISION);  // 1 XLM = 2 TOKENB
-        
+        set_price(&env, &pair2, 2 * PRECISION); // 1 XLM = 2 TOKENB
+
         add_available_pair(&env, pair1.clone());
         add_available_pair(&env, pair2.clone());
 
-        let path = find_optimal_path(&env, token_a.clone(), token_b.clone(), 100 * PRECISION).unwrap();
-        
+        let path =
+            find_optimal_path(&env, token_a.clone(), token_b.clone(), 100 * PRECISION).unwrap();
+
         assert_eq!(path.hops.len(), 2);
         assert_eq!(path.estimated_slippage, 20); // 10 bps per hop
-        
+
         let final_amount = calculate_multi_hop_price(&env, path, 100 * PRECISION);
-        
+
         // Manual calculation:
         // 100 TOKENA -> XLM: 100 * 10 = 1000 XLM. Slippage 0.1% -> 999 XLM
         // 999 XLM -> TOKENB: 999 * 2 = 1998 TOKENB. Slippage 0.1% -> 1996.002 -> 1996
         // Precision is 10,000,000
         // 999 * 2 * 9990 / 10000 = 1998 * 0.999 = 1996.002
-        assert_eq!(final_amount, 1996_0020000); 
+        assert_eq!(final_amount, 1996_0020000);
     }
 
     #[test]
@@ -302,11 +320,24 @@ mod tests {
         let c = create_asset(&env, "C");
         let d = create_asset(&env, "D");
 
-        let graph = vec![&env,
-            AssetPair { base: a.clone(), quote: b.clone() },
-            AssetPair { base: b.clone(), quote: c.clone() },
-            AssetPair { base: c.clone(), quote: d.clone() },
-            AssetPair { base: a.clone(), quote: d.clone() },
+        let graph = vec![
+            &env,
+            AssetPair {
+                base: a.clone(),
+                quote: b.clone(),
+            },
+            AssetPair {
+                base: b.clone(),
+                quote: c.clone(),
+            },
+            AssetPair {
+                base: c.clone(),
+                quote: d.clone(),
+            },
+            AssetPair {
+                base: a.clone(),
+                quote: d.clone(),
+            },
         ];
 
         let paths = find_all_paths(&env, &graph, &a, &d, 3);
@@ -318,13 +349,16 @@ mod tests {
         let env = Env::default();
         let token_a = create_asset(&env, "TOKENA");
         let token_b = create_asset(&env, "TOKENB");
-        let pair = AssetPair { base: token_a.clone(), quote: token_b.clone() };
-        
+        let pair = AssetPair {
+            base: token_a.clone(),
+            quote: token_b.clone(),
+        };
+
         set_price(&env, &pair, PRECISION);
         add_available_pair(&env, pair);
 
         // Huge amount to trigger high slippage (1B units > 10k units triggers volume slippage)
-        // 1B units = 10^9. Threshold is 1000. 
+        // 1B units = 10^9. Threshold is 1000.
         // volume_slippage = (10^9 - 1000) / 10000 * 5 bps
         // (1,000,000,000 - 1000) / 10000 * 5 = 100,000 * 5 = 500,000 bps = 5000%
         let result = find_optimal_path(&env, token_a, token_b, 1_000_000_000 * PRECISION);
@@ -336,18 +370,23 @@ mod tests {
         let env = Env::default();
         let a = create_asset(&env, "A");
         let b = create_asset(&env, "B");
-        let pair = AssetPair { base: a.clone(), quote: b.clone() };
-        
+        let pair = AssetPair {
+            base: a.clone(),
+            quote: b.clone(),
+        };
+
         set_price(&env, &pair, PRECISION);
         add_available_pair(&env, pair.clone());
 
         let path1 = find_optimal_path(&env, a.clone(), b.clone(), 100 * PRECISION).unwrap();
-        
+
         // Remove pair from available but it should still be in cache
         let mut pairs = storage::get_available_pairs(&env);
         pairs.remove(pair.clone());
-        env.storage().persistent().set(&storage::StorageKey::AvailablePairs, &pairs);
-        
+        env.storage()
+            .persistent()
+            .set(&storage::StorageKey::AvailablePairs, &pairs);
+
         let path2 = find_optimal_path(&env, a.clone(), b.clone(), 100 * PRECISION).unwrap();
         assert_eq!(path1.hops.len(), path2.hops.len());
     }

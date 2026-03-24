@@ -1,6 +1,6 @@
-use soroban_sdk::{contracttype, Address, Env, Map, Vec};
 use crate::errors::AdminError;
 use crate::types::{Signal, SignalAction};
+use soroban_sdk::{contracttype, Address, Env, Map, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,13 +36,13 @@ pub fn create_collaborative_signal(
     if total != 10000 {
         return Err(AdminError::InvalidParameter);
     }
-    
+
     if co_authors.len() + 1 != contribution_pcts.len() {
         return Err(AdminError::InvalidParameter);
     }
 
     let mut authors = Vec::new(env);
-    
+
     // Primary author auto-approves
     authors.push_back(Author {
         address: primary_author,
@@ -68,8 +68,8 @@ pub fn approve_collaborative_signal(
     signal_id: u64,
     approver: &Address,
 ) -> Result<bool, AdminError> {
-    let mut authors = get_collaborative_signal(env, signal_id)
-        .ok_or(AdminError::InvalidParameter)?;
+    let mut authors =
+        get_collaborative_signal(env, signal_id).ok_or(AdminError::InvalidParameter)?;
 
     let mut found = false;
     for i in 0..authors.len() {
@@ -149,17 +149,14 @@ pub fn is_collaborative_signal(env: &Env, signal_id: u64) -> bool {
 
 /// Helper to distribute provider fees among co-authors
 /// Takes the provider_fee portion and splits it according to contribution percentages
-pub fn split_provider_fee(
-    authors: &Vec<Author>,
-    provider_fee: i128,
-) -> Vec<(u32, i128)> {
+pub fn split_provider_fee(authors: &Vec<Author>, provider_fee: i128) -> Vec<(u32, i128)> {
     let mut splits = Vec::new(&authors.env());
-    
+
     for i in 0..authors.len() {
         let author = authors.get(i).unwrap();
         let author_share = (provider_fee * author.contribution_pct as i128) / 10000;
         splits.push_back((i, author_share));
     }
-    
+
     splits
 }

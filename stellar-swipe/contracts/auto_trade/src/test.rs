@@ -25,6 +25,68 @@ fn setup_signal(_env: &Env, signal_id: u64, expiry: u64) -> storage::Signal {
     }
 }
 
+fn stat_arb_basket(env: &Env) -> soroban_sdk::Vec<u32> {
+    let mut basket = soroban_sdk::Vec::new(env);
+    basket.push_back(1);
+    basket.push_back(2);
+    basket.push_back(3);
+    basket
+}
+
+fn stat_arb_history(env: &Env, values: &[i128]) -> soroban_sdk::Vec<i128> {
+    let mut prices = soroban_sdk::Vec::new(env);
+    for value in values {
+        prices.push_back(*value);
+    }
+    prices
+}
+
+fn grant_auth(
+    env: &Env,
+    contract_id: &Address,
+    user: &Address,
+    max_amount: i128,
+    duration_days: u32,
+) {
+    env.as_contract(contract_id, || {
+        AutoTradeContract::grant_authorization(
+            env.clone(),
+            user.clone(),
+            max_amount,
+            duration_days,
+        )
+        .unwrap();
+    });
+}
+
+fn revoke_auth(env: &Env, contract_id: &Address, user: &Address) {
+    env.as_contract(contract_id, || {
+        AutoTradeContract::revoke_authorization(env.clone(), user.clone()).unwrap();
+    });
+}
+
+fn configure_stat_arb(
+    env: &Env,
+    contract_id: &Address,
+    user: &Address,
+    entry_z_score: i128,
+    exit_z_score: i128,
+) {
+    env.as_contract(contract_id, || {
+        AutoTradeContract::configure_stat_arb_strategy(
+            env.clone(),
+            user.clone(),
+            stat_arb_basket(env),
+            6,
+            1,
+            entry_z_score,
+            exit_z_score,
+            1,
+        )
+        .unwrap();
+    });
+}
+
 #[test]
 fn test_execute_trade_invalid_amount() {
     let env = setup_env();
@@ -572,11 +634,12 @@ fn test_grant_authorization_success() {
     let user = Address::generate(&env);
 
     env.as_contract(&contract_id, || {
-        let res = AutoTradeContract::grant_authorization(env.clone(), user.clone(), 500_0000000, 30);
+        let res =
+            AutoTradeContract::grant_authorization(env.clone(), user.clone(), 500_0000000, 30);
         assert!(res.is_ok());
 
         let config = AutoTradeContract::get_auth_config(env.clone(), user.clone()).unwrap();
-        assert_eq!(config.authorized, true);
+        assert!(config.authorized);
         assert_eq!(config.max_trade_amount, 500_0000000);
         assert_eq!(config.expires_at, 1000 + (30 * 86400));
     });
@@ -600,9 +663,9 @@ fn test_revoke_authorization() {
     let contract_id = env.register(AutoTradeContract, ());
     let user = Address::generate(&env);
 
+    grant_auth(&env, &contract_id, &user, 1000_0000000, 30);
+
     env.as_contract(&contract_id, || {
-        AutoTradeContract::grant_authorization(env.clone(), user.clone(), 1000_0000000, 30)
-            .unwrap();
         AutoTradeContract::revoke_authorization(env.clone(), user.clone()).unwrap();
 
         let config = AutoTradeContract::get_auth_config(env.clone(), user.clone());
@@ -618,10 +681,10 @@ fn test_trade_under_limit_succeeds() {
     let signal_id = 1;
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
+    grant_auth(&env, &contract_id, &user, 500_0000000, 30);
+
     env.as_contract(&contract_id, || {
         storage::set_signal(&env, signal_id, &signal);
-        AutoTradeContract::grant_authorization(env.clone(), user.clone(), 500_0000000, 30)
-            .unwrap();
         env.storage()
             .temporary()
             .set(&(user.clone(), symbol_short!("balance")), &1000_0000000i128);
@@ -648,10 +711,10 @@ fn test_trade_over_limit_fails() {
     let signal_id = 1;
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
+    grant_auth(&env, &contract_id, &user, 500_0000000, 30);
+
     env.as_contract(&contract_id, || {
         storage::set_signal(&env, signal_id, &signal);
-        AutoTradeContract::grant_authorization(env.clone(), user.clone(), 500_0000000, 30)
-            .unwrap();
         env.storage()
             .temporary()
             .set(&(user.clone(), symbol_short!("balance")), &1000_0000000i128);
@@ -675,12 +738,11 @@ fn test_revoked_authorization_blocks_trade() {
     let signal_id = 1;
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
+    grant_auth(&env, &contract_id, &user, 1000_0000000, 30);
+    revoke_auth(&env, &contract_id, &user);
+
     env.as_contract(&contract_id, || {
         storage::set_signal(&env, signal_id, &signal);
-        AutoTradeContract::grant_authorization(env.clone(), user.clone(), 1000_0000000, 30)
-            .unwrap();
-        AutoTradeContract::revoke_authorization(env.clone(), user.clone()).unwrap();
-
         let res = AutoTradeContract::execute_trade(
             env.clone(),
             user.clone(),
@@ -700,12 +762,10 @@ fn test_expired_authorization_blocks_trade() {
     let signal_id = 1;
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 100000);
 
+    grant_auth(&env, &contract_id, &user, 1000_0000000, 1);
+
     env.as_contract(&contract_id, || {
         storage::set_signal(&env, signal_id, &signal);
-        // Grant with 1 day duration
-        AutoTradeContract::grant_authorization(env.clone(), user.clone(), 1000_0000000, 1)
-            .unwrap();
-
         // Fast forward time beyond expiry
         env.ledger().set_timestamp(1000 + 86400 + 1);
 
@@ -726,12 +786,10 @@ fn test_multiple_authorization_grants_latest_applies() {
     let contract_id = env.register(AutoTradeContract, ());
     let user = Address::generate(&env);
 
-    env.as_contract(&contract_id, || {
-        AutoTradeContract::grant_authorization(env.clone(), user.clone(), 500_0000000, 30)
-            .unwrap();
-        AutoTradeContract::grant_authorization(env.clone(), user.clone(), 1000_0000000, 60)
-            .unwrap();
+    grant_auth(&env, &contract_id, &user, 500_0000000, 30);
+    grant_auth(&env, &contract_id, &user, 1000_0000000, 60);
 
+    env.as_contract(&contract_id, || {
         let config = AutoTradeContract::get_auth_config(env.clone(), user.clone()).unwrap();
         assert_eq!(config.max_trade_amount, 1000_0000000);
         assert_eq!(config.expires_at, 1000 + (60 * 86400));
@@ -746,10 +804,10 @@ fn test_authorization_at_exact_limit() {
     let signal_id = 1;
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
+    grant_auth(&env, &contract_id, &user, 500_0000000, 30);
+
     env.as_contract(&contract_id, || {
         storage::set_signal(&env, signal_id, &signal);
-        AutoTradeContract::grant_authorization(env.clone(), user.clone(), 500_0000000, 30)
-            .unwrap();
         env.storage()
             .temporary()
             .set(&(user.clone(), symbol_short!("balance")), &1000_0000000i128);
@@ -765,5 +823,158 @@ fn test_authorization_at_exact_limit() {
             500_0000000,
         );
         assert!(res.is_ok());
+    });
+}
+
+#[test]
+fn test_stat_arb_trade_creates_active_portfolio_state_correctly() {
+    let env = setup_env();
+    let contract_id = env.register(AutoTradeContract, ());
+    let user = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            1,
+            stat_arb_history(&env, &[100, 101, 102, 103, 104, 180]),
+        )
+        .unwrap();
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            2,
+            stat_arb_history(&env, &[80, 81, 82, 83, 84, 85]),
+        )
+        .unwrap();
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            3,
+            stat_arb_history(&env, &[60, 61, 62, 63, 64, 65]),
+        )
+        .unwrap();
+    });
+
+    configure_stat_arb(&env, &contract_id, &user, 500, 250);
+
+    env.as_contract(&contract_id, || {
+        let portfolio =
+            AutoTradeContract::execute_stat_arb_trade(env.clone(), user.clone(), 90_000).unwrap();
+
+        assert_eq!(portfolio.asset_positions.len(), 3);
+        assert_eq!(portfolio.total_value, 90_000);
+        assert!(
+            AutoTradeContract::get_active_stat_arb_portfolio(env.clone(), user.clone()).is_some()
+        );
+    });
+}
+
+#[test]
+fn test_stat_arb_rebalance_updates_toward_new_hedge_ratios() {
+    let env = setup_env();
+    let contract_id = env.register(AutoTradeContract, ());
+    let user = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            1,
+            stat_arb_history(&env, &[100, 101, 102, 103, 104, 180]),
+        )
+        .unwrap();
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            2,
+            stat_arb_history(&env, &[80, 81, 82, 83, 84, 85]),
+        )
+        .unwrap();
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            3,
+            stat_arb_history(&env, &[60, 61, 62, 63, 64, 65]),
+        )
+        .unwrap();
+    });
+
+    configure_stat_arb(&env, &contract_id, &user, 500, 250);
+
+    let opened = env.as_contract(&contract_id, || {
+        AutoTradeContract::execute_stat_arb_trade(env.clone(), user.clone(), 90_000).unwrap()
+    });
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+
+    env.as_contract(&contract_id, || {
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            2,
+            stat_arb_history(&env, &[80, 82, 84, 86, 88, 90]),
+        )
+        .unwrap();
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            3,
+            stat_arb_history(&env, &[60, 62, 64, 66, 68, 70]),
+        )
+        .unwrap();
+    });
+
+    env.as_contract(&contract_id, || {
+        let rebalanced =
+            AutoTradeContract::rebalance_stat_arb_portfolio(env.clone(), user.clone()).unwrap();
+        assert_eq!(rebalanced.portfolio_id, opened.portfolio_id);
+        assert!(rebalanced.last_rebalanced_at > opened.last_rebalanced_at);
+    });
+}
+
+#[test]
+fn test_stat_arb_exit_closes_on_convergence() {
+    let env = setup_env();
+    let contract_id = env.register(AutoTradeContract, ());
+    let user = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            1,
+            stat_arb_history(&env, &[100, 101, 102, 103, 104, 180]),
+        )
+        .unwrap();
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            2,
+            stat_arb_history(&env, &[80, 81, 82, 83, 84, 85]),
+        )
+        .unwrap();
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            3,
+            stat_arb_history(&env, &[60, 61, 62, 63, 64, 65]),
+        )
+        .unwrap();
+    });
+
+    configure_stat_arb(&env, &contract_id, &user, 500, 250);
+
+    env.as_contract(&contract_id, || {
+        AutoTradeContract::execute_stat_arb_trade(env.clone(), user.clone(), 90_000).unwrap();
+    });
+
+    env.as_contract(&contract_id, || {
+        AutoTradeContract::set_stat_arb_price_history(
+            env.clone(),
+            1,
+            stat_arb_history(&env, &[100, 101, 102, 103, 104, 105]),
+        )
+        .unwrap();
+    });
+
+    env.as_contract(&contract_id, || {
+        let exit_check = AutoTradeContract::check_stat_arb_exit(env.clone(), user.clone()).unwrap();
+        assert!(exit_check.should_exit);
+    });
+
+    env.as_contract(&contract_id, || {
+        AutoTradeContract::close_stat_arb_portfolio(env.clone(), user.clone()).unwrap();
+        assert!(
+            AutoTradeContract::get_active_stat_arb_portfolio(env.clone(), user.clone()).is_none()
+        );
     });
 }

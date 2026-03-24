@@ -46,10 +46,8 @@ pub fn grant_authorization(
         .set(&AuthKey::Authorization(user.clone()), &config);
 
     #[allow(deprecated)]
-    env.events().publish(
-        (Symbol::new(env, "auth_granted"), user.clone()),
-        config,
-    );
+    env.events()
+        .publish((Symbol::new(env, "auth_granted"), user.clone()), config);
 
     Ok(())
 }
@@ -63,10 +61,8 @@ pub fn revoke_authorization(env: &Env, user: &Address) -> Result<(), AutoTradeEr
         .remove(&AuthKey::Authorization(user.clone()));
 
     #[allow(deprecated)]
-    env.events().publish(
-        (Symbol::new(env, "auth_revoked"), user.clone()),
-        (),
-    );
+    env.events()
+        .publish((Symbol::new(env, "auth_revoked"), user.clone()), ());
 
     Ok(())
 }

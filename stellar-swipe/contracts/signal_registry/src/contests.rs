@@ -1,6 +1,6 @@
-use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 use crate::errors::ContestError;
 use crate::types::Signal;
+use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,7 +63,7 @@ pub fn create_contest(
     prize_pool: i128,
 ) -> Result<u64, ContestError> {
     let current_time = env.ledger().timestamp();
-    
+
     if start_time >= end_time {
         return Err(ContestError::InvalidTimeRange);
     }
@@ -92,12 +92,20 @@ pub fn create_contest(
     };
 
     let contests_key = ContestStorageKey::Contests;
-    let mut contests: Map<u64, Contest> = env.storage().persistent().get(&contests_key).unwrap_or(Map::new(env));
+    let mut contests: Map<u64, Contest> = env
+        .storage()
+        .persistent()
+        .get(&contests_key)
+        .unwrap_or(Map::new(env));
     contests.set(contest_id, contest.clone());
     env.storage().persistent().set(&contests_key, &contests);
 
     let active_key = ContestStorageKey::ActiveContests;
-    let mut active: Vec<u64> = env.storage().persistent().get(&active_key).unwrap_or(Vec::new(env));
+    let mut active: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&active_key)
+        .unwrap_or(Vec::new(env));
     active.push_back(contest_id);
     env.storage().persistent().set(&active_key, &active);
 
@@ -107,10 +115,18 @@ pub fn create_contest(
 pub fn auto_enter_signal(env: &Env, signal: &Signal) -> Result<(), ContestError> {
     let current_time = env.ledger().timestamp();
     let active_key = ContestStorageKey::ActiveContests;
-    let active_contests: Vec<u64> = env.storage().persistent().get(&active_key).unwrap_or(Vec::new(env));
+    let active_contests: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&active_key)
+        .unwrap_or(Vec::new(env));
 
     let contests_key = ContestStorageKey::Contests;
-    let mut contests: Map<u64, Contest> = env.storage().persistent().get(&contests_key).unwrap_or(Map::new(env));
+    let mut contests: Map<u64, Contest> = env
+        .storage()
+        .persistent()
+        .get(&contests_key)
+        .unwrap_or(Map::new(env));
 
     for i in 0..active_contests.len() {
         let contest_id = active_contests.get(i).unwrap();
@@ -120,19 +136,22 @@ pub fn auto_enter_signal(env: &Env, signal: &Signal) -> Result<(), ContestError>
                 && current_time <= contest.end_time
             {
                 let provider = signal.provider.clone();
-                let mut entry = contest.entries.get(provider.clone()).unwrap_or(ContestEntry {
-                    provider: provider.clone(),
-                    signals_submitted: Vec::new(env),
-                    total_roi: 0,
-                    success_rate: 0,
-                    total_volume: 0,
-                    score: 0,
-                });
+                let mut entry = contest
+                    .entries
+                    .get(provider.clone())
+                    .unwrap_or(ContestEntry {
+                        provider: provider.clone(),
+                        signals_submitted: Vec::new(env),
+                        total_roi: 0,
+                        success_rate: 0,
+                        total_volume: 0,
+                        score: 0,
+                    });
 
                 entry.signals_submitted.push_back(signal.id);
                 entry.total_roi += signal.total_roi;
                 entry.total_volume += signal.total_volume;
-                
+
                 let total_signals = entry.signals_submitted.len() as u32;
                 let successful = signal.successful_executions;
                 entry.success_rate = if total_signals > 0 {
@@ -164,9 +183,15 @@ fn calculate_contest_score(entry: &ContestEntry, metric: &ContestMetric, _env: &
 pub fn finalize_contest(env: &Env, contest_id: u64) -> Result<Vec<Address>, ContestError> {
     let current_time = env.ledger().timestamp();
     let contests_key = ContestStorageKey::Contests;
-    let mut contests: Map<u64, Contest> = env.storage().persistent().get(&contests_key).unwrap_or(Map::new(env));
+    let mut contests: Map<u64, Contest> = env
+        .storage()
+        .persistent()
+        .get(&contests_key)
+        .unwrap_or(Map::new(env));
 
-    let mut contest = contests.get(contest_id).ok_or(ContestError::ContestNotFound)?;
+    let mut contest = contests
+        .get(contest_id)
+        .ok_or(ContestError::ContestNotFound)?;
 
     if current_time < contest.end_time {
         return Err(ContestError::ContestNotEnded);
@@ -177,7 +202,7 @@ pub fn finalize_contest(env: &Env, contest_id: u64) -> Result<Vec<Address>, Cont
 
     let mut qualified_entries: Vec<ContestEntry> = Vec::new(env);
     let entry_keys = contest.entries.keys();
-    
+
     for i in 0..entry_keys.len() {
         let key = entry_keys.get(i).unwrap();
         if let Some(entry) = contest.entries.get(key) {
@@ -201,7 +226,7 @@ pub fn finalize_contest(env: &Env, contest_id: u64) -> Result<Vec<Address>, Cont
 
     let mut winners: Vec<Address> = Vec::new(env);
     let winner_count = qualified_entries.len().min(3);
-    
+
     for i in 0..winner_count {
         let entry = qualified_entries.get(i).unwrap();
         winners.push_back(entry.provider.clone());
@@ -218,7 +243,11 @@ pub fn finalize_contest(env: &Env, contest_id: u64) -> Result<Vec<Address>, Cont
 
     // Remove from active contests
     let active_key = ContestStorageKey::ActiveContests;
-    let mut active: Vec<u64> = env.storage().persistent().get(&active_key).unwrap_or(Vec::new(env));
+    let mut active: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&active_key)
+        .unwrap_or(Vec::new(env));
     let mut new_active: Vec<u64> = Vec::new(env);
     for i in 0..active.len() {
         let id = active.get(i).unwrap();
@@ -231,17 +260,21 @@ pub fn finalize_contest(env: &Env, contest_id: u64) -> Result<Vec<Address>, Cont
     Ok(winners)
 }
 
-fn distribute_prize_pool(env: &Env, contest: &Contest, winners: &Vec<Address>) -> Result<(), ContestError> {
+fn distribute_prize_pool(
+    env: &Env,
+    contest: &Contest,
+    winners: &Vec<Address>,
+) -> Result<(), ContestError> {
     if contest.prize_pool == 0 || winners.is_empty() {
         return Ok(());
     }
 
     let percentages = [50, 30, 20]; // 1st: 50%, 2nd: 30%, 3rd: 20%
-    
+
     for i in 0..winners.len().min(3) {
         let winner = winners.get(i).unwrap();
         let prize = (contest.prize_pool * percentages[i as usize]) / 100;
-        
+
         // Store prize allocation (actual token transfer would happen externally)
         let prize_key = (contest.id, winner.clone());
         env.storage().persistent().set(&prize_key, &prize);
@@ -252,19 +285,31 @@ fn distribute_prize_pool(env: &Env, contest: &Contest, winners: &Vec<Address>) -
 
 pub fn get_contest(env: &Env, contest_id: u64) -> Result<Contest, ContestError> {
     let contests_key = ContestStorageKey::Contests;
-    let contests: Map<u64, Contest> = env.storage().persistent().get(&contests_key).unwrap_or(Map::new(env));
-    contests.get(contest_id).ok_or(ContestError::ContestNotFound)
+    let contests: Map<u64, Contest> = env
+        .storage()
+        .persistent()
+        .get(&contests_key)
+        .unwrap_or(Map::new(env));
+    contests
+        .get(contest_id)
+        .ok_or(ContestError::ContestNotFound)
 }
 
 pub fn get_active_contests(env: &Env) -> Vec<u64> {
     let active_key = ContestStorageKey::ActiveContests;
-    env.storage().persistent().get(&active_key).unwrap_or(Vec::new(env))
+    env.storage()
+        .persistent()
+        .get(&active_key)
+        .unwrap_or(Vec::new(env))
 }
 
-pub fn get_contest_leaderboard(env: &Env, contest_id: u64) -> Result<Vec<ContestEntry>, ContestError> {
+pub fn get_contest_leaderboard(
+    env: &Env,
+    contest_id: u64,
+) -> Result<Vec<ContestEntry>, ContestError> {
     let contest = get_contest(env, contest_id)?;
     let mut entries: Vec<ContestEntry> = Vec::new(env);
-    
+
     let entry_keys = contest.entries.keys();
     for i in 0..entry_keys.len() {
         let key = entry_keys.get(i).unwrap();

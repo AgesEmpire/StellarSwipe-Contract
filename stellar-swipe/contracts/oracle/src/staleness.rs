@@ -1,6 +1,6 @@
 // contracts/oracle/src/staleness.rs
-use soroban_sdk::{contracttype, Env, Address, symbol_short, Symbol};
 use common::AssetPair;
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

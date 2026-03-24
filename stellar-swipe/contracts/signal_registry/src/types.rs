@@ -1,5 +1,5 @@
-use soroban_sdk::{contracttype, Address, String, Symbol, Vec};
 use crate::categories::{RiskLevel, SignalCategory};
+use soroban_sdk::{contracttype, Address, String, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]

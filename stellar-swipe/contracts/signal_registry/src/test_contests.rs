@@ -1,9 +1,12 @@
 #![cfg(test)]
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, String};
+use crate::categories::{RiskLevel, SignalCategory};
 use crate::contests::{Contest, ContestEntry, ContestMetric, ContestStatus};
 use crate::types::{Signal, SignalAction, SignalStatus};
-use crate::categories::{RiskLevel, SignalCategory};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env, String,
+};
 
 #[test]
 fn test_create_contest() {
@@ -80,7 +83,7 @@ fn test_auto_enter_signal() {
 
     let contest = contests::get_contest(&env, contest_id).unwrap();
     let entry = contest.entries.get(provider.clone()).unwrap();
-    
+
     assert_eq!(entry.signals_submitted.len(), 1);
     assert_eq!(entry.total_roi, 150);
     assert_eq!(entry.total_volume, 1000);

@@ -1,7 +1,11 @@
-use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 use crate::errors::VersioningError;
-use crate::types::{Signal, SignalStatus};
+use crate::errors::VersioningError;
 use crate::events;
+use crate::events;
+use crate::types::{Signal, SignalStatus};
+use crate::types::{Signal, SignalStatus};
+use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
+use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 
 const MAX_UPDATES_PER_SIGNAL: u32 = 5;
 const UPDATE_COOLDOWN_SECONDS: u64 = 3600; // 1 hour
@@ -59,14 +63,32 @@ pub fn update_signal(
 
     // Check update count
     let update_count_key = VersioningStorageKey::UpdateCount(signal_id);
-    let update_count: u32 = env.storage().persistent().get(&update_count_key).unwrap_or(0);
+    let update_count: u32 = env
+        .storage()
+        .persistent()
+        .get(&update_count_key)
+        .unwrap_or(0);
+    let update_count: u32 = env
+        .storage()
+        .persistent()
+        .get(&update_count_key)
+        .unwrap_or(0);
     if update_count >= MAX_UPDATES_PER_SIGNAL {
         return Err(VersioningError::MaxUpdatesReached);
     }
 
     // Check cooldown
     let last_update_key = VersioningStorageKey::LastUpdateTime(signal_id);
-    let last_update: u64 = env.storage().persistent().get(&last_update_key).unwrap_or(0);
+    let last_update: u64 = env
+        .storage()
+        .persistent()
+        .get(&last_update_key)
+        .unwrap_or(0);
+    let last_update: u64 = env
+        .storage()
+        .persistent()
+        .get(&last_update_key)
+        .unwrap_or(0);
     let current_time = env.ledger().timestamp();
     if current_time < last_update + UPDATE_COOLDOWN_SECONDS {
         return Err(VersioningError::UpdateCooldown);
@@ -92,9 +114,16 @@ pub fn update_signal(
         updated_at: current_time,
         updated_by: updater.clone(),
     };
-    
+
     let version_storage_key = VersioningStorageKey::SignalVersions(signal_id, current_version);
-    env.storage().persistent().set(&version_storage_key, &version_record);
+    env.storage()
+        .persistent()
+        .set(&version_storage_key, &version_record);
+
+    let version_storage_key = VersioningStorageKey::SignalVersions(signal_id, current_version);
+    env.storage()
+        .persistent()
+        .set(&version_storage_key, &version_record);
 
     // Apply updates
     if let Some(price) = new_price {
@@ -117,15 +146,15 @@ pub fn update_signal(
 
     // Update metadata
     env.storage().persistent().set(&version_key, &new_version);
-    env.storage().persistent().set(&update_count_key, &(update_count + 1));
-    env.storage().persistent().set(&last_update_key, &current_time);
+    env.storage()
+        .persistent()
+        .set(&update_count_key, &(update_count + 1));
+    env.storage()
+        .persistent()
+        .set(&last_update_key, &current_time);
 
     // Emit event
     events::emit_signal_updated(env, signal_id, new_version, updater.clone());
-
-    Ok(new_version)
-}
-    env.storage().persistent().set(&last_update_key, &current_time);
 
     Ok(new_version)
 }
@@ -145,12 +174,7 @@ pub fn get_signal_history(env: &Env, signal_id: u64) -> Vec<SignalVersion> {
     history
 }
 
-pub fn record_copy(
-    env: &Env,
-    user: &Address,
-    signal_id: u64,
-    version: u32,
-) {
+pub fn record_copy(env: &Env, user: &Address, signal_id: u64, version: u32) {
     let copy_key = VersioningStorageKey::CopyRecords(user.clone(), signal_id);
     let copy_record = CopyRecord {
         user: user.clone(),
@@ -160,7 +184,7 @@ pub fn record_copy(
         notified_of_updates: Vec::new(env),
     };
     env.storage().persistent().set(&copy_key, &copy_record);
-    
+
     // Emit event
     events::emit_copy_recorded(env, user.clone(), signal_id, version);
 }
@@ -206,5 +230,8 @@ pub fn get_latest_version(env: &Env, signal_id: u64) -> u32 {
 
 pub fn get_update_count(env: &Env, signal_id: u64) -> u32 {
     let update_count_key = VersioningStorageKey::UpdateCount(signal_id);
-    env.storage().persistent().get(&update_count_key).unwrap_or(0)
+    env.storage()
+        .persistent()
+        .get(&update_count_key)
+        .unwrap_or(0)
 }

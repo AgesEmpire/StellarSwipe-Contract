@@ -1,8 +1,8 @@
 //! Oracle storage layer
 
-use soroban_sdk::{contracttype, Env, Map};
-use common::{Asset, AssetPair};
 use crate::errors::OracleError;
+use common::{Asset, AssetPair};
+use soroban_sdk::{contracttype, Env, Map};
 
 const DAY_IN_LEDGERS: u32 = 17280; // ~24 hours
 
@@ -36,9 +36,11 @@ pub fn set_base_currency(env: &Env, asset: Asset) {
     env.storage()
         .persistent()
         .set(&StorageKey::BaseCurrency, &asset);
-    env.storage()
-        .persistent()
-        .extend_ttl(&StorageKey::BaseCurrency, DAY_IN_LEDGERS, DAY_IN_LEDGERS);
+    env.storage().persistent().extend_ttl(
+        &StorageKey::BaseCurrency,
+        DAY_IN_LEDGERS,
+        DAY_IN_LEDGERS,
+    );
 }
 
 /// Get price for asset pair
@@ -54,19 +56,25 @@ pub fn get_price(env: &Env, pair: &AssetPair) -> Result<i128, OracleError> {
 pub fn set_price(env: &Env, pair: &AssetPair, price: i128) {
     let key = StorageKey::Price(pair.clone());
     let ts_key = StorageKey::PriceTimestamp(pair.clone());
-    
+
     env.storage().persistent().set(&key, &price);
-    env.storage().persistent().set(&ts_key, &env.ledger().timestamp());
-    
-    env.storage().persistent().extend_ttl(&key, DAY_IN_LEDGERS, DAY_IN_LEDGERS);
-    env.storage().persistent().extend_ttl(&ts_key, DAY_IN_LEDGERS, DAY_IN_LEDGERS);
+    env.storage()
+        .persistent()
+        .set(&ts_key, &env.ledger().timestamp());
+
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, DAY_IN_LEDGERS, DAY_IN_LEDGERS);
+    env.storage()
+        .persistent()
+        .extend_ttl(&ts_key, DAY_IN_LEDGERS, DAY_IN_LEDGERS);
 }
 
 /// Get cached conversion rate
 pub fn get_cached_conversion(env: &Env, from: &Asset, to: &Asset) -> Option<CachedConversion> {
     let key = StorageKey::ConversionCache(from.clone(), to.clone());
     let cached: Option<CachedConversion> = env.storage().temporary().get(&key);
-    
+
     if let Some(ref c) = cached {
         // Cache valid for 5 minutes (60 ledgers)
         if env.ledger().timestamp() - c.timestamp < 300 {
@@ -99,8 +107,14 @@ pub fn get_available_pairs(env: &Env) -> Map<AssetPair, bool> {
 pub fn add_available_pair(env: &Env, pair: AssetPair) {
     let mut pairs = get_available_pairs(env);
     pairs.set(pair, true);
-    env.storage().persistent().set(&StorageKey::AvailablePairs, &pairs);
-    env.storage().persistent().extend_ttl(&StorageKey::AvailablePairs, DAY_IN_LEDGERS, DAY_IN_LEDGERS);
+    env.storage()
+        .persistent()
+        .set(&StorageKey::AvailablePairs, &pairs);
+    env.storage().persistent().extend_ttl(
+        &StorageKey::AvailablePairs,
+        DAY_IN_LEDGERS,
+        DAY_IN_LEDGERS,
+    );
 }
 
 fn default_base_currency(env: &Env) -> Asset {

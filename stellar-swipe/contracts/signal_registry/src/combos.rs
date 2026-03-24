@@ -110,7 +110,7 @@ pub struct ComboExecution {
 pub struct ComboPerformanceSummary {
     pub combo_id: u64,
     pub total_executions: u32,
-    pub combined_roi: i128,     // average across all executions
+    pub combined_roi: i128, // average across all executions
     pub total_volume: i128,
 }
 
@@ -342,8 +342,7 @@ pub fn execute_combo_signal(
             for i in 0..combo.component_signals.len() {
                 let comp = combo.component_signals.get(i).unwrap();
 
-                let should_execute =
-                    evaluate_condition(env, &comp, &component_executions)?;
+                let should_execute = evaluate_condition(env, &comp, &component_executions)?;
 
                 if should_execute {
                     let amount = (total_amount * comp.weight as i128) / WEIGHT_TOTAL as i128;
@@ -406,11 +405,7 @@ pub fn execute_combo_signal(
 }
 
 /// Cancel an active combo (only the provider may cancel).
-pub fn cancel_combo(
-    env: &Env,
-    combo_id: u64,
-    provider: &Address,
-) -> Result<(), ComboError> {
+pub fn cancel_combo(env: &Env, combo_id: u64, provider: &Address) -> Result<(), ComboError> {
     let mut combo = get_combo(env, combo_id).ok_or(ComboError::ComboNotFound)?;
 
     if combo.provider != *provider {
@@ -531,10 +526,7 @@ fn simulate_trade_roi(env: &Env, signal_id: u64, _amount: i128) -> i128 {
 }
 
 /// Calculate a weighted-average combined ROI across all non-skipped components.
-fn calculate_combined_roi(
-    executions: &Vec<ComponentExecution>,
-    total_amount: i128,
-) -> i128 {
+fn calculate_combined_roi(executions: &Vec<ComponentExecution>, total_amount: i128) -> i128 {
     if total_amount == 0 {
         return 0;
     }

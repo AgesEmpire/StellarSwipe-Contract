@@ -13,4 +13,12 @@ pub enum AutoTradeError {
     DailyTradeLimitExceeded = 7,
     PositionLimitExceeded = 8,
     StopLossTriggered = 9,
+    InvalidBasketSize = 10,
+    InsufficientPriceHistory = 11,
+    InvalidPriceData = 12,
+    NonCointegratedBasket = 13,
+    ActivePortfolioExists = 14,
+    NoActivePortfolio = 15,
+    NoTradeSignal = 16,
+    InvalidStatArbConfig = 17,
 }
