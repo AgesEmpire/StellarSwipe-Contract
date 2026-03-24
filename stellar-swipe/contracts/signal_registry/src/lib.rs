@@ -12,6 +12,7 @@ mod expiry;
 mod fees;
 mod import;
 mod leaderboard;
+mod ml_scoring;
 mod performance;
 mod query;
  feature/cross-chain-sync
@@ -59,6 +60,9 @@ use errors::{AdminError, ContestError, TemplateError, VersioningError};
 pub use leaderboard::{
     get_leaderboard as get_leaderboard_internal, LeaderboardMetric, ProviderLeaderboard,
 };
+pub use ml_scoring::{
+    MLModel, SignalFeatures, SignalScore,
+};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
 use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
@@ -70,22 +74,8 @@ use types::{
     SignalAction, SignalData, SignalPerformanceView, SignalStatus, SignalSummary, SortOption,
     TradeExecution,
 };
- trust-score-system
-use combos::{
-    cancel_combo, create_combo_signal, execute_combo_signal, get_combo,
-    get_combo_executions_pub, get_combo_performance, ComboExecution,
-    ComboPerformanceSummary, ComboSignal, ComboType, ComponentExecution,
-    ComponentSignal,
-};
-use errors::ComboError;
-use contests::{
-    Contest, ContestEntry, ContestMetric, ContestStatus,
-};
-use versioning::{SignalVersion, CopyRecord};
 use reputation::{calculate_trust_score, get_trust_score, update_trust_score, update_median_values, TrustScoreDetails, TrustScoreTier};
-
-use versioning::{CopyRecord, SignalVersion};
- main
+use versioning::{SignalVersion, CopyRecord};
 
 const MAX_EXPIRY_SECONDS: u64 = 30 * 24 * 60 * 60;
 
