@@ -26,7 +26,6 @@ fn setup_signal(_env: &Env, signal_id: u64, expiry: u64) -> storage::Signal {
     }
 }
 
- issue-87-reentrancy-protection
 /* 
 // TODO: Fix test_risk_parity_rebalance before PR. 
 // Currently failing due to integer precision or trade size issues in execution.
@@ -146,7 +145,6 @@ fn configure_stat_arb(
         .unwrap();
     });
 }
- main
 
 #[test]
 fn test_execute_trade_invalid_amount() {
@@ -727,12 +725,11 @@ fn test_revoke_authorization() {
     grant_auth(&env, &contract_id, &user, 1000_0000000, 30);
 
     env.as_contract(&contract_id, || {
- feat/governance-token-distribution-111
         storage::authorize_user_with_limits(&env, &user, 1000_0000000, 30);
         storage::revoke_user_authorization(&env, &user);
 
         AutoTradeContract::revoke_authorization(env.clone(), user.clone()).unwrap();
- main
+ 
 
         let config = AutoTradeContract::get_auth_config(env.clone(), user.clone());
         assert!(config.is_none());
@@ -751,9 +748,7 @@ fn test_trade_under_limit_succeeds() {
 
     env.as_contract(&contract_id, || {
         storage::set_signal(&env, signal_id, &signal);
- feat/governance-token-distribution-111
         storage::authorize_user_with_limits(&env, &user, 500_0000000, 30);
- main
         env.storage()
             .temporary()
             .set(&(user.clone(), symbol_short!("balance")), &1000_0000000i128);
@@ -784,10 +779,8 @@ fn test_trade_over_limit_fails() {
 
     env.as_contract(&contract_id, || {
         storage::set_signal(&env, signal_id, &signal);
- feat/governance-token-distribution-111
         storage::authorize_user_with_limits(&env, &user, 500_0000000, 30);
 
- main
         env.storage()
             .temporary()
             .set(&(user.clone(), symbol_short!("balance")), &1000_0000000i128);
@@ -842,12 +835,10 @@ fn test_expired_authorization_blocks_trade() {
 
     env.as_contract(&contract_id, || {
         storage::set_signal(&env, signal_id, &signal);
- feat/governance-token-distribution-111
         // Grant with 1 day duration
         storage::authorize_user_with_limits(&env, &user, 1000_0000000, 1);
 
 
- main
         // Fast forward time beyond expiry
         env.ledger().set_timestamp(1000 + 86400 + 1);
 
@@ -868,21 +859,20 @@ fn test_multiple_authorization_grants_latest_applies() {
     let contract_id = env.register(AutoTradeContract, ());
     let user = Address::generate(&env);
 
- feat/governance-token-distribution-111
     env.as_contract(&contract_id, || {
         storage::authorize_user_with_limits(&env, &user, 500_0000000, 30);
         storage::authorize_user_with_limits(&env, &user, 1000_0000000, 60);
 
     grant_auth(&env, &contract_id, &user, 500_0000000, 30);
     grant_auth(&env, &contract_id, &user, 1000_0000000, 60);
- main
+    });
 
     env.as_contract(&contract_id, || {
         let config = AutoTradeContract::get_auth_config(env.clone(), user.clone()).unwrap();
         assert_eq!(config.max_trade_amount, 1000_0000000);
         assert_eq!(config.expires_at, 1000 + (60 * 86400));
     });
-}
+
 
 #[test]
 fn test_authorization_at_exact_limit() {
@@ -896,10 +886,8 @@ fn test_authorization_at_exact_limit() {
 
     env.as_contract(&contract_id, || {
         storage::set_signal(&env, signal_id, &signal);
- feat/governance-token-distribution-111
         storage::authorize_user_with_limits(&env, &user, 500_0000000, 30);
 
- main
         env.storage()
             .temporary()
             .set(&(user.clone(), symbol_short!("balance")), &1000_0000000i128);

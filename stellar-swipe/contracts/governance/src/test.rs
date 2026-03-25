@@ -10,8 +10,9 @@ use crate::{
     ParameterAdjustmentAuthority, RewardConfigUpdateAction, TreasurySpendAction,
     TreasurySpendAuthority, VoteType,
 };
+use crate::proposals::{GovernanceConfig, ProposalStatus, ProposalType, VoteType as GovernanceVoteType};
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, Env, Map, String, Vec};
+use soroban_sdk::{Address, Bytes, Env, Map, String, Vec};
 use stellar_swipe_common::Asset;
 
 const SUPPLY: i128 = 1_000_000_000;
@@ -737,4 +738,156 @@ fn committee_override_and_cross_committee_approval_are_tracked() {
 
     let stored_request = client.cross_committee_request(&request.id);
     assert_eq!(stored_request.status, CrossCommitteeStatus::Approved);
+}
+
+#[test]
+fn governance_proposal_vote_finalize_and_execute() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+    client.stake(&recipients.public_sale, &80_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::ParameterChange(
+            String::from_str(&env, "liquidity_reward_bps"),
+            100,
+            120,
+        ),
+        &String::from_str(&env, "Adjust reward"),
+        &String::from_str(&env, "Increase by 20%"),
+        &Bytes::new(&env),
+    );
+
+    env.ledger().set_timestamp(70);
+    client.cast_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    client.cast_vote(&proposal_id, &recipients.public_sale, &GovernanceVoteType::For);
+
+    env.ledger().set_timestamp(8 * 86_400);
+    let status = client.finalize_proposal(&proposal_id);
+    assert_eq!(status, ProposalStatus::Succeeded);
+
+    let proposal = client.proposal(&proposal_id);
+    assert_eq!(proposal.status, ProposalStatus::Executed);
+}
+
+#[test]
+fn timelock_queue_execute_and_cancel_flow() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let cfg = GovernanceConfig {
+        min_proposal_threshold: 1_000,
+        voting_period: 7 * 86_400,
+        voting_delay: 60,
+        quorum_threshold: 1_000,
+        approval_threshold: 5_000,
+        execution_delay: 60,
+    };
+    client.configure_governance(&admin, &cfg);
+    client.initialize_timelock(&admin, &3_600u64, &(7 * 86_400u64), &admin);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+    client.stake(&recipients.public_sale, &80_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::FeatureToggle(String::from_str(&env, "new_signal_ui"), true),
+        &String::from_str(&env, "Enable feature"),
+        &String::from_str(&env, "toggle"),
+        &Bytes::new(&env),
+    );
+
+    env.ledger().set_timestamp(70);
+    client.cast_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    client.cast_vote(&proposal_id, &recipients.public_sale, &GovernanceVoteType::For);
+
+    env.ledger().set_timestamp(8 * 86_400);
+    assert_eq!(client.finalize_proposal(&proposal_id), ProposalStatus::Succeeded);
+
+    let action_id = client.queue_action(&proposal_id);
+    let early = client.try_execute_queued_action(&action_id, &admin);
+    assert_eq!(early, Err(Ok(GovernanceError::InvalidDuration)));
+
+    client.cancel_queued_action(&action_id, &admin);
+    let analytics = client.timelock_analytics();
+    assert_eq!(analytics.total_cancelled, 1);
+}
+
+#[test]
+fn governance_reputation_tracks_activity() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+    client.stake(&recipients.public_sale, &80_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "Community sentiment")),
+        &String::from_str(&env, "Signal"),
+        &String::from_str(&env, "Record governance sentiment"),
+        &Bytes::new(&env),
+    );
+
+    env.ledger().set_timestamp(70);
+    client.cast_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    client.cast_vote(&proposal_id, &recipients.public_sale, &GovernanceVoteType::For);
+
+    env.ledger().set_timestamp(8 * 86_400);
+    client.finalize_proposal(&proposal_id);
+
+    let proposer_rep = client.governance_reputation(&recipients.community_rewards);
+    let voter_rep = client.governance_reputation(&recipients.public_sale);
+
+    assert!(proposer_rep.participation_history.proposals_created >= 1);
+    assert!(voter_rep.participation_history.votes_cast >= 1);
+    assert!(proposer_rep.reputation_score > 0);
+}
+
+#[test]
+fn conviction_voting_accumulates_over_time() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let pool_id = client.create_conviction_pool(&admin, &100_000i128, &1_000i128, &86_400u64);
+    let proposal_id = client.create_conviction_proposal(
+        &pool_id,
+        &recipients.community_rewards,
+        &String::from_str(&env, "Fund builder grant"),
+        &10_000i128,
+        &recipients.public_sale,
+    );
+
+    client.vote_conviction(
+        &pool_id,
+        &proposal_id,
+        &recipients.community_rewards,
+        &1_000i128,
+    );
+
+    env.ledger().set_timestamp(10 * 86_400);
+    let conviction = client.update_proposal_conviction(&pool_id, &proposal_id);
+    assert!(conviction > 0);
+
+    let analytics = client.analyze_conviction_proposal(&pool_id, &proposal_id);
+    assert!(analytics.current_conviction > 0);
+    assert_eq!(analytics.total_voters, 1);
 }
