@@ -13,6 +13,7 @@ use crate::analytics::{update_transfer_analytics, update_validator_analytics};
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChainId {
+    Stellar,
     Ethereum,
     Bitcoin,
     Polygon,
@@ -128,6 +129,7 @@ pub fn get_chain_finality_config(env: &Env, chain_id: ChainId) -> Result<ChainFi
         ChainId::Bitcoin => 2,
         ChainId::Polygon => 3,
         ChainId::BNB => 4,
+        ChainId::Stellar => return Err(String::from_linear(env, "Stellar has no finality config")),
     };
 
     if let Some(config) = env
@@ -175,6 +177,13 @@ fn get_default_config(chain_id: ChainId) -> ChainFinalityConfig {
             reorg_depth_limit: 20,
             verification_method: VerificationMethod::BlockConfirmations,
         },
+        ChainId::Stellar => ChainFinalityConfig {
+            chain_id,
+            required_confirmations: 1,
+            average_block_time: 5,
+            reorg_depth_limit: 0,
+            verification_method: VerificationMethod::BlockConfirmations,
+        },
     }
 }
 
@@ -185,6 +194,7 @@ pub fn set_chain_finality_config(env: &Env, config: &ChainFinalityConfig) {
         ChainId::Bitcoin => 2,
         ChainId::Polygon => 3,
         ChainId::BNB => 4,
+        ChainId::Stellar => return,
     };
 
     env.storage()
