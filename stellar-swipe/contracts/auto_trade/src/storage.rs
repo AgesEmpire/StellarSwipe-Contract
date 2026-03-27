@@ -25,3 +25,18 @@ pub fn get_signal(env: &Env, id: u64) -> Option<Signal> {
 pub fn set_signal(env: &Env, id: u64, signal: &Signal) {
     env.storage().persistent().set(&DataKey::Signal(id), signal);
 }
+
+/// Test helper: grant unlimited authorization to a user
+#[cfg(test)]
+pub fn authorize_user(env: &Env, user: &Address) {
+    use crate::auth::{AuthConfig, AuthKey};
+    env.storage().persistent().set(
+        &AuthKey::Authorization(user.clone()),
+        &AuthConfig {
+            authorized: true,
+            max_trade_amount: i128::MAX,
+            expires_at: u64::MAX,
+            granted_at: env.ledger().timestamp(),
+        },
+    );
+}

@@ -13,4 +13,13 @@ pub enum AutoTradeError {
     DailyTradeLimitExceeded = 7,
     PositionLimitExceeded = 8,
     StopLossTriggered = 9,
+    // Rate limit errors
+    RateLimitPenalty = 10,
+    BelowMinTransfer = 11,
+    CooldownNotElapsed = 12,
+    HourlyTransferLimitExceeded = 13,
+    HourlyVolumeLimitExceeded = 14,
+    DailyTransferLimitExceeded = 15,
+    DailyVolumeLimitExceeded = 16,
+    GlobalCapacityExceeded = 17,
 }

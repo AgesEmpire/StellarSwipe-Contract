@@ -767,3 +767,517 @@ fn test_authorization_at_exact_limit() {
         assert!(res.is_ok());
     });
 }
+
+// ========================================
+// Rate Limit Tests
+// ========================================
+
+mod rate_limit_tests {
+    use super::*;
+    use crate::rate_limit::{BridgeRateLimits, ViolationType};
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+
+    fn setup_with_rate_limits(env: &Env) -> (soroban_sdk::Address, soroban_sdk::Address) {
+        let contract_id = env.register(AutoTradeContract, ());
+        let admin = soroban_sdk::Address::generate(env);
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::init_rate_limit_admin(env.clone(), admin.clone());
+            // Tight limits for testing
+            AutoTradeContract::set_rate_limits(
+                env.clone(),
+                BridgeRateLimits {
+                    per_user_hourly_transfers: 3,
+                    per_user_hourly_volume: 1_000,
+                    per_user_daily_transfers: 10,
+                    per_user_daily_volume: 5_000,
+                    global_hourly_capacity: 100,
+                    global_daily_volume: 50_000,
+                    min_transfer_amount: 10,
+                    cooldown_between_transfers: 0, // no cooldown for most tests
+                },
+            )
+            .unwrap();
+        });
+        (contract_id, admin)
+    }
+
+    fn setup_signal_and_user(
+        env: &Env,
+        contract_id: &soroban_sdk::Address,
+    ) -> (soroban_sdk::Address, u64) {
+        let user = soroban_sdk::Address::generate(env);
+        let signal_id = 42u64;
+        env.as_contract(contract_id, || {
+            storage::set_signal(
+                env,
+                signal_id,
+                &storage::Signal {
+                    signal_id,
+                    price: 100,
+                    expiry: env.ledger().timestamp() + 10_000,
+                    base_asset: 1,
+                },
+            );
+            storage::authorize_user(env, &user);
+            env.storage()
+                .temporary()
+                .set(&(user.clone(), soroban_sdk::symbol_short!("balance")), &10_000i128);
+            env.storage()
+                .temporary()
+                .set(&(soroban_sdk::symbol_short!("liquidity"), signal_id), &10_000i128);
+        });
+        (user, signal_id)
+    }
+
+    #[test]
+    fn test_hourly_transfer_count_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (contract_id, _admin) = setup_with_rate_limits(&env);
+        let (user, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        // 3 trades should succeed (limit = 3)
+        for _ in 0..3 {
+            env.as_contract(&contract_id, || {
+                AutoTradeContract::execute_trade(
+                    env.clone(),
+                    user.clone(),
+                    signal_id,
+                    OrderType::Market,
+                    50,
+                )
+                .unwrap();
+            });
+        }
+
+        // 4th should fail
+        env.as_contract(&contract_id, || {
+            let res = AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                50,
+            );
+            assert_eq!(res, Err(AutoTradeError::HourlyTransferLimitExceeded));
+        });
+    }
+
+    #[test]
+    fn test_hourly_volume_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (contract_id, _admin) = setup_with_rate_limits(&env);
+        let (user, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        // First trade of 900 is fine (volume limit = 1000)
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                900,
+            )
+            .unwrap();
+        });
+
+        // Second trade of 200 would exceed 1000 volume
+        env.as_contract(&contract_id, || {
+            let res = AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                200,
+            );
+            assert_eq!(res, Err(AutoTradeError::HourlyVolumeLimitExceeded));
+        });
+    }
+
+    #[test]
+    fn test_below_minimum_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (contract_id, _admin) = setup_with_rate_limits(&env);
+        let (user, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        env.as_contract(&contract_id, || {
+            let res = AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                5, // below min_transfer_amount = 10
+            );
+            assert_eq!(res, Err(AutoTradeError::BelowMinTransfer));
+        });
+    }
+
+    #[test]
+    fn test_cooldown_between_transfers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (contract_id, _admin) = setup_with_rate_limits(&env);
+        let (user, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        // Set cooldown to 60 seconds
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::set_rate_limits(
+                env.clone(),
+                BridgeRateLimits {
+                    per_user_hourly_transfers: 10,
+                    per_user_hourly_volume: 100_000,
+                    per_user_daily_transfers: 50,
+                    per_user_daily_volume: 500_000,
+                    global_hourly_capacity: 1000,
+                    global_daily_volume: 5_000_000,
+                    min_transfer_amount: 10,
+                    cooldown_between_transfers: 60,
+                },
+            )
+            .unwrap();
+        });
+
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                50,
+            )
+            .unwrap();
+        });
+
+        // Immediate second trade should fail
+        env.as_contract(&contract_id, || {
+            let res = AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                50,
+            );
+            assert_eq!(res, Err(AutoTradeError::CooldownNotElapsed));
+        });
+
+        // After cooldown passes it should succeed
+        env.ledger().set_timestamp(10_000 + 61);
+        env.as_contract(&contract_id, || {
+            let res = AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                50,
+            );
+            assert!(res.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_whitelist_bypasses_rate_limits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (contract_id, _admin) = setup_with_rate_limits(&env);
+        let (user, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        // Whitelist the user
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::add_to_whitelist(env.clone(), user.clone()).unwrap();
+            assert!(AutoTradeContract::is_whitelisted(env.clone(), user.clone()));
+        });
+
+        // Should be able to exceed the hourly limit of 3
+        for _ in 0..5 {
+            env.as_contract(&contract_id, || {
+                AutoTradeContract::execute_trade(
+                    env.clone(),
+                    user.clone(),
+                    signal_id,
+                    OrderType::Market,
+                    50,
+                )
+                .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn test_penalty_blocks_user() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (contract_id, _admin) = setup_with_rate_limits(&env);
+        let (user, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        // Apply a violation (1st = 1 hour penalty)
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::record_violation(
+                env.clone(),
+                user.clone(),
+                ViolationType::HourlyCountExceeded,
+            )
+            .unwrap();
+        });
+
+        // Trade should be blocked
+        env.as_contract(&contract_id, || {
+            let res = AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                50,
+            );
+            assert_eq!(res, Err(AutoTradeError::RateLimitPenalty));
+        });
+
+        // After penalty expires it should work
+        env.ledger().set_timestamp(10_000 + 3601);
+        env.as_contract(&contract_id, || {
+            let res = AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                50,
+            );
+            assert!(res.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_progressive_penalties() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (contract_id, _admin) = setup_with_rate_limits(&env);
+        let (user, _) = setup_signal_and_user(&env, &contract_id);
+
+        let expected_durations: &[(u32, u64)] = &[
+            (1, 3600),
+            (2, 3600),
+            (3, 86400),
+            (4, 86400),
+            (5, 86400),
+            (6, 604800),
+        ];
+
+        for (expected_count, expected_duration) in expected_durations {
+            env.as_contract(&contract_id, || {
+                AutoTradeContract::record_violation(
+                    env.clone(),
+                    user.clone(),
+                    ViolationType::HourlyCountExceeded,
+                )
+                .unwrap();
+                let history =
+                    AutoTradeContract::get_user_rate_history(env.clone(), user.clone());
+                assert_eq!(history.violation_count, *expected_count);
+                assert_eq!(
+                    history.penalty_until,
+                    env.ledger().timestamp() + expected_duration
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_global_capacity_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (contract_id, _admin) = setup_with_rate_limits(&env);
+
+        // Set global capacity to 2
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::set_rate_limits(
+                env.clone(),
+                BridgeRateLimits {
+                    per_user_hourly_transfers: 100,
+                    per_user_hourly_volume: 1_000_000,
+                    per_user_daily_transfers: 500,
+                    per_user_daily_volume: 5_000_000,
+                    global_hourly_capacity: 2,
+                    global_daily_volume: 10_000_000,
+                    min_transfer_amount: 10,
+                    cooldown_between_transfers: 0,
+                },
+            )
+            .unwrap();
+        });
+
+        // Two different users fill global capacity
+        for _ in 0..2 {
+            let u = soroban_sdk::Address::generate(&env);
+            let sid = 99u64;
+            env.as_contract(&contract_id, || {
+                storage::set_signal(
+                    &env,
+                    sid,
+                    &storage::Signal {
+                        signal_id: sid,
+                        price: 100,
+                        expiry: env.ledger().timestamp() + 10_000,
+                        base_asset: 1,
+                    },
+                );
+                storage::authorize_user(&env, &u);
+                env.storage()
+                    .temporary()
+                    .set(&(u.clone(), soroban_sdk::symbol_short!("balance")), &10_000i128);
+                env.storage()
+                    .temporary()
+                    .set(&(soroban_sdk::symbol_short!("liquidity"), sid), &10_000i128);
+                AutoTradeContract::execute_trade(
+                    env.clone(),
+                    u.clone(),
+                    sid,
+                    OrderType::Market,
+                    50,
+                )
+                .unwrap();
+            });
+        }
+
+        // Third user should hit global capacity
+        let u3 = soroban_sdk::Address::generate(&env);
+        let sid3 = 100u64;
+        env.as_contract(&contract_id, || {
+            storage::set_signal(
+                &env,
+                sid3,
+                &storage::Signal {
+                    signal_id: sid3,
+                    price: 100,
+                    expiry: env.ledger().timestamp() + 10_000,
+                    base_asset: 1,
+                },
+            );
+            storage::authorize_user(&env, &u3);
+            env.storage()
+                .temporary()
+                .set(&(u3.clone(), soroban_sdk::symbol_short!("balance")), &10_000i128);
+            env.storage()
+                .temporary()
+                .set(&(soroban_sdk::symbol_short!("liquidity"), sid3), &10_000i128);
+            let res = AutoTradeContract::execute_trade(
+                env.clone(),
+                u3.clone(),
+                sid3,
+                OrderType::Market,
+                50,
+            );
+            assert_eq!(res, Err(AutoTradeError::GlobalCapacityExceeded));
+        });
+    }
+
+    #[test]
+    fn test_dynamic_adjustment_low_load() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (contract_id, _admin) = setup_with_rate_limits(&env);
+
+        // global_hourly_capacity = 100, current load = 0 → 0% → relax
+        env.as_contract(&contract_id, || {
+            let before = AutoTradeContract::get_rate_limits(env.clone());
+            AutoTradeContract::adjust_rate_limits(env.clone()).unwrap();
+            let after = AutoTradeContract::get_rate_limits(env.clone());
+            assert_eq!(
+                after.per_user_hourly_transfers,
+                (before.per_user_hourly_transfers + 1).min(20)
+            );
+        });
+    }
+
+    #[test]
+    fn test_dynamic_adjustment_high_load() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (contract_id, _admin) = setup_with_rate_limits(&env);
+        let (user, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        // Set capacity to 1 and execute 1 trade → 100% load
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::set_rate_limits(
+                env.clone(),
+                BridgeRateLimits {
+                    per_user_hourly_transfers: 10,
+                    per_user_hourly_volume: 100_000,
+                    per_user_daily_transfers: 50,
+                    per_user_daily_volume: 500_000,
+                    global_hourly_capacity: 1,
+                    global_daily_volume: 5_000_000,
+                    min_transfer_amount: 10,
+                    cooldown_between_transfers: 0,
+                },
+            )
+            .unwrap();
+            AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                50,
+            )
+            .unwrap();
+        });
+
+        env.as_contract(&contract_id, || {
+            let before = AutoTradeContract::get_rate_limits(env.clone());
+            AutoTradeContract::adjust_rate_limits(env.clone()).unwrap();
+            let after = AutoTradeContract::get_rate_limits(env.clone());
+            assert!(after.per_user_hourly_transfers <= before.per_user_hourly_transfers);
+            assert!(after.cooldown_between_transfers >= before.cooldown_between_transfers);
+        });
+    }
+
+    #[test]
+    fn test_remove_from_whitelist_restores_limits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (contract_id, _admin) = setup_with_rate_limits(&env);
+        let (user, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::add_to_whitelist(env.clone(), user.clone()).unwrap();
+            AutoTradeContract::remove_from_whitelist(env.clone(), user.clone()).unwrap();
+            assert!(!AutoTradeContract::is_whitelisted(env.clone(), user.clone()));
+        });
+
+        // Exhaust hourly limit
+        for _ in 0..3 {
+            env.as_contract(&contract_id, || {
+                AutoTradeContract::execute_trade(
+                    env.clone(),
+                    user.clone(),
+                    signal_id,
+                    OrderType::Market,
+                    50,
+                )
+                .unwrap();
+            });
+        }
+
+        env.as_contract(&contract_id, || {
+            let res = AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                50,
+            );
+            assert_eq!(res, Err(AutoTradeError::HourlyTransferLimitExceeded));
+        });
+    }
+}

@@ -7,6 +7,7 @@ mod errors;
 mod history;
 mod multi_asset;
 mod portfolio;
+mod rate_limit;
 mod risk;
 mod sdex;
 mod storage;
@@ -88,6 +89,8 @@ impl AutoTradeContract {
         if !auth::is_authorized(&env, &user, amount) {
             return Err(AutoTradeError::Unauthorized);
         }
+
+        rate_limit::check_rate_limits(&env, &user, amount)?;
 
         if !sdex::has_sufficient_balance(&env, &user, &signal.base_asset, amount) {
             return Err(AutoTradeError::InsufficientBalance);
@@ -176,6 +179,7 @@ impl AutoTradeContract {
             .set(&DataKey::Trades(user.clone(), signal_id), &trade);
 
         if execution.executed_amount > 0 {
+            rate_limit::record_transfer(&env, &user, execution.executed_amount);
             let hist_status = match status {
                 TradeStatus::Filled | TradeStatus::PartiallyFilled => {
                     history::HistoryTradeStatus::Executed
@@ -282,6 +286,67 @@ impl AutoTradeContract {
     /// Revoke authorization
     pub fn revoke_authorization(env: Env, user: Address) -> Result<(), AutoTradeError> {
         auth::revoke_authorization(&env, &user)
+    }
+
+    /// Initialize rate limit admin
+    pub fn init_rate_limit_admin(env: Env, admin: Address) {
+        admin.require_auth();
+        rate_limit::set_admin(&env, &admin);
+    }
+
+    /// Configure rate limits (admin only)
+    pub fn set_rate_limits(
+        env: Env,
+        limits: rate_limit::BridgeRateLimits,
+    ) -> Result<(), AutoTradeError> {
+        let admin = rate_limit::get_admin(&env).ok_or(AutoTradeError::Unauthorized)?;
+        admin.require_auth();
+        rate_limit::set_limits(&env, &limits);
+        Ok(())
+    }
+
+    /// Add user to rate limit whitelist (admin only)
+    pub fn add_to_whitelist(env: Env, user: Address) -> Result<(), AutoTradeError> {
+        rate_limit::add_to_whitelist(&env, &user)
+    }
+
+    /// Remove user from whitelist (admin only)
+    pub fn remove_from_whitelist(env: Env, user: Address) -> Result<(), AutoTradeError> {
+        rate_limit::remove_from_whitelist(&env, &user)
+    }
+
+    /// Record a rate limit violation and apply penalty (admin only)
+    pub fn record_violation(
+        env: Env,
+        user: Address,
+        violation_type: rate_limit::ViolationType,
+    ) -> Result<(), AutoTradeError> {
+        let admin = rate_limit::get_admin(&env).ok_or(AutoTradeError::Unauthorized)?;
+        admin.require_auth();
+        rate_limit::record_violation(&env, &user, violation_type)
+    }
+
+    /// Dynamically adjust rate limits based on current load
+    pub fn adjust_rate_limits(env: Env) -> Result<(), AutoTradeError> {
+        rate_limit::adjust_limits_based_on_load(&env)
+    }
+
+    /// Get current rate limits
+    pub fn get_rate_limits(env: Env) -> rate_limit::BridgeRateLimits {
+        rate_limit::get_limits(&env)
+    }
+
+    /// Get user transfer history
+    pub fn get_user_rate_history(
+        env: Env,
+        user: Address,
+    ) -> rate_limit::UserTransferHistory {
+        rate_limit::get_user_history(&env, &user)
+    }
+
+    /// Check if user is whitelisted
+    pub fn is_whitelisted(env: Env, user: Address) -> bool {
+        rate_limit::is_whitelisted(&env, &user)
     }
 
     /// Get authorization config
