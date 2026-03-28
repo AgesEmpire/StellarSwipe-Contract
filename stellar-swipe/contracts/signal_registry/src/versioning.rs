@@ -1,10 +1,6 @@
 use crate::errors::VersioningError;
-use crate::errors::VersioningError;
-use crate::events;
 use crate::events;
 use crate::types::{Signal, SignalStatus};
-use crate::types::{Signal, SignalStatus};
-use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 
 const MAX_UPDATES_PER_SIGNAL: u32 = 5;

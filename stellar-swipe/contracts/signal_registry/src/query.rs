@@ -12,9 +12,17 @@ pub fn get_active_signals(
     offset: u32,
     limit: u32,
     sort_by: SortOption,
+    category_filter: Option<SignalCategory>,
 ) -> Vec<SignalSummary> {
     let mut active_signals = Vec::new(env);
     let current_time = env.ledger().timestamp();
+
+    // Use category index if filter provided (requires access to contract storage)
+    if let Some(category) = category_filter {
+        // Note: query.rs can't access contract storage directly.
+        // For now, full scan; index usage in contract call wrapper.
+        // To use index, move logic or pass index_map.
+    }
 
     // 1. Filter out expired signals and optionally filter by provider
     for i in 0..signals_map.keys().len() {

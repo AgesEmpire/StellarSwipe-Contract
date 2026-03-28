@@ -1,20 +1,11 @@
- feature/emergency-pause-circuit-breaker
-use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
-use crate::types::{Signal, SignalStatus};
-
- main
 use crate::social::get_follower_count;
 use crate::types::{Signal, SignalStatus};
-use soroban_sdk::{Address, Env, Map, String, Vec};
+use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 
 const MIN_SIGNALS_FOR_ANALYTICS: u32 = 10;
 const HOURS_24: u64 = 86400;
 
- feature/cross-chain-sync
-#[soroban_sdk::contracttype]
-
 #[contracttype]
- main
 #[derive(Clone, Debug)]
 pub struct ProviderAnalytics {
     pub provider: Address,
@@ -27,7 +18,6 @@ pub struct ProviderAnalytics {
     pub follower_growth_rate: i128,
 }
 
-#[soroban_sdk::contracttype]
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct GlobalAnalytics {

@@ -359,20 +359,25 @@ pub fn check_position_limit(
     Ok(())
 }
 
-/// Check if stop-loss is triggered for a sell
+/// Check if stop-loss is triggered for a sell, preferring oracle price over SDEX spot.
+///
+/// `oracle_price` — when `Some`, this manipulation-resistant price is used;
+/// when `None`, `current_price` (SDEX spot) is used as a fallback.
 pub fn check_stop_loss(
     env: &Env,
     user: &Address,
     asset_id: u32,
     current_price: i128,
+    oracle_price: Option<i128>,
     config: &RiskConfig,
 ) -> bool {
     let positions = get_user_positions(env, user);
 
     if let Some(position) = positions.get(asset_id) {
+        let reference_price = oracle_price.unwrap_or(current_price);
         let stop_loss_price = position.entry_price * (100 - config.stop_loss_pct as i128) / 100;
 
-        if current_price <= stop_loss_price {
+        if reference_price <= stop_loss_price {
             return true;
         }
     }
@@ -380,7 +385,10 @@ pub fn check_stop_loss(
     false
 }
 
-/// Perform all risk checks before executing a trade
+/// Perform all risk checks before executing a trade.
+///
+/// `oracle_price` — when `Some`, used for stop-loss evaluation instead of
+/// the SDEX spot `price`, providing manipulation resistance.
 pub fn validate_trade(
     env: &Env,
     user: &Address,
@@ -388,6 +396,7 @@ pub fn validate_trade(
     amount: i128,
     price: i128,
     is_sell: bool,
+    oracle_price: Option<i128>,
 ) -> Result<bool, AutoTradeError> {
     let config = get_risk_config(env, user);
 
@@ -399,9 +408,9 @@ pub fn validate_trade(
         check_position_limit(env, user, asset_id, amount, price, &config)?;
     }
 
-    // Check stop-loss (only for sells)
+    // Check stop-loss (only for sells), using oracle price when available
     let stop_loss_triggered = if is_sell {
-        check_stop_loss(env, user, asset_id, price, &config)
+        check_stop_loss(env, user, asset_id, price, oracle_price, &config)
     } else {
         false
     };
@@ -557,7 +566,7 @@ mod tests {
             // Entry price 100, stop loss at 15% = 85
             update_position(&env, &user, 1, 1000, 100);
 
-            let triggered = check_stop_loss(&env, &user, 1, 90, &config);
+            let triggered = check_stop_loss(&env, &user, 1, 90, None, &config);
             assert!(!triggered);
         });
     }
@@ -574,7 +583,7 @@ mod tests {
             // Entry price 100, stop loss at 15% = 85
             update_position(&env, &user, 1, 1000, 100);
 
-            let triggered = check_stop_loss(&env, &user, 1, 80, &config);
+            let triggered = check_stop_loss(&env, &user, 1, 80, None, &config);
             assert!(triggered);
         });
     }

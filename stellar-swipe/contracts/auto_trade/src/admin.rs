@@ -6,6 +6,10 @@ use crate::errors::AutoTradeError;
 #[contracttype]
 pub enum AdminStorageKey {
     Admin,
+    Guardian,
+    OracleAddress,
+    OracleCircuitBreaker,
+    OracleWhitelist(u32), // keyed by asset_pair
     PauseStates,
     CircuitBreakerStats,
     CircuitBreakerConfig,
@@ -44,6 +48,35 @@ pub fn require_admin(env: &Env, caller: &Address) -> Result<(), AutoTradeError> 
     Ok(())
 }
 
+pub fn set_guardian(env: &Env, caller: &Address, guardian: Address) -> Result<(), AutoTradeError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+    env.storage().instance().set(&AdminStorageKey::Guardian, &guardian);
+    env.events().publish((soroban_sdk::Symbol::new(env, "guardian_set"),), guardian);
+    Ok(())
+}
+
+pub fn revoke_guardian(env: &Env, caller: &Address) -> Result<(), AutoTradeError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+    let guardian: Address = env
+        .storage()
+        .instance()
+        .get(&AdminStorageKey::Guardian)
+        .ok_or(AutoTradeError::Unauthorized)?;
+    env.storage().instance().remove(&AdminStorageKey::Guardian);
+    env.events().publish((soroban_sdk::Symbol::new(env, "guardian_revoked"),), guardian);
+    Ok(())
+}
+
+pub fn get_guardian(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&AdminStorageKey::Guardian)
+}
+
+fn is_guardian(env: &Env, caller: &Address) -> bool {
+    get_guardian(env).map(|g| &g == caller).unwrap_or(false)
+}
+
 pub fn pause_category(
     env: &Env,
     caller: &Address,
@@ -51,8 +84,12 @@ pub fn pause_category(
     duration: Option<u64>,
     reason: String,
 ) -> Result<(), AutoTradeError> {
-    require_admin(env, caller)?;
-    caller.require_auth();
+    if is_guardian(env, caller) {
+        caller.require_auth();
+    } else {
+        require_admin(env, caller)?;
+        caller.require_auth();
+    }
 
     let now = env.ledger().timestamp();
     let auto_unpause_at = duration.map(|d| now + d);
