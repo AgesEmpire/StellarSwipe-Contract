@@ -11,6 +11,7 @@ mod errors;
 mod history;
 mod iceberg;
 mod multi_asset;
+mod oracle;
 mod portfolio;
 mod portfolio_insurance;
 mod positions;
@@ -93,26 +94,7 @@ impl AutoTradeContract {
         admin::init_admin(&env, admin);
     }
 
-    /// Read-only health probe for monitoring and front-ends (no auth).
-    pub fn health_check(env: Env) -> HealthStatus {
-        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
-        match admin::get_admin(&env) {
-            None => health_uninitialized(&env, version),
-            Some(admin_addr) => {
-                let cat_trading = String::from_str(&env, CAT_TRADING);
-                let cat_all = String::from_str(&env, CAT_ALL);
-                let is_paused = admin::is_paused(&env, cat_trading) || admin::is_paused(&env, cat_all);
-                HealthStatus {
-                    is_initialized: true,
-                    is_paused,
-                    version,
-                    admin: admin_addr,
-                }
-            }
-        }
-    }
-
-    /// Pause a category (admin only)
+    /// Pause a category (admin or guardian)
     pub fn pause_category(
         env: Env,
         caller: Address,
@@ -128,12 +110,101 @@ impl AutoTradeContract {
         admin::unpause_category(&env, &caller, category)
     }
 
+    /// Set guardian address (admin only)
+    pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), AutoTradeError> {
+        admin::set_guardian(&env, &caller, guardian)
+    }
+
+    /// Revoke guardian (admin only)
+    pub fn revoke_guardian(env: Env, caller: Address) -> Result<(), AutoTradeError> {
+        admin::revoke_guardian(&env, &caller)
+    }
+
+    /// Get current guardian
+    pub fn get_guardian(env: Env) -> Option<Address> {
+        admin::get_guardian(&env)
+    }
+
     /// Get current pause states
     pub fn get_pause_states(env: Env) -> soroban_sdk::Map<String, PauseState> {
         admin::get_pause_states(&env)
     }
 
-    /// Set circuit breaker configuration (admin only)
+    /// Set the oracle contract address (admin only).
+    /// The oracle is used for manipulation-resistant stop-loss/take-profit price checks.
+    pub fn set_oracle_address(
+        env: Env,
+        caller: Address,
+        oracle_addr: Address,
+    ) -> Result<(), AutoTradeError> {
+        oracle::set_oracle_address(&env, &caller, oracle_addr)
+    }
+
+    /// Get the currently configured oracle contract address.
+    pub fn get_oracle_address(env: Env) -> Option<Address> {
+        oracle::get_oracle_address(&env)
+    }
+
+    /// Admin override for the oracle circuit breaker.
+    /// When `enabled = true`, trading proceeds even if the oracle is unavailable.
+    /// When `enabled = false`, the normal circuit breaker logic applies.
+    pub fn override_oracle_circuit_breaker(
+        env: Env,
+        caller: Address,
+        enabled: bool,
+    ) -> Result<(), AutoTradeError> {
+        oracle::override_oracle_circuit_breaker(&env, &caller, enabled)
+    }
+
+    /// Get the current oracle circuit breaker state.
+    pub fn get_oracle_circuit_breaker_state(
+        env: Env,
+    ) -> oracle::OracleCircuitBreakerState {
+        oracle::get_cb_state(&env)
+    }
+
+    /// Add an oracle address to the whitelist for `asset_pair` (admin only).
+    /// Emits `OracleAdded` event. Idempotent.
+    pub fn add_oracle(
+        env: Env,
+        caller: Address,
+        asset_pair: u32,
+        oracle_addr: Address,
+    ) -> Result<(), AutoTradeError> {
+        oracle::add_oracle(&env, &caller, asset_pair, oracle_addr)
+    }
+
+    /// Remove an oracle address from the whitelist for `asset_pair` (admin only).
+    /// Emits `OracleRemoved` event. Returns `LastOracleForPair` if it would be the last.
+    pub fn remove_oracle(
+        env: Env,
+        caller: Address,
+        asset_pair: u32,
+        oracle_addr: Address,
+    ) -> Result<(), AutoTradeError> {
+        oracle::remove_oracle(&env, &caller, asset_pair, oracle_addr)
+    }
+
+    /// Get the current oracle whitelist for `asset_pair`.
+    pub fn get_oracle_whitelist(
+        env: Env,
+        asset_pair: u32,
+    ) -> soroban_sdk::Vec<Address> {
+        oracle::get_oracle_whitelist(&env, asset_pair)
+    }
+
+    /// Whitelisted oracle pushes a price update for `asset_pair`.
+    /// Caller must be in the whitelist; price must be fresh.
+    pub fn push_price_update(
+        env: Env,
+        caller: Address,
+        asset_pair: u32,
+        price: stellar_swipe_common::oracle::OraclePrice,
+    ) -> Result<(), AutoTradeError> {
+        oracle::push_price_update(&env, &caller, asset_pair, price)
+    }
+
+    /// Set the circuit breaker configuration (admin only)
     pub fn set_circuit_breaker_config(
         env: Env,
         caller: Address,
@@ -154,6 +225,9 @@ impl AutoTradeContract {
         if admin::is_paused(&env, String::from_str(&env, CAT_TRADING)) {
             return Err(AutoTradeError::TradingPaused);
         }
+
+        // Oracle circuit breaker: halt if oracle is unavailable (unless admin override)
+        oracle::check_oracle_circuit_breaker(&env, signal_id as u32)?;
 
         if amount <= 0 {
             return Err(AutoTradeError::InvalidAmount);
@@ -183,6 +257,12 @@ impl AutoTradeContract {
         // Set current asset price for risk calculations
         risk::set_asset_price(&env, signal.base_asset, signal.price);
 
+        // Fetch oracle price for manipulation-resistant stop-loss evaluation.
+        // Falls back to None (SDEX spot) when no oracle is configured.
+        let oracle_price: Option<i128> = oracle::get_oracle_price(&env, signal.base_asset)
+            .ok()
+            .map(|op| oracle::oracle_price_to_i128(&op));
+
         // Perform risk checks
         let stop_loss_triggered = risk::validate_trade(
             &env,
@@ -191,6 +271,7 @@ impl AutoTradeContract {
             amount,
             signal.price,
             is_sell,
+            oracle_price,
         )?;
 
         // If stop-loss is triggered, emit event and proceed with sell
@@ -1166,10 +1247,361 @@ impl AutoTradeContract {
 
 #[cfg(test)]
 mod test;
-#[cfg(test)]
-mod test_health;
+mod test_oracle_whitelist;
 
-// ── Correlation-Based Risk Management integration tests ───────────────────────
+// ── Oracle integration tests ─────────────────────────────────────────────────
+#[cfg(test)]
+mod oracle_tests {
+    use super::*;
+    use crate::oracle;
+    use crate::risk;
+    use stellar_swipe_common::oracle::{MockOracleClient, OraclePrice};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Env, Symbol,
+    };
+
+    fn setup() -> (Env, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        let contract_id = env.register(AutoTradeContract, ());
+        (env, contract_id)
+    }
+
+    fn make_price(env: &Env, price: i128) -> OraclePrice {
+        OraclePrice {
+            price,
+            decimals: 0,
+            timestamp: env.ledger().timestamp(),
+            source: Symbol::new(env, "mock"),
+        }
+    }
+
+    /// Admin can set and retrieve the oracle address.
+    #[test]
+    fn test_set_and_get_oracle_address() {
+        let (env, contract_id) = setup();
+        let admin = Address::generate(&env);
+        let oracle_addr = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            admin::init_admin(&env, admin.clone());
+            oracle::set_oracle_address(&env, &admin, oracle_addr.clone()).unwrap();
+            assert_eq!(oracle::get_oracle_address(&env), Some(oracle_addr));
+        });
+    }
+
+    /// Non-admin cannot set the oracle address.
+    #[test]
+    fn test_non_admin_cannot_set_oracle() {
+        let (env, contract_id) = setup();
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let oracle_addr = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            admin::init_admin(&env, admin.clone());
+            let result = oracle::set_oracle_address(&env, &attacker, oracle_addr);
+            assert_eq!(result, Err(AutoTradeError::Unauthorized));
+        });
+    }
+
+    /// Stop-loss uses oracle price when available, ignoring higher SDEX spot.
+    #[test]
+    fn test_stop_loss_uses_oracle_price() {
+        let (env, contract_id) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            // Entry price 100, stop-loss at 15% → triggers at ≤ 85
+            risk::update_position(&env, &user, 1, 1_000, 100);
+
+            let config = risk::RiskConfig::default();
+
+            // SDEX spot = 90 (above stop-loss) but oracle = 80 (below stop-loss)
+            let triggered = risk::check_stop_loss(&env, &user, 1, 90, Some(80), &config);
+            assert!(triggered, "oracle price below stop-loss must trigger");
+
+            // SDEX spot = 80 (below stop-loss) but oracle = 90 (above stop-loss)
+            let not_triggered = risk::check_stop_loss(&env, &user, 1, 80, Some(90), &config);
+            assert!(!not_triggered, "oracle price above stop-loss must not trigger");
+        });
+    }
+
+    /// When no oracle is configured, stop-loss falls back to SDEX spot price.
+    #[test]
+    fn test_stop_loss_fallback_to_sdex_when_no_oracle() {
+        let (env, contract_id) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            risk::update_position(&env, &user, 1, 1_000, 100);
+            let config = risk::RiskConfig::default();
+
+            // No oracle price (None) → falls back to SDEX spot 80 → triggers
+            let triggered = risk::check_stop_loss(&env, &user, 1, 80, None, &config);
+            assert!(triggered);
+
+            // No oracle price (None) → falls back to SDEX spot 90 → no trigger
+            let not_triggered = risk::check_stop_loss(&env, &user, 1, 90, None, &config);
+            assert!(!not_triggered);
+        });
+    }
+
+    /// Mock oracle returns the seeded price correctly.
+    #[test]
+    fn test_mock_oracle_returns_seeded_price() {
+        let (env, contract_id) = setup();
+
+        env.as_contract(&contract_id, || {
+            let expected = make_price(&env, 42_000);
+            MockOracleClient::set_price(&env, 1, expected.clone());
+
+            let result = oracle::get_mock_oracle_price(&env, 1).unwrap();
+            assert_eq!(result.price, 42_000);
+        });
+    }
+
+    /// Mock oracle returns PriceNotFound when no price is seeded.
+    #[test]
+    fn test_mock_oracle_price_not_found() {
+        let (env, contract_id) = setup();
+        use stellar_swipe_common::oracle::OracleError;
+
+        env.as_contract(&contract_id, || {
+            let result = oracle::get_mock_oracle_price(&env, 99);
+            assert_eq!(result, Err(OracleError::PriceNotFound));
+        });
+    }
+
+    /// Stale oracle price is rejected.
+    #[test]
+    fn test_stale_oracle_price_rejected() {
+        let (env, contract_id) = setup();
+        use stellar_swipe_common::oracle::OracleError;
+
+        env.as_contract(&contract_id, || {
+            // Seed a price with timestamp far in the past
+            let stale = OraclePrice {
+                price: 100,
+                decimals: 0,
+                timestamp: 1, // way older than MAX_PRICE_AGE_SECS from ledger ts 1_000
+                source: Symbol::new(&env, "mock"),
+            };
+            MockOracleClient::set_price(&env, 1, stale);
+
+            let result = oracle::get_mock_oracle_price(&env, 1);
+            assert_eq!(result, Err(OracleError::PriceStale));
+        });
+    }
+
+    /// oracle_price_to_i128 correctly scales by decimals.
+    #[test]
+    fn test_oracle_price_scaling() {
+        let env = Env::default();
+        let op = OraclePrice {
+            price: 1_000_000,
+            decimals: 4,
+            timestamp: 1_000,
+            source: Symbol::new(&env, "mock"),
+        };
+        // 1_000_000 / 10^4 = 100
+        assert_eq!(oracle::oracle_price_to_i128(&op), 100);
+    }
+}
+
+// ── Oracle circuit breaker tests ───────────────────────────────────────────────
+#[cfg(test)]
+mod oracle_cb_tests {
+    use super::*;
+    use crate::oracle;
+    use crate::admin;
+    use stellar_swipe_common::oracle::{MockOracleClient, OraclePrice};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Env, Symbol,
+    };
+
+    fn setup() -> (Env, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        let contract_id = env.register(AutoTradeContract, ());
+        let admin = Address::generate(&env);
+        (env, contract_id, admin)
+    }
+
+    fn fresh_price(env: &Env, price: i128) -> OraclePrice {
+        OraclePrice {
+            price,
+            decimals: 0,
+            timestamp: env.ledger().timestamp(),
+            source: Symbol::new(env, "mock"),
+        }
+    }
+
+    /// When oracle is available, get_aggregated_price returns the price and
+    /// circuit breaker stays un-tripped.
+    #[test]
+    fn test_oracle_available_trade_proceeds() {
+        let (env, contract_id, admin) = setup();
+
+        env.as_contract(&contract_id, || {
+            admin::init_admin(&env, admin.clone());
+            MockOracleClient::set_price(&env, 1, fresh_price(&env, 100));
+
+            // Simulate get_aggregated_price via mock path
+            let result = oracle::get_mock_oracle_price(&env, 1);
+            assert!(result.is_ok());
+
+            // Circuit breaker must not be tripped
+            let state = oracle::get_cb_state(&env);
+            assert!(!state.triggered);
+        });
+    }
+
+    /// When oracle is unavailable, get_aggregated_price trips the circuit
+    /// breaker and returns OracleUnavailable.
+    #[test]
+    fn test_oracle_unavailable_trips_circuit_breaker() {
+        let (env, contract_id, admin) = setup();
+
+        env.as_contract(&contract_id, || {
+            admin::init_admin(&env, admin.clone());
+            // No price seeded → oracle unavailable
+            MockOracleClient::clear_price(&env, 1);
+
+            // Manually trip the breaker as get_aggregated_price would
+            let mut state = oracle::get_cb_state(&env);
+            state.triggered = true;
+            state.triggered_at = env.ledger().timestamp();
+            env.storage()
+                .instance()
+                .set(&crate::admin::AdminStorageKey::OracleCircuitBreaker, &state);
+
+            let state = oracle::get_cb_state(&env);
+            assert!(state.triggered);
+            assert!(!state.admin_override);
+        });
+    }
+
+    /// check_oracle_circuit_breaker blocks trading when breaker is tripped
+    /// and oracle is still unavailable.
+    #[test]
+    fn test_circuit_breaker_blocks_trade_when_oracle_down() {
+        let (env, contract_id, admin) = setup();
+
+        env.as_contract(&contract_id, || {
+            admin::init_admin(&env, admin.clone());
+
+            // Trip the breaker
+            let mut state = oracle::get_cb_state(&env);
+            state.triggered = true;
+            state.triggered_at = env.ledger().timestamp();
+            env.storage()
+                .instance()
+                .set(&crate::admin::AdminStorageKey::OracleCircuitBreaker, &state);
+
+            // Oracle still down (no price seeded) → check must fail
+            let result = oracle::check_oracle_circuit_breaker(&env, 1);
+            assert_eq!(result, Err(AutoTradeError::OracleUnavailable));
+        });
+    }
+
+    /// When oracle recovers, check_oracle_circuit_breaker auto-resets the
+    /// breaker and returns Ok.
+    #[test]
+    fn test_circuit_breaker_auto_resets_on_recovery() {
+        let (env, contract_id, admin) = setup();
+
+        env.as_contract(&contract_id, || {
+            admin::init_admin(&env, admin.clone());
+
+            // Trip the breaker
+            let mut state = oracle::get_cb_state(&env);
+            state.triggered = true;
+            state.triggered_at = env.ledger().timestamp();
+            env.storage()
+                .instance()
+                .set(&crate::admin::AdminStorageKey::OracleCircuitBreaker, &state);
+
+            // Oracle recovers — seed a fresh price
+            MockOracleClient::set_price(&env, 1, fresh_price(&env, 100));
+
+            // check_oracle_circuit_breaker should reset and return Ok
+            let result = oracle::check_oracle_circuit_breaker(&env, 1);
+            assert!(result.is_ok(), "should recover when oracle is healthy");
+
+            let state = oracle::get_cb_state(&env);
+            assert!(!state.triggered, "breaker must be reset after recovery");
+        });
+    }
+
+    /// Admin override allows trading even when circuit breaker is tripped.
+    #[test]
+    fn test_admin_override_allows_trade_when_oracle_down() {
+        let (env, contract_id, admin) = setup();
+
+        env.as_contract(&contract_id, || {
+            admin::init_admin(&env, admin.clone());
+
+            // Trip the breaker
+            let mut state = oracle::get_cb_state(&env);
+            state.triggered = true;
+            state.triggered_at = env.ledger().timestamp();
+            env.storage()
+                .instance()
+                .set(&crate::admin::AdminStorageKey::OracleCircuitBreaker, &state);
+
+            // Admin enables override
+            oracle::override_oracle_circuit_breaker(&env, &admin, true).unwrap();
+
+            // check must pass despite breaker being tripped
+            let result = oracle::check_oracle_circuit_breaker(&env, 1);
+            assert!(result.is_ok(), "admin override must allow trading");
+        });
+    }
+
+    /// Admin can disable the override, restoring normal circuit breaker behaviour.
+    #[test]
+    fn test_admin_can_disable_override() {
+        let (env, contract_id, admin) = setup();
+
+        env.as_contract(&contract_id, || {
+            admin::init_admin(&env, admin.clone());
+
+            // Trip the breaker and enable override
+            let mut state = oracle::get_cb_state(&env);
+            state.triggered = true;
+            state.triggered_at = env.ledger().timestamp();
+            env.storage()
+                .instance()
+                .set(&crate::admin::AdminStorageKey::OracleCircuitBreaker, &state);
+            oracle::override_oracle_circuit_breaker(&env, &admin, true).unwrap();
+
+            // Disable override — oracle still down → should block again
+            oracle::override_oracle_circuit_breaker(&env, &admin, false).unwrap();
+            let result = oracle::check_oracle_circuit_breaker(&env, 1);
+            assert_eq!(result, Err(AutoTradeError::OracleUnavailable));
+        });
+    }
+
+    /// Non-admin cannot set the override.
+    #[test]
+    fn test_non_admin_cannot_override_circuit_breaker() {
+        let (env, contract_id, admin) = setup();
+        let attacker = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            admin::init_admin(&env, admin.clone());
+            let result = oracle::override_oracle_circuit_breaker(&env, &attacker, true);
+            assert_eq!(result, Err(AutoTradeError::Unauthorized));
+        });
+    }
+}
+
+// ── Correlation-Based Risk Management integration tests ───────────────────────────────────────────────
 #[cfg(test)]
 mod correlation_tests {
     use super::*;

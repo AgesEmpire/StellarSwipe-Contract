@@ -4,13 +4,14 @@ use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignalCategory {
-    SwingTrade, // 1-7 days
-    DayTrade,   // <24 hours
-    LongTerm,   // >7 days
-    Scalping,   // <1 hour
-    Breakout,   // Technical breakout
-    Reversal,   // Trend reversal
-    Momentum,   // Momentum play
+    /// Ultra-short term trades (<1 hour)
+    SCALP,
+    /// Short-term swing trades (1-7 days)
+    SWING,
+    /// Position trades (>7 days)
+    LONG_TERM,
+    /// Exploit temporary price inefficiencies across exchanges/pairs
+    ARBITRAGE,
 }
 
 #[contracttype]

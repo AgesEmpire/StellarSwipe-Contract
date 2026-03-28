@@ -1,6 +1,3 @@
-use soroban_sdk::contracterror;
-
-#[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AutoTradeError {
     InvalidAmount = 1,
@@ -11,59 +8,135 @@ pub enum AutoTradeError {
     InsufficientLiquidity = 6,
     DailyTradeLimitExceeded = 7,
     PositionLimitExceeded = 8,
-    DcaStrategyNotFound = 9,
-    DcaStrategyInactive = 10,
-    DcaEndTimeReached = 11,
-    MrStrategyNotFound = 12,
-    MrInsufficientHistory = 13,
-    MrLowVolatility = 14,
-    TradingPaused = 15,
-    StrategyNotFound = 16,
-    PositionAlreadyExists = 17,
-    InvalidBasketSize = 18,
-    InsufficientPriceHistory = 19,
-    InvalidPriceData = 20,
-    NonCointegratedBasket = 21,
-    ActivePortfolioExists = 22,
-    NoActivePortfolio = 23,
-    NoTradeSignal = 24,
-    InvalidStatArbConfig = 25,
-    PairsStrategyNotFound = 26,
-    PairsActivePositionExists = 27,
-    PairsNoActivePosition = 28,
-    InsufficientCorrelation = 29,
-    PairNotCointegrated = 30,
-    InvalidPairsConfig = 31,
-    ArbitrageOpportunityExpired = 32,
-    ArbitrageUnprofitable = 33,
-    ArbTooLarge = 34,
-    FrontRunningRisk = 35,
-    InvalidInsuranceConfig = 36,
-    InsuranceNotConfigured = 37,
-    SelfReferral = 38,
-    ReferralAlreadySet = 39,
-    CircularReferral = 40,
-    ReferralLimitExceeded = 41,
-    InvalidTWAPDuration = 42,
-    TWAPOrderNotFound = 43,
-    NotTWAPOwner = 44,
-    TWAPNotActive = 45,
-    CorrelationLimitExceeded = 46,
-    TooManyCorrelatedPositions = 47,
-    ConditionalOrderNotFound = 48,
-    InvalidConditionalConfig = 49,
-    ConditionalOrderNotPending = 50,
-    ConditionalOrderNotTriggered = 51,
-    RateLimitPenalty = 52,
-    BelowMinTransfer = 53,
-    CooldownNotElapsed = 54,
-    HourlyTransferLimitExceeded = 55,
-    HourlyVolumeLimitExceeded = 56,
-    DailyTransferLimitExceeded = 57,
-    DailyVolumeLimitExceeded = 58,
-    GlobalCapacityExceeded = 59,
-    BridgePaused = 60,
-    NotPaused = 61,
-    RecoveryNotFound = 62,
-    RecoveryIncomplete = 63,
+    StopLossTriggered = 9,
+    DcaStrategyNotFound = 10,
+    DcaStrategyInactive = 11,
+    DcaEndTimeReached = 12,
+    MrStrategyNotFound = 13,
+    MrInsufficientHistory = 14,
+    MrLowVolatility = 15,
+docs/contract-events-documentation
+    TradingPaused = 16,
+    StrategyNotFound = 17,
+    PositionAlreadyExists = 18,
+    RankingDisabled = 19,
+    InvalidBasketSize = 20,
+    InsufficientPriceHistory = 21,
+    InvalidPriceData = 22,
+    NonCointegratedBasket = 23,
+    ActivePortfolioExists = 24,
+    NoActivePortfolio = 25,
+    NoTradeSignal = 26,
+    InvalidStatArbConfig = 27,
+    PairsStrategyNotFound = 28,
+    PairsActivePositionExists = 29,
+    PairsNoActivePosition = 30,
+    InsufficientCorrelation = 31,
+    PairNotCointegrated = 32,
+    InvalidPairsConfig = 33,
+    ArbitrageOpportunityExpired = 34,
+    ArbitrageUnprofitable = 35,
+    ArbTooLarge = 36,
+    FrontRunningRisk = 37,
+    InvalidInsuranceConfig = 38,
+    InsuranceNotConfigured = 39,
+    SelfReferral = 40,
+    ReferralAlreadySet = 41,
+    CircularReferral = 42,
+    ReferralLimitExceeded = 43,
+    InvalidTWAPDuration = 44,
+    TWAPOrderNotFound = 45,
+    NotTWAPOwner = 46,
+    TWAPNotActive = 47,
+    CorrelationLimitExceeded = 48,
+    TooManyCorrelatedPositions = 49,
+    ConditionalOrderNotFound = 50,
+    ConditionalOrderNotPending = 51,
+    ConditionalOrderNotTriggered = 52,
+    InvalidConditionalConfig = 53,
+    RateLimitPenalty = 54,
+    BelowMinTransfer = 55,
+    CooldownNotElapsed = 56,
+    HourlyTransferLimitExceeded = 57,
+    HourlyVolumeLimitExceeded = 58,
+    DailyTransferLimitExceeded = 59,
+    DailyVolumeLimitExceeded = 60,
+    GlobalCapacityExceeded = 61,
+
+
+feature/dca-strategy
+    DcaStrategyNotFound = 10,
+    DcaStrategyInactive = 11,
+    DcaEndTimeReached = 12,
+ main
+
+    TradingPaused = 10,
+
+    StrategyNotFound = 11,
+    PositionAlreadyExists = 12,
+    RankingDisabled = 13,
+
+    InvalidBasketSize = 14,
+    InsufficientPriceHistory = 15,
+    InvalidPriceData = 16,
+    NonCointegratedBasket = 17,
+    ActivePortfolioExists = 18,
+    NoActivePortfolio = 19,
+    NoTradeSignal = 20,
+    InvalidStatArbConfig = 21,
+    
+    // Pairs Trading
+    PairsStrategyNotFound = 22,
+    PairsActivePositionExists = 23,
+    PairsNoActivePosition = 24,
+    InsufficientCorrelation = 25,
+    PairNotCointegrated = 26,
+    InvalidPairsConfig = 27,
+ 
+ main
+    // Arbitrage
+    ArbitrageOpportunityExpired = 28,
+    ArbitrageUnprofitable = 29,
+    ArbTooLarge = 30,
+    FrontRunningRisk = 31,
+
+    // Insurance
+    InvalidInsuranceConfig = 32,
+    InsuranceNotConfigured = 33,
+
+    // Referral
+    SelfReferral = 34,
+    ReferralAlreadySet = 35,
+    CircularReferral = 36,
+    ReferralLimitExceeded = 37,
+
+ TWAP-Orders
+    // TWAP
+    InvalidTWAPDuration = 38,
+    TWAPOrderNotFound = 39,
+    NotTWAPOwner = 40,
+    TWAPNotActive = 41,
+
+Correlation-Based-Risk
+    // Correlation
+    CorrelationLimitExceeded = 42,
+    TooManyCorrelatedPositions = 43,
+
+    // Conditional Orders
+    ConditionalOrderNotFound = 44,
+    ConditionalOrderNotPending = 45,
+    ConditionalOrderNotTriggered = 46,
+    InvalidConditionalConfig = 47,
+
+    // Oracle circuit breaker
+    OracleUnavailable = 48,
+
+    // Oracle whitelist
+    LastOracleForPair = 49,
+
+ main
+ main
+main
+ main
+ main
 }

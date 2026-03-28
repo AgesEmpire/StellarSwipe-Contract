@@ -1,5 +1,13 @@
 use crate::types::Asset;
+ main
+ feature/cross-chain-sync
+use soroban_sdk::{Address, Env, Symbol, Vec};
+
+use soroban_sdk::{Address, Env, Symbol, String, Vec, contracttype};
+ main
+
 use soroban_sdk::{Address, Env, String, Symbol, Vec};
+ main
 
 pub fn emit_admin_transferred(env: &Env, old_admin: Address, new_admin: Address) {
     let topics = (Symbol::new(env, "admin_transferred"), old_admin, new_admin);
@@ -56,9 +64,28 @@ pub fn emit_fee_collected(
         .publish(topics, (total_fee, platform_fee, provider_fee));
 }
 
-pub fn emit_signal_expired(env: &Env, signal_id: u64, provider: Address, expiry_time: u64) {
+#[contracttype]
+#[derive(Clone)]
+pub struct SignalAdoptedEvent {
+    pub signal_id: u64,
+    pub adopter: Address,
+    pub new_count: u32,
+}
+
+/// Emitted when signal adoption counter increments (Issue #169)
+pub fn emit_signal_adopted(
+    env: &Env,
+    signal_id: u64,
+    adopter: Address,
+    new_count: u32,
+) {
+    let topics = (Symbol::new(env, "signal_adopted"), signal_id);
+    env.events().publish(topics, SignalAdoptedEvent { signal_id, adopter, new_count });
+}
+
+pub fn emit_signal_expired(env: &Env, signal_id: u64, provider: Address, expired_at_ledger: u64) {
     let topics = (Symbol::new(env, "signal_expired"), provider, signal_id);
-    env.events().publish(topics, expiry_time);
+    env.events().publish(topics, expired_at_ledger);
 }
 
 pub fn emit_trade_executed(env: &Env, signal_id: u64, executor: Address, roi: i128, volume: i128) {
@@ -197,7 +224,6 @@ pub fn emit_cross_chain_signal_synced(
     env.events().publish(topics, new_status);
 }
 
-
 pub fn emit_emergency_paused(env: &Env, category: String, paused_by: Address, reason: String, auto_unpause_at: Option<u64>) {
     let topics = (Symbol::new(env, "emergency_paused"), category, paused_by);
     env.events().publish(topics, (reason, auto_unpause_at));
@@ -212,4 +238,19 @@ pub fn emit_circuit_breaker_triggered(env: &Env, category: String, reason: Strin
     let topics = (Symbol::new(env, "circuit_breaker_triggered"), category);
     env.events().publish(topics, reason);
 }
+ docs/contract-events-documentation
 
+
+pub fn emit_guardian_set(env: &Env, guardian: Address) {
+    let topics = (Symbol::new(env, "guardian_set"),);
+    env.events().publish(topics, guardian);
+}
+
+pub fn emit_guardian_revoked(env: &Env, guardian: Address) {
+    let topics = (Symbol::new(env, "guardian_revoked"),);
+    env.events().publish(topics, guardian);
+}
+
+ main
+ main
+ main

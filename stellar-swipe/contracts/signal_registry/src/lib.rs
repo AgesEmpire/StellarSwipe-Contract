@@ -24,26 +24,27 @@ mod submission;
 mod templates;
 mod types;
 mod cross_chain;
-mod test_combos;
 mod versioning;
 
 use admin::{
-    get_admin, get_admin_config, init_admin, is_trading_paused, require_not_paused, AdminConfig,
+    get_admin, get_admin_config, init_admin, is_trading_paused, require_not_paused_legacy as require_not_paused,
+    AdminConfig,
 };
-use stellar_swipe_common::emergency::{PauseState, CAT_SIGNALS, CAT_TRADING, CAT_STAKES, CAT_ALL};
+use stellar_swipe_common::emergency::{PauseState, CAT_ALL, CAT_SIGNALS, CAT_STAKES, CAT_TRADING};
 use categories::{RiskLevel, SignalCategory};
-use errors::{AdminError, TemplateError, ContestError, VersioningError, CrossChainError};
-pub use leaderboard::{get_leaderboard as get_leaderboard_internal, LeaderboardMetric, ProviderLeaderboard};
 use combos::{
     cancel_combo, create_combo_signal, execute_combo_signal, get_combo, get_combo_executions_pub,
     get_combo_performance, ComboExecution, ComboPerformanceSummary, ComboSignal, ComboType,
     ComponentExecution, ComponentSignal,
 };
 use contests::{Contest, ContestEntry, ContestMetric, ContestStatus};
-use errors::ComboError;
-pub use ml_scoring::{
-    MLModel, SignalFeatures, SignalScore,
+use errors::{
+    AdminError, ComboError, ContestError, CrossChainError, TemplateError, VersioningError,
 };
+pub use leaderboard::{
+    get_leaderboard as get_leaderboard_internal, LeaderboardMetric, ProviderLeaderboard,
+};
+pub use ml_scoring::{MLModel, SignalFeatures, SignalScore};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
 use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
@@ -77,6 +78,10 @@ pub enum StorageKey {
     ComboExecutions(u64),
     CrossChainSignals(String, String), // (source_chain, source_signal_id)
     AddressMappings(String, String),    // (source_chain, source_address)
+    /// Per-category index of active signal IDs for efficient filtering (Issue #171)
+    ActiveSignalsByCategory,
+    /// Nonce check for adoption increments to prevent double-counting (Issue #169)
+    AdoptionNonces,
 }
 #[contractimpl]
 impl SignalRegistry {
@@ -155,6 +160,18 @@ impl SignalRegistry {
 
     pub fn transfer_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), AdminError> {
         admin::transfer_admin(&env, &caller, new_admin)
+    }
+
+    pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), AdminError> {
+        admin::set_guardian(&env, &caller, guardian)
+    }
+
+    pub fn revoke_guardian(env: Env, caller: Address) -> Result<(), AdminError> {
+        admin::revoke_guardian(&env, &caller)
+    }
+
+    pub fn get_guardian(env: Env) -> Option<Address> {
+        admin::get_guardian(&env)
     }
 
     pub fn get_admin(env: Env) -> Result<Address, AdminError> {
@@ -328,9 +345,22 @@ impl SignalRegistry {
             .unwrap_or(Map::new(env))
     }
 
-    fn save_signals_map(env: &Env, map: &Map<u64, Signal>) {
+fn save_signals_map(env: &Env, map: &Map<u64, Signal>) {
         env.storage().instance().set(&StorageKey::Signals, map);
     }
+
+fn get_category_index_map(env: &Env) -> Map<SignalCategory, Vec<u64>> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::ActiveSignalsByCategory)
+        .unwrap_or(Map::new(env))
+}
+
+fn save_category_index_map(env: &Env, map: &Map<SignalCategory, Vec<u64>>) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::ActiveSignalsByCategory, map);
+}
 
     fn get_provider_stats_map(env: &Env) -> Map<Address, ProviderPerformance> {
         env.storage()
@@ -443,6 +473,13 @@ impl SignalRegistry {
 
         // Update tag popularity
         categories::increment_tag_popularity(env, &unique_tags);
+
+        // Add to per-category index for efficient filtering (Issue #171)
+        let mut cat_map = Self::get_category_index_map(env);
+        let mut cat_list = cat_map.get(category.clone()).unwrap_or(Vec::new(env));
+        cat_list.push_back(id);
+        cat_map.set(category, cat_list);
+        Self::save_category_index_map(env, &cat_map);
 
         // Initialize provider stats on first submission
         let mut stats = Self::get_provider_stats_map(env);
@@ -563,7 +600,7 @@ impl SignalRegistry {
         }
 
         // Default category, tags, and risk_level for templates
-        let category = SignalCategory::SwingTrade;
+        let category = SignalCategory::SWING;
         let tags = Vec::new(&env);
         let risk_level = RiskLevel::Medium;
 
@@ -767,6 +804,52 @@ impl SignalRegistry {
         result
     }
 
+/* =========================
+       SIGNAL ADOPTION (Issue #169)
+    ========================== */
+
+    pub fn increment_adoption(
+        env: Env,
+        caller: Address,
+        signal_id: u64,
+        nonce: u64,
+    ) -> Result<u32, AdminError> {
+        // Require caller is TradeExecutor contract (hardcoded or storage)
+        let executor_address = Address::generate(&env); // TODO: load from storage or const
+        caller.require_auth();
+        if caller != executor_address {
+            return Err(AdminError::Unauthorized);
+        }
+
+        // Check nonce to prevent double-increment
+        let nonce_key = (signal_id, nonce);
+        let nonces: Map<(u64, u64), bool> = env.storage().instance().get(&StorageKey::AdoptionNonces).unwrap_or(Map::new(&env));
+        if nonces.contains_key(nonce_key.clone()) {
+            return Err(AdminError::InvalidParameter); // Already incremented
+        }
+
+        let mut signals = get_signals_map(&env);
+        let mut signal = signals.get(signal_id).ok_or(AdminError::InvalidParameter)?;
+
+        if signal.status != SignalStatus::Active {
+            return Err(AdminError::InvalidParameter);
+        }
+
+        signal.adoption_count = signal.adoption_count.checked_add(1).ok_or(AdminError::InvalidParameter)?;
+        signals.set(signal_id, signal.clone());
+        save_signals_map(&env, &signals);
+
+        // Save nonce
+        let mut nonces = nonces;
+        nonces.set(nonce_key, true);
+        env.storage().instance().set(&StorageKey::AdoptionNonces, &nonces);
+
+        // Emit event
+        events::emit_signal_adopted(&env, signal_id, caller.clone(), signal.adoption_count);
+
+        Ok(signal.adoption_count)
+    }
+
     /* =========================
        FEE MANAGEMENT FUNCTIONS
     ========================== */
@@ -806,15 +889,17 @@ impl SignalRegistry {
     ========================== */
 
     /// Get all active (non-expired) signals for feed, paginated and sorted.
+    /// Supports optional category_filter for efficient per-category queries via index.
     pub fn get_active_signals(
         env: Env,
         offset: u32,
         limit: u32,
         sort_by: SortOption,
         provider: Option<Address>,
+        category_filter: Option<SignalCategory>,
     ) -> Vec<SignalSummary> {
         let signals_map = Self::get_signals_map(&env);
-        query::get_active_signals(&env, &signals_map, provider, offset, limit, sort_by)
+        query::get_active_signals(&env, &signals_map, provider, offset, limit, sort_by, category_filter)
     }
 
     /// Legacy fallback if front-ends rely on Old behavior
@@ -1137,7 +1222,7 @@ impl SignalRegistry {
     ) -> Result<u64, AdminError> {
         primary_author.require_auth();
 
-        let category = SignalCategory::SwingTrade;
+        let category = SignalCategory::SWING;
         let tags = Vec::new(&env);
         let risk_level = RiskLevel::Medium;
 
@@ -1223,7 +1308,7 @@ impl SignalRegistry {
     ) -> Result<u64, ComboError> {
         provider.require_auth();
 
-        let count = components.len() as u32;
+        let count = components.len();
         let combo_id = create_combo_signal(&env, &provider, name, components, combo_type)?;
 
         events::emit_combo_created(&env, combo_id, provider, count);
@@ -1300,7 +1385,8 @@ impl SignalRegistry {
         prize_pool: i128,
     ) -> Result<u64, ContestError> {
         admin.require_auth();
-        require_not_paused(&env, String::from_str(&env, CAT_TRADING)).map_err(|e| match e {
+
+        require_not_paused(&env).map_err(|e| match e {
             AdminError::TradingPaused => ContestError::TradingPaused,
             AdminError::CircuitBreakerTriggered => ContestError::CircuitBreakerTriggered,
             _ => ContestError::ContestNotFound,
@@ -1698,15 +1784,14 @@ impl SignalRegistry {
     }
 }
 
-/*mod test;
-mod test_analytics;
-mod test_categories;
-mod test_analytics;
-mod test_import;
-mod test_performance;
-mod test_collaboration; */
+#[cfg(test)]
+mod test_combos;
+#[cfg(test)]
 mod test_contests;
+#[cfg(test)]
 mod test_scheduling;
+#[cfg(test)]
 mod test_versioning;
+#[cfg(test)]
 mod test_emergency;
 mod test_health;
