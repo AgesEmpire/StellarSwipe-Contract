@@ -38,6 +38,19 @@ pub struct Position {
     pub status: PositionStatus,
     /// Set when `status == Closed`; ignored while open.
     pub realized_pnl: i128,
+    /// Ledger close time when `status == Closed`; `0` while open.
+    pub closed_at: u64,
+}
+
+/// One closed leg in `get_trade_history` (newest-first pages).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeHistoryEntry {
+    pub trade_id: u64,
+    pub entry_price: i128,
+    pub amount: i128,
+    pub realized_pnl: i128,
+    pub closed_at: u64,
 }
 
 #[contract]
@@ -100,6 +113,7 @@ impl UserPortfolio {
             amount,
             status: PositionStatus::Open,
             realized_pnl: 0,
+            closed_at: 0,
         };
         env.storage().persistent().set(&DataKey::Position(id), &pos);
 
@@ -151,7 +165,17 @@ impl UserPortfolio {
         }
         pos.status = PositionStatus::Closed;
         pos.realized_pnl = realized_pnl;
+        pos.closed_at = env.ledger().timestamp();
         env.storage().persistent().set(&pkey, &pos);
+
+        let chrono_key = DataKey::UserClosedChronological(user.clone());
+        let mut closed_order: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&chrono_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        closed_order.push_back(position_id);
+        env.storage().persistent().set(&chrono_key, &closed_order);
 
         badges::after_close_position(&env, &user, realized_pnl);
     }
@@ -164,6 +188,16 @@ impl UserPortfolio {
     /// Portfolio P&L including open positions when oracle price is available.
     pub fn get_pnl(env: Env, user: Address) -> PnlSummary {
         queries::compute_get_pnl(&env, user)
+    }
+
+    /// Paginated closed trades, newest first. `cursor` is `trade_id` of the last item from the prior page; `limit` at most 50.
+    pub fn get_trade_history(
+        env: Env,
+        user: Address,
+        cursor: Option<u64>,
+        limit: u32,
+    ) -> Vec<TradeHistoryEntry> {
+        queries::get_trade_history(&env, user, cursor, limit)
     }
 
     fn require_admin(env: &Env) {
@@ -315,6 +349,58 @@ mod tests {
         assert_eq!(pnl.total_pnl, 50);
         // invested: 1000 closed + 500 open = 1500
         assert_eq!(pnl.roi_bps, 333);
+    }
+
+    /// 100 closes, pages of 20: full coverage in reverse chronological order.
+    #[test]
+    fn get_trade_history_paginate_100_by_20() {
+        let env = Env::default();
+        let (_, user, portfolio_id, _) = setup_portfolio(&env, true, 100, 1000);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+
+        for i in 0..100 {
+            let id = client.open_position(&user, &100, &(i as i128 + 1));
+            client.close_position(&user, &id, &(i as i128));
+        }
+
+        let mut cursor = Option::<u64>::None;
+        let mut flat: Vec<u64> = Vec::new(&env);
+        loop {
+            let page = client.get_trade_history(&user, &cursor, &20);
+            if page.is_empty() {
+                break;
+            }
+            for j in 0..page.len() {
+                if let Some(e) = page.get(j) {
+                    flat.push_back(e.trade_id);
+                }
+            }
+            if page.len() < 20 {
+                break;
+            }
+            let last_idx = page.len() - 1;
+            let last = page.get(last_idx).expect("last entry");
+            cursor = Some(last.trade_id);
+        }
+
+        assert_eq!(flat.len(), 100);
+        for i in 0u32..100 {
+            let expected = 100_u64 - i as u64;
+            assert_eq!(flat.get(i), Some(expected));
+        }
+    }
+
+    #[test]
+    fn get_trade_history_limit_capped_at_50() {
+        let env = Env::default();
+        let (_, user, portfolio_id, _) = setup_portfolio(&env, true, 100, 1000);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        for i in 0..60 {
+            let id = client.open_position(&user, &100, &(100 + i as i128));
+            client.close_position(&user, &id, &0);
+        }
+        let page = client.get_trade_history(&user, &Option::None, &200);
+        assert_eq!(page.len(), 50);
     }
 }
 

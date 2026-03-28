@@ -1,8 +1,10 @@
-//! Read-side P&L aggregation: realized from closed positions, unrealized via oracle price.
+//! Read-side P&L aggregation and paginated trade history.
 
 use crate::storage::DataKey;
-use crate::{PnlSummary, Position, PositionStatus};
+use crate::{PnlSummary, Position, PositionStatus, TradeHistoryEntry};
 use soroban_sdk::{symbol_short, Address, Env, Val, Vec};
+
+pub const MAX_TRADE_HISTORY_PAGE: u32 = 50;
 
 const GET_PRICE: soroban_sdk::Symbol = symbol_short!("get_price");
 
@@ -127,4 +129,71 @@ fn roi_basis_points(total_pnl: i128, total_invested: i128) -> i32 {
     } else {
         q as i32
     }
+}
+
+/// Closed trades newest-first. `cursor` is the `trade_id` shown last on the previous page (the oldest
+/// item of that page). Invalid `cursor` returns an empty page.
+pub fn get_trade_history(
+    env: &Env,
+    user: Address,
+    cursor: Option<u64>,
+    limit: u32,
+) -> Vec<TradeHistoryEntry> {
+    let limit = limit.min(MAX_TRADE_HISTORY_PAGE);
+    if limit == 0 {
+        return Vec::new(env);
+    }
+
+    let closed_ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UserClosedChronological(user))
+        .unwrap_or_else(|| Vec::new(env));
+
+    let len = closed_ids.len();
+    if len == 0 {
+        return Vec::new(env);
+    }
+
+    let mut idx: i64 = match cursor {
+        None => (len - 1) as i64,
+        Some(cursor_id) => {
+            let mut found: Option<u32> = None;
+            for i in 0..len {
+                if closed_ids.get(i) == Some(cursor_id) {
+                    found = Some(i);
+                    break;
+                }
+            }
+            match found {
+                Some(i) if i > 0 => (i - 1) as i64,
+                Some(_) => -1,
+                None => return Vec::new(env),
+            }
+        }
+    };
+
+    let mut out: Vec<TradeHistoryEntry> = Vec::new(env);
+    let mut taken: u32 = 0;
+    while taken < limit && idx >= 0 {
+        let id = match closed_ids.get(idx as u32) {
+            Some(v) => v,
+            None => break,
+        };
+        let pkey = DataKey::Position(id);
+        if let Some(pos) = env.storage().persistent().get::<DataKey, Position>(&pkey) {
+            if pos.status == PositionStatus::Closed {
+                out.push_back(TradeHistoryEntry {
+                    trade_id: id,
+                    entry_price: pos.entry_price,
+                    amount: pos.amount,
+                    realized_pnl: pos.realized_pnl,
+                    closed_at: pos.closed_at,
+                });
+                taken += 1;
+            }
+        }
+        idx -= 1;
+    }
+    out
 }

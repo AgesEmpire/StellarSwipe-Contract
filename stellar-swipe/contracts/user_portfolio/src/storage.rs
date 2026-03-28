@@ -21,4 +21,6 @@ pub enum DataKey {
     EarlyAdopterCap,
     /// How many distinct users have opened at least one position (ordering for early adopter).
     TotalUsersFirstOpen,
+    /// Closed position IDs in chronological close order (oldest close first) for pagination.
+    UserClosedChronological(Address),
 }
