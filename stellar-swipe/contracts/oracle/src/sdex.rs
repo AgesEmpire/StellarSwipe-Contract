@@ -1,11 +1,6 @@
- feature/emergency-pause-circuit-breaker
-use soroban_sdk::{contracttype, Env, Address, Vec, panic_with_error};
-use stellar_swipe_common::{Asset, AssetPair};
+use soroban_sdk::{contracttype, Env, Vec};
 
- main
 use crate::errors::OracleError;
-use common::{Asset, AssetPair};
-use soroban_sdk::{panic_with_error, Address, Env, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug)]

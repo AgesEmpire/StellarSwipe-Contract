@@ -15,6 +15,8 @@ mod voting;
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_health;
 
 use committees::{
     list_committees as list_registered_committees, CommitteeAction, CommitteeElection,
@@ -106,6 +108,8 @@ pub enum StorageKey {
     ReputationState,
     VoteRecords,
     ConvictionState,
+    /// Global pause flag surfaced by `health_check` (admin-controlled).
+    ContractPaused,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -217,6 +221,9 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .set(&StorageKey::Initialized, &true);
+        env.storage()
+            .instance()
+            .set(&StorageKey::ContractPaused, &false);
         track_holder(&env, &recipients.team);
         track_holder(&env, &recipients.early_investors);
         track_holder(&env, &recipients.community_rewards);
@@ -225,6 +232,39 @@ impl GovernanceContract {
 
         emit_initialized(&env, &admin, &name, &symbol, total_supply);
         emit_distribution_initialized(&env, &distribution);
+        Ok(())
+    }
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> stellar_swipe_common::HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        if !is_initialized(&env) {
+            return stellar_swipe_common::health_uninitialized(&env, version);
+        }
+        let admin = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| stellar_swipe_common::placeholder_admin(&env));
+        let is_paused = env
+            .storage()
+            .instance()
+            .get(&StorageKey::ContractPaused)
+            .unwrap_or(false);
+        stellar_swipe_common::HealthStatus {
+            is_initialized: true,
+            is_paused,
+            version,
+            admin,
+        }
+    }
+
+    /// Sets the global pause flag read by `health_check` (admin only).
+    pub fn set_contract_paused(env: Env, admin: Address, paused: bool) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::ContractPaused, &paused);
         Ok(())
     }
 

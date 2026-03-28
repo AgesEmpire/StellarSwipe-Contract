@@ -14,6 +14,7 @@ mod multi_asset;
 mod portfolio;
 mod portfolio_insurance;
 mod positions;
+mod rate_limit;
 mod referral;
 mod risk;
 mod risk_parity;
@@ -25,7 +26,8 @@ mod twap;
 use crate::storage::DataKey;
 use advanced_risk::AutoSellResult;
 use errors::AutoTradeError;
-use stellar_swipe_common::emergency::{CAT_TRADING, PauseState};
+use stellar_swipe_common::emergency::{CAT_ALL, CAT_TRADING, PauseState};
+use stellar_swipe_common::{health_uninitialized, HealthStatus};
 
 use risk_parity::{AssetRisk, RebalanceTrade};
 
@@ -89,6 +91,25 @@ impl AutoTradeContract {
     /// Initialize the contract with an admin
     pub fn initialize(env: Env, admin: Address) {
         admin::init_admin(&env, admin);
+    }
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        match admin::get_admin(&env) {
+            None => health_uninitialized(&env, version),
+            Some(admin_addr) => {
+                let cat_trading = String::from_str(&env, CAT_TRADING);
+                let cat_all = String::from_str(&env, CAT_ALL);
+                let is_paused = admin::is_paused(&env, cat_trading) || admin::is_paused(&env, cat_all);
+                HealthStatus {
+                    is_initialized: true,
+                    is_paused,
+                    version,
+                    admin: admin_addr,
+                }
+            }
+        }
     }
 
     /// Pause a category (admin only)
@@ -562,11 +583,6 @@ impl AutoTradeContract {
         auth::get_auth_config(&env, &user)
     }
 
- feature/mean-reversion-strategy
-feature/mean-reversion-strategy
-
- feature/dca-strategy
- main
     // ── DCA ──────────────────────────────────────────────────────────────────
 
     pub fn create_dca(
@@ -626,7 +642,6 @@ feature/mean-reversion-strategy
         strategy_id: u64,
     ) -> Result<strategies::dca::DCAPerformance, AutoTradeError> {
         strategies::dca::analyze_dca_performance(&env, strategy_id)
- feature/mean-reversion-strategy
     }
 
     // ── Mean Reversion ────────────────────────────────────────────────────────
@@ -1024,7 +1039,6 @@ feature/mean-reversion-strategy
             asset_b,
             lookback_days,
         )
- main
     }
 
     // ── Correlation-Based Risk Management (Issue #correlation) ───────────────
@@ -1150,7 +1164,10 @@ feature/mean-reversion-strategy
     }
 }
 
+#[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_health;
 
 // ── Correlation-Based Risk Management integration tests ───────────────────────
 #[cfg(test)]

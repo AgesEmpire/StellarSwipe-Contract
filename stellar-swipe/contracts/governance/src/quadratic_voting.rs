@@ -126,7 +126,7 @@ pub fn store_vote_credits(env: &Env, credits: &VoteCredits) {
 pub fn allocate_vote_credits(env: &Env, user: Address) -> Result<i128, GovernanceError> {
     let config = get_quadratic_voting_config(env);
     if !config.enabled {
-        return Err(GovernanceError::QuadraticVotingDisabled);
+        return Err(GovernanceError::InvalidGovernanceConfig);
     }
 
     let staked = get_effective_voting_power(env, &user);
@@ -211,7 +211,7 @@ pub fn cast_quadratic_vote(
 
     let config = get_quadratic_voting_config(env);
     if !config.enabled {
-        return Err(GovernanceError::QuadraticVotingDisabled);
+        return Err(GovernanceError::InvalidGovernanceConfig);
     }
 
     if config.sybil_resistance_enabled {
@@ -222,7 +222,7 @@ pub fn cast_quadratic_vote(
             .map(|v| v.verified)
             .unwrap_or(false);
         if !verified {
-            return Err(GovernanceError::IdentityNotVerified);
+            return Err(GovernanceError::InvalidProposal);
         }
     }
 

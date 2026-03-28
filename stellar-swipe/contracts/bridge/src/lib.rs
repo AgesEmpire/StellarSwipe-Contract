@@ -1,5 +1,8 @@
 #![no_std]
 
+use soroban_sdk::{contract, contractimpl, Env};
+use stellar_swipe_common::HealthStatus;
+
 pub mod monitoring;
 pub mod governance;
 pub mod analytics;
@@ -58,3 +61,17 @@ pub use messaging::{
     expire_timed_out_message,
     get_cross_chain_message,
 };
+
+#[contract]
+pub struct BridgeContract;
+
+#[contractimpl]
+impl BridgeContract {
+    /// Read-only health for ops / frontends; no auth, no storage writes.
+    pub fn health_check(env: Env) -> HealthStatus {
+        crate::governance::bridge_health_check(&env)
+    }
+}
+
+#[cfg(test)]
+mod test_health;

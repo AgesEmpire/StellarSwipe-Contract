@@ -34,21 +34,13 @@ pub fn validate_tag(tag: &String) -> Result<(), AdminError> {
 
     // Check alphanumeric and basic chars (letters, numbers, hyphen, underscore)
     for byte in bytes.iter() {
- feature/emergency-pause-circuit-breaker
         let b = byte;
-        if !((b >= b'a' && b <= b'z') || 
-             (b >= b'A' && b <= b'Z') || 
-             (b >= b'0' && b <= b'9') || 
-             b == b'-' || b == b'_') {
-
-        let b = *byte;
         if !((b >= b'a' && b <= b'z')
             || (b >= b'A' && b <= b'Z')
             || (b >= b'0' && b <= b'9')
             || b == b'-'
             || b == b'_')
         {
- main
             return Err(AdminError::InvalidParameter);
         }
     }
@@ -69,13 +61,8 @@ pub fn validate_tags(tags: &Vec<String>) -> Result<(), AdminError> {
 }
 
 pub fn deduplicate_tags(env: &Env, tags: Vec<String>) -> Vec<String> {
- feature/emergency-pause-circuit-breaker
     let mut unique: Vec<String> = Vec::new(env);
-    
 
-    let mut unique = Vec::new(env);
-
- main
     for i in 0..tags.len() {
         let tag = tags.get(i).unwrap();
         let mut found = false;
@@ -192,13 +179,9 @@ pub fn auto_suggest_tags(env: &Env, rationale: &String) -> Vec<String> {
 }
 
 fn contains_bytes(haystack: &soroban_sdk::Bytes, needle: &[u8]) -> bool {
-    let hay_len = haystack.len(); feature/emergency-pause-circuit-breaker
+    let hay_len = haystack.len();
     let needle_len = needle.len() as u32;
-    
 
-    let needle_len = needle.len();
-
- main
     if needle_len > hay_len {
         return false;
     }

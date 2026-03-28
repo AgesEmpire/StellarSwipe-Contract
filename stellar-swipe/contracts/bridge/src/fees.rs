@@ -40,7 +40,7 @@ pub fn set_bridge_treasury(env: &Env, bridge_id: u64, treasury: Address) {
 
 pub fn get_bridge_treasury(env: &Env, bridge_id: u64) -> Result<Address, String> {
     env.storage().persistent().get(&FeeStorageKey::TreasuryTarget(bridge_id))
-        .ok_or_else(|| String::from_linear(env, "Treasury not set"))
+        .ok_or_else(|| String::from_str(env, "Treasury not set"))
 }
 
 pub fn set_bridge_fee_config(env: &Env, config: &BridgeFeeConfig) {
@@ -49,7 +49,7 @@ pub fn set_bridge_fee_config(env: &Env, config: &BridgeFeeConfig) {
 
 pub fn get_bridge_fee_config(env: &Env, bridge_id: u64) -> Result<BridgeFeeConfig, String> {
     env.storage().persistent().get(&FeeStorageKey::FeeConfig(bridge_id))
-        .ok_or_else(|| String::from_linear(env, "Fee config not found"))
+        .ok_or_else(|| String::from_str(env, "Fee config not found"))
 }
 
 pub fn get_bridge_fee_stats(env: &Env, bridge_id: u64) -> BridgeFeeStats {

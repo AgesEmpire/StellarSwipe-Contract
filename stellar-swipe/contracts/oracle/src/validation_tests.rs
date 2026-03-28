@@ -7,7 +7,7 @@ mod validation_tests {
     use soroban_sdk::{testutils::Ledger, Env, String, Address};
     use crate::history::*;
     use crate::errors::OracleError;
-    use common::{Asset, AssetPair};
+    use stellar_swipe_common::{Asset, AssetPair};
 
     fn usdc_xlm_pair(env: &Env) -> AssetPair {
         AssetPair {

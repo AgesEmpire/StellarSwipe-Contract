@@ -1,10 +1,6 @@
 use crate::errors::VersioningError;
-use crate::errors::VersioningError;
-use crate::events;
 use crate::events;
 use crate::types::{Signal, SignalStatus};
-use crate::types::{Signal, SignalStatus};
-use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 
 const MAX_UPDATES_PER_SIGNAL: u32 = 5;
@@ -68,22 +64,12 @@ pub fn update_signal(
         .persistent()
         .get(&update_count_key)
         .unwrap_or(0);
-    let update_count: u32 = env
-        .storage()
-        .persistent()
-        .get(&update_count_key)
-        .unwrap_or(0);
     if update_count >= MAX_UPDATES_PER_SIGNAL {
         return Err(VersioningError::MaxUpdatesReached);
     }
 
     // Check cooldown
     let last_update_key = VersioningStorageKey::LastUpdateTime(signal_id);
-    let last_update: u64 = env
-        .storage()
-        .persistent()
-        .get(&last_update_key)
-        .unwrap_or(0);
     let last_update: u64 = env
         .storage()
         .persistent()
@@ -114,11 +100,6 @@ pub fn update_signal(
         updated_at: current_time,
         updated_by: updater.clone(),
     };
-
-    let version_storage_key = VersioningStorageKey::SignalVersions(signal_id, current_version);
-    env.storage()
-        .persistent()
-        .set(&version_storage_key, &version_record);
 
     let version_storage_key = VersioningStorageKey::SignalVersions(signal_id, current_version);
     env.storage()
