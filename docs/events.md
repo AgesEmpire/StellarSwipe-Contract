@@ -1,3 +1,26 @@
+ main
+# Signal Registry Events
+
+## SignalSubmitted
+Emitted when a new signal is submitted via create_signal().
+
+**Topics:** (`signal_registry`, `signal_submitted`)
+**Data:** `{ signal_id: u64, provider: Address, asset_pair: String, action: SignalAction, expiry: u64, risk_rating: RiskLevel }`
+
+## SignalExpired
+Emitted when signal status changes to Expired during expiry check.
+
+**Topics:** (`signal_registry`, `signal_expired`)
+**Data:** `{ signal_id: u64, provider: Address, expired_at: u64 }`
+
+## Other Events
+- `trade_executed`
+- `signal_status_changed`
+- `provider_stats_updated`
+- `follow_gained`
+- `emergency_paused`
+- etc. (see events.rs)
+=======
 # StellarSwipe contract events
 
 This document lists **contract events** emitted via `env.events().publish(topics, data)` across the five workspace contracts under `stellar-swipe/contracts/`. It is the canonical reference for frontends and off-chain indexers.
@@ -357,3 +380,4 @@ Use this list to confirm the doc is sufficient:
 ## Maintenance
 
 Any PR that adds or changes event emissions must update this file in the same PR (see [`.github/pull_request_template.md`](../.github/pull_request_template.md)).
+ main

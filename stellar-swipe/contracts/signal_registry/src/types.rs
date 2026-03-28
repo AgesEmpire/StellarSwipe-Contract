@@ -42,6 +42,8 @@ pub enum SignalAction {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// TradeSignal struct for storing trading signals with category tags for filtering.
+/// Category: SCALP (ultra-short), SWING (short-term), LONG_TERM (position), ARBITRAGE (inefficiencies).
 pub struct Signal {
     pub id: u64,
     pub provider: Address,
@@ -56,10 +58,13 @@ pub struct Signal {
     pub successful_executions: u32,
     pub total_volume: i128,
     pub total_roi: i128,
+    /// Required SignalCategory tag: SCALP, SWING, LONG_TERM, ARBITRAGE for feed filtering.
     pub category: SignalCategory,
     pub tags: Vec<String>,
     pub risk_level: RiskLevel,
     pub is_collaborative: bool,
+    /// Number of unique adoptions/trades copying this signal
+    pub adoption_count: u32,
 }
 
 #[contracttype]

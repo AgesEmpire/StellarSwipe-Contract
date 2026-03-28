@@ -77,6 +77,10 @@ pub enum StorageKey {
     ComboExecutions(u64),
     CrossChainSignals(String, String), // (source_chain, source_signal_id)
     AddressMappings(String, String),    // (source_chain, source_address)
+    /// Per-category index of active signal IDs for efficient filtering (Issue #171)
+    ActiveSignalsByCategory,
+    /// Nonce check for adoption increments to prevent double-counting (Issue #169)
+    AdoptionNonces,
 }
 #[contractimpl]
 impl SignalRegistry {
@@ -322,9 +326,22 @@ impl SignalRegistry {
             .unwrap_or(Map::new(env))
     }
 
-    fn save_signals_map(env: &Env, map: &Map<u64, Signal>) {
+fn save_signals_map(env: &Env, map: &Map<u64, Signal>) {
         env.storage().instance().set(&StorageKey::Signals, map);
     }
+
+fn get_category_index_map(env: &Env) -> Map<SignalCategory, Vec<u64>> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::ActiveSignalsByCategory)
+        .unwrap_or(Map::new(env))
+}
+
+fn save_category_index_map(env: &Env, map: &Map<SignalCategory, Vec<u64>>) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::ActiveSignalsByCategory, map);
+}
 
     fn get_provider_stats_map(env: &Env) -> Map<Address, ProviderPerformance> {
         env.storage()
@@ -437,6 +454,13 @@ impl SignalRegistry {
 
         // Update tag popularity
         categories::increment_tag_popularity(env, &unique_tags);
+
+        // Add to per-category index for efficient filtering (Issue #171)
+        let mut cat_map = Self::get_category_index_map(env);
+        let mut cat_list = cat_map.get(category.clone()).unwrap_or(Vec::new(env));
+        cat_list.push_back(id);
+        cat_map.set(category, cat_list);
+        Self::save_category_index_map(env, &cat_map);
 
         // Initialize provider stats on first submission
         let mut stats = Self::get_provider_stats_map(env);
@@ -557,7 +581,7 @@ impl SignalRegistry {
         }
 
         // Default category, tags, and risk_level for templates
-        let category = SignalCategory::SwingTrade;
+        let category = SignalCategory::SWING;
         let tags = Vec::new(&env);
         let risk_level = RiskLevel::Medium;
 
@@ -761,6 +785,52 @@ impl SignalRegistry {
         result
     }
 
+/* =========================
+       SIGNAL ADOPTION (Issue #169)
+    ========================== */
+
+    pub fn increment_adoption(
+        env: Env,
+        caller: Address,
+        signal_id: u64,
+        nonce: u64,
+    ) -> Result<u32, AdminError> {
+        // Require caller is TradeExecutor contract (hardcoded or storage)
+        let executor_address = Address::generate(&env); // TODO: load from storage or const
+        caller.require_auth();
+        if caller != executor_address {
+            return Err(AdminError::Unauthorized);
+        }
+
+        // Check nonce to prevent double-increment
+        let nonce_key = (signal_id, nonce);
+        let nonces: Map<(u64, u64), bool> = env.storage().instance().get(&StorageKey::AdoptionNonces).unwrap_or(Map::new(&env));
+        if nonces.contains_key(nonce_key.clone()) {
+            return Err(AdminError::InvalidParameter); // Already incremented
+        }
+
+        let mut signals = get_signals_map(&env);
+        let mut signal = signals.get(signal_id).ok_or(AdminError::InvalidParameter)?;
+
+        if signal.status != SignalStatus::Active {
+            return Err(AdminError::InvalidParameter);
+        }
+
+        signal.adoption_count = signal.adoption_count.checked_add(1).ok_or(AdminError::InvalidParameter)?;
+        signals.set(signal_id, signal.clone());
+        save_signals_map(&env, &signals);
+
+        // Save nonce
+        let mut nonces = nonces;
+        nonces.set(nonce_key, true);
+        env.storage().instance().set(&StorageKey::AdoptionNonces, &nonces);
+
+        // Emit event
+        events::emit_signal_adopted(&env, signal_id, caller.clone(), signal.adoption_count);
+
+        Ok(signal.adoption_count)
+    }
+
     /* =========================
        FEE MANAGEMENT FUNCTIONS
     ========================== */
@@ -800,15 +870,17 @@ impl SignalRegistry {
     ========================== */
 
     /// Get all active (non-expired) signals for feed, paginated and sorted.
+    /// Supports optional category_filter for efficient per-category queries via index.
     pub fn get_active_signals(
         env: Env,
         offset: u32,
         limit: u32,
         sort_by: SortOption,
         provider: Option<Address>,
+        category_filter: Option<SignalCategory>,
     ) -> Vec<SignalSummary> {
         let signals_map = Self::get_signals_map(&env);
-        query::get_active_signals(&env, &signals_map, provider, offset, limit, sort_by)
+        query::get_active_signals(&env, &signals_map, provider, offset, limit, sort_by, category_filter)
     }
 
     /// Legacy fallback if front-ends rely on Old behavior
@@ -1131,7 +1203,7 @@ impl SignalRegistry {
     ) -> Result<u64, AdminError> {
         primary_author.require_auth();
 
-        let category = SignalCategory::SwingTrade;
+        let category = SignalCategory::SWING;
         let tags = Vec::new(&env);
         let risk_level = RiskLevel::Medium;
 
