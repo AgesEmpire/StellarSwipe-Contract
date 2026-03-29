@@ -1,7 +1,7 @@
 //! Historical price storage and TWAP calculation
 
 use crate::errors::OracleError;
-use common::AssetPair;
+use stellar_swipe_common::AssetPair;
 use soroban_sdk::Env;
 
 const BUCKET_SIZE: u64 = 300; // 5 minutes
@@ -93,8 +93,8 @@ pub fn get_twap_deviation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::Asset;
-    use soroban_sdk::{testutils::Ledger, Address, Env, String};
+    use stellar_swipe_common::Asset;
+    use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, String};
 
     fn test_pair(env: &Env) -> AssetPair {
         AssetPair {

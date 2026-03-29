@@ -1,7 +1,14 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{testutils::Address as _, Address, Env, String};
+
+fn xlm_asset(env: &Env) -> Asset {
+    Asset {
+        code: String::from_str(env, "XLM"),
+        issuer: None,
+    }
+}
 
 fn create_test_env() -> (Env, Address, Address, Address, Address) {
     let env = Env::default();
@@ -20,7 +27,7 @@ fn test_initialize() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
 
     // Should panic on second init
     // client.initialize(&admin); // Uncomment to test panic
@@ -32,7 +39,7 @@ fn test_register_oracle() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
 
     let reputation = client.get_oracle_reputation(&oracle1);
@@ -47,7 +54,7 @@ fn test_submit_price() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
 
     client.submit_price(&oracle1, &100_000_000);
@@ -63,7 +70,7 @@ fn test_reputation_calculation_accurate_oracle() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -94,7 +101,7 @@ fn test_weight_adjustment() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -120,7 +127,7 @@ fn test_slash_for_major_deviation() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -144,7 +151,7 @@ fn test_oracle_removal_for_poor_performance() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -180,7 +187,7 @@ fn test_reputation_recovery() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -216,7 +223,7 @@ fn test_weighted_median() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -242,7 +249,7 @@ fn test_minimum_oracles_maintained() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
     client.register_oracle(&admin, &oracle2);
     client.register_oracle(&admin, &oracle3);
@@ -287,7 +294,7 @@ fn test_invalid_price_rejected() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
     client.register_oracle(&admin, &oracle1);
 
     let result = client.try_submit_price(&oracle1, &0);
@@ -304,7 +311,7 @@ fn test_unregistered_oracle_cannot_submit() {
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin);
+    client.initialize(&admin, &xlm_asset(&env));
 
     let result = client.try_submit_price(&unregistered, &100_000_000);
     assert!(result.is_err());

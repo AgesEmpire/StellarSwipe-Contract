@@ -1,19 +1,19 @@
-// contracts/oracle/src/staleness.rs
- feature/emergency-pause-circuit-breaker
-use soroban_sdk::{contracttype, Env, Address, symbol_short, Symbol};
+use soroban_sdk::{contracttype, Env};
 use stellar_swipe_common::AssetPair;
 
-use common::AssetPair;
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
- main
+#[contracttype]
+#[derive(Clone)]
+enum StaleStorageKey {
+    Meta(AssetPair),
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StalenessLevel {
-    Fresh,    // < 2m
-    Aging,    // 2-5m
-    Stale,    // 5-15m
-    Critical, // > 15m
+    Fresh,
+    Aging,
+    Stale,
+    Critical,
 }
 
 #[contracttype]
@@ -26,11 +26,38 @@ pub struct PriceMetadata {
     pub is_paused: bool,
 }
 
-pub fn check_staleness(pair: AssetPair, current_time: u64) -> StalenessLevel {
-    let metadata = get_price_metadata(pair);
-    let age = current_time.saturating_sub(metadata.last_update);
+pub fn default_metadata() -> PriceMetadata {
+    PriceMetadata {
+        last_update: 0,
+        update_count_24h: 0,
+        avg_update_interval: 0,
+        staleness_level: StalenessLevel::Critical,
+        is_paused: false,
+    }
+}
 
-    // thresholds can be pulled from a PairConfig
+fn load_metadata(env: &Env, pair: &AssetPair) -> PriceMetadata {
+    env.storage()
+        .instance()
+        .get(&StaleStorageKey::Meta(pair.clone()))
+        .unwrap_or_else(default_metadata)
+}
+
+pub fn get_metadata(env: &Env, pair: &AssetPair) -> PriceMetadata {
+    load_metadata(env, pair)
+}
+
+pub fn set_metadata(env: &Env, pair: &AssetPair, metadata: PriceMetadata) {
+    env.storage()
+        .instance()
+        .set(&StaleStorageKey::Meta(pair.clone()), &metadata);
+}
+
+pub fn check_staleness(env: &Env, pair: AssetPair) -> StalenessLevel {
+    let metadata = load_metadata(env, &pair);
+    let now = env.ledger().timestamp();
+    let age = now.saturating_sub(metadata.last_update);
+
     match age {
         0..=120 => StalenessLevel::Fresh,
         121..=300 => StalenessLevel::Aging,

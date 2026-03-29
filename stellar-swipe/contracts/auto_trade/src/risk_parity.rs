@@ -3,11 +3,11 @@
 //! Equalizes the risk contribution of each asset in a portfolio.
 //! High volatility assets receive lower weights, low volatility assets receive higher weights.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Vec, Map, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, Symbol, Vec};
 
-use crate::risk;
-use crate::portfolio;
 use crate::errors::AutoTradeError;
+use crate::portfolio;
+use crate::risk;
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -45,17 +45,17 @@ pub fn calculate_risk_parity_rebalance(
     for i in 0..portfolio.assets.len() {
         let asset = portfolio.assets.get(i).unwrap();
         let vol = risk::calculate_volatility(env, asset.asset_id, 30);
-        
+
         // Risk Contribution = Value * Volatility
         let risk_contrib = asset.current_value_xlm * vol;
-        
+
         asset_risks.push_back(AssetRisk {
             asset_id: asset.asset_id,
             volatility_bps: vol,
             current_value_xlm: asset.current_value_xlm,
             current_risk_contribution: risk_contrib,
         });
-        
+
         total_risk_contribution += risk_contrib;
     }
 
@@ -89,7 +89,7 @@ pub fn calculate_risk_parity_rebalance(
     for i in 0..asset_risks.len() {
         let ar = asset_risks.get(i).unwrap();
         let inv_vol = inv_vols.get(i).unwrap();
-        
+
         // Target Value = Total Portfolio Value * (inv_vol / inv_vol_sum)
         let target_value = (total_value * inv_vol) / inv_vol_sum;
 
@@ -117,12 +117,9 @@ pub fn calculate_risk_parity_rebalance(
 }
 
 /// Execute a risk parity rebalance for a user.
-pub fn execute_risk_parity_rebalance(
-    env: &Env,
-    user: &Address,
-) -> Result<(), AutoTradeError> {
+pub fn execute_risk_parity_rebalance(env: &Env, user: &Address) -> Result<(), AutoTradeError> {
     let config = risk::get_risk_parity_config(env, user);
-    
+
     if !config.enabled {
         return Err(AutoTradeError::Unauthorized);
     }
@@ -143,7 +140,7 @@ pub fn execute_risk_parity_rebalance(
     // Execute trades (simplified: in real SDEX would need asset IDs to symbols/XDR)
     for i in 0..trades.len() {
         let trade = trades.get(i).unwrap();
-        
+
         // In a real contract, this would call SDEX to buy/sell
         // For this implementation, we update positions to reflect the rebalance
         let mut positions = risk::get_user_positions(env, user);
@@ -156,7 +153,7 @@ pub fn execute_risk_parity_rebalance(
                 } else {
                     pos.amount -= amount_change;
                 }
-                
+
                 if pos.amount <= 0 {
                     positions.remove(trade.asset_id);
                 } else {
@@ -164,7 +161,9 @@ pub fn execute_risk_parity_rebalance(
                 }
             }
         }
-        env.storage().persistent().set(&risk::RiskDataKey::UserPositions(user.clone()), &positions);
+        env.storage()
+            .persistent()
+            .set(&risk::RiskDataKey::UserPositions(user.clone()), &positions);
     }
 
     // Update last rebalance time
@@ -175,7 +174,7 @@ pub fn execute_risk_parity_rebalance(
     // Emit event
     env.events().publish(
         (Symbol::new(env, "risk_parity_rebalance"), user.clone()),
-        now
+        now,
     );
 
     Ok(())

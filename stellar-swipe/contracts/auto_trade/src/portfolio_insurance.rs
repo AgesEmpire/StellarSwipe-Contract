@@ -16,7 +16,7 @@ use crate::risk;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HedgePurpose {
     PortfolioProtection,
-    AssetSpecificHedge { hedged_asset: u32 },
+    AssetSpecificHedge(u32),
 }
 
 /// A single open hedge position.
@@ -186,8 +186,7 @@ pub fn rebalance_hedges(env: &Env, user: &Address) -> Result<Vec<u32>, AutoTrade
     }
 
     let current_value = risk::calculate_portfolio_value(env, user);
-    let target_hedge_value =
-        (current_value * insurance.hedge_ratio_bps as i128) / 10_000;
+    let target_hedge_value = (current_value * insurance.hedge_ratio_bps as i128) / 10_000;
 
     let mut current_hedge_value: i128 = 0;
     for i in 0..insurance.active_hedges.len() {
@@ -198,7 +197,11 @@ pub fn rebalance_hedges(env: &Env, user: &Address) -> Result<Vec<u32>, AutoTrade
     }
 
     let hedge_delta = target_hedge_value - current_hedge_value;
-    let denominator = if target_hedge_value > 0 { target_hedge_value } else { 1 };
+    let denominator = if target_hedge_value > 0 {
+        target_hedge_value
+    } else {
+        1
+    };
     let delta_bps = (hedge_delta.abs() * 10_000) / denominator;
 
     if delta_bps < insurance.rebalance_threshold_bps as i128 {
@@ -337,9 +340,7 @@ fn calculate_optimal_hedges(
                 asset: asset_id,
                 amount,
                 entry_price: price,
-                purpose: HedgePurpose::AssetSpecificHedge {
-                    hedged_asset: asset_id,
-                },
+                purpose: HedgePurpose::AssetSpecificHedge(asset_id),
             });
         }
     }

@@ -77,9 +77,9 @@ pub struct GridStrategy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GridPerformance {
     pub total_profit: i128,
-    pub roi_pct: u32,      // basis points (×100)
+    pub roi_pct: u32, // basis points (×100)
     pub total_fills: u32,
-    pub fill_rate: u32,    // basis points (×100)
+    pub fill_rate: u32, // basis points (×100)
     pub avg_profit_per_fill: i128,
     pub active_orders: u32,
 }
@@ -213,8 +213,8 @@ pub fn place_grid_orders(env: &Env, strategy_id: u64) -> Result<(), AutoTradeErr
     let current_price = get_current_price(env, strategy.asset_pair);
 
     for level in 0..strategy.grid_config.num_grids {
-        let grid_price = strategy.grid_config.lower_price
-            + (level as i128 * strategy.grid_config.grid_spacing);
+        let grid_price =
+            strategy.grid_config.lower_price + (level as i128 * strategy.grid_config.grid_spacing);
 
         let order_type = if grid_price < current_price {
             OrderSide::Buy
@@ -282,7 +282,15 @@ pub fn on_grid_order_filled(
     }
 
     let level = filled_level.ok_or(AutoTradeError::SignalNotFound)?;
-    let filled_order = strategy.active_orders.remove(level).unwrap();
+    let filled_order = strategy
+        .active_orders
+        .get(level)
+        .ok_or(AutoTradeError::SignalNotFound)?;
+feat/smart-order-routing-84
+
+    let filled_for_profit = filled_order.clone();
+ main
+    strategy.active_orders.remove(level);
 
     strategy.filled_orders.push_back(FilledGridOrder {
         level: filled_order.level,
@@ -292,13 +300,26 @@ pub fn on_grid_order_filled(
         filled_at: env.ledger().timestamp(),
     });
 
-    if let Some(profit) = calculate_grid_profit(&strategy, &filled_order, fill_price, fill_amount)
+ feat/smart-order-routing-84
+    if let Some(profit) = calculate_grid_profit(&strategy, &filled_order, fill_price, fill_amount) {
+
+    if let Some(profit) =
+        calculate_grid_profit(&strategy, &filled_for_profit, fill_price, fill_amount)
     {
+ main
         strategy.total_profit += profit;
 
         #[allow(deprecated)]
         env.events().publish(
-            (Symbol::new(env, "grid_profit"), strategy_id, filled_order.level),
+ feat/smart-order-routing-84
+            (
+                Symbol::new(env, "grid_profit"),
+                strategy_id,
+                filled_order.level,
+            ),
+
+            (Symbol::new(env, "grid_profit"), strategy_id, filled_for_profit.level),
+main
             profit,
         );
     }
@@ -546,8 +567,7 @@ mod tests {
         let (env, contract_id) = setup();
         env.as_contract(&contract_id, || {
             let user = Address::generate(&env);
-            let err =
-                initialize_grid_strategy(&env, user, 1, 2_000, 1_000, 2, 10_000).unwrap_err();
+            let err = initialize_grid_strategy(&env, user, 1, 2_000, 1_000, 2, 10_000).unwrap_err();
             assert_eq!(err, AutoTradeError::InvalidAmount);
         });
     }

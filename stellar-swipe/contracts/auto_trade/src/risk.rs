@@ -13,6 +13,8 @@ pub struct RiskConfig {
     pub max_position_pct: u32,  // Percentage (0-100)
     pub daily_trade_limit: u32, // Max trades per 24 hours
     pub stop_loss_pct: u32,     // Percentage (0-100)
+    pub trailing_stop_enabled: bool,
+    pub trailing_stop_pct: u32, // Basis points, e.g. 1000 = 10%
 }
 
 impl Default for RiskConfig {
@@ -21,6 +23,8 @@ impl Default for RiskConfig {
             max_position_pct: 20,  // 20% of portfolio
             daily_trade_limit: 10, // 10 trades per day
             stop_loss_pct: 15,     // 15% stop loss
+            trailing_stop_enabled: false,
+            trailing_stop_pct: 1000,
         }
     }
 }
@@ -51,6 +55,7 @@ pub struct Position {
     pub asset_id: u32,
     pub amount: i128,
     pub entry_price: i128,
+    pub high_price: i128,
     pub timestamp: u64,
 }
 
@@ -110,21 +115,39 @@ pub fn set_risk_parity_config(env: &Env, user: &Address, config: &RiskParityConf
 /// ==========================
 
 pub fn record_price(env: &Env, asset_id: u32, price: i128) {
-    let count: u32 = env.storage().persistent().get(&RiskDataKey::AssetPriceHistoryCount(asset_id)).unwrap_or(0);
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&RiskDataKey::AssetPriceHistoryCount(asset_id))
+        .unwrap_or(0);
     let slot = count % 30; // Store last 30 prices
-    env.storage().persistent().set(&RiskDataKey::AssetPriceHistory(asset_id, slot), &price);
-    env.storage().persistent().set(&RiskDataKey::AssetPriceHistoryCount(asset_id), &(count + 1));
+    env.storage()
+        .persistent()
+        .set(&RiskDataKey::AssetPriceHistory(asset_id, slot), &price);
+    env.storage()
+        .persistent()
+        .set(&RiskDataKey::AssetPriceHistoryCount(asset_id), &(count + 1));
 }
 
 fn get_price_history(env: &Env, asset_id: u32, window: u32) -> Vec<i128> {
     let mut prices = Vec::new(env);
-    let count: u32 = env.storage().persistent().get(&RiskDataKey::AssetPriceHistoryCount(asset_id)).unwrap_or(0);
-    if count == 0 { return prices; }
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&RiskDataKey::AssetPriceHistoryCount(asset_id))
+        .unwrap_or(0);
+    if count == 0 {
+        return prices;
+    }
 
     let window = window.min(count).min(30);
     for i in 0..window {
         let idx = (count + 30 - 1 - i) % 30;
-        if let Some(price) = env.storage().persistent().get(&RiskDataKey::AssetPriceHistory(asset_id, idx)) {
+        if let Some(price) = env
+            .storage()
+            .persistent()
+            .get(&RiskDataKey::AssetPriceHistory(asset_id, idx))
+        {
             prices.push_front(price);
         }
     }
@@ -132,7 +155,9 @@ fn get_price_history(env: &Env, asset_id: u32, window: u32) -> Vec<i128> {
 }
 
 fn isqrt(n: i128) -> i128 {
-    if n <= 0 { return 0; }
+    if n <= 0 {
+        return 0;
+    }
     let mut x = n;
     let mut y = (x + 1) / 2;
     while y < x {
@@ -150,17 +175,21 @@ pub fn calculate_volatility(env: &Env, asset_id: u32, window: u32) -> i128 {
 
     let mut returns = Vec::new(env);
     for i in 1..prices.len() {
-        let prev = prices.get(i-1).unwrap();
+        let prev = prices.get(i - 1).unwrap();
         let curr = prices.get(i).unwrap();
         if prev > 0 {
             returns.push_back((curr - prev) * 10000 / prev);
         }
     }
 
-    if returns.is_empty() { return DEFAULT_VOLATILITY_BPS; }
+    if returns.is_empty() {
+        return DEFAULT_VOLATILITY_BPS;
+    }
 
     let mut sum = 0i128;
-    for r in returns.iter() { sum += r; }
+    for r in returns.iter() {
+        sum += r;
+    }
     let mean = sum / (returns.len() as i128);
 
     let mut var_sum = 0i128;
@@ -171,7 +200,11 @@ pub fn calculate_volatility(env: &Env, asset_id: u32, window: u32) -> i128 {
     let variance = var_sum / (returns.len() as i128);
     let vol = isqrt(variance);
 
-    if vol == 0 { DEFAULT_VOLATILITY_BPS } else { vol }
+    if vol == 0 {
+        DEFAULT_VOLATILITY_BPS
+    } else {
+        vol
+    }
 }
 
 /// ==========================
@@ -190,11 +223,35 @@ pub fn update_position(env: &Env, user: &Address, asset_id: u32, amount: i128, p
     if amount == 0 {
         positions.remove(asset_id);
     } else {
-        let position = Position {
-            asset_id,
-            amount,
-            entry_price: price,
-            timestamp: env.ledger().timestamp(),
+        let position = if let Some(existing) = positions.get(asset_id) {
+            let is_reduction = amount < existing.amount;
+            Position {
+                asset_id,
+                amount,
+                entry_price: if is_reduction {
+                    existing.entry_price
+                } else {
+                    price
+                },
+                high_price: if existing.high_price > price {
+                    existing.high_price
+                } else {
+                    price
+                },
+                timestamp: if is_reduction {
+                    existing.timestamp
+                } else {
+                    env.ledger().timestamp()
+                },
+            }
+        } else {
+            Position {
+                asset_id,
+                amount,
+                entry_price: price,
+                high_price: price,
+                timestamp: env.ledger().timestamp(),
+            }
         };
         positions.set(asset_id, position);
     }
@@ -330,20 +387,25 @@ pub fn check_position_limit(
     Ok(())
 }
 
-/// Check if stop-loss is triggered for a sell
+/// Check if stop-loss is triggered for a sell, preferring oracle price over SDEX spot.
+///
+/// `oracle_price` — when `Some`, this manipulation-resistant price is used;
+/// when `None`, `current_price` (SDEX spot) is used as a fallback.
 pub fn check_stop_loss(
     env: &Env,
     user: &Address,
     asset_id: u32,
     current_price: i128,
+    oracle_price: Option<i128>,
     config: &RiskConfig,
 ) -> bool {
     let positions = get_user_positions(env, user);
 
     if let Some(position) = positions.get(asset_id) {
+        let reference_price = oracle_price.unwrap_or(current_price);
         let stop_loss_price = position.entry_price * (100 - config.stop_loss_pct as i128) / 100;
 
-        if current_price <= stop_loss_price {
+        if reference_price <= stop_loss_price {
             return true;
         }
     }
@@ -351,7 +413,10 @@ pub fn check_stop_loss(
     false
 }
 
-/// Perform all risk checks before executing a trade
+/// Perform all risk checks before executing a trade.
+///
+/// `oracle_price` — when `Some`, used for stop-loss evaluation instead of
+/// the SDEX spot `price`, providing manipulation resistance.
 pub fn validate_trade(
     env: &Env,
     user: &Address,
@@ -359,6 +424,7 @@ pub fn validate_trade(
     amount: i128,
     price: i128,
     is_sell: bool,
+    oracle_price: Option<i128>,
 ) -> Result<bool, AutoTradeError> {
     let config = get_risk_config(env, user);
 
@@ -370,9 +436,9 @@ pub fn validate_trade(
         check_position_limit(env, user, asset_id, amount, price, &config)?;
     }
 
-    // Check stop-loss (only for sells)
+    // Check stop-loss (only for sells), using oracle price when available
     let stop_loss_triggered = if is_sell {
-        check_stop_loss(env, user, asset_id, price, &config)
+        check_stop_loss(env, user, asset_id, price, oracle_price, &config)
     } else {
         false
     };
@@ -410,6 +476,8 @@ mod tests {
             assert_eq!(config.max_position_pct, 20);
             assert_eq!(config.daily_trade_limit, 10);
             assert_eq!(config.stop_loss_pct, 15);
+            assert!(!config.trailing_stop_enabled);
+            assert_eq!(config.trailing_stop_pct, 1000);
         });
     }
 
@@ -424,6 +492,8 @@ mod tests {
                 max_position_pct: 30,
                 daily_trade_limit: 15,
                 stop_loss_pct: 10,
+                trailing_stop_enabled: true,
+                trailing_stop_pct: 1500,
             };
             set_risk_config(&env, &user, &custom_config);
 
@@ -524,7 +594,7 @@ mod tests {
             // Entry price 100, stop loss at 15% = 85
             update_position(&env, &user, 1, 1000, 100);
 
-            let triggered = check_stop_loss(&env, &user, 1, 90, &config);
+            let triggered = check_stop_loss(&env, &user, 1, 90, None, &config);
             assert!(!triggered);
         });
     }
@@ -541,7 +611,7 @@ mod tests {
             // Entry price 100, stop loss at 15% = 85
             update_position(&env, &user, 1, 1000, 100);
 
-            let triggered = check_stop_loss(&env, &user, 1, 80, &config);
+            let triggered = check_stop_loss(&env, &user, 1, 80, None, &config);
             assert!(triggered);
         });
     }

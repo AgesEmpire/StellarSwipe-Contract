@@ -18,6 +18,7 @@ pub const DEFAULT_POSITION_LIMIT: u32 = 20; // 20%
 #[derive(Clone)]
 pub enum AdminStorageKey {
     Admin,
+    Guardian,
     MinStake,
     TradeFee,
     StopLoss,
@@ -28,6 +29,7 @@ pub enum AdminStorageKey {
     MultiSigEnabled,
     MultiSigSigners,
     MultiSigThreshold,
+    FeeCollectionPaused,
 }
 
 #[contracttype]
@@ -96,6 +98,39 @@ pub fn get_admin(env: &Env) -> Result<Address, AdminError> {
         .instance()
         .get(&AdminStorageKey::Admin)
         .ok_or(AdminError::NotInitialized)
+}
+
+/// Set guardian address (admin only)
+pub fn set_guardian(env: &Env, caller: &Address, guardian: Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+    env.storage().instance().set(&AdminStorageKey::Guardian, &guardian);
+    emit_guardian_set(env, guardian);
+    Ok(())
+}
+
+/// Revoke guardian (admin only)
+pub fn revoke_guardian(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+    let guardian: Address = env
+        .storage()
+        .instance()
+        .get(&AdminStorageKey::Guardian)
+        .ok_or(AdminError::NotInitialized)?;
+    env.storage().instance().remove(&AdminStorageKey::Guardian);
+    emit_guardian_revoked(env, guardian);
+    Ok(())
+}
+
+/// Get current guardian, if any
+pub fn get_guardian(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&AdminStorageKey::Guardian)
+}
+
+/// Check if caller is the guardian
+fn is_guardian(env: &Env, caller: &Address) -> bool {
+    get_guardian(env).map(|g| &g == caller).unwrap_or(false)
 }
 
 /// Verify caller is admin
@@ -268,7 +303,7 @@ pub fn get_default_position_limit(env: &Env) -> u32 {
         .unwrap_or(DEFAULT_POSITION_LIMIT)
 }
 
-/// Pause a category
+/// Pause a category (admin or guardian)
 pub fn pause_category(
     env: &Env,
     caller: &Address,
@@ -276,8 +311,12 @@ pub fn pause_category(
     duration: Option<u64>,
     reason: String,
 ) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
-    caller.require_auth();
+    if is_guardian(env, caller) {
+        caller.require_auth();
+    } else {
+        require_admin(env, caller)?;
+        caller.require_auth();
+    }
 
     let now = env.ledger().timestamp();
     let auto_unpause_at = duration.map(|d| now + d);
@@ -583,6 +622,52 @@ pub fn remove_multisig_signer(
 
     emit_multisig_signer_removed(env, signer_to_remove, caller.clone());
     Ok(())
+}
+
+// ==================== Fee Collection Pause (Issue #189) ====================
+
+/// Pause fee collection. Read operations and position closures continue.
+pub fn pause_fee_collection(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::FeeCollectionPaused, &true);
+
+    emit_parameter_updated(
+        env,
+        soroban_sdk::Symbol::new(env, "fee_paused"),
+        0,
+        1,
+    );
+    Ok(())
+}
+
+/// Resume fee collection.
+pub fn resume_fee_collection(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::FeeCollectionPaused, &false);
+
+    emit_parameter_updated(
+        env,
+        soroban_sdk::Symbol::new(env, "fee_paused"),
+        1,
+        0,
+    );
+    Ok(())
+}
+
+/// Check if fee collection is paused.
+pub fn is_fee_collection_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::FeeCollectionPaused)
+        .unwrap_or(false)
 }
 
 /// Set circuit breaker configuration
