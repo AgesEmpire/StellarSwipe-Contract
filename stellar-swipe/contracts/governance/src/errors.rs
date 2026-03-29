@@ -54,9 +54,4 @@ pub enum GovernanceError {
     ActionNotFound = 48,
     InvalidTimelockConfig = 49,
     ConvictionPoolNotFound = 50,
-
-    // Quadratic Voting
-    QuadraticVotingDisabled = 51,
-    IdentityNotVerified = 52,
-    InsufficientVoteCredits = 53,
 }

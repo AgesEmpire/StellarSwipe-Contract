@@ -53,6 +53,7 @@ use types::{
     RecurrencePattern, Signal, SignalAction, SignalData, SignalPerformanceView, SignalStatus,
     SignalSummary, SortOption, SyncStatus, TradeExecution,
 };
+use stellar_swipe_common::{health_uninitialized, placeholder_admin, HealthStatus};
 use reputation::{calculate_trust_score, get_trust_score, update_trust_score, update_median_values, TrustScoreDetails, TrustScoreTier};
 use versioning::{SignalVersion, CopyRecord};
 
@@ -201,6 +202,24 @@ impl SignalRegistry {
 
     pub fn get_config(env: Env) -> AdminConfig {
         get_admin_config(&env)
+    }
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        if !admin::has_admin(&env) {
+            return health_uninitialized(&env, version);
+        }
+        let admin_addr = match get_admin(&env) {
+            Ok(a) => a,
+            Err(_) => placeholder_admin(&env),
+        };
+        HealthStatus {
+            is_initialized: true,
+            is_paused: is_trading_paused(&env),
+            version,
+            admin: admin_addr,
+        }
     }
 
     pub fn set_circuit_breaker_config(
@@ -1775,3 +1794,4 @@ mod test_scheduling;
 mod test_versioning;
 #[cfg(test)]
 mod test_emergency;
+mod test_health;

@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn test_send_payload_too_large() {
         let (env, sender, _) = setup();
-        let big = Bytes::from_slice(env, &[0u8; 4097]);
+        let big = Bytes::from_slice(&env, &[0u8; 4097]);
         let result = send_cross_chain_message(
             &env, sender, ChainId::Ethereum, target(&env), big, 100_000, false,
         );

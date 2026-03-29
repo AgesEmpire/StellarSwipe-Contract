@@ -1119,6 +1119,7 @@ fn test_authorization_at_exact_limit() {
         assert!(res.is_ok());
     });
 }
+feat/batch-copy-trade
 
 
 // ========================================
@@ -1798,3 +1799,5 @@ mod insurance_tests {
         });
     }
 }
+
+ main

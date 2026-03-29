@@ -1,19 +1,9 @@
 #![cfg(test)]
 use super::*;
- feature/emergency-pause-circuit-breaker
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, String, vec};
-use crate::contests::{Contest, ContestEntry, ContestMetric, ContestStatus};
-use crate::types::{SignalAction, SignalStatus};
-use crate::categories::{RiskLevel, SignalCategory};
-
 use crate::categories::{RiskLevel, SignalCategory};
 use crate::contests::{Contest, ContestEntry, ContestMetric, ContestStatus};
 use crate::types::{Signal, SignalAction, SignalStatus};
-use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    Address, Env, String,
-};
- main
+use soroban_sdk::{testutils::{Address as _, Ledger}, vec, Address, Env, String};
 
 fn setup<'a>(env: &'a Env) -> (Address, SignalRegistryClient<'a>) {
     env.mock_all_auths();

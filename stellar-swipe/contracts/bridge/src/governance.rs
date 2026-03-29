@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use soroban_sdk::{contracttype, Address, Env, Map, String, Symbol, Vec};
+use stellar_swipe_common::{health_uninitialized, placeholder_admin, HealthStatus};
 
 /// Governance proposal statuses
 #[contracttype]
@@ -27,17 +28,17 @@ pub struct BridgeSecurityConfig {
     pub transfer_delay_seconds: u64,
 }
 
-/// Types of governance proposals
+/// Types of governance proposals (tuple variants — Soroban `contracttype` does not support struct fields on variants).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProposalType {
-    AddValidator { validator: Address },
-    RemoveValidator { validator: Address },
-    UpdateSecurityLimits { new_limits: BridgeSecurityConfig },
+    AddValidator(Address),
+    RemoveValidator(Address),
+    UpdateSecurityLimits(BridgeSecurityConfig),
     PauseBridge,
     UnpauseBridge,
-    UpdateRequiredSignatures { new_count: u32 },
-    EmergencyWithdraw { asset_id: String, amount: i128, recipient: Address },
+    UpdateRequiredSignatures(u32),
+    EmergencyWithdraw(String, i128, Address),
 }
 
 /// Governance proposal
@@ -228,13 +229,13 @@ fn validate_proposal_type(
     proposal_type: &ProposalType,
 ) -> Result<(), String> {
     match proposal_type {
-        ProposalType::AddValidator { validator } => {
+        ProposalType::AddValidator(validator) => {
             let bridge = get_bridge(env, bridge_id)?;
             if bridge.validators.contains(validator) {
                 return Err(String::from_str(env, "Already a validator"));
             }
         }
-        ProposalType::RemoveValidator { validator } => {
+        ProposalType::RemoveValidator(validator) => {
             let bridge = get_bridge(env, bridge_id)?;
             if !bridge.validators.contains(validator) {
                 return Err(String::from_str(env, "Not a validator"));
@@ -243,13 +244,13 @@ fn validate_proposal_type(
                 return Err(String::from_str(env, "Would drop below min validators"));
             }
         }
-        ProposalType::UpdateRequiredSignatures { new_count } => {
+        ProposalType::UpdateRequiredSignatures(new_count) => {
             let governance = get_bridge_governance(env, bridge_id)?;
             if *new_count == 0 || *new_count > governance.signers.len() as u32 {
                 return Err(String::from_str(env, "Invalid signature count"));
             }
         }
-        ProposalType::EmergencyWithdraw { amount, .. } => {
+        ProposalType::EmergencyWithdraw(_, amount, _) => {
             if *amount <= 0 {
                 return Err(String::from_str(env, "Invalid amount"));
             }
@@ -346,13 +347,13 @@ pub fn execute_bridge_proposal(
 
     // Execute based on proposal type
     match &proposal.proposal_type {
-        ProposalType::AddValidator { validator } => {
+        ProposalType::AddValidator(validator) => {
             execute_add_validator(env, bridge_id, validator)?;
         }
-        ProposalType::RemoveValidator { validator } => {
+        ProposalType::RemoveValidator(validator) => {
             execute_remove_validator(env, bridge_id, validator)?;
         }
-        ProposalType::UpdateSecurityLimits { new_limits } => {
+        ProposalType::UpdateSecurityLimits(new_limits) => {
             execute_update_security_limits(env, bridge_id, new_limits)?;
         }
         ProposalType::PauseBridge => {
@@ -361,10 +362,10 @@ pub fn execute_bridge_proposal(
         ProposalType::UnpauseBridge => {
             execute_unpause_bridge(env, bridge_id)?;
         }
-        ProposalType::UpdateRequiredSignatures { new_count } => {
+        ProposalType::UpdateRequiredSignatures(new_count) => {
             execute_update_required_signatures(env, bridge_id, *new_count)?;
         }
-        ProposalType::EmergencyWithdraw { asset_id, amount, recipient } => {
+        ProposalType::EmergencyWithdraw(asset_id, amount, recipient) => {
             execute_emergency_withdraw(env, bridge_id, asset_id, *amount, recipient)?;
         }
     }
@@ -551,7 +552,7 @@ pub fn emergency_execute_proposal(
 
     // Only certain proposal types can be emergency executed
     match proposal.proposal_type {
-        ProposalType::PauseBridge | ProposalType::EmergencyWithdraw { .. } => {
+        ProposalType::PauseBridge | ProposalType::EmergencyWithdraw(..) => {
             execute_bridge_proposal(env, bridge_id, proposal_id)?;
             
             env.events().publish(
@@ -677,7 +678,7 @@ pub fn rotate_bridge_signers(
         env,
         bridge_id,
         proposer,
-        ProposalType::UpdateRequiredSignatures { new_count: new_required_signatures },
+        ProposalType::UpdateRequiredSignatures(new_required_signatures),
         String::from_str(env, "Rotate signers"),
     )?;
 
@@ -779,7 +780,7 @@ fn store_proposal(env: &Env, bridge_id: u64, proposal_id: u64, proposal: &Govern
         .set(&GovernanceDataKey::Proposal(bridge_id, proposal_id), proposal);
 }
 
-fn get_bridge(env: &Env, bridge_id: u64) -> Result<Bridge, String> {
+pub(crate) fn get_bridge(env: &Env, bridge_id: u64) -> Result<Bridge, String> {
     env.storage()
         .persistent()
         .get(&GovernanceDataKey::Bridge(bridge_id))
@@ -795,6 +796,41 @@ fn store_bridge(env: &Env, bridge_id: u64, bridge: &Bridge) {
 /// ==========================
 /// Query Functions
 /// ==========================
+
+fn vec_first_address(vec: &Vec<Address>, _env: &Env) -> Option<Address> {
+    if vec.len() == 0 {
+        return None;
+    }
+    vec.get(0)
+}
+
+/// Read-only health probe for monitoring. Tries bridge id `0` then `1` so typical testnets and unit tests match.
+pub fn bridge_health_check(env: &Env) -> HealthStatus {
+    let version = String::from_str(env, env!("CARGO_PKG_VERSION"));
+    for bridge_id in [0_u64, 1_u64] {
+        let bridge_opt: Option<Bridge> = env
+            .storage()
+            .persistent()
+            .get(&GovernanceDataKey::Bridge(bridge_id));
+        if let Some(ref bridge) = bridge_opt {
+            let is_paused = matches!(bridge.status, BridgeStatus::Paused);
+            let admin = vec_first_address(&bridge.validators, env).unwrap_or_else(|| {
+                env.storage()
+                    .persistent()
+                    .get(&GovernanceDataKey::BridgeGovernance(bridge_id))
+                    .and_then(|g: BridgeGovernance| vec_first_address(&g.signers, env))
+                    .unwrap_or_else(|| placeholder_admin(env))
+            });
+            return HealthStatus {
+                is_initialized: true,
+                is_paused,
+                version,
+                admin,
+            };
+        }
+    }
+    health_uninitialized(env, version)
+}
 
 /// Get bridge status
 pub fn get_bridge_status(env: &Env, bridge_id: u64) -> Result<BridgeStatus, String> {
@@ -919,11 +955,11 @@ mod tests {
         initialize_bridge_governance(&env, 1, signers, 3).unwrap();
 
         let new_validator = Address::generate(&env);
-        let proposal_type = ProposalType::AddValidator { validator: new_validator };
+        let proposal_type = ProposalType::AddValidator(new_validator);
         let description = String::from_str(&env, "Add new validator");
 
         env.mock_all_auths();
-        let result = create_bridge_proposal(&env, 1, proposer, proposal_type, description);
+        let result = create_bridge_proposal(&env, 1, proposer.clone(), proposal_type, description);
         assert!(result.is_ok());
 
         let proposal_id = result.unwrap();
@@ -945,7 +981,7 @@ mod tests {
         initialize_bridge_governance(&env, 1, signers, 3).unwrap();
 
         let new_validator = Address::generate(&env);
-        let proposal_type = ProposalType::AddValidator { validator: new_validator };
+        let proposal_type = ProposalType::AddValidator(new_validator);
         let description = String::from_str(&env, "Add new validator");
 
         env.mock_all_auths();
@@ -963,7 +999,7 @@ mod tests {
         initialize_bridge_governance(&env, 1, signers, 3).unwrap();
 
         let new_validator = Address::generate(&env);
-        let proposal_type = ProposalType::AddValidator { validator: new_validator };
+        let proposal_type = ProposalType::AddValidator(new_validator);
         let description = String::from_str(&env, "Add new validator");
 
         env.mock_all_auths();
@@ -986,7 +1022,7 @@ mod tests {
         initialize_bridge_governance(&env, 1, signers, 3).unwrap();
 
         let new_validator = Address::generate(&env);
-        let proposal_type = ProposalType::AddValidator { validator: new_validator };
+        let proposal_type = ProposalType::AddValidator(new_validator);
         let description = String::from_str(&env, "Add new validator");
 
         env.mock_all_auths();
@@ -1008,7 +1044,7 @@ mod tests {
         initialize_bridge(&env, 1, validators, 2, security_config).unwrap();
 
         let new_validator = Address::generate(&env);
-        let proposal_type = ProposalType::AddValidator { validator: new_validator.clone() };
+        let proposal_type = ProposalType::AddValidator(new_validator.clone());
         let description = String::from_str(&env, "Add new validator");
 
         env.mock_all_auths();
@@ -1045,7 +1081,7 @@ mod tests {
         initialize_bridge_governance(&env, 1, signers.clone(), 3).unwrap();
         initialize_bridge(&env, 1, validators, 2, security_config).unwrap();
 
-        let proposal_type = ProposalType::RemoveValidator { validator: validator_to_remove.clone() };
+        let proposal_type = ProposalType::RemoveValidator(validator_to_remove.clone());
         let description = String::from_str(&env, "Remove validator");
 
         env.mock_all_auths();
@@ -1149,7 +1185,7 @@ mod tests {
             transfer_delay_seconds: 600,
         };
 
-        let proposal_type = ProposalType::UpdateSecurityLimits { new_limits: new_limits.clone() };
+        let proposal_type = ProposalType::UpdateSecurityLimits(new_limits.clone());
         let description = String::from_str(&env, "Update security limits");
 
         env.mock_all_auths();
@@ -1176,7 +1212,7 @@ mod tests {
 
         initialize_bridge_governance(&env, 1, signers.clone(), 3).unwrap();
 
-        let proposal_type = ProposalType::UpdateRequiredSignatures { new_count: 4 };
+        let proposal_type = ProposalType::UpdateRequiredSignatures(4);
         let description = String::from_str(&env, "Update required signatures");
 
         env.mock_all_auths();
@@ -1265,7 +1301,7 @@ mod tests {
         initialize_bridge_governance(&env, 1, signers.clone(), 3).unwrap();
 
         let new_validator = Address::generate(&env);
-        let proposal_type = ProposalType::AddValidator { validator: new_validator };
+        let proposal_type = ProposalType::AddValidator(new_validator);
         let description = String::from_str(&env, "Add validator");
 
         env.mock_all_auths();
@@ -1296,7 +1332,7 @@ mod tests {
         initialize_bridge_governance(&env, 1, signers, 3).unwrap();
 
         let new_validator = Address::generate(&env);
-        let proposal_type = ProposalType::AddValidator { validator: new_validator };
+        let proposal_type = ProposalType::AddValidator(new_validator);
         let description = String::from_str(&env, "Add validator");
 
         env.mock_all_auths();
@@ -1319,7 +1355,7 @@ mod tests {
         initialize_bridge_governance(&env, 1, signers, 3).unwrap();
 
         let new_validator = Address::generate(&env);
-        let proposal_type = ProposalType::AddValidator { validator: new_validator };
+        let proposal_type = ProposalType::AddValidator(new_validator);
         let description = String::from_str(&env, "Add validator");
 
         env.mock_all_auths();
@@ -1337,7 +1373,7 @@ mod tests {
         initialize_bridge_governance(&env, 1, signers.clone(), 3).unwrap();
 
         let new_validator = Address::generate(&env);
-        let proposal_type = ProposalType::AddValidator { validator: new_validator };
+        let proposal_type = ProposalType::AddValidator(new_validator);
         let description = String::from_str(&env, "Add validator");
 
         env.mock_all_auths();
@@ -1372,7 +1408,7 @@ mod tests {
         // Create multiple proposals
         for i in 0..3 {
             let new_validator = Address::generate(&env);
-            let proposal_type = ProposalType::AddValidator { validator: new_validator };
+            let proposal_type = ProposalType::AddValidator(new_validator);
             let description = String::from_str(&env, "Add validator");
             create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description).unwrap();
         }
@@ -1393,7 +1429,7 @@ mod tests {
         // Create multiple proposals
         for _ in 0..5 {
             let new_validator = Address::generate(&env);
-            let proposal_type = ProposalType::AddValidator { validator: new_validator };
+            let proposal_type = ProposalType::AddValidator(new_validator);
             let description = String::from_str(&env, "Add validator");
             create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description).unwrap();
         }
@@ -1458,7 +1494,7 @@ mod tests {
 
         // Step 2: Create proposal to add validator
         let new_validator = Address::generate(&env);
-        let proposal_type = ProposalType::AddValidator { validator: new_validator.clone() };
+        let proposal_type = ProposalType::AddValidator(new_validator.clone());
         let description = String::from_str(&env, "Add new validator");
 
         env.mock_all_auths();
@@ -1503,7 +1539,7 @@ mod tests {
             &env,
             1,
             signers.get(0).unwrap(),
-            ProposalType::AddValidator { validator: validator1 },
+            ProposalType::AddValidator(validator1),
             String::from_str(&env, "Add validator 1"),
         ).unwrap();
 
@@ -1512,7 +1548,7 @@ mod tests {
             &env,
             1,
             signers.get(0).unwrap(),
-            ProposalType::AddValidator { validator: validator2 },
+            ProposalType::AddValidator(validator2),
             String::from_str(&env, "Add validator 2"),
         ).unwrap();
 

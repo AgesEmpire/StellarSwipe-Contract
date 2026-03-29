@@ -1,5 +1,4 @@
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
 pub enum AutoTradeError {
     InvalidAmount = 1,
     Unauthorized = 2,

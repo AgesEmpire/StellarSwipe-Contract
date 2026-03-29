@@ -42,6 +42,9 @@ pub fn authorize_user_with_limits(
     env.storage()
         .persistent()
         .set(&AuthKey::Authorization(user.clone()), &config);
+    env.storage()
+        .temporary()
+        .set(&(user.clone(), symbol_short!("balance")), &i128::MAX);
 }
 
 pub fn revoke_user_authorization(env: &Env, user: &Address) {
