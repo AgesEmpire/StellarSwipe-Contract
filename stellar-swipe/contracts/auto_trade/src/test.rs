@@ -1072,6 +1072,337 @@ fn test_stat_arb_exit_closes_on_convergence() {
 }
 
 // ========================================
+// Exit Strategy Tests (tiered TP + trailing stops)
+// ========================================
+
+#[cfg(test)]
+mod exit_strategy_tests {
+    use super::*;
+    use crate::exit_strategy::{StopLossTier, StrategyStatus, TakeProfitTier};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Env, Vec,
+    };
+
+    fn setup() -> (Env, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        let cid = env.register(AutoTradeContract, ());
+        (env, cid)
+    }
+
+    // ── Preset: Conservative (3 TPs + 10% trail) ─────────────────────────────
+
+    #[test]
+    fn test_contract_conservative_tp1_partial_close() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            let id = AutoTradeContract::create_conservative_exit(
+                env.clone(), user.clone(), 1, 1_000, 10_000,
+            ).unwrap();
+
+            // TP1 at +20% = 1200
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 1_200).unwrap();
+            assert_eq!(trades.len(), 1);
+
+            let s = AutoTradeContract::get_exit_strategy(env.clone(), id).unwrap();
+            // 33.33% of 10_000 = 3_333 closed → 6_667 remaining
+            assert_eq!(s.current_position_size, 10_000 - 3_333);
+            assert_eq!(s.status, StrategyStatus::Active);
+        });
+    }
+
+    #[test]
+    fn test_contract_conservative_multiple_tps_same_update() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            let id = AutoTradeContract::create_conservative_exit(
+                env.clone(), user.clone(), 1, 1_000, 10_000,
+            ).unwrap();
+
+            // Price gaps past TP1 and TP2 simultaneously
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 1_500).unwrap();
+            assert_eq!(trades.len(), 2);
+
+            let s = AutoTradeContract::get_exit_strategy(env.clone(), id).unwrap();
+            // TP1: close 3333 → 6667 remaining
+            // TP2: close 50% of 6667 = 3333 → 3334 remaining
+            assert_eq!(s.current_position_size, 3_334);
+            assert_eq!(s.status, StrategyStatus::Active);
+        });
+    }
+
+    #[test]
+    fn test_contract_conservative_all_tps_complete() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            let id = AutoTradeContract::create_conservative_exit(
+                env.clone(), user.clone(), 1, 1_000, 10_000,
+            ).unwrap();
+
+            // Price hits all 3 TPs at once (+100%)
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 2_000).unwrap();
+            assert_eq!(trades.len(), 3);
+
+            let s = AutoTradeContract::get_exit_strategy(env.clone(), id).unwrap();
+            assert_eq!(s.current_position_size, 0);
+            assert_eq!(s.status, StrategyStatus::Complete);
+        });
+    }
+
+    // ── Trailing stop: triggers before any TP ────────────────────────────────
+
+    #[test]
+    fn test_contract_stop_triggered_before_tp() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            // entry=1000, trail=10% from start → stop at 900
+            let id = AutoTradeContract::create_conservative_exit(
+                env.clone(), user.clone(), 1, 1_000, 10_000,
+            ).unwrap();
+
+            // Price rises to 1100 (no TP), then drops 10% → stop at 990
+            AutoTradeContract::check_exit_strategy(env.clone(), id, 1_100).unwrap();
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 990).unwrap();
+            assert_eq!(trades.len(), 1);
+
+            let s = AutoTradeContract::get_exit_strategy(env.clone(), id).unwrap();
+            assert_eq!(s.current_position_size, 0);
+            assert_eq!(s.status, StrategyStatus::StopHit);
+        });
+    }
+
+    // ── Tiered trailing stop tightens after profit threshold ─────────────────
+
+    #[test]
+    fn test_contract_trailing_stop_tightens_after_20pct_profit() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            // Balanced: trail 10% initially, tightens to 7% after 20% profit
+            let id = AutoTradeContract::create_balanced_exit(
+                env.clone(), user.clone(), 1, 1_000, 10_000,
+            ).unwrap();
+
+            // Rise to 1200 (+20%) → tier 2 activates (trail 7%)
+            AutoTradeContract::check_exit_strategy(env.clone(), id, 1_200).unwrap();
+
+            // 1200 * 93% = 1116 → exactly at 7% trail, no stop
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 1_116).unwrap();
+            assert_eq!(trades.len(), 0);
+
+            // 1115 → just below 7% trail of 1200 → stop triggered
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 1_115).unwrap();
+            assert_eq!(trades.len(), 1);
+
+            let s = AutoTradeContract::get_exit_strategy(env.clone(), id).unwrap();
+            assert_eq!(s.status, StrategyStatus::StopHit);
+        });
+    }
+
+    // ── Preset: Aggressive (4 TPs + tiered trails 10%/7%/5%) ─────────────────
+
+    #[test]
+    fn test_contract_aggressive_four_tps_all_hit() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            let id = AutoTradeContract::create_aggressive_exit(
+                env.clone(), user.clone(), 1, 1_000, 10_000,
+            ).unwrap();
+
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 2_500).unwrap();
+            assert_eq!(trades.len(), 4);
+
+            let s = AutoTradeContract::get_exit_strategy(env.clone(), id).unwrap();
+            assert_eq!(s.current_position_size, 0);
+            assert_eq!(s.status, StrategyStatus::Complete);
+        });
+    }
+
+    #[test]
+    fn test_contract_aggressive_tight_trail_after_50pct_profit() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            let id = AutoTradeContract::create_aggressive_exit(
+                env.clone(), user.clone(), 1, 1_000, 10_000,
+            ).unwrap();
+
+            // Rise to 1500 (+50%) → tier 3 activates (trail 5%)
+            AutoTradeContract::check_exit_strategy(env.clone(), id, 1_500).unwrap();
+
+            // 1500 * 95% = 1425 → exactly at 5% trail, no stop
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 1_425).unwrap();
+            assert_eq!(trades.len(), 0);
+
+            // 1424 → just below 5% trail → stop triggered
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 1_424).unwrap();
+            assert_eq!(trades.len(), 1);
+
+            let s = AutoTradeContract::get_exit_strategy(env.clone(), id).unwrap();
+            assert_eq!(s.status, StrategyStatus::StopHit);
+        });
+    }
+
+    // ── Custom strategy with explicit tiers ───────────────────────────────────
+
+    #[test]
+    fn test_contract_custom_exit_strategy() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            let mut tps: Vec<TakeProfitTier> = Vec::new(&env);
+            tps.push_back(TakeProfitTier { price: 120, position_pct: 5_000, executed: false });
+            tps.push_back(TakeProfitTier { price: 150, position_pct: 10_000, executed: false });
+
+            let mut sls: Vec<StopLossTier> = Vec::new(&env);
+            sls.push_back(StopLossTier { trigger_profit_pct: 0, trail_pct: 8, active: true });
+
+            let id = AutoTradeContract::create_exit_strategy(
+                env.clone(), user.clone(), 42, 100, 1_000, tps, sls,
+            ).unwrap();
+
+            // TP1 at 120 → close 50%
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 120).unwrap();
+            assert_eq!(trades.len(), 1);
+            let s = AutoTradeContract::get_exit_strategy(env.clone(), id).unwrap();
+            assert_eq!(s.current_position_size, 500);
+
+            // TP2 at 150 → close remaining 100%
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 150).unwrap();
+            assert_eq!(trades.len(), 1);
+            let s = AutoTradeContract::get_exit_strategy(env.clone(), id).unwrap();
+            assert_eq!(s.current_position_size, 0);
+            assert_eq!(s.status, StrategyStatus::Complete);
+        });
+    }
+
+    // ── Manual position adjustment ────────────────────────────────────────────
+
+    #[test]
+    fn test_contract_manual_position_adjust_updates_remaining_tiers() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            let id = AutoTradeContract::create_conservative_exit(
+                env.clone(), user.clone(), 1, 1_000, 10_000,
+            ).unwrap();
+
+            // User manually closes half the position
+            AutoTradeContract::adjust_exit_position(
+                env.clone(), user.clone(), id, 5_000,
+            ).unwrap();
+
+            let s = AutoTradeContract::get_exit_strategy(env.clone(), id).unwrap();
+            assert_eq!(s.current_position_size, 5_000);
+            assert_eq!(s.status, StrategyStatus::Active);
+
+            // Remaining TP tiers still execute against the adjusted size
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 2_000).unwrap();
+            assert!(trades.len() > 0);
+        });
+    }
+
+    #[test]
+    fn test_contract_manual_adjust_to_zero_marks_complete() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            let id = AutoTradeContract::create_conservative_exit(
+                env.clone(), user.clone(), 1, 1_000, 10_000,
+            ).unwrap();
+
+            AutoTradeContract::adjust_exit_position(
+                env.clone(), user.clone(), id, 0,
+            ).unwrap();
+
+            let s = AutoTradeContract::get_exit_strategy(env.clone(), id).unwrap();
+            assert_eq!(s.status, StrategyStatus::Complete);
+        });
+    }
+
+    // ── Edge cases ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_contract_no_execution_on_inactive_strategy() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            let id = AutoTradeContract::create_conservative_exit(
+                env.clone(), user.clone(), 1, 1_000, 10_000,
+            ).unwrap();
+
+            AutoTradeContract::adjust_exit_position(env.clone(), user.clone(), id, 0).unwrap();
+
+            // Further price checks on a Complete strategy return empty
+            let trades = AutoTradeContract::check_exit_strategy(env.clone(), id, 9_999).unwrap();
+            assert_eq!(trades.len(), 0);
+        });
+    }
+
+    #[test]
+    fn test_contract_get_user_exit_strategies() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            AutoTradeContract::create_conservative_exit(
+                env.clone(), user.clone(), 1, 1_000, 10_000,
+            ).unwrap();
+            AutoTradeContract::create_balanced_exit(
+                env.clone(), user.clone(), 2, 2_000, 5_000,
+            ).unwrap();
+            AutoTradeContract::create_aggressive_exit(
+                env.clone(), user.clone(), 3, 500, 20_000,
+            ).unwrap();
+
+            let ids = AutoTradeContract::get_user_exit_strategies(env.clone(), user.clone());
+            assert_eq!(ids.len(), 3);
+        });
+    }
+
+    #[test]
+    fn test_contract_invalid_entry_price_rejected() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+
+        env.as_contract(&cid, || {
+            let err = AutoTradeContract::create_conservative_exit(
+                env.clone(), user.clone(), 1, 0, 10_000,
+            ).unwrap_err();
+            assert_eq!(err, AutoTradeError::InvalidAmount);
+        });
+    }
+
+    #[test]
+    fn test_contract_get_nonexistent_strategy_errors() {
+        let (env, cid) = setup();
+
+        env.as_contract(&cid, || {
+            let err = AutoTradeContract::get_exit_strategy(env.clone(), 999).unwrap_err();
+            assert_eq!(err, AutoTradeError::ExitStrategyNotFound);
+        });
+    }
+}
+
+// ========================================
 // Portfolio Insurance & Dynamic Hedging Tests (Issue #89)
 // ========================================
 

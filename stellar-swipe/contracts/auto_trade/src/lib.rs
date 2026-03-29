@@ -1,10 +1,6 @@
 #![no_std]
 
- feature/emergency-pause-circuit-breaker
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, String};
-
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, String, Vec};
- main
 
 mod admin;
 mod auth;
@@ -24,10 +20,8 @@ mod strategies;
 
 use crate::storage::DataKey;
 use errors::AutoTradeError;
- feature/emergency-pause-circuit-breaker
 use stellar_swipe_common::emergency::{CAT_TRADING, PauseState};
-
-use risk_parity::{AssetRisk, RebalanceTrade}; main
+use risk_parity::{AssetRisk, RebalanceTrade};
 
 pub use iceberg::{
     create_iceberg_order, cancel_iceberg_order, get_full_order_view, get_public_order_view,

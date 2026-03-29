@@ -28,12 +28,6 @@ pub fn set_signal(env: &Env, id: u64, signal: &Signal) {
     env.storage().persistent().set(&DataKey::Signal(id), signal);
 }
 
- feat/governance-token-distribution-111
-/// Backwards-compatible helper for legacy tests.
-pub fn authorize_user(env: &Env, user: &Address) {
-    authorize_user_with_limits(env, user, i128::MAX / 4, 30);
-}
-
 pub fn authorize_user_with_limits(
     env: &Env,
     user: &Address,
@@ -46,7 +40,6 @@ pub fn authorize_user_with_limits(
         expires_at: env.ledger().timestamp() + (duration_days as u64 * 86400),
         granted_at: env.ledger().timestamp(),
     };
-
     env.storage()
         .persistent()
         .set(&AuthKey::Authorization(user.clone()), &config);
@@ -56,16 +49,9 @@ pub fn revoke_user_authorization(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&AuthKey::Authorization(user.clone()));
+}
+
 #[cfg(test)]
 pub fn authorize_user(env: &Env, user: &Address) {
-    let config = crate::auth::AuthConfig {
-        authorized: true,
-        max_trade_amount: 1_000_000_000_000,
-        expires_at: env.ledger().timestamp() + (30 * 86400),
-        granted_at: env.ledger().timestamp(),
-    };
-    env.storage()
-        .persistent()
-        .set(&crate::auth::AuthKey::Authorization(user.clone()), &config);
- main
+    authorize_user_with_limits(env, user, 1_000_000_000_000, 30);
 }
