@@ -8,8 +8,20 @@ members = [
   "contracts/governance",
   "contracts/oracle",
   "contracts/bridge",
+ main
+
+ feature/reputation-score
+  "contracts/fee_collector",
+
+ main
+ main
   "contracts/fee_collector",
   "contracts/user_portfolio",
+ main
+
+ main
+ main
+ main
 ]
 
 [workspace.dependencies]

@@ -1,0 +1,95 @@
+.hud {
+  display: flex;
+  gap: 1rem;
+  padding: 1rem;
+  background: rgba(0, 0, 0, 0.8);
+  border-radius: 8px;
+  backdrop-filter: blur(10px);
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  z-index: 1000;
+  transition: opacity 0.2s ease;
+}
+
+.hud.loading {
+  opacity: 0.7;
+}
+
+.stat-widget {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 80px;
+  padding: 0.5rem;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.stat-label {
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.8);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 0.25rem;
+}
+
+.stat-value {
+  font-size: 1rem;
+  font-weight: bold;
+  color: white;
+  text-align: center;
+}
+
+.cash-widget .stat-value {
+  color: #4ade80;
+}
+
+.income-widget .stat-value {
+  color: #60a5fa;
+}
+
+.boost-widget .stat-value {
+  color: #f59e0b;
+}
+
+/* Mobile responsive */
+@media (max-width: 768px) {
+  .hud {
+    position: fixed;
+    top: auto;
+    bottom: 1rem;
+    right: 1rem;
+    left: 1rem;
+    flex-direction: row;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.75rem;
+  }
+  
+  .stat-widget {
+    flex: 1;
+    min-width: auto;
+    padding: 0.5rem 0.25rem;
+  }
+  
+  .stat-label {
+    font-size: 0.625rem;
+  }
+  
+  .stat-value {
+    font-size: 0.875rem;
+  }
+}
+
+/* Empty/zero states */
+.stat-widget.empty .stat-value {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.stat-widget.empty .stat-value::after {
+  content: " (empty)";
+  font-size: 0.75rem;
+  opacity: 0.7;
+}

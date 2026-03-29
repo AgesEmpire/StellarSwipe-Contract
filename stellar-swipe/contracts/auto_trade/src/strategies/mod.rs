@@ -1,3 +1,6 @@
+pub mod grid;
+pub mod momentum;
+pub mod sentiment;
  feat/smart-order-routing-84
 
 pub mod dca;

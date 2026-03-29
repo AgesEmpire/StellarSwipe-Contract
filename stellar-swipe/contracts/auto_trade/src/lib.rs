@@ -1,5 +1,6 @@
 #![no_std]
 
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, String, Vec};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
 mod admin;
@@ -8,6 +9,7 @@ mod auth;
 mod conditional;
 mod correlation;
 mod errors;
+mod exit_strategy;
 mod history;
 mod iceberg;
 mod multi_asset;
@@ -36,6 +38,7 @@ use crate::storage::DataKey;
 use advanced_risk::AutoSellResult;
 feat/smart-order-routing-84
 use errors::AutoTradeError;
+use stellar_swipe_common::emergency::{CAT_TRADING, PauseState};
 use stellar_swipe_common::emergency::{PauseState, CAT_TRADING};
 
  feat/batch-copy-trade
@@ -1037,6 +1040,103 @@ impl AutoTradeContract {
         user: Address,
     ) -> Option<portfolio_insurance::PortfolioInsurance> {
         portfolio_insurance::get_insurance(&env, &user)
+    }
+
+    // ── Exit Strategy (tiered TP + trailing stops) ─────────────────────────
+
+    /// Create a custom exit strategy with explicit TP and stop-loss tiers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_exit_strategy(
+        env: Env,
+        user: Address,
+        signal_id: u64,
+        entry_price: i128,
+        position_size: i128,
+        take_profit_tiers: soroban_sdk::Vec<exit_strategy::TakeProfitTier>,
+        stop_loss_tiers: soroban_sdk::Vec<exit_strategy::StopLossTier>,
+    ) -> Result<u64, AutoTradeError> {
+        user.require_auth();
+        exit_strategy::create_exit_strategy(
+            &env,
+            user,
+            signal_id,
+            entry_price,
+            position_size,
+            take_profit_tiers,
+            stop_loss_tiers,
+        )
+    }
+
+    /// Create a conservative preset exit strategy (3 TPs + 10% trail).
+    pub fn create_conservative_exit(
+        env: Env,
+        user: Address,
+        signal_id: u64,
+        entry_price: i128,
+        position_size: i128,
+    ) -> Result<u64, AutoTradeError> {
+        user.require_auth();
+        exit_strategy::preset_conservative(&env, user, signal_id, entry_price, position_size)
+    }
+
+    /// Create a balanced preset exit strategy (2 TPs + tiered trails 10%/7%).
+    pub fn create_balanced_exit(
+        env: Env,
+        user: Address,
+        signal_id: u64,
+        entry_price: i128,
+        position_size: i128,
+    ) -> Result<u64, AutoTradeError> {
+        user.require_auth();
+        exit_strategy::preset_balanced(&env, user, signal_id, entry_price, position_size)
+    }
+
+    /// Create an aggressive preset exit strategy (4 TPs + tiered trails 10%/7%/5%).
+    pub fn create_aggressive_exit(
+        env: Env,
+        user: Address,
+        signal_id: u64,
+        entry_price: i128,
+        position_size: i128,
+    ) -> Result<u64, AutoTradeError> {
+        user.require_auth();
+        exit_strategy::preset_aggressive(&env, user, signal_id, entry_price, position_size)
+    }
+
+    /// Check current price against all tiers and auto-execute any triggered exits.
+    pub fn check_exit_strategy(
+        env: Env,
+        strategy_id: u64,
+        current_price: i128,
+    ) -> Result<soroban_sdk::Vec<u64>, AutoTradeError> {
+        exit_strategy::check_and_execute_exits(&env, strategy_id, current_price)
+    }
+
+    /// Get exit strategy state.
+    pub fn get_exit_strategy(
+        env: Env,
+        strategy_id: u64,
+    ) -> Result<exit_strategy::ExitStrategy, AutoTradeError> {
+        exit_strategy::get_exit_strategy(&env, strategy_id)
+    }
+
+    /// Get all exit strategy IDs for a user.
+    pub fn get_user_exit_strategies(
+        env: Env,
+        user: Address,
+    ) -> soroban_sdk::Vec<u64> {
+        exit_strategy::get_user_exit_strategies(&env, &user)
+    }
+
+    /// Manually adjust remaining position size (e.g. after partial manual close).
+    pub fn adjust_exit_position(
+        env: Env,
+        user: Address,
+        strategy_id: u64,
+        new_size: i128,
+    ) -> Result<(), AutoTradeError> {
+        user.require_auth();
+        exit_strategy::adjust_position_size(&env, &user, strategy_id, new_size)
     }
 
     // ── Grid Trading Strategy (Issue #104) ───────────────────────────────────

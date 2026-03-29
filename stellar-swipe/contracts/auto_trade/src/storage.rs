@@ -18,6 +18,14 @@ pub enum DataKey {
     Signal(u64),
 }
 
+/// Get a signal by ID
+pub fn get_signal(env: &Env, id: u64) -> Option<Signal> {
+    env.storage().persistent().get(&DataKey::Signal(id))
+}
+
+/// Set a signal
+pub fn set_signal(env: &Env, id: u64, signal: &Signal) {
+    env.storage().persistent().set(&DataKey::Signal(id), signal);
 /// Test helper: auth plus max temporary SDEX balance.
 pub fn authorize_user(env: &Env, user: &Address) {
     authorize_user_with_limits(env, user, i128::MAX / 4, 30);
@@ -38,7 +46,6 @@ pub fn authorize_user_with_limits(
         expires_at: env.ledger().timestamp() + (duration_days as u64 * 86400),
         granted_at: env.ledger().timestamp(),
     };
-
     env.storage()
         .persistent()
         .set(&AuthKey::Authorization(user.clone()), &config);
@@ -51,4 +58,9 @@ pub fn revoke_user_authorization(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&AuthKey::Authorization(user.clone()));
+}
+
+#[cfg(test)]
+pub fn authorize_user(env: &Env, user: &Address) {
+    authorize_user_with_limits(env, user, 1_000_000_000_000, 30);
 }
