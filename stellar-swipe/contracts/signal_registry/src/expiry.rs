@@ -320,10 +320,14 @@ mod tests {
             successful_executions: 0,
             total_volume: 0,
             total_roi: 0,
-            category: crate::categories::SignalCategory::SwingTrade,
+            category: crate::categories::SignalCategory::SWING,
             risk_level: crate::categories::RiskLevel::Medium,
             is_collaborative: false,
             tags: soroban_sdk::Vec::new(env),
+            submitted_at: env.ledger().timestamp(),
+            rationale_hash: String::from_str(env, "Test signal"),
+            confidence: 50,
+            adoption_count: 0,
         }
     }
 

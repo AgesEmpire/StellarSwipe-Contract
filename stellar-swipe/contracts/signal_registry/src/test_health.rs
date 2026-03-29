@@ -39,9 +39,7 @@ fn health_initialized_paused() {
     let admin = Address::generate(&env);
 
     client.initialize(&admin);
-    client
-        .pause_trading(&admin)
-        .expect("pause should succeed under mock auth");
+    client.pause_trading(&admin);
 
     let h = client.health_check();
     assert!(h.is_initialized);

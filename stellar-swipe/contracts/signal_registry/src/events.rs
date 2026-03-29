@@ -1,13 +1,5 @@
 use crate::types::Asset;
- main
- feature/cross-chain-sync
-use soroban_sdk::{Address, Env, Symbol, Vec};
-
-use soroban_sdk::{Address, Env, Symbol, String, Vec, contracttype};
- main
-
-use soroban_sdk::{Address, Env, String, Symbol, Vec};
- main
+use soroban_sdk::{contracttype, Address, Env, String, Symbol, Vec};
 
 pub fn emit_admin_transferred(env: &Env, old_admin: Address, new_admin: Address) {
     let topics = (Symbol::new(env, "admin_transferred"), old_admin, new_admin);
@@ -72,7 +64,6 @@ pub struct SignalAdoptedEvent {
     pub new_count: u32,
 }
 
-/// Emitted when signal adoption counter increments (Issue #169)
 pub fn emit_signal_adopted(
     env: &Env,
     signal_id: u64,
@@ -179,6 +170,37 @@ pub fn emit_signal_updated(env: &Env, signal_id: u64, version: u32, updater: Add
     env.events().publish(topics, version);
 }
 
+#[contracttype]
+#[derive(Clone)]
+pub struct SignalEditedEvent {
+    pub signal_id: u64,
+    pub provider: Address,
+    pub price: i128,
+    pub rationale_hash: String,
+    pub confidence: u32,
+}
+
+pub fn emit_signal_edited(
+    env: &Env,
+    signal_id: u64,
+    provider: Address,
+    price: i128,
+    rationale_hash: String,
+    confidence: u32,
+) {
+    let topics = (Symbol::new(env, "signal_edited"), signal_id, provider.clone());
+    env.events().publish(
+        topics,
+        SignalEditedEvent {
+            signal_id,
+            provider,
+            price,
+            rationale_hash,
+            confidence,
+        },
+    );
+}
+
 pub fn emit_copy_recorded(env: &Env, user: Address, signal_id: u64, version: u32) {
     let topics = (Symbol::new(env, "copy_recorded"), signal_id, user);
     env.events().publish(topics, version);
@@ -224,7 +246,13 @@ pub fn emit_cross_chain_signal_synced(
     env.events().publish(topics, new_status);
 }
 
-pub fn emit_emergency_paused(env: &Env, category: String, paused_by: Address, reason: String, auto_unpause_at: Option<u64>) {
+pub fn emit_emergency_paused(
+    env: &Env,
+    category: String,
+    paused_by: Address,
+    reason: String,
+    auto_unpause_at: Option<u64>,
+) {
     let topics = (Symbol::new(env, "emergency_paused"), category, paused_by);
     env.events().publish(topics, (reason, auto_unpause_at));
 }
@@ -238,19 +266,33 @@ pub fn emit_circuit_breaker_triggered(env: &Env, category: String, reason: Strin
     let topics = (Symbol::new(env, "circuit_breaker_triggered"), category);
     env.events().publish(topics, reason);
 }
- docs/contract-events-documentation
-
 
 pub fn emit_guardian_set(env: &Env, guardian: Address) {
-    let topics = (Symbol::new(env, "guardian_set"),);
-    env.events().publish(topics, guardian);
+    let topics = (Symbol::new(env, "guardian_set"), guardian);
+    env.events().publish(topics, ());
 }
 
 pub fn emit_guardian_revoked(env: &Env, guardian: Address) {
-    let topics = (Symbol::new(env, "guardian_revoked"),);
-    env.events().publish(topics, guardian);
+    let topics = (Symbol::new(env, "guardian_revoked"), guardian);
+    env.events().publish(topics, ());
 }
 
- main
- main
- main
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationUpdatedEvent {
+    pub provider: Address,
+    pub old_score: u32,
+    pub new_score: u32,
+}
+
+pub fn emit_reputation_updated(env: &Env, provider: Address, old_score: u32, new_score: u32) {
+    let topics = (Symbol::new(env, "reputation_updated"), provider.clone());
+    env.events().publish(
+        topics,
+        ReputationUpdatedEvent {
+            provider,
+            old_score,
+            new_score,
+        },
+    );
+}

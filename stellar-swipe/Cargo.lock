@@ -602,6 +602,7 @@ version = "0.0.0"
 dependencies = [
  "proptest",
  "soroban-sdk",
+ "stellar_swipe_common",
 ]
 
 [[package]]

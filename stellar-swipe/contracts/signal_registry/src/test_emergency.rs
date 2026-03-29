@@ -34,7 +34,7 @@ fn test_granular_pause() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &Vec::new(&env),
         &RiskLevel::Medium,
     );
@@ -51,7 +51,7 @@ fn test_granular_pause() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &Vec::new(&env),
         &RiskLevel::Medium,
     );
@@ -88,7 +88,7 @@ fn test_pause_all_blocks_everything() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &Vec::new(&env),
         &RiskLevel::Medium,
     );
@@ -126,7 +126,7 @@ fn test_circuit_breaker_trigger() {
         &100_000,
         &String::from_str(&env, "Test"),
         &(env.ledger().timestamp() + 3600),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &Vec::new(&env),
         &RiskLevel::Medium,
     );

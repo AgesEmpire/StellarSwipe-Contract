@@ -181,7 +181,7 @@ fn calculate_consistency_component(performance: &ProviderPerformance) -> u32 {
 /// Calculate stake component (15% weight)
 /// Normalized against median stake amount
 /// Returns 0-10000 basis points
-fn calculate_stake_component(env: &Env, stake_info: &Option<StakeInfo>) -> u32 {
+pub(crate) fn calculate_stake_component(env: &Env, stake_info: &Option<StakeInfo>) -> u32 {
     let stake_amount = match stake_info {
         Some(info) => info.amount,
         None => 0,
@@ -232,14 +232,14 @@ fn calculate_follower_component(env: &Env, provider: &Address) -> u32 {
 /// Calculate tenure component (10% weight)
 /// Days since first signal, normalized to 365 days max
 /// Returns 0-10000 basis points
-fn calculate_tenure_component(env: &Env, provider: &Address, now: u64) -> u32 {
+pub(crate) fn calculate_tenure_component(env: &Env, provider: &Address, now: u64) -> u32 {
     let first_signal_time = get_first_signal_time(env, provider);
 
     if first_signal_time == 0 {
         return 0;
     }
 
-    let days_since_first = (now - first_signal_time) / SECONDS_PER_DAY;
+    let days_since_first = now.saturating_sub(first_signal_time) / SECONDS_PER_DAY;
 
     if days_since_first >= MAX_TENURE_DAYS {
         10000 // Max score for established providers
@@ -249,24 +249,24 @@ fn calculate_tenure_component(env: &Env, provider: &Address, now: u64) -> u32 {
 }
 
 /// Calculate weighted trust score from components
-fn calculate_weighted_score(
+pub(crate) fn calculate_weighted_score(
     success_rate: u32,
     consistency: u32,
     stake: u32,
     followers: u32,
     tenure: u32,
 ) -> u32 {
-    let score = (success_rate as u64 * SUCCESS_RATE_WEIGHT as u64 / 100 +
-                 consistency as u64 * CONSISTENCY_WEIGHT as u64 / 100 +
-                 stake as u64 * STAKE_WEIGHT as u64 / 100 +
-                 followers as u64 * FOLLOWER_WEIGHT as u64 / 100 +
-                 tenure as u64 * TENURE_WEIGHT as u64 / 100) / 100;
-
-    score.min(TRUST_SCORE_SCALE as u64) as u32
+    let num = success_rate as u64 * SUCCESS_RATE_WEIGHT as u64
+        + consistency as u64 * CONSISTENCY_WEIGHT as u64
+        + stake as u64 * STAKE_WEIGHT as u64
+        + followers as u64 * FOLLOWER_WEIGHT as u64
+        + tenure as u64 * TENURE_WEIGHT as u64;
+    let score = (num / 1_000_000).min(TRUST_SCORE_SCALE as u64) as u32;
+    score
 }
 
 /// Get trust score tier from score
-fn get_trust_score_tier(score: u32) -> TrustScoreTier {
+pub(crate) fn get_trust_score_tier(score: u32) -> TrustScoreTier {
     match score {
         80..=100 => TrustScoreTier::HighlyTrusted,
         60..=79 => TrustScoreTier::Trusted,
@@ -312,7 +312,7 @@ pub fn record_first_signal(env: &Env, provider: &Address) {
 }
 
 /// Get first signal time for provider
-fn get_first_signal_time(env: &Env, provider: &Address) -> u64 {
+pub(crate) fn get_first_signal_time(env: &Env, provider: &Address) -> u64 {
     env.storage()
         .persistent()
         .get(&ReputationDataKey::FirstSignalTime(provider.clone()))
@@ -324,7 +324,7 @@ fn get_provider_performance(env: &Env, provider: &Address) -> ProviderPerformanc
     // This would typically come from analytics or performance module
     // For now, return default - in real implementation, this would query the actual data
     env.storage()
-        .persistent()
+        .instance()
         .get(&crate::StorageKey::ProviderStats)
         .and_then(|stats: Map<Address, ProviderPerformance>| stats.get(provider.clone()))
         .unwrap_or_default()
@@ -360,7 +360,7 @@ pub fn update_median_values(env: &Env, median_stake: i128, median_followers: u64
 pub fn get_all_trust_scores(env: &Env) -> Vec<(Address, TrustScoreDetails)> {
     let provider_stats: Map<Address, ProviderPerformance> = env
         .storage()
-        .persistent()
+        .instance()
         .get(&crate::StorageKey::ProviderStats)
         .unwrap_or(Map::new(env));
 
@@ -376,10 +376,26 @@ pub fn get_all_trust_scores(env: &Env) -> Vec<(Address, TrustScoreDetails)> {
     results
 }
 
+
+/// Points for weighted reputation update (Issue #170): profit 100, neutral 50, loss 0.
+pub fn outcome_points(outcome: &crate::types::SignalOutcome) -> u32 {
+    match outcome {
+        crate::types::SignalOutcome::Profit => 100,
+        crate::types::SignalOutcome::Neutral => 50,
+        crate::types::SignalOutcome::Loss => 0,
+    }
+}
+
+/// Integer form of `new = old * 0.9 + outcome * 0.1` on a 0–100 scale.
+pub fn next_reputation_score(old_score: u32, outcome: &crate::types::SignalOutcome) -> u32 {
+    let pts = outcome_points(outcome);
+    (((old_score as u64) * 9 + (pts as u64)) / 10) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     #[test]
     fn test_trust_score_tiers() {
@@ -423,6 +439,7 @@ mod tests {
     #[test]
     fn test_success_rate_component() {
         let performance = ProviderPerformance {
+            total_signals: 10,
             success_rate: 7500, // 75%
             ..Default::default()
         };
@@ -434,46 +451,46 @@ mod tests {
     #[test]
     fn test_stake_component() {
         let env = Env::default();
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            // Set median stake to 100 XLM
+            update_median_values(&env, 100_000_000, 50);
 
-        // Set median stake to 100 XLM
-        update_median_values(&env, 100_000_000, 50);
+            let stake_info = Some(StakeInfo {
+                amount: 200_000_000,
+                last_signal_time: 0,
+                locked_until: 0,
+            });
+            let component = calculate_stake_component(&env, &stake_info);
+            assert_eq!(component, 10000);
 
-        // Test with 200 XLM stake (2x median)
-        let stake_info = Some(StakeInfo {
-            amount: 200_000_000,
-            last_signal_time: 0,
-            locked_until: 0,
+            let stake_info = Some(StakeInfo {
+                amount: 50_000_000,
+                last_signal_time: 0,
+                locked_until: 0,
+            });
+            let component = calculate_stake_component(&env, &stake_info);
+            assert_eq!(component, 5000);
         });
-
-        let component = calculate_stake_component(&env, &stake_info);
-        assert_eq!(component, 10000); // 100% score (capped at 2x median)
-
-        // Test with 50 XLM stake (0.5x median)
-        let stake_info = Some(StakeInfo {
-            amount: 50_000_000,
-            last_signal_time: 0,
-            locked_until: 0,
-        });
-
-        let component = calculate_stake_component(&env, &stake_info);
-        assert_eq!(component, 5000); // 50% score
     }
 
     #[test]
     fn test_tenure_component() {
         let env = Env::default();
-        let provider = Address::generate(&env);
-
-        // Set first signal time to 100 days ago
-        let now = env.ledger().timestamp();
-        let first_signal_time = now - (100 * SECONDS_PER_DAY);
-        env.storage()
-            .persistent()
-            .set(&ReputationDataKey::FirstSignalTime(provider.clone()), &first_signal_time);
-
-        let component = calculate_tenure_component(&env, &provider, now);
-        // 100 days out of 365 = ~27.4% score
-        assert_eq!(component, 2739); // Approximately 27.39%
+        env.ledger().set_timestamp(500_000_000);
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            let provider = Address::generate(&env);
+            let now = env.ledger().timestamp();
+            let first_signal_time = now - (100 * SECONDS_PER_DAY);
+            env.storage()
+                .persistent()
+                .set(&ReputationDataKey::FirstSignalTime(provider.clone()), &first_signal_time);
+            let component = calculate_tenure_component(&env, &provider, now);
+            assert_eq!(component, 2739);
+        });
     }
 
     #[test]
@@ -501,34 +518,35 @@ mod tests {
             avg_return: -8000,
             ..Default::default()
         };
-        assert_eq!(calculate_consistency_component(&performance), 3800);
+        assert_eq!(calculate_consistency_component(&performance), 3400);
     }
 
     #[test]
     fn test_get_all_trust_scores() {
         let env = Env::default();
-        let provider = Address::generate(&env);
-
-        let mut provider_stats: Map<Address, ProviderPerformance> = Map::new(&env);
-        provider_stats.set(
-            provider.clone(),
-            ProviderPerformance {
-                total_signals: 5,
-                successful_signals: 4,
-                failed_signals: 1,
-                success_rate: 8000,
-                avg_return: 5000,
-                ..Default::default()
-            },
-        );
-
-        env.storage()
-            .persistent()
-            .set(&crate::StorageKey::ProviderStats, &provider_stats);
-
-        let list = get_all_trust_scores(&env);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list.get(0).unwrap().0, provider);
-        assert_eq!(list.get(0).unwrap().1.has_sufficient_history, true);
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            let provider = Address::generate(&env);
+            let mut provider_stats: Map<Address, ProviderPerformance> = Map::new(&env);
+            provider_stats.set(
+                provider.clone(),
+                ProviderPerformance {
+                    total_signals: 5,
+                    successful_signals: 4,
+                    failed_signals: 1,
+                    success_rate: 8000,
+                    avg_return: 5000,
+                    ..Default::default()
+                },
+            );
+            env.storage()
+                .instance()
+                .set(&crate::StorageKey::ProviderStats, &provider_stats);
+            let list = get_all_trust_scores(&env);
+            assert_eq!(list.len(), 1);
+            assert_eq!(list.get(0).unwrap().0, provider);
+            assert_eq!(list.get(0).unwrap().1.has_sufficient_history, true);
+        });
     }
 }

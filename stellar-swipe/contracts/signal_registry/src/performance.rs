@@ -254,11 +254,15 @@ mod tests {
             executions: 0,
             total_volume: 0,
             total_roi: 0,
-            category: crate::categories::SignalCategory::SwingTrade,
+            category: crate::categories::SignalCategory::SWING,
             risk_level: crate::categories::RiskLevel::Medium,
             is_collaborative: false,
             tags: soroban_sdk::vec![&soroban_sdk::Env::default()],
             successful_executions: 0,
+            submitted_at: 1000,
+            rationale_hash: soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "Test"),
+            confidence: 50,
+            adoption_count: 0,
         };
 
         let status = evaluate_signal_status(&signal, 2001);
@@ -280,11 +284,15 @@ mod tests {
             executions: 0,
             total_volume: 0,
             total_roi: 0,
-            category: crate::categories::SignalCategory::SwingTrade,
+            category: crate::categories::SignalCategory::SWING,
             risk_level: crate::categories::RiskLevel::Medium,
             is_collaborative: false,
             tags: soroban_sdk::vec![&soroban_sdk::Env::default()],
             successful_executions: 0,
+            submitted_at: 1000,
+            rationale_hash: soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "Test"),
+            confidence: 50,
+            adoption_count: 0,
         };
 
         assert_eq!(get_signal_average_roi(&signal), 0);

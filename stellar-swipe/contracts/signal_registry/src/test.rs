@@ -61,7 +61,7 @@ fn create_and_read_signal() {
         &100_000,
         &String::from_str(&env, "Breakout confirmed"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -93,7 +93,7 @@ fn test_invalid_asset_pair_rejected() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -106,7 +106,7 @@ fn test_invalid_asset_pair_rejected() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -119,7 +119,7 @@ fn test_invalid_asset_pair_rejected() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -151,7 +151,7 @@ fn test_custom_asset_pair_with_issuer() {
         &100_000,
         &String::from_str(&env, "Full format"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -186,7 +186,7 @@ fn test_pause_blocks_signals() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -205,7 +205,7 @@ fn test_pause_blocks_signals() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -434,7 +434,7 @@ fn provider_stats_initialized() {
         &200_000,
         &String::from_str(&env, "Resistance hit"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -558,7 +558,7 @@ fn test_get_active_signals_excludes_expired() {
             &100_000,
             &String::from_str(&env, "Active"),
             &(current_time + 10000),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -573,7 +573,7 @@ fn test_get_active_signals_excludes_expired() {
             &200_000,
             &String::from_str(&env, "Expired"),
             &(current_time + 10),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -622,7 +622,7 @@ fn test_cleanup_batch_limit() {
             &100_000,
             &String::from_str(&env, "Test"),
             &(current_time + 10),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -671,7 +671,7 @@ fn test_pending_expiry_count() {
             &100_000,
             &String::from_str(&env, "Test"),
             &(current_time + 10),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -824,7 +824,7 @@ fn test_feed_filtered_by_followed() {
         &100_000,
         &String::from_str(&env, "A1"),
         &(current_time + 10000),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "A")],
         &RiskLevel::Medium,
     );
@@ -835,7 +835,7 @@ fn test_feed_filtered_by_followed() {
         &100_000,
         &String::from_str(&env, "B1"),
         &(current_time + 10000),
-        &SignalCategory::DayTrade,
+        &SignalCategory::SCALP,
         &vec![&env, String::from_str(&env, "B")],
         &RiskLevel::High,
     );

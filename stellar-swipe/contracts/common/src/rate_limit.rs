@@ -133,7 +133,7 @@ pub fn check_rate_limit(env: &Env, user: &Address, action: ActionType, trust_sco
     let timestamps = get_timestamps(env, user, &action);
     let recent_count = timestamps
         .iter()
-        .filter(|t| now.saturating_sub(t) < config.window_secs)
+        .filter(|t| now.saturating_sub(*t) < config.window_secs)
         .count() as u32;
 
     if recent_count >= max {

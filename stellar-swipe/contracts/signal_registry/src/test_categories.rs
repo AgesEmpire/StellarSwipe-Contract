@@ -95,7 +95,7 @@ fn test_add_tags_exceeds_max() {
         &1_000_000,
         &create_string(&env, "Test signal"),
         &(env.ledger().timestamp() + 86400),
-        &SignalCategory::DayTrade,
+        &SignalCategory::SCALP,
         &initial_tags,
         &RiskLevel::Low,
     );
@@ -168,14 +168,14 @@ fn test_filter_by_category() {
     );
 
     let mut categories = Vec::new(&env);
-    categories.push_back(SignalCategory::SwingTrade);
+    categories.push_back(SignalCategory::SWING);
 
     let filtered = client.get_signals_filtered(&Some(categories), &None, &None, &0, &10);
 
     assert_eq!(filtered.len(), 1);
     assert_eq!(
         filtered.get(0).unwrap().category,
-        SignalCategory::SwingTrade
+        SignalCategory::SWING
     );
 }
 
@@ -197,7 +197,7 @@ fn test_filter_by_tags() {
         &1_000_000,
         &create_string(&env, "Bullish signal"),
         &(env.ledger().timestamp() + 86400),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &tags1,
         &RiskLevel::Low,
     );
@@ -209,7 +209,7 @@ fn test_filter_by_tags() {
         &50_000_000_000,
         &create_string(&env, "Bearish signal"),
         &(env.ledger().timestamp() + 86400),
-        &SignalCategory::DayTrade,
+        &SignalCategory::SCALP,
         &tags2,
         &RiskLevel::High,
     );
@@ -285,7 +285,7 @@ fn test_combined_filters() {
         &1_000_000,
         &create_string(&env, "Signal 1"),
         &(env.ledger().timestamp() + 86400),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &tags1,
         &RiskLevel::Medium,
     );
@@ -298,13 +298,13 @@ fn test_combined_filters() {
         &50_000_000_000,
         &create_string(&env, "Signal 2"),
         &(env.ledger().timestamp() + 86400),
-        &SignalCategory::DayTrade,
+        &SignalCategory::SCALP,
         &tags2,
         &RiskLevel::High,
     );
 
     let mut categories = Vec::new(&env);
-    categories.push_back(SignalCategory::SwingTrade);
+    categories.push_back(SignalCategory::SWING);
 
     let mut filter_tags = Vec::new(&env);
     filter_tags.push_back(create_string(&env, "momentum"));
@@ -323,7 +323,7 @@ fn test_combined_filters() {
     assert_eq!(filtered.len(), 1);
     assert_eq!(
         filtered.get(0).unwrap().category,
-        SignalCategory::SwingTrade
+        SignalCategory::SWING
     );
 }
 
@@ -348,7 +348,7 @@ fn test_popular_tags() {
         &1_000_000,
         &create_string(&env, "Signal 1"),
         &(env.ledger().timestamp() + 86400),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &tags1,
         &RiskLevel::Low,
     );
@@ -403,7 +403,7 @@ fn test_pagination() {
             &(1_000_000 + i as i128),
             &create_string(&env, &format!("Signal {}", i)),
             &(env.ledger().timestamp() + 86400),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &tags,
             &RiskLevel::Low,
         );

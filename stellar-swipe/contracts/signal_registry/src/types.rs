@@ -63,9 +63,37 @@ pub struct Signal {
     pub tags: Vec<String>,
     pub risk_level: RiskLevel,
     pub is_collaborative: bool,
+    /// Ledger time when the signal was submitted (edit window anchor; Issue #168).
+    pub submitted_at: u64,
+    /// Editable fingerprint of rationale (Issue #168).
+    pub rationale_hash: String,
+    /// Provider confidence 0-100.
+    pub confidence: u32,
     /// Number of unique adoptions/trades copying this signal
     pub adoption_count: u32,
 }
+
+/// Outcome reported by TradeExecutor when a signal is closed (Issue #170).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignalOutcome {
+    Profit,
+    Loss,
+    Neutral,
+}
+
+/// Partial update payload for `update_signal` (Issue #168). Only flags that are true are applied.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SignalEditInput {
+    pub set_price: bool,
+    pub price: i128,
+    pub set_rationale_hash: bool,
+    pub rationale_hash: String,
+    pub set_confidence: bool,
+    pub confidence: u32,
+}
+
 
 #[contracttype]
 #[derive(Clone, Debug, Default)]

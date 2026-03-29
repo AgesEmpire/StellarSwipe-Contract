@@ -1,5 +1,6 @@
 #![cfg(test)]
 use crate::analytics::*;
+use crate::categories::{RiskLevel, SignalCategory};
 use crate::types::{Signal, SignalAction, SignalStatus};
 use soroban_sdk::{testutils::Address as _, Address, Env, Map, String};
 
@@ -27,6 +28,11 @@ fn create_test_signal(
         successful_executions: if total_roi > 0 { executions } else { 0 },
         total_volume: 1000,
         total_roi,
+        category: SignalCategory::SWING,
+        tags: soroban_sdk::Vec::new(env),
+        risk_level: RiskLevel::Medium,
+        is_collaborative: false,
+        adoption_count: 0,
     }
 }
 
