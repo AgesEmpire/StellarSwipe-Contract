@@ -41,6 +41,8 @@ pub enum StorageKey {
     ConsensusPrice,
     PauseStates,
     OracleWeight(Address),
+    PendingAdmin,
+    PendingAdminExpiry,
 }
 
 #[contracttype]

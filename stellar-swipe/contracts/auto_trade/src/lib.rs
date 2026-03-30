@@ -145,6 +145,21 @@ impl AutoTradeContract {
         admin::revoke_guardian(&env, &caller)
     }
 
+    /// Propose admin transfer (current admin only)
+    pub fn propose_admin_transfer(env: Env, caller: Address, new_admin: Address) -> Result<(), AutoTradeError> {
+        admin::propose_admin_transfer(&env, &caller, new_admin)
+    }
+
+    /// Accept admin transfer (new admin only)
+    pub fn accept_admin_transfer(env: Env, caller: Address) -> Result<(), AutoTradeError> {
+        admin::accept_admin_transfer(&env, &caller)
+    }
+
+    /// Cancel pending admin transfer (current admin only)
+    pub fn cancel_admin_transfer(env: Env, caller: Address) -> Result<(), AutoTradeError> {
+        admin::cancel_admin_transfer(&env, &caller)
+    }
+
     /// Get current guardian
     pub fn get_guardian(env: Env) -> Option<Address> {
         admin::get_guardian(&env)
@@ -1445,6 +1460,8 @@ impl AutoTradeContract {
 #[cfg(test)]
 mod test;
 mod test_oracle_whitelist;
+#[cfg(test)]
+mod test_admin_transfer;
 
 // ── Oracle integration tests ─────────────────────────────────────────────────
 #[cfg(test)]

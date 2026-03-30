@@ -15,6 +15,8 @@ pub enum AdminStorageKey {
     PauseStates,
     CircuitBreakerStats,
     CircuitBreakerConfig,
+    PendingAdmin,
+    PendingAdminExpiry,
 }
 
 pub fn init_admin(env: &Env, admin: Address) {
@@ -243,4 +245,116 @@ pub fn update_cb_stats(env: &Env, failed: bool, volume: i128, price: i128) {
             // In a real implementation, we would emit an event here too
         }
     }
+}
+
+// ==================== Two-Step Admin Transfer ====================
+// 48 hours in seconds (using ledger seconds)
+const PENDING_ADMIN_EXPIRY_LEDGERS: u64 = 48 * 60 * 60;
+
+/// Propose a new admin (requires current admin)
+pub fn propose_admin_transfer(
+    env: &Env,
+    caller: &Address,
+    new_admin: Address,
+) -> Result<(), AutoTradeError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+
+    let now = env.ledger().timestamp();
+    let expires_at = now + PENDING_ADMIN_EXPIRY_LEDGERS;
+
+    // Store pending admin and expiry time
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::PendingAdmin, &new_admin);
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::PendingAdminExpiry, &expires_at);
+
+    // Emit event
+    env.events().publish(
+        (
+            soroban_sdk::Symbol::new(env, "admin_transfer_proposed"),
+            caller.clone(),
+            new_admin,
+        ),
+        expires_at,
+    );
+
+    Ok(())
+}
+
+/// Accept admin transfer (called by new admin)
+pub fn accept_admin_transfer(env: &Env, caller: &Address) -> Result<(), AutoTradeError> {
+    caller.require_auth();
+
+    // Get current pending admin
+    let pending_admin: Address = env
+        .storage()
+        .instance()
+        .get(&AdminStorageKey::PendingAdmin)
+        .ok_or(AutoTradeError::PendingAdminNotFound)?;
+
+    // Verify caller is the pending admin
+    if caller != &pending_admin {
+        return Err(AutoTradeError::Unauthorized);
+    }
+
+    // Check if transfer has expired
+    let expires_at: u64 = env
+        .storage()
+        .instance()
+        .get(&AdminStorageKey::PendingAdminExpiry)
+        .ok_or(AutoTradeError::PendingAdminNotFound)?;
+
+    let now = env.ledger().timestamp();
+    if now >= expires_at {
+        // Clean up expired transfer
+        env.storage().instance().remove(&AdminStorageKey::PendingAdmin);
+        env.storage().instance().remove(&AdminStorageKey::PendingAdminExpiry);
+        return Err(AutoTradeError::PendingAdminExpired);
+    }
+
+    // Get old admin for event
+    let old_admin = get_admin(env).ok_or(AutoTradeError::Unauthorized)?;
+
+    // Complete the transfer
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::Admin, &pending_admin);
+
+    // Clean up pending admin entries
+    env.storage().instance().remove(&AdminStorageKey::PendingAdmin);
+    env.storage().instance().remove(&AdminStorageKey::PendingAdminExpiry);
+
+    // Emit completion event
+    env.events().publish(
+        (
+            soroban_sdk::Symbol::new(env, "admin_transfer_completed"),
+            old_admin,
+            pending_admin,
+        ),
+        (),
+    );
+
+    Ok(())
+}
+
+/// Cancel pending admin transfer (current admin only)
+pub fn cancel_admin_transfer(env: &Env, caller: &Address) -> Result<(), AutoTradeError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+
+    // Check if there's a pending transfer
+    let _pending_admin: Address = env
+        .storage()
+        .instance()
+        .get(&AdminStorageKey::PendingAdmin)
+        .ok_or(AutoTradeError::PendingAdminNotFound)?;
+
+    // Remove pending transfer
+    env.storage().instance().remove(&AdminStorageKey::PendingAdmin);
+    env.storage().instance().remove(&AdminStorageKey::PendingAdminExpiry);
+
+    Ok(())
 }

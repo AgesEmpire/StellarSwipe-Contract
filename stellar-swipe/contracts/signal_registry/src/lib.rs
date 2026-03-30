@@ -239,6 +239,18 @@ impl SignalRegistry {
         admin::transfer_admin(&env, &caller, new_admin)
     }
 
+    pub fn propose_admin_transfer(env: Env, caller: Address, new_admin: Address) -> Result<(), AdminError> {
+        admin::propose_admin_transfer(&env, &caller, new_admin)
+    }
+
+    pub fn accept_admin_transfer(env: Env, caller: Address) -> Result<(), AdminError> {
+        admin::accept_admin_transfer(&env, &caller)
+    }
+
+    pub fn cancel_admin_transfer(env: Env, caller: Address) -> Result<(), AdminError> {
+        admin::cancel_admin_transfer(&env, &caller)
+    }
+
     pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), AdminError> {
         admin::set_guardian(&env, &caller, guardian)
     }
@@ -2041,4 +2053,6 @@ mod test_emergency;
 mod test_signal_issues;
 #[cfg(test)]
 mod test_adoption;
+#[cfg(test)]
+mod test_admin_transfer;
 mod test_health;

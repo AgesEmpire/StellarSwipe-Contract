@@ -10,10 +10,7 @@ doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
- main
 stellar_swipe_common = { path = "../common" }
-
- main
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

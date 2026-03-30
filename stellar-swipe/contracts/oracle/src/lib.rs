@@ -149,6 +149,21 @@ impl OracleContract {
         admin::unpause_category(&env, &caller, category)
     }
 
+    /// Propose admin transfer (current admin only)
+    pub fn propose_admin_transfer(env: Env, caller: Address, new_admin: Address) -> Result<(), OracleError> {
+        admin::propose_admin_transfer(&env, &caller, new_admin)
+    }
+
+    /// Accept admin transfer (new admin only)
+    pub fn accept_admin_transfer(env: Env, caller: Address) -> Result<(), OracleError> {
+        admin::accept_admin_transfer(&env, &caller)
+    }
+
+    /// Cancel pending admin transfer (current admin only)
+    pub fn cancel_admin_transfer(env: Env, caller: Address) -> Result<(), OracleError> {
+        admin::cancel_admin_transfer(&env, &caller)
+    }
+
     /// Calculate TWAP for 1 hour
     pub fn get_twap_1h(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
         history::calculate_twap(&env, &pair, 3600)
@@ -637,3 +652,6 @@ mod test;
 
 #[cfg(test)]
 mod test_health;
+
+#[cfg(test)]
+mod test_admin_transfer;
