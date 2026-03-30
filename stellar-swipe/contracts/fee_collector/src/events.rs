@@ -22,3 +22,10 @@ pub struct TreasuryWithdrawal {
     pub amount: i128,
     pub remaining_balance: i128,
 }
+
+#[contractevent]
+pub struct FeesClaimed {
+    pub provider: Address,
+    pub token: Address,
+    pub amount: i128,
+}

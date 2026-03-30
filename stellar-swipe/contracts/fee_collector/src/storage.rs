@@ -8,9 +8,10 @@ pub const DEFAULT_FEE_RATE_BPS: u32 = 30; // 0.3%
 pub enum StorageKey {
     Admin,
     Initialized,
-    TreasuryBalance(Address), // persistent, per-token
-    QueuedWithdrawal,         // instance, single-slot
-    FeeRate,                  // instance, current fee rate in bps
+    TreasuryBalance(Address),          // persistent, per-token
+    QueuedWithdrawal,                  // instance, single-slot
+    FeeRate,                           // instance, current fee rate in bps
+    ProviderPendingFees(Address, Address), // persistent, per (provider, token)
 }
 
 #[contracttype]
@@ -81,6 +82,12 @@ pub fn set_queued_withdrawal(env: &Env, withdrawal: &QueuedWithdrawal) {
         .set(&StorageKey::QueuedWithdrawal, withdrawal);
 }
 
+pub fn remove_queued_withdrawal(env: &Env) {
+    env.storage()
+        .instance()
+        .remove(&StorageKey::QueuedWithdrawal);
+}
+
 // --- Fee Rate ---
 
 pub fn get_fee_rate(env: &Env) -> u32 {
@@ -96,8 +103,17 @@ pub fn set_fee_rate(env: &Env, rate: u32) {
         .set(&StorageKey::FeeRate, &rate);
 }
 
-pub fn remove_queued_withdrawal(env: &Env) {
+// --- Provider Pending Fees ---
+
+pub fn get_pending_fees(env: &Env, provider: &Address, token: &Address) -> i128 {
     env.storage()
-        .instance()
-        .remove(&StorageKey::QueuedWithdrawal);
+        .persistent()
+        .get(&StorageKey::ProviderPendingFees(provider.clone(), token.clone()))
+        .unwrap_or(0i128)
+}
+
+pub fn set_pending_fees(env: &Env, provider: &Address, token: &Address, amount: i128) {
+    env.storage()
+        .persistent()
+        .set(&StorageKey::ProviderPendingFees(provider.clone(), token.clone()), &amount);
 }
