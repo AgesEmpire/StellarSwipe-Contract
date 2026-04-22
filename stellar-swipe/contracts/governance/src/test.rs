@@ -891,3 +891,49 @@ fn conviction_voting_accumulates_over_time() {
     assert!(analytics.current_conviction > 0);
     assert_eq!(analytics.total_voters, 1);
 }
+
+#[test]
+fn upgrade_announcement_event_emitted_on_contract_upgrade_proposal_success() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+    client.stake(&recipients.public_sale, &80_000_000i128);
+
+    let new_wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+    let migration_notes_hash = Bytes::from_array(&env, &[2u8; 32]);
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::ContractUpgrade(
+            String::from_str(&env, "auto_trade"),
+            new_wasm_hash.clone(),
+        ),
+        &String::from_str(&env, "Upgrade auto_trade contract"),
+        &String::from_str(&env, "Deploy new version"),
+        &migration_notes_hash,
+    );
+
+    env.ledger().set_timestamp(70);
+    client.cast_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    client.cast_vote(&proposal_id, &recipients.public_sale, &GovernanceVoteType::For);
+
+    env.ledger().set_timestamp(8 * 86_400);
+    let status = client.finalize_proposal(&proposal_id);
+    assert_eq!(status, ProposalStatus::Succeeded);
+
+    // Check event was emitted
+    let events = env.events().all();
+    assert_eq!(events.len(), 2); // propnew and upgrade announced
+    let upgrade_event = &events[1];
+    assert_eq!(upgrade_event.0, (symbol_short!("upgrade"), symbol_short!("announced")));
+    let (contract, hash, exec_after, notes) = upgrade_event.1.clone();
+    assert_eq!(contract, String::from_str(&env, "auto_trade"));
+    assert_eq!(hash, new_wasm_hash);
+    assert_eq!(exec_after, 8 * 86_400 + 0); // execution_delay is 0 by default
+    assert_eq!(notes, migration_notes_hash);
+}

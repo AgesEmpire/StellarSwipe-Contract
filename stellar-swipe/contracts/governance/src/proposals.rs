@@ -354,6 +354,17 @@ pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, 
         ProposalStatus::Failed
     };
     let status = proposal.status.clone();
+
+    if status == ProposalStatus::Succeeded {
+        if let ProposalType::ContractUpgrade(ref contract, ref new_hash) = proposal.proposal_type {
+            let execution_available_after = proposal.voting_ends.saturating_add(cfg.execution_delay);
+            env.events().publish(
+                (symbol_short!("upgrade"), symbol_short!("announced")),
+                (contract.clone(), new_hash.clone(), execution_available_after, proposal.execution_payload.clone()),
+            );
+        }
+    }
+
     put_proposal(env, &proposal)?;
 
     if status == ProposalStatus::Succeeded && cfg.execution_delay == 0 {
