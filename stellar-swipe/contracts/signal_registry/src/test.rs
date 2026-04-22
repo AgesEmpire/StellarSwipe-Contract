@@ -349,7 +349,7 @@ fn test_admin_transfer_expires() {
         .with_mut(|ledger| ledger.sequence_number += 34_560 + 1);
 
     let result = client.try_accept_admin_transfer(&pending_admin);
-    assert_eq!(result, Err(Ok(AdminError::AdminTransferExpired)));
+    assert_eq!(result, Err(Ok(AdminError::PendingAdminExpired)));
     assert_eq!(client.get_admin(), admin);
 }
 
@@ -370,7 +370,7 @@ fn test_admin_transfer_can_be_cancelled() {
     client.cancel_admin_transfer(&admin);
 
     let result = client.try_accept_admin_transfer(&pending_admin);
-    assert_eq!(result, Err(Ok(AdminError::NoPendingAdminTransfer)));
+    assert_eq!(result, Err(Ok(AdminError::PendingAdminNotFound)));
     assert_eq!(client.get_admin(), admin);
 }
 
@@ -658,7 +658,7 @@ fn test_get_active_signals_excludes_expired() {
 
     // Get active signals - should only return 3 (followed_only = false)
     let any_user = Address::generate(&env);
-    let active = client.get_active_signals(&any_user, &false);
+    let active = client.get_active_signals_archived(&any_user, &false);
     assert_eq!(active.len(), 3);
 
     // All returned signals should be active
@@ -918,11 +918,11 @@ fn test_feed_filtered_by_followed() {
     client.follow_provider(&user, &provider_a);
 
     // All signals (followed_only = false)
-    let all_active = client.get_active_signals(&user, &false);
+    let all_active = client.get_active_signals_archived(&user, &false);
     assert_eq!(all_active.len(), 2);
 
     // Filtered feed (followed_only = true) - only provider_a
-    let followed_active = client.get_active_signals(&user, &true);
+    let followed_active = client.get_active_signals_archived(&user, &true);
     assert_eq!(followed_active.len(), 1);
     assert_eq!(followed_active.get(0).unwrap().provider, provider_a);
 }

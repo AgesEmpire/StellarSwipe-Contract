@@ -30,11 +30,7 @@ use admin::{
     get_admin, get_admin_config, init_admin, is_trading_paused,
     require_not_paused_legacy as require_not_paused, AdminConfig,
 };
- refactor/157-shared-constants
 use stellar_swipe_common::emergency::PauseState;
-
-use stellar_swipe_common::emergency::{PauseState, CAT_ALL, CAT_SIGNALS, CAT_STAKES, CAT_TRADING};
- main
 use stellar_swipe_common::rate_limit::{self as rl, ActionType as RLAction, RateLimitConfig};
 use stellar_swipe_common::{
     CAT_ALL, CAT_SIGNALS, CAT_STAKES, CAT_TRADING, SECONDS_PER_30_DAY_MONTH,
@@ -263,18 +259,6 @@ impl SignalRegistry {
         caller: Address,
         new_admin: Address,
     ) -> Result<(), AdminError> {
-        admin::propose_admin_transfer(&env, &caller, new_admin)
-    }
-
-    pub fn accept_admin_transfer(env: Env, caller: Address) -> Result<(), AdminError> {
-        admin::accept_admin_transfer(&env, &caller)
-    }
-
-    pub fn cancel_admin_transfer(env: Env, caller: Address) -> Result<(), AdminError> {
-        admin::cancel_admin_transfer(&env, &caller)
-    }
-
-    pub fn propose_admin_transfer(env: Env, caller: Address, new_admin: Address) -> Result<(), AdminError> {
         admin::propose_admin_transfer(&env, &caller, new_admin)
     }
 
@@ -2100,6 +2084,8 @@ impl SignalRegistry {
 }
 
 #[cfg(test)]
+mod test;
+#[cfg(test)]
 mod test_adoption;
 #[cfg(test)]
 mod test_combos;
@@ -2107,13 +2093,11 @@ mod test_combos;
 mod test_contests;
 #[cfg(test)]
 mod test_emergency;
+#[cfg(test)]
 mod test_health;
 #[cfg(test)]
 mod test_scheduling;
 #[cfg(test)]
 mod test_signal_issues;
 #[cfg(test)]
-mod test_adoption;
-#[cfg(test)]
 mod test_admin_transfer;
-mod test_health;
