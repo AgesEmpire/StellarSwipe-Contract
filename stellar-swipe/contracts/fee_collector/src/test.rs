@@ -688,3 +688,79 @@ mod property_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Overflow and division-by-zero tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_collect_fee_overflow_trade_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 1);
+    client.set_oracle_contract(&oracle_id);
+
+    // i128::MAX * fee_rate overflows checked_mul → ArithmeticOverflow
+    StellarAssetClient::new(&env, &token).mint(&trader, &i128::MAX);
+    let result = client.try_collect_fee(&trader, &token, &i128::MAX, &asset);
+    assert_eq!(result, Err(Ok(ContractError::ArithmeticOverflow)));
+}
+
+#[test]
+fn test_withdraw_treasury_fees_overflow_balance() {
+    // Seed treasury with i128::MAX, then try to subtract more than available.
+    // checked_sub on (i128::MAX - amount) where amount > i128::MAX would underflow.
+    // The guard `amount > treasury_balance` fires first, so we test the sub path
+    // by seeding exactly i128::MAX and withdrawing i128::MAX (valid path, no overflow).
+    // To trigger the checked_sub overflow path we need balance < amount after the guard,
+    // which is prevented by the guard — so we verify the guard itself catches it.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (recipient, token, contract_id, client) = setup(&env, 100);
+    env.ledger().set_timestamp(0);
+    client.queue_withdrawal(&recipient, &token, &100);
+    env.ledger().set_timestamp(86_400);
+
+    // Drain treasury between queue and withdraw to trigger InsufficientTreasuryBalance
+    env.as_contract(&contract_id, || {
+        set_treasury_balance(&env, &token, 0);
+    });
+    let result = client.try_withdraw_treasury_fees(&recipient, &token, &100);
+    assert_eq!(result, Err(Ok(ContractError::InsufficientTreasuryBalance)));
+}
+
+#[test]
+fn test_collect_fee_zero_trade_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 1);
+    client.set_oracle_contract(&oracle_id);
+
+    // Zero amount must be rejected before any arithmetic
+    let result = client.try_collect_fee(&trader, &token, &0, &asset);
+    assert_eq!(result, Err(Ok(ContractError::InvalidAmount)));
+}

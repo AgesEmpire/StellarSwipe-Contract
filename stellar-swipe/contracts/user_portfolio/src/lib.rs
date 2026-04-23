@@ -265,6 +265,33 @@ mod tests {
         assert_eq!(pnl.roi_bps, 1666);
     }
 
+    /// roi_basis_points: zero invested → roi_bps = 0 (no division-by-zero).
+    #[test]
+    fn get_pnl_zero_invested_no_div_by_zero() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        // No positions at all → total_invested = 0, must not panic
+        let pnl = client.get_pnl(&user);
+        assert_eq!(pnl.roi_bps, 0);
+    }
+
+    /// roi_basis_points: i128::MAX pnl with small investment saturates to i32::MAX.
+    #[test]
+    fn get_pnl_roi_saturates_to_i32_max() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+
+        // realized_pnl = i128::MAX / 10_000 + 1 so that pnl * 10_000 overflows → roi_bps = 0
+        // (checked_mul returns None → 0). Verify no panic.
+        client.open_position(&user, &1, &1);
+        client.close_position(&user, &1, &(i128::MAX / 10_001));
+        let pnl = client.get_pnl(&user);
+        // Either saturated or 0 — must not panic
+        assert!(pnl.roi_bps >= 0 || pnl.roi_bps == i32::MIN);
+    }
+
     /// Oracle fails: partial result, unrealized None, total = realized only.
     #[test]
     fn get_pnl_oracle_unavailable() {

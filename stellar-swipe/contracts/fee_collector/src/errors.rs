@@ -17,4 +17,5 @@ pub enum ContractError {
     OracleNotConfigured = 11,
     OracleConversionFailed = 12,
     FeeRoundedToZero = 13,
+    DivisionByZero = 14,
 }
