@@ -455,7 +455,7 @@ fn swap_reverts_when_balance_below_min() {
     MockSdexRouterClient::new(&env, &router_id).set_amount_out(&300_000);
 
     let err = env.as_contract(&exec_id, || {
-        execute_sdex_swap(&env, &router_id, &token_a, &token_b, 1_000_000, 400_000, Vec::new(&env))
+        execute_sdex_swap(&env, &router_id, &token_a, &token_b, 1_000_000, 400_000)
     });
     assert_eq!(err, Err(ContractError::SlippageExceeded));
 }
@@ -483,131 +483,9 @@ fn swap_with_slippage_reverts_when_exceeded() {
 
     let min = sdex::min_received_from_slippage(1_000_000, 100).unwrap();
     let err = env.as_contract(&exec_id, || {
-        execute_sdex_swap(&env, &router_id, &token_a, &token_b, 1_000_000, min, Vec::new(&env))
+        execute_sdex_swap(&env, &router_id, &token_a, &token_b, 1_000_000, min)
     });
     assert_eq!(err, Err(ContractError::SlippageExceeded));
-}
-
-// ── Multi-hop path tests ──────────────────────────────────────────────────────
-
-#[contract]
-pub struct MockSdexRouterWithPath;
-
-#[contractimpl]
-impl MockSdexRouterWithPath {
-    pub fn set_amount_out(env: Env, out: i128) {
-        env.storage().instance().set(&symbol_short!("amtout"), &out);
-    }
-
-    pub fn swap(
-        env: Env,
-        pull_from: Address,
-        from_token: Address,
-        to_token: Address,
-        amount_in: i128,
-        _min_out: i128,
-        recipient: Address,
-    ) -> i128 {
-        let router = env.current_contract_address();
-        token::Client::new(&env, &from_token).transfer_from(&router, &pull_from, &router, &amount_in);
-        let out: i128 = env.storage().instance().get(&symbol_short!("amtout")).unwrap_or(amount_in);
-        let to_mux: MuxedAddress = recipient.into();
-        token::Client::new(&env, &to_token).transfer(&router, &to_mux, &out);
-        out
-    }
-
-    pub fn swap_path(
-        env: Env,
-        pull_from: Address,
-        from_token: Address,
-        to_token: Address,
-        _path: soroban_sdk::Vec<Address>,
-        amount_in: i128,
-        _min_out: i128,
-        recipient: Address,
-    ) -> i128 {
-        let router = env.current_contract_address();
-        token::Client::new(&env, &from_token).transfer_from(&router, &pull_from, &router, &amount_in);
-        let out: i128 = env.storage().instance().get(&symbol_short!("amtout")).unwrap_or(amount_in);
-        let to_mux: MuxedAddress = recipient.into();
-        token::Client::new(&env, &to_token).transfer(&router, &to_mux, &out);
-        out
-    }
-}
-
-fn setup_path_router(env: &Env) -> (Address, Address, Address, Address) {
-    let admin = Address::generate(env);
-    let token_a = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let token_b = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let router_id = env.register(MockSdexRouterWithPath, ());
-    let exec_id = env.register(TradeExecutorContract, ());
-    let exec = TradeExecutorContractClient::new(env, &exec_id);
-    exec.initialize(&admin);
-    exec.set_sdex_router(&router_id);
-    StellarAssetClient::new(env, &token_a).mint(&exec_id, &1_000_000_000);
-    StellarAssetClient::new(env, &token_b).mint(&router_id, &10_000_000_000);
-    (exec_id, router_id, token_a, token_b)
-}
-
-#[test]
-fn swap_direct_no_path() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (exec_id, router_id, token_a, token_b) = setup_path_router(&env);
-    MockSdexRouterWithPathClient::new(&env, &router_id).set_amount_out(&800_000);
-    let out = env.as_contract(&exec_id, || {
-        execute_sdex_swap(&env, &router_id, &token_a, &token_b, 1_000_000, 700_000, Vec::new(&env))
-    });
-    assert_eq!(out, Ok(800_000));
-}
-
-#[test]
-fn swap_two_hop_path() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (exec_id, router_id, token_a, token_b) = setup_path_router(&env);
-    let admin = Address::generate(&env);
-    let mid = env.register_stellar_asset_contract_v2(admin).address();
-    MockSdexRouterWithPathClient::new(&env, &router_id).set_amount_out(&900_000);
-    let mut path = Vec::new(&env);
-    path.push_back(mid);
-    let out = env.as_contract(&exec_id, || {
-        execute_sdex_swap(&env, &router_id, &token_a, &token_b, 1_000_000, 800_000, path)
-    });
-    assert_eq!(out, Ok(900_000));
-}
-
-#[test]
-fn swap_five_hop_path() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (exec_id, router_id, token_a, token_b) = setup_path_router(&env);
-    let admin = Address::generate(&env);
-    MockSdexRouterWithPathClient::new(&env, &router_id).set_amount_out(&950_000);
-    let mut path = Vec::new(&env);
-    for _ in 0..5 {
-        path.push_back(env.register_stellar_asset_contract_v2(admin.clone()).address());
-    }
-    let out = env.as_contract(&exec_id, || {
-        execute_sdex_swap(&env, &router_id, &token_a, &token_b, 1_000_000, 900_000, path)
-    });
-    assert_eq!(out, Ok(950_000));
-}
-
-#[test]
-fn swap_six_hop_path_returns_path_too_long() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (exec_id, router_id, token_a, token_b) = setup_path_router(&env);
-    let admin = Address::generate(&env);
-    let mut path = Vec::new(&env);
-    for _ in 0..6 {
-        path.push_back(env.register_stellar_asset_contract_v2(admin.clone()).address());
-    }
-    let err = env.as_contract(&exec_id, || {
-        execute_sdex_swap(&env, &router_id, &token_a, &token_b, 1_000_000, 900_000, path)
-    });
-    assert_eq!(err, Err(ContractError::PathTooLong));
 }
 
 // ── cancel_copy_trade tests ───────────────────────────────────────────────────
