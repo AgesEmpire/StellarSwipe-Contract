@@ -133,14 +133,13 @@ pub fn subscribe_to_provider(
     env.storage().persistent().set(&sub_key, &record);
     extend_persistent_subscription_key(env, &sub_key, duration_days);
 
-    #[allow(deprecated)]
-    env.events().publish(
-        (
-            symbol_short!("sub_cr"),
-            user.clone(),
-            provider.clone(),
-        ),
-        expires_at,
+    shared::events::emit_subscription_created(
+        env,
+        shared::events::EvtSubscriptionCreated {
+            user: user.clone(),
+            provider: provider.clone(),
+            expires_at,
+        },
     );
 
     Ok(())

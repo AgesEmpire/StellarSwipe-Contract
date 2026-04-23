@@ -181,9 +181,18 @@ impl UserPortfolio {
             } else {
                 0
             };
-            env.events().publish(
-                (Symbol::new(&env, "TradeShareable"), user.clone()),
-                (position_id, asset_pair, pos.entry_price, exit_price, pnl_bps, signal_provider, signal_id),
+            shared::events::emit_trade_shareable(
+                env,
+                shared::events::EvtTradeShareable {
+                    user: user.clone(),
+                    position_id,
+                    asset_pair,
+                    entry_price: pos.entry_price,
+                    exit_price,
+                    pnl_bps,
+                    signal_provider,
+                    signal_id,
+                },
             );
         }
     }
@@ -263,9 +272,13 @@ impl UserPortfolio {
         env.storage().persistent().set(&pkey, &pos);
 
         // Emit event for keeper close (no TradeShareable since pnl=0).
-        env.events().publish(
-            (Symbol::new(&env, "PositionClosedByKeeper"), user.clone()),
-            (position_id, asset_pair),
+        shared::events::emit_position_closed_by_keeper(
+            env,
+            shared::events::EvtPositionClosedByKeeper {
+                user: user.clone(),
+                position_id,
+                asset_pair,
+            },
         );
     }
 
@@ -548,5 +561,55 @@ mod tests {
                 .unwrap_or(false)
         });
         assert!(!found, "TradeShareable must not be emitted for breakeven");
+    }
+
+    // ── Event format tests ────────────────────────────────────────────────────
+
+    fn last_topics(env: &Env) -> (soroban_sdk::Symbol, soroban_sdk::Symbol) {
+        use soroban_sdk::testutils::Events;
+        let events = env.events().all();
+        let e = events.last().unwrap();
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1;
+        let t0 = soroban_sdk::Symbol::try_from(topics.get(0).unwrap()).unwrap();
+        let t1 = soroban_sdk::Symbol::try_from(topics.get(1).unwrap()).unwrap();
+        (t0, t1)
+    }
+
+    #[test]
+    fn trade_shareable_event_has_two_topic_format() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        let provider = dummy_provider(&env);
+        client.open_position(&user, &100, &1_000);
+        client.close_position(&user, &1, &200, &120i128, &42u32, &provider, &7u64);
+        let (contract, event) = last_topics(&env);
+        assert_eq!(contract, soroban_sdk::Symbol::new(&env, "user_portfolio"));
+        assert_eq!(event, soroban_sdk::Symbol::new(&env, "trade_shareable"));
+    }
+
+    #[test]
+    fn subscription_created_event_has_two_topic_format() {
+        use soroban_sdk::testutils::Ledger;
+        use soroban_sdk::token::StellarAssetClient;
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let subscriber = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let portfolio_id = env.register_contract(None, UserPortfolio);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        client.initialize(&admin, &oracle);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        StellarAssetClient::new(&env, &token).mint(&subscriber, &1_000_000i128);
+        client.set_provider_subscription_terms(&provider, &token, &10_000i128);
+        client.subscribe_to_provider(&subscriber, &provider, &7u32);
+        let (contract, event) = last_topics(&env);
+        assert_eq!(contract, soroban_sdk::Symbol::new(&env, "user_portfolio"));
+        assert_eq!(event, soroban_sdk::Symbol::new(&env, "subscription_created"));
     }
 }

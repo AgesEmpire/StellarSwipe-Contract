@@ -608,6 +608,85 @@ fn test_claim_fees_unauthorized() {
 }
 
 // ---------------------------------------------------------------------------
+// Event format tests — verify two-topic (contract_name, event_name) schema
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod event_format_tests {
+    use soroban_sdk::{
+        testutils::{Address as _, Events},
+        token::StellarAssetClient,
+        Address, Env, Symbol,
+    };
+
+    use crate::{set_pending_fees, set_treasury_balance, FeeCollector, FeeCollectorClient};
+
+    fn first_event_topics(env: &Env) -> (Symbol, Symbol) {
+        let events = env.events().all();
+        let e = events.last().unwrap();
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1;
+        let t0 = Symbol::try_from(topics.get(0).unwrap()).unwrap();
+        let t1 = Symbol::try_from(topics.get(1).unwrap()).unwrap();
+        (t0, t1)
+    }
+
+    #[test]
+    fn fee_rate_updated_has_two_topic_format() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let id = env.register(FeeCollector, ());
+        let client = FeeCollectorClient::new(&env, &id);
+        client.initialize(&admin);
+        client.set_fee_rate(&50u32);
+        let (contract, event) = first_event_topics(&env);
+        assert_eq!(contract, Symbol::new(&env, "fee_collector"));
+        assert_eq!(event, Symbol::new(&env, "fee_rate_updated"));
+    }
+
+    #[test]
+    fn fees_claimed_has_two_topic_format() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        let id = env.register(FeeCollector, ());
+        let client = FeeCollectorClient::new(&env, &id);
+        client.initialize(&admin);
+        StellarAssetClient::new(&env, &token).mint(&id, &1000i128);
+        env.as_contract(&id, || set_pending_fees(&env, &provider, &token, 1000i128));
+        client.claim_fees(&provider, &token);
+        let (contract, event) = first_event_topics(&env);
+        assert_eq!(contract, Symbol::new(&env, "fee_collector"));
+        assert_eq!(event, Symbol::new(&env, "fees_claimed"));
+    }
+
+    #[test]
+    fn withdrawal_queued_has_two_topic_format() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        let id = env.register(FeeCollector, ());
+        let client = FeeCollectorClient::new(&env, &id);
+        client.initialize(&admin);
+        StellarAssetClient::new(&env, &token).mint(&id, &500i128);
+        env.as_contract(&id, || set_treasury_balance(&env, &token, 500i128));
+        env.ledger().set_timestamp(0);
+        client.queue_withdrawal(&recipient, &token, &500i128);
+        let (contract, event) = first_event_topics(&env);
+        assert_eq!(contract, Symbol::new(&env, "fee_collector"));
+        assert_eq!(event, Symbol::new(&env, "withdrawal_queued"));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fee rounding tests
 // ---------------------------------------------------------------------------
 //

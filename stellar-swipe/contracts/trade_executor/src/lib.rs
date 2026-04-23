@@ -363,9 +363,14 @@ impl TradeExecutorContract {
         close_args.push_back(realized_pnl.into_val(&env));
         env.invoke_contract::<()>(&portfolio, &close_sym, close_args);
 
-        env.events().publish(
-            (Symbol::new(&env, "TradeCancelled"),),
-            (user, trade_id, exit_price, realized_pnl),
+        shared::events::emit_trade_cancelled(
+            &env,
+            shared::events::EvtTradeCancelled {
+                user: user.clone(),
+                trade_id,
+                exit_price,
+                realized_pnl,
+            },
         );
 
         Ok(())

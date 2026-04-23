@@ -4,7 +4,13 @@ mod errors;
 pub use errors::ContractError;
 
 mod events;
-pub use events::{FeeRateUpdated, FeesClaimed, TreasuryWithdrawal, WithdrawalQueued};
+pub use events::{
+    EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed, EvtTreasuryWithdrawal, EvtWithdrawalQueued,
+};
+use events::{
+    emit_fee_collected, emit_fee_rate_updated, emit_fees_claimed, emit_treasury_withdrawal,
+    emit_withdrawal_queued,
+};
 
 mod rebates;
 
@@ -114,13 +120,15 @@ impl FeeCollector {
                 queued_at,
             },
         );
-        WithdrawalQueued {
-            recipient: recipient.clone(),
-            token: token.clone(),
-            amount,
-            available_at: queued_at + SECONDS_PER_DAY,
-        }
-        .publish(&env);
+        emit_withdrawal_queued(
+            &env,
+            EvtWithdrawalQueued {
+                recipient: recipient.clone(),
+                token: token.clone(),
+                amount,
+                available_at: queued_at + SECONDS_PER_DAY,
+            },
+        );
         Ok(())
     }
 
@@ -162,13 +170,15 @@ impl FeeCollector {
         set_treasury_balance(&env, &token, new_balance);
         remove_queued_withdrawal(&env);
 
-        TreasuryWithdrawal {
-            recipient: recipient.clone(),
-            token: token.clone(),
-            amount,
-            remaining_balance: new_balance,
-        }
-        .publish(&env);
+        emit_treasury_withdrawal(
+            &env,
+            EvtTreasuryWithdrawal {
+                recipient: recipient.clone(),
+                token: token.clone(),
+                amount,
+                remaining_balance: new_balance,
+            },
+        );
 
         Ok(())
     }
@@ -201,12 +211,14 @@ impl FeeCollector {
         let old_rate = get_fee_rate(&env);
         set_fee_rate_storage(&env, new_rate_bps);
 
-        FeeRateUpdated {
-            old_rate,
-            new_rate: new_rate_bps,
-            updated_by: admin,
-        }
-        .publish(&env);
+        emit_fee_rate_updated(
+            &env,
+            EvtFeeRateUpdated {
+                old_rate,
+                new_rate: new_rate_bps,
+                updated_by: admin,
+            },
+        );
 
         Ok(())
     }
@@ -261,6 +273,17 @@ impl FeeCollector {
 
         rebates::record_trade_volume(&env, &trader, &trade_asset, trade_amount)?;
 
+        emit_fee_collected(
+            &env,
+            EvtFeeCollected {
+                trader: trader.clone(),
+                token: token.clone(),
+                trade_amount,
+                fee_amount,
+                fee_rate_bps: fee_rate,
+            },
+        );
+
         Ok(fee_amount)
     }
 
@@ -283,12 +306,14 @@ impl FeeCollector {
             set_pending_fees(&env, &provider, &token, 0);
         }
 
-        FeesClaimed {
-            provider: provider.clone(),
-            token: token.clone(),
-            amount,
-        }
-        .publish(&env);
+        emit_fees_claimed(
+            &env,
+            EvtFeesClaimed {
+                provider: provider.clone(),
+                token: token.clone(),
+                amount,
+            },
+        );
 
         Ok(amount)
     }

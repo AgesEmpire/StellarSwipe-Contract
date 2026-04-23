@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-sdk = { workspace = true }
 stellar_swipe_common = { path = "../common" }
+shared = { path = "../shared" }
 
 [dev-dependencies]
 signal_registry = { path = "../signal_registry" }

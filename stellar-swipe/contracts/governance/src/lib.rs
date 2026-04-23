@@ -1551,17 +1551,24 @@ fn emit_vesting_created(
 
 #[allow(deprecated)]
 fn emit_vesting_released(env: &Env, beneficiary: &Address, amount: i128) {
-    env.events().publish(
-        (symbol_short!("gov"), symbol_short!("vestrel")),
-        (beneficiary.clone(), amount),
+    shared::events::emit_vesting_released(
+        env,
+        shared::events::EvtVestingReleased {
+            beneficiary: beneficiary.clone(),
+            amount,
+        },
     );
 }
 
 #[allow(deprecated)]
 fn emit_stake_changed(env: &Env, holder: &Address, amount: i128, is_stake: bool) {
-    env.events().publish(
-        (symbol_short!("gov"), symbol_short!("stake")),
-        (holder.clone(), amount, is_stake),
+    shared::events::emit_stake_changed(
+        env,
+        shared::events::EvtStakeChanged {
+            holder: holder.clone(),
+            amount,
+            is_stake,
+        },
     );
 }
 
@@ -1575,9 +1582,12 @@ fn emit_reward_accrued(env: &Env, beneficiary: &Address, volume: i128, reward: i
 
 #[allow(deprecated)]
 fn emit_reward_claimed(env: &Env, beneficiary: &Address, amount: i128) {
-    env.events().publish(
-        (symbol_short!("gov"), symbol_short!("claim")),
-        (beneficiary.clone(), amount),
+    shared::events::emit_reward_claimed(
+        env,
+        shared::events::EvtRewardClaimed {
+            beneficiary: beneficiary.clone(),
+            amount,
+        },
     );
 }
 

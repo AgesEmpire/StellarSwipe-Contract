@@ -937,3 +937,91 @@ fn upgrade_announcement_event_emitted_on_contract_upgrade_proposal_success() {
     assert_eq!(exec_after, 8 * 86_400 + 0); // execution_delay is 0 by default
     assert_eq!(notes, migration_notes_hash);
 }
+
+// ── Event format tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod event_format_tests {
+    use super::*;
+    use soroban_sdk::{testutils::Events, Symbol};
+
+    fn last_topics(env: &Env) -> (Symbol, Symbol) {
+        let events = env.events().all();
+        let e = events.last().unwrap();
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1;
+        let t0 = Symbol::try_from(topics.get(0).unwrap()).unwrap();
+        let t1 = Symbol::try_from(topics.get(1).unwrap()).unwrap();
+        (t0, t1)
+    }
+
+    fn setup_gov(env: &Env) -> (Address, GovernanceContractClient) {
+        let admin = Address::generate(env);
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(env, &id);
+        let recipients = DistributionRecipients {
+            team: Address::generate(env),
+            early_investors: Address::generate(env),
+            community_rewards: Address::generate(env),
+            treasury: Address::generate(env),
+            public_sale: Address::generate(env),
+        };
+        client.initialize(
+            &admin,
+            &soroban_sdk::String::from_str(env, "StellarSwipe"),
+            &soroban_sdk::String::from_str(env, "SSW"),
+            &7u32,
+            &1_000_000_000i128,
+            &recipients,
+        );
+        (admin, client)
+    }
+
+    #[test]
+    fn stake_changed_event_has_two_topic_format() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup_gov(&env);
+        let user = Address::generate(&env);
+        // Give user a balance first via distribution mock — use admin accrual
+        // then stake
+        let _ = client.try_stake(&user, &1i128); // may fail if no balance; just check event shape if it fires
+        // Use accrue to give balance then stake
+        let _ = client.try_accrue_liquidity_rewards(
+            &Address::generate(&env),
+            &user,
+            &1_000_000i128,
+        );
+        let _ = client.try_stake(&user, &100i128);
+        // Find stake_changed event
+        let found = env.events().all().iter().any(|e| {
+            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+            let t0 = topics.get(0).and_then(|v| Symbol::try_from(v).ok());
+            let t1 = topics.get(1).and_then(|v| Symbol::try_from(v).ok());
+            t0 == Some(Symbol::new(&env, "governance"))
+                && t1 == Some(Symbol::new(&env, "stake_changed"))
+        });
+        assert!(found, "stake_changed must use (governance, stake_changed) topics");
+    }
+
+    #[test]
+    fn vesting_released_event_has_two_topic_format() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = setup_gov(&env);
+        let beneficiary = Address::generate(&env);
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        client.create_vesting_schedule(
+            &admin,
+            &beneficiary,
+            &1_000i128,
+            &0u64,
+            &0u64,
+            &1u64,
+        );
+        env.ledger().with_mut(|l| l.timestamp = 10);
+        client.release_vested_tokens(&beneficiary);
+        let (contract, event) = last_topics(&env);
+        assert_eq!(contract, Symbol::new(&env, "governance"));
+        assert_eq!(event, Symbol::new(&env, "vesting_released"));
+    }
+}
