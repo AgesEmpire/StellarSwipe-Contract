@@ -11,6 +11,9 @@ use crate::errors::{ContractError, InsufficientBalanceDetail};
 /// Default maximum open copy-trade positions per user (safety rail for novices).
 pub const MAX_POSITIONS_PER_USER: u32 = 20;
 
+/// Maximum portfolio percentage allowed per copy trade (20% = 2000 bps).
+pub const MAX_POSITION_PCT_BPS: u32 = 2_000;
+
 /// Default estimated fee budget (in token smallest units) included in the balance check.
 pub const DEFAULT_ESTIMATED_COPY_TRADE_FEE: i128 = 500_000;
 
@@ -48,6 +51,48 @@ pub fn check_user_balance(
             available,
         })
     }
+}
+
+/// Resolve the effective trade amount from an optional portfolio percentage.
+///
+/// - `Some(pct_bps)`: query the user's token balance as a proxy for portfolio value,
+///   compute `balance * pct_bps / 10_000`, cap at `MAX_POSITION_PCT_BPS`.
+///   Falls back to `explicit_amount` if the oracle is unavailable or the computed
+///   amount is zero.
+/// - `None`: return `explicit_amount` unchanged.
+pub fn resolve_trade_amount(
+    env: &Env,
+    user: &Address,
+    token: &Address,
+    explicit_amount: i128,
+    portfolio_pct_bps: Option<u32>,
+    oracle: Option<Address>,
+) -> Result<i128, ContractError> {
+    let Some(mut pct_bps) = portfolio_pct_bps else {
+        return Ok(explicit_amount);
+    };
+
+    // Cap at 20%.
+    if pct_bps > MAX_POSITION_PCT_BPS {
+        return Err(ContractError::PositionPctTooHigh);
+    }
+
+    // Oracle unavailable → fall back to explicit amount.
+    if oracle.is_none() {
+        return Ok(explicit_amount);
+    }
+
+    let portfolio_value = token::Client::new(env, token).balance(user);
+    let computed = portfolio_value
+        .checked_mul(pct_bps as i128)
+        .and_then(|v| v.checked_div(10_000))
+        .unwrap_or(0);
+
+    if computed <= 0 {
+        return Ok(explicit_amount);
+    }
+
+    Ok(computed)
 }
 
 /// Atomically enforce the per-user position cap **and** record the new copy position in a

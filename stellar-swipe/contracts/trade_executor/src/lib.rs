@@ -7,7 +7,8 @@ pub mod sdex;
 
 use errors::{ContractError, InsufficientBalanceDetail};
 use risk_gates::{
-    check_user_balance, validate_and_record_position, DEFAULT_ESTIMATED_COPY_TRADE_FEE,
+    check_user_balance, resolve_trade_amount, validate_and_record_position,
+    DEFAULT_ESTIMATED_COPY_TRADE_FEE,
 };
 use sdex::{execute_sdex_swap, min_received_from_slippage};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Val, Vec};
@@ -211,6 +212,7 @@ impl TradeExecutorContract {
         user: Address,
         token: Address,
         amount: i128,
+        portfolio_pct_bps: Option<u32>,
     ) -> Result<(), ContractError> {
         // ── Auth ──────────────────────────────────────────────────────────────
         user.require_auth();
@@ -243,10 +245,25 @@ impl TradeExecutorContract {
             env.storage().instance().get(&key).unwrap_or(false)
         };
 
+        // ── Resolve effective amount (portfolio % or explicit) ─────────────────
+        let oracle: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, triggers::ORACLE_KEY));
+        let effective_amount = match resolve_trade_amount(
+            &env, &user, &token, amount, portfolio_pct_bps, oracle,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                env.storage().temporary().remove(&lock_key);
+                return Err(e);
+            }
+        };
+
         // ── Cross-contract call #1: SEP-41 balance check ──────────────────────
         let fee = effective_estimated_fee(&env);
         let bal_key = StorageKey::LastInsufficientBalance(user.clone());
-        match check_user_balance(&env, &user, &token, amount, fee) {
+        match check_user_balance(&env, &user, &token, effective_amount, fee) {
             Ok(()) => {
                 env.storage().instance().remove(&bal_key);
             }
@@ -258,9 +275,6 @@ impl TradeExecutorContract {
         }
 
         // ── Cross-contract call #2: batched position-limit check + record ─────
-        // Replaces the previous two calls:
-        //   old call #2: portfolio.get_open_position_count(user)
-        //   old call #3: portfolio.record_copy_position(user)
         validate_and_record_position(&env, &portfolio, &user, exempt)?;
 
         env.storage().temporary().remove(&lock_key);

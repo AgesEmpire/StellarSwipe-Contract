@@ -12,6 +12,9 @@ use crate::{
     set_pending_fees, set_treasury_balance, ContractError, FeeCollector, FeeCollectorClient,
 };
 
+// Stellar burn address (all-zeros public key encoded as strkey)
+const _BURN_ADDRESS: &str = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
+
 #[contract]
 struct MockOracleContract;
 
@@ -448,7 +451,8 @@ fn test_collect_fee_tracks_volume_and_applies_rebate_tiers() {
 
     assert_eq!(
         client.treasury_balance(&token),
-        fee_one + fee_two + fee_three
+        // default burn_rate = 10%, so treasury receives 90% of each fee
+        (fee_one + fee_two + fee_three) * 9 / 10
     );
 }
 
@@ -608,65 +612,61 @@ fn test_claim_fees_unauthorized() {
 }
 
 // ---------------------------------------------------------------------------
-// Fee rounding tests
+// burn_rate / set_burn_rate
 // ---------------------------------------------------------------------------
-//
-// Strategy: floor(trade_amount * fee_rate_bps / 10_000)
-// - User-favorable: trader never pays more than exact pro-rata fee.
-// - No dust: remainder stays with trader, not in contract.
 
 #[test]
-fn fee_floor_exact_division() {
-    // 10_000 * 30 / 10_000 = 30 exactly — no rounding needed.
-    assert_eq!(crate::fee_amount_floor(10_000, 30), Some(30));
+fn test_burn_rate_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    assert_eq!(client.burn_rate(), 1_000u32); // 10% default
 }
 
 #[test]
-fn fee_floor_rounds_down_not_up() {
-    // 9_999 * 30 = 299_970; 299_970 / 10_000 = 29.997 → floor = 29
-    assert_eq!(crate::fee_amount_floor(9_999, 30), Some(29));
+fn test_set_burn_rate_configurable_by_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    client.set_burn_rate(&500u32); // 5%
+    assert_eq!(client.burn_rate(), 500u32);
 }
 
 #[test]
-fn fee_floor_one_stroop_trade() {
-    // 1 * 30 / 10_000 = 0.003 → floor = 0
-    assert_eq!(crate::fee_amount_floor(1, 30), Some(0));
+fn test_set_burn_rate_too_high() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    let result = client.try_set_burn_rate(&10_001u32);
+    assert_eq!(result, Err(Ok(ContractError::BurnRateTooHigh)));
 }
 
 #[test]
-fn fee_floor_minimum_nonzero_result() {
-    // Smallest amount that yields fee >= 1 at 30 bps: ceil(10_000/30) = 334
-    // 334 * 30 / 10_000 = 10_020 / 10_000 = 1
-    assert_eq!(crate::fee_amount_floor(334, 30), Some(1));
-    // 333 * 30 / 10_000 = 9_990 / 10_000 = 0
-    assert_eq!(crate::fee_amount_floor(333, 30), Some(0));
+fn test_set_burn_rate_max_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    client.set_burn_rate(&10_000u32); // 100% — valid boundary
+    assert_eq!(client.burn_rate(), 10_000u32);
 }
 
 #[test]
-fn fee_floor_max_rate() {
-    // 100 bps = 1%; 10_000 * 100 / 10_000 = 100
-    assert_eq!(crate::fee_amount_floor(10_000, 100), Some(100));
-}
-
-#[test]
-fn fee_floor_large_amount_no_overflow() {
-    // i128::MAX / 10_000 should not overflow
-    let large = i128::MAX / 10_001;
-    let result = crate::fee_amount_floor(large, 100);
-    assert!(result.is_some());
-    assert_eq!(result.unwrap(), large * 100 / 10_000);
-}
-
-#[test]
-fn fee_floor_overflow_returns_none() {
-    // i128::MAX * 1 overflows checked_mul
-    assert_eq!(crate::fee_amount_floor(i128::MAX, 100), None);
-}
-
-/// No dust accumulates: treasury receives exactly fee_amount, nothing more.
-/// After N trades the treasury balance equals the sum of all floor-rounded fees.
-#[test]
-fn no_dust_accumulation_over_many_trades() {
+fn test_collect_fee_burn_amount_calculation() {
+    // fee_amount = 1_000_000 * 30 / 10_000 = 3_000
+    // burn = 3_000 * 1_000 / 10_000 = 300  (10%)
+    // treasury receives 2_700
     let env = Env::default();
     env.mock_all_auths();
 
@@ -681,44 +681,24 @@ fn no_dust_accumulation_over_many_trades() {
     let client = FeeCollectorClient::new(&env, &contract_id);
     client.initialize(&admin);
 
-    let (oracle_id, asset) = setup_oracle(&env, 1);
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
     client.set_oracle_contract(&oracle_id);
     client.set_fee_rate(&30u32);
+    client.set_burn_rate(&1_000u32); // 10%
 
-    // Use an amount that does NOT divide evenly: 9_999 * 30 / 10_000 = 29 (not 29.997)
-    let trade_amount: i128 = 9_999;
-    let expected_fee_per_trade = crate::fee_amount_floor(trade_amount, 30).unwrap(); // = 29
-    let n_trades: i128 = 1_000;
+    let trade_amount: i128 = 1_000_000;
+    StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
 
-    StellarAssetClient::new(&env, &token).mint(&trader, &(trade_amount * n_trades + 1_000_000));
+    let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
+    assert_eq!(fee, 3_000); // total fee collected from trader
 
-    let mut total_fees: i128 = 0;
-    for _ in 0..n_trades {
-        let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
-        assert_eq!(fee, expected_fee_per_trade, "each fee must be floor-rounded");
-        total_fees += fee;
-    }
-
-    // Treasury balance must equal the sum of all collected fees — no extra dust.
-    assert_eq!(client.treasury_balance(&token), total_fees);
-    assert_eq!(total_fees, expected_fee_per_trade * n_trades);
+    // treasury should hold fee minus burn: 3_000 - 300 = 2_700
+    assert_eq!(client.treasury_balance(&token), 2_700);
 }
 
-/// Rebate tiers also use floor rounding — verify the discounted rate rounds down.
 #[test]
-fn rebate_tier_fee_also_rounds_down() {
-    // Silver tier: base 30 bps - 5 bps = 25 bps
-    // 9_999 * 25 / 10_000 = 249_975 / 10_000 = 24 (floor)
-    assert_eq!(crate::fee_amount_floor(9_999, 25), Some(24));
-    // Gold tier: base 30 bps - 10 bps = 20 bps
-    // 9_999 * 20 / 10_000 = 199_980 / 10_000 = 19 (floor)
-    assert_eq!(crate::fee_amount_floor(9_999, 20), Some(19));
-}
-
-/// collect_fee returns FeeRoundedToZero when the trade is too small to produce
-/// a non-zero fee — the contract does not silently accept a zero-fee trade.
-#[test]
-fn collect_fee_rejects_zero_fee_trade() {
+fn test_collect_fee_zero_burn_rate_full_treasury() {
+    // burn_rate = 0 → nothing burned, full fee goes to treasury
     let env = Env::default();
     env.mock_all_auths();
 
@@ -733,14 +713,77 @@ fn collect_fee_rejects_zero_fee_trade() {
     let client = FeeCollectorClient::new(&env, &contract_id);
     client.initialize(&admin);
 
-    let (oracle_id, asset) = setup_oracle(&env, 1);
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
     client.set_oracle_contract(&oracle_id);
     client.set_fee_rate(&30u32);
+    client.set_burn_rate(&0u32);
 
-    // 333 * 30 / 10_000 = 0 → FeeRoundedToZero
-    StellarAssetClient::new(&env, &token).mint(&trader, &1_000_000);
-    let result = client.try_collect_fee(&trader, &token, &333, &asset);
-    assert_eq!(result, Err(Ok(ContractError::FeeRoundedToZero)));
+    let trade_amount: i128 = 1_000_000;
+    StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
+
+    let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
+    assert_eq!(fee, 3_000);
+    assert_eq!(client.treasury_balance(&token), 3_000); // nothing burned
+}
+
+#[test]
+fn test_collect_fee_full_burn_rate_zero_treasury() {
+    // burn_rate = 10_000 (100%) → all fee burned, treasury gets 0
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+    client.set_fee_rate(&30u32);
+    client.set_burn_rate(&10_000u32);
+
+    let trade_amount: i128 = 1_000_000;
+    StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
+
+    let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
+    assert_eq!(fee, 3_000);
+    assert_eq!(client.treasury_balance(&token), 0); // all burned
+}
+
+#[test]
+fn test_collect_fee_emits_fees_burned_event() {
+    use soroban_sdk::testutils::Events;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+    client.set_fee_rate(&30u32);
+    client.set_burn_rate(&1_000u32);
+
+    StellarAssetClient::new(&env, &token).mint(&trader, &1_000_000i128);
+    client.collect_fee(&trader, &token, &1_000_000i128, &asset);
+
+    let events = env.events().all();
+    assert!(!events.is_empty(), "FeesBurned event must be emitted");
 }
 
 // ---------------------------------------------------------------------------

@@ -49,16 +49,14 @@ use errors::{
     SignalOutcomeError, TemplateError, VersioningError,
 };
 pub use leaderboard::{
-    get_leaderboard as get_leaderboard_internal, LeaderboardMetric, ProviderLeaderboard,
+    get_leaderboard as get_leaderboard_internal, update_leaderboard_index, LeaderboardMetric,
+    ProviderLeaderboard, ProviderLeaderboardEntry, ProviderMetric,
 };
 pub use ml_scoring::{MLModel, SignalFeatures, SignalScore};
 use reputation::{
     calculate_trust_score, get_trust_score, update_median_values, update_trust_score,
     TrustScoreDetails, TrustScoreTier,
 };
-use categories::{RiskLevel, SignalCategory};
-use errors::{AdminError, TemplateError, ContestError, VersioningError};
-pub use leaderboard::{get_leaderboard as get_leaderboard_internal, update_leaderboard_index, LeaderboardMetric, ProviderLeaderboard};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
 use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
@@ -1095,6 +1093,18 @@ impl SignalRegistry {
     ) -> Vec<ProviderLeaderboard> {
         let stats_map = Self::get_provider_stats_map(&env);
         get_leaderboard_internal(&env, &stats_map, metric, limit)
+    }
+
+    /// Get top N providers ranked by the requested metric.
+    ///
+    /// Providers with fewer than 10 closed signals are excluded.
+    /// Verified providers (stake >= minimum) are flagged in results.
+    pub fn get_provider_leaderboard(
+        env: Env,
+        metric: ProviderMetric,
+        limit: u32,
+    ) -> Vec<ProviderLeaderboardEntry> {
+        leaderboard::get_provider_leaderboard(&env, metric, limit)
     }
 
     /// Get top providers sorted by success rate

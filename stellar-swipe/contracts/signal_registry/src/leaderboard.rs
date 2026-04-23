@@ -1,38 +1,45 @@
-//! Pre-aggregated leaderboard index for O(1) query reads.
+//! Pre-aggregated provider leaderboard with four sort metrics.
 //!
-//! # Design
-//! Instead of scanning all providers at query time (O(N) reads + O(N²) sort),
-//! we maintain two sorted index arrays in persistent storage — one ranked by
-//! `success_rate`, one by `total_volume` — each capped at `INDEX_CAPACITY`
-//! entries. The index is updated on every relevant event (signal close,
-//! provider stats update) via `update_leaderboard_index`.
+//! Four sorted index arrays (one per metric) are maintained in persistent storage,
+//! each capped at INDEX_CAPACITY. Updated on every signal close via
+//! update_leaderboard_index. Queries are O(1) storage reads.
 //!
-//! # Complexity
-//! - Query (`get_leaderboard`): O(1) storage reads (reads one index entry).
-//! - Update (`update_leaderboard_index`): O(INDEX_CAPACITY) in-memory insertion
-//!   sort on the cached Vec — no additional storage reads beyond the index itself.
-//!
-//! # Before / After instruction count comparison
-//! Before (runtime sort over all providers):
-//!   - Storage reads: O(P) where P = provider count
-//!   - CPU: O(P²) bubble sort
-//!   - For P=100: ~10,000 comparisons + 100 storage reads ≈ 500k instructions
-//!
-//! After (index read):
-//!   - Storage reads: 1 (the index)
-//!   - CPU: O(1) slice of pre-sorted Vec
-//!   - For P=100: ~100 instructions
+//! Qualification: provider must have >= MIN_CLOSED_SIGNALS (10) closed signals.
 
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Vec};
 
+use crate::stake;
 use crate::types::ProviderPerformance;
 
-pub const MIN_SIGNALS_QUALIFICATION: u32 = 5;
+pub const MIN_CLOSED_SIGNALS: u32 = 10;
 pub const DEFAULT_LEADERBOARD_LIMIT: u32 = 10;
 pub const MAX_LEADERBOARD_LIMIT: u32 = 50;
-
-/// Maximum entries maintained in each sorted index.
 pub const INDEX_CAPACITY: u32 = 100;
+
+// ── Public types ──────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderMetric {
+    BySuccessRate,
+    ByTotalAdopters,
+    ByTotalProfitDelta,
+    ByStake,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProviderLeaderboardEntry {
+    pub rank: u32,
+    pub provider: Address,
+    pub metric_value: i128,
+    pub total_signals: u32,
+    pub verified: bool,
+}
+
+// ── Legacy aliases ────────────────────────────────────────────────────────────
+
+pub type ProviderLeaderboard = ProviderLeaderboardEntry;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,34 +49,29 @@ pub enum LeaderboardMetric {
     Followers,
 }
 
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ProviderLeaderboard {
-    pub rank: u32,
-    pub provider: Address,
-    pub success_rate: u32,
-    pub total_volume: i128,
-    pub total_signals: u32,
-}
-
-// ── Storage keys ─────────────────────────────────────────────────────────────
+// ── Storage keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone)]
 pub enum LeaderboardKey {
     SuccessRateIndex,
-    VolumeIndex,
+    AdoptersIndex,
+    ProfitDeltaIndex,
+    StakeIndex,
 }
 
-// ── Index entry (stored in sorted arrays) ────────────────────────────────────
+// ── Index entry ───────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct IndexEntry {
     pub provider: Address,
+    pub closed_signals: u32,
     pub success_rate: u32,
-    pub total_volume: i128,
-    pub total_signals: u32,
+    pub total_adopters: u32,
+    pub total_profit_delta: i128,
+    pub stake_amount: i128,
+    pub verified: bool,
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -86,101 +88,98 @@ fn save_index(env: &Env, key: LeaderboardKey, index: &Vec<IndexEntry>) {
 }
 
 fn is_qualified(entry: &IndexEntry) -> bool {
-    entry.total_signals >= MIN_SIGNALS_QUALIFICATION && entry.success_rate > 0
+    entry.closed_signals >= MIN_CLOSED_SIGNALS
 }
 
-/// Insert-sort `entry` into `index` by `score_fn` descending, capped at `INDEX_CAPACITY`.
-/// Replaces existing entry for the same provider if present.
 fn upsert_sorted<F>(env: &Env, index: &mut Vec<IndexEntry>, entry: IndexEntry, score_fn: F)
 where
     F: Fn(&IndexEntry) -> i128,
 {
-    // Remove existing entry for this provider (if any).
-    let mut new_index: Vec<IndexEntry> = Vec::new(env);
+    let mut without: Vec<IndexEntry> = Vec::new(env);
     for i in 0..index.len() {
         let e = index.get(i).unwrap();
         if e.provider != entry.provider {
-            new_index.push_back(e);
+            without.push_back(e);
         }
     }
 
     if !is_qualified(&entry) {
-        *index = new_index;
+        *index = without;
         return;
     }
 
-    // Find insertion position (descending order).
     let entry_score = score_fn(&entry);
-    let mut insert_at = new_index.len();
-    for i in 0..new_index.len() {
-        if score_fn(&new_index.get(i).unwrap()) < entry_score {
+    let mut insert_at = without.len();
+    for i in 0..without.len() {
+        if score_fn(&without.get(i).unwrap()) < entry_score {
             insert_at = i;
             break;
         }
     }
 
-    // Build final index with entry inserted.
     let mut result: Vec<IndexEntry> = Vec::new(env);
     for i in 0..insert_at {
-        result.push_back(new_index.get(i).unwrap());
+        result.push_back(without.get(i).unwrap());
     }
     result.push_back(entry);
-    for i in insert_at..new_index.len() {
-        result.push_back(new_index.get(i).unwrap());
+    for i in insert_at..without.len() {
+        result.push_back(without.get(i).unwrap());
     }
 
-    // Cap at INDEX_CAPACITY.
     let cap = INDEX_CAPACITY.min(result.len());
     let mut capped: Vec<IndexEntry> = Vec::new(env);
     for i in 0..cap {
         capped.push_back(result.get(i).unwrap());
     }
-
     *index = capped;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Update both sorted indexes for `provider` after their stats change.
-///
-/// Call this on every signal close / provider stats update.
-/// O(INDEX_CAPACITY) in-memory work, 2 storage reads + 2 writes.
 pub fn update_leaderboard_index(env: &Env, provider: Address, stats: &ProviderPerformance) {
+    let stake_info = stake::get_stake_info(env, &provider);
+    let stake_amount = stake_info.as_ref().map(|s| s.amount).unwrap_or(0);
+    let verified = stake_amount >= stake::DEFAULT_MINIMUM_STAKE;
+
+    let closed_signals = stats
+        .successful_signals
+        .saturating_add(stats.failed_signals);
+
     let entry = IndexEntry {
         provider: provider.clone(),
+        closed_signals,
         success_rate: stats.success_rate,
-        total_volume: stats.total_volume,
-        total_signals: stats.total_signals,
+        total_adopters: stats.total_copies as u32,
+        total_profit_delta: stats.avg_return.saturating_mul(closed_signals as i128),
+        stake_amount,
+        verified,
     };
 
-    // Update success-rate index.
-    let mut sr_index = load_index(env, LeaderboardKey::SuccessRateIndex);
-    upsert_sorted(env, &mut sr_index, entry.clone(), |e| e.success_rate as i128);
-    save_index(env, LeaderboardKey::SuccessRateIndex, &sr_index);
+    let mut sr = load_index(env, LeaderboardKey::SuccessRateIndex);
+    upsert_sorted(env, &mut sr, entry.clone(), |e| e.success_rate as i128);
+    save_index(env, LeaderboardKey::SuccessRateIndex, &sr);
 
-    // Update volume index.
-    let mut vol_index = load_index(env, LeaderboardKey::VolumeIndex);
-    upsert_sorted(env, &mut vol_index, entry, |e| e.total_volume);
-    save_index(env, LeaderboardKey::VolumeIndex, &vol_index);
+    let mut ad = load_index(env, LeaderboardKey::AdoptersIndex);
+    upsert_sorted(env, &mut ad, entry.clone(), |e| e.total_adopters as i128);
+    save_index(env, LeaderboardKey::AdoptersIndex, &ad);
 
-    #[allow(deprecated)]
+    let mut pd = load_index(env, LeaderboardKey::ProfitDeltaIndex);
+    upsert_sorted(env, &mut pd, entry.clone(), |e| e.total_profit_delta);
+    save_index(env, LeaderboardKey::ProfitDeltaIndex, &pd);
+
+    let mut sk = load_index(env, LeaderboardKey::StakeIndex);
+    upsert_sorted(env, &mut sk, entry, |e| e.stake_amount);
+    save_index(env, LeaderboardKey::StakeIndex, &sk);
+
     env.events()
         .publish((symbol_short!("lb_upd"), provider), stats.success_rate);
 }
 
-/// O(1) leaderboard query — reads the pre-sorted index directly.
-///
-/// Returns up to `limit` qualified providers. Followers returns empty (MVP).
-pub fn get_leaderboard(
+pub fn get_provider_leaderboard(
     env: &Env,
-    _stats_map: &soroban_sdk::Map<Address, ProviderPerformance>,
-    metric: LeaderboardMetric,
+    metric: ProviderMetric,
     limit: u32,
-) -> Vec<ProviderLeaderboard> {
-    if metric == LeaderboardMetric::Followers {
-        return Vec::new(env);
-    }
-
+) -> Vec<ProviderLeaderboardEntry> {
     let limit = if limit == 0 {
         DEFAULT_LEADERBOARD_LIMIT
     } else {
@@ -188,31 +187,49 @@ pub fn get_leaderboard(
     };
 
     let key = match metric {
-        LeaderboardMetric::SuccessRate => LeaderboardKey::SuccessRateIndex,
-        LeaderboardMetric::Volume => LeaderboardKey::VolumeIndex,
-        LeaderboardMetric::Followers => unreachable!(),
+        ProviderMetric::BySuccessRate => LeaderboardKey::SuccessRateIndex,
+        ProviderMetric::ByTotalAdopters => LeaderboardKey::AdoptersIndex,
+        ProviderMetric::ByTotalProfitDelta => LeaderboardKey::ProfitDeltaIndex,
+        ProviderMetric::ByStake => LeaderboardKey::StakeIndex,
     };
 
-    // Single storage read — O(1).
     let index = load_index(env, key);
-
     let take = limit.min(index.len());
     let mut result = Vec::new(env);
-    let mut rank = 1u32;
 
     for i in 0..take {
         let e = index.get(i).unwrap();
-        result.push_back(ProviderLeaderboard {
-            rank,
+        let metric_value = match metric {
+            ProviderMetric::BySuccessRate => e.success_rate as i128,
+            ProviderMetric::ByTotalAdopters => e.total_adopters as i128,
+            ProviderMetric::ByTotalProfitDelta => e.total_profit_delta,
+            ProviderMetric::ByStake => e.stake_amount,
+        };
+        result.push_back(ProviderLeaderboardEntry {
+            rank: i + 1,
             provider: e.provider,
-            success_rate: e.success_rate,
-            total_volume: e.total_volume,
-            total_signals: e.total_signals,
+            metric_value,
+            total_signals: e.closed_signals,
+            verified: e.verified,
         });
-        rank = i + 2;
     }
 
     result
+}
+
+/// Legacy wrapper kept for backward-compat with existing get_leaderboard callers.
+pub fn get_leaderboard(
+    env: &Env,
+    _stats_map: &soroban_sdk::Map<Address, ProviderPerformance>,
+    metric: LeaderboardMetric,
+    limit: u32,
+) -> Vec<ProviderLeaderboardEntry> {
+    let pm = match metric {
+        LeaderboardMetric::SuccessRate => ProviderMetric::BySuccessRate,
+        LeaderboardMetric::Volume => ProviderMetric::ByTotalProfitDelta,
+        LeaderboardMetric::Followers => return Vec::new(env),
+    };
+    get_provider_leaderboard(env, pm, limit)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -222,101 +239,164 @@ mod tests {
     use super::*;
     use crate::types::ProviderPerformance;
     use soroban_sdk::testutils::Address as TestAddress;
-    use soroban_sdk::{contract, Env, Map};
+    use soroban_sdk::{contract, Env};
 
     #[contract]
     struct TestContract;
 
-    fn setup() -> Env {
-        Env::default()
-    }
-
-    fn make_stats(success_rate: u32, total_volume: i128, total_signals: u32) -> ProviderPerformance {
+    fn make_stats(
+        success_rate: u32,
+        total_copies: u64,
+        avg_return: i128,
+        successful: u32,
+        failed: u32,
+    ) -> ProviderPerformance {
         ProviderPerformance {
-            total_signals,
-            successful_signals: 0,
-            failed_signals: 0,
-            total_copies: 0,
+            total_signals: successful + failed,
+            successful_signals: successful,
+            failed_signals: failed,
+            total_copies,
             success_rate,
-            avg_return: 0,
-            total_volume,
+            avg_return,
+            total_volume: 0,
         }
     }
 
-    /// Insert 100 providers and verify index correctness + O(1) query.
+    /// 30 providers with varied metrics — verify top-10 by each metric.
     #[test]
-    fn test_index_correct_after_100_updates() {
-        let env = setup();
-        let contract_addr = env.register(TestContract, ());
+    fn test_30_providers_top_10_by_each_metric() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
 
-        env.as_contract(&contract_addr, || {
-            let mut providers = Vec::new(&env);
-            for i in 0..100u32 {
+        env.as_contract(&cid, || {
+            // Provider i:
+            //   success_rate   = (i+1)*100   bps  (100..=3000)
+            //   total_copies   = (i+1)*5          (5..=150)
+            //   avg_return     = (i as i128-14)*10 (-140..=150)
+            //   closed_signals = 10+i              (10..=39, all qualify)
+            for i in 0..30u32 {
                 let p = Address::generate(&env);
-                providers.push_back(p.clone());
-                let stats = make_stats(i + 1, (i as i128 + 1) * 1_000, 10);
+                let closed = 10 + i;
+                let stats = make_stats(
+                    (i + 1) * 100,
+                    ((i + 1) * 5) as u64,
+                    (i as i128 - 14) * 10,
+                    closed / 2 + 1,
+                    closed / 2,
+                );
                 update_leaderboard_index(&env, p, &stats);
             }
 
-            let empty_map: Map<Address, ProviderPerformance> = Map::new(&env);
-
-            // Success-rate leaderboard: top entry should have success_rate = 100
-            let lb = get_leaderboard(&env, &empty_map, LeaderboardMetric::SuccessRate, 10);
+            // BY_SUCCESS_RATE
+            let lb = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
             assert_eq!(lb.len(), 10);
-            assert_eq!(lb.get(0).unwrap().success_rate, 100);
-            assert!(lb.get(0).unwrap().success_rate >= lb.get(1).unwrap().success_rate);
+            assert_eq!(lb.get(0).unwrap().metric_value, 3000);
+            assert_eq!(lb.get(0).unwrap().rank, 1);
+            for i in 0..9u32 {
+                assert!(
+                    lb.get(i).unwrap().metric_value >= lb.get(i + 1).unwrap().metric_value
+                );
+            }
 
-            // Volume leaderboard: top entry should have highest volume
-            let lb_vol = get_leaderboard(&env, &empty_map, LeaderboardMetric::Volume, 10);
-            assert_eq!(lb_vol.len(), 10);
-            assert!(lb_vol.get(0).unwrap().total_volume >= lb_vol.get(1).unwrap().total_volume);
+            // BY_TOTAL_ADOPTERS
+            let lb = get_provider_leaderboard(&env, ProviderMetric::ByTotalAdopters, 10);
+            assert_eq!(lb.len(), 10);
+            assert_eq!(lb.get(0).unwrap().metric_value, 150);
+            for i in 0..9u32 {
+                assert!(
+                    lb.get(i).unwrap().metric_value >= lb.get(i + 1).unwrap().metric_value
+                );
+            }
+
+            // BY_TOTAL_PROFIT_DELTA
+            let lb = get_provider_leaderboard(&env, ProviderMetric::ByTotalProfitDelta, 10);
+            assert_eq!(lb.len(), 10);
+            for i in 0..9u32 {
+                assert!(
+                    lb.get(i).unwrap().metric_value >= lb.get(i + 1).unwrap().metric_value
+                );
+            }
+
+            // BY_STAKE — no stakes set, all zero; verify <= 10 and descending
+            let lb_stake = get_provider_leaderboard(&env, ProviderMetric::ByStake, 10);
+            let n = lb_stake.len();
+            assert!(n <= 10);
+            for i in 0..n.saturating_sub(1) {
+                assert!(
+                    lb_stake.get(i).unwrap().metric_value
+                        >= lb_stake.get(i + 1).unwrap().metric_value
+                );
+            }
         });
     }
 
     #[test]
-    fn test_unqualified_provider_excluded() {
-        let env = setup();
-        let contract_addr = env.register(TestContract, ());
-
-        env.as_contract(&contract_addr, || {
+    fn test_under_min_signals_excluded() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
             let p = Address::generate(&env);
-            // total_signals = 3 < MIN_SIGNALS_QUALIFICATION
-            let stats = make_stats(80, 5_000, 3);
+            // 9 closed signals — below threshold
+            let stats = make_stats(8000, 50, 100, 5, 4);
             update_leaderboard_index(&env, p, &stats);
-
-            let empty_map: Map<Address, ProviderPerformance> = Map::new(&env);
-            let lb = get_leaderboard(&env, &empty_map, LeaderboardMetric::SuccessRate, 10);
+            let lb = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
             assert_eq!(lb.len(), 0);
         });
     }
 
     #[test]
-    fn test_upsert_updates_existing_provider() {
-        let env = setup();
-        let contract_addr = env.register(TestContract, ());
-
-        env.as_contract(&contract_addr, || {
+    fn test_exactly_min_signals_qualifies() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
             let p = Address::generate(&env);
-            update_leaderboard_index(&env, p.clone(), &make_stats(50, 1_000, 10));
-            update_leaderboard_index(&env, p.clone(), &make_stats(90, 9_000, 20));
-
-            let empty_map: Map<Address, ProviderPerformance> = Map::new(&env);
-            let lb = get_leaderboard(&env, &empty_map, LeaderboardMetric::SuccessRate, 10);
-            // Only one entry for this provider, with updated stats
+            let stats = make_stats(7000, 20, 50, 5, 5); // 10 closed
+            update_leaderboard_index(&env, p, &stats);
+            let lb = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
             assert_eq!(lb.len(), 1);
-            assert_eq!(lb.get(0).unwrap().success_rate, 90);
+            assert_eq!(lb.get(0).unwrap().total_signals, 10);
         });
     }
 
     #[test]
-    fn test_followers_returns_empty() {
-        let env = setup();
-        let contract_addr = env.register(TestContract, ());
+    fn test_upsert_no_duplicates() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p = Address::generate(&env);
+            update_leaderboard_index(&env, p.clone(), &make_stats(5000, 10, 50, 6, 5));
+            update_leaderboard_index(&env, p.clone(), &make_stats(9000, 30, 200, 8, 5));
+            let lb = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
+            assert_eq!(lb.len(), 1);
+            assert_eq!(lb.get(0).unwrap().metric_value, 9000);
+        });
+    }
 
-        env.as_contract(&contract_addr, || {
-            let empty_map: Map<Address, ProviderPerformance> = Map::new(&env);
-            let lb = get_leaderboard(&env, &empty_map, LeaderboardMetric::Followers, 10);
-            assert_eq!(lb.len(), 0);
+    #[test]
+    fn test_verified_flag_without_stake() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p = Address::generate(&env);
+            update_leaderboard_index(&env, p, &make_stats(8000, 20, 100, 6, 5));
+            let lb = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
+            assert_eq!(lb.len(), 1);
+            assert!(!lb.get(0).unwrap().verified);
+        });
+    }
+
+    #[test]
+    fn test_legacy_get_leaderboard_wrapper() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p = Address::generate(&env);
+            update_leaderboard_index(&env, p, &make_stats(7500, 15, 80, 6, 5));
+            let empty_map = soroban_sdk::Map::new(&env);
+            let lb = get_leaderboard(&env, &empty_map, LeaderboardMetric::SuccessRate, 10);
+            assert_eq!(lb.len(), 1);
+            let lb_f = get_leaderboard(&env, &empty_map, LeaderboardMetric::Followers, 10);
+            assert_eq!(lb_f.len(), 0);
         });
     }
 }
