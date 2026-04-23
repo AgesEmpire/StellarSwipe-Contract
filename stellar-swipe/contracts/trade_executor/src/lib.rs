@@ -296,7 +296,23 @@ impl TradeExecutorContract {
             .instance()
             .get(&StorageKey::SdexRouter)
             .ok_or(ContractError::NotInitialized)?;
-        execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received)
+        execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received, Vec::new(&env))
+    }
+
+    pub fn swap_path(
+        env: Env,
+        from_token: Address,
+        to_token: Address,
+        path: Vec<Address>,
+        amount: i128,
+        min_received: i128,
+    ) -> Result<i128, ContractError> {
+        let router = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SdexRouter)
+            .ok_or(ContractError::NotInitialized)?;
+        execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received, path)
     }
 
     pub fn swap_with_slippage(
@@ -353,7 +369,7 @@ impl TradeExecutorContract {
             .get(&StorageKey::SdexRouter)
             .ok_or(ContractError::NotInitialized)?;
 
-        let exit_price = execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received)?;
+        let exit_price = execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received, Vec::new(&env))?;
 
         let realized_pnl = exit_price - amount;
         let close_sym = Symbol::new(&env, "close_position");

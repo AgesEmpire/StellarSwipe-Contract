@@ -21,4 +21,5 @@ pub enum ContractError {
     Unauthorized = 6,
     TradeNotFound = 7,
     SlippageExceeded = 8,
+    PathTooLong = 9,
 }

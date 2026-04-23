@@ -39,23 +39,22 @@ pub fn min_received_from_slippage(amount: i128, max_slippage_bps: u32) -> Option
     amount.checked_mul(num)?.checked_div(10_000)
 }
 
-/// Execute a swap by approving the router on `from_token` and invoking its `swap` function.
+/// Maximum number of intermediate hops allowed by the Stellar protocol.
+pub const MAX_PATH_HOPS: usize = 5;
+
+/// Execute a swap via the SDEX router.
 ///
-/// Expected router ABI (topics / ordering must match `invoke_contract` args):
+/// - `path` empty  → direct swap (`swap` entrypoint)
+/// - `path` non-empty → multi-hop path payment (`swap_path` entrypoint); max 5 hops.
 ///
+/// Router ABI for direct swap:
 /// ```text
-/// swap(
-///   pull_from: Address,   // SAC balance this swap debits (usually the caller contract)
-///   from_token: Address,  // input SAC contract
-///   to_token: Address,     // output SAC contract
-///   amount_in: i128,
-///   min_out: i128,         // router-level minimum; executor still enforces balance check
-///   recipient: Address,    // receives output tokens (usually pull_from)
-/// ) -> i128                // reported amount out (informational)
+/// swap(pull_from, from_token, to_token, amount_in, min_out, recipient) -> i128
 /// ```
-///
-/// The router should `transfer_from` `amount_in` from `pull_from` and `transfer`
-/// output tokens to `recipient`.
+/// Router ABI for path swap:
+/// ```text
+/// swap_path(pull_from, from_token, to_token, path: Vec<Address>, amount_in, min_out, recipient) -> i128
+/// ```
 pub fn execute_sdex_swap(
     env: &Env,
     sdex_router: &Address,
@@ -63,9 +62,13 @@ pub fn execute_sdex_swap(
     to_token: &Address,
     amount: i128,
     min_received: i128,
+    path: Vec<Address>,
 ) -> Result<i128, ContractError> {
     if amount <= 0 || min_received < 0 {
         return Err(ContractError::InvalidAmount);
+    }
+    if path.len() as usize > MAX_PATH_HOPS {
+        return Err(ContractError::PathTooLong);
     }
 
     let this = env.current_contract_address();
@@ -78,21 +81,29 @@ pub fn execute_sdex_swap(
         .checked_add(ROUTER_ALLOWANCE_LEDGERS)
         .ok_or(ContractError::InvalidAmount)?;
 
-    // SEP-41: current contract authorizes router to pull `amount` of from_token.
     from_client.approve(&this, sdex_router, &amount, &expiration);
 
     let balance_before = to_client.balance(&this);
 
-    let swap_sym = Symbol::new(env, SDEX_SWAP_FN);
     let mut args = Vec::<Val>::new(env);
     args.push_back(this.clone().into_val(env));
     args.push_back(from_token.clone().into_val(env));
     args.push_back(to_token.clone().into_val(env));
-    args.push_back(amount.into_val(env));
-    args.push_back(min_received.into_val(env));
-    args.push_back(this.clone().into_val(env));
 
-    let _reported_out: i128 = env.invoke_contract(sdex_router, &swap_sym, args);
+    let fn_sym = if path.is_empty() {
+        args.push_back(amount.into_val(env));
+        args.push_back(min_received.into_val(env));
+        args.push_back(this.clone().into_val(env));
+        Symbol::new(env, SDEX_SWAP_FN)
+    } else {
+        args.push_back(path.into_val(env));
+        args.push_back(amount.into_val(env));
+        args.push_back(min_received.into_val(env));
+        args.push_back(this.clone().into_val(env));
+        Symbol::new(env, "swap_path")
+    };
+
+    let _reported_out: i128 = env.invoke_contract(sdex_router, &fn_sym, args);
 
     let balance_after = to_client.balance(&this);
     let actual_received = balance_after.checked_sub(balance_before).unwrap_or(0);
