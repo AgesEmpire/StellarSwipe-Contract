@@ -104,7 +104,9 @@ impl FeeCollector {
             recipient: recipient.clone(),
             token: token.clone(),
             amount,
-            available_at: queued_at + SECONDS_PER_DAY,
+            available_at: queued_at
+                .checked_add(SECONDS_PER_DAY)
+                .ok_or(ContractError::ArithmeticOverflow)?,
         }
         .publish(&env);
         Ok(())
@@ -127,7 +129,11 @@ impl FeeCollector {
             _ => return Err(ContractError::WithdrawalNotQueued),
         };
 
-        if env.ledger().timestamp() < queued.queued_at + SECONDS_PER_DAY {
+        if env.ledger().timestamp()
+            < queued.queued_at
+                .checked_add(SECONDS_PER_DAY)
+                .ok_or(ContractError::ArithmeticOverflow)?
+        {
             return Err(ContractError::TimelockNotElapsed);
         }
 

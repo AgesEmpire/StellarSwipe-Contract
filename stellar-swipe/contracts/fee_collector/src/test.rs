@@ -1008,3 +1008,104 @@ fn test_fee_rounded_to_zero_error() {
     let result = client.try_collect_fee(&trader, &token, &trade_amount, &asset);
     assert_eq!(result, Err(Ok(ContractError::FeeRoundedToZero)));
 }
+
+// ---------------------------------------------------------------------------
+// Overflow / division-by-zero tests
+// ---------------------------------------------------------------------------
+
+/// collect_fee: trade_amount * fee_rate overflows i128 → ArithmeticOverflow.
+/// We use i128::MAX as trade_amount with fee_rate > 1 to force overflow in checked_mul.
+#[test]
+fn test_collect_fee_overflow_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+    client.set_fee_rate(&30u32);
+
+    // i128::MAX * 30 overflows — checked_mul returns None → ArithmeticOverflow
+    StellarAssetClient::new(&env, &token).mint(&trader, &i128::MAX);
+    let result = client.try_collect_fee(&trader, &token, &i128::MAX, &asset);
+    assert_eq!(result, Err(Ok(ContractError::ArithmeticOverflow)));
+}
+
+/// queue_withdrawal: queued_at near u64::MAX + SECONDS_PER_DAY overflows → ArithmeticOverflow.
+#[test]
+fn test_queue_withdrawal_timestamp_overflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    StellarAssetClient::new(&env, &token).mint(&contract_id, &1000i128);
+    env.as_contract(&contract_id, || {
+        set_treasury_balance(&env, &token, 1000i128);
+    });
+
+    // Set timestamp so that queued_at + SECONDS_PER_DAY (86400) wraps u64
+    env.ledger().set_timestamp(u64::MAX - 100);
+
+    let result = client.try_queue_withdrawal(&recipient, &token, &1000i128);
+    assert_eq!(result, Err(Ok(ContractError::ArithmeticOverflow)));
+}
+
+/// withdraw_treasury_fees: timelock check with queued_at near u64::MAX → ArithmeticOverflow.
+#[test]
+fn test_withdraw_timelock_timestamp_overflow() {
+    use crate::{set_queued_withdrawal, QueuedWithdrawal};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    StellarAssetClient::new(&env, &token).mint(&contract_id, &1000i128);
+    env.as_contract(&contract_id, || {
+        set_treasury_balance(&env, &token, 1000i128);
+        // Manually inject a queued withdrawal with queued_at near u64::MAX
+        set_queued_withdrawal(
+            &env,
+            &QueuedWithdrawal {
+                recipient: recipient.clone(),
+                token: token.clone(),
+                amount: 1000,
+                queued_at: u64::MAX - 100,
+            },
+        );
+    });
+
+    // Current timestamp is 0; queued_at + SECONDS_PER_DAY overflows → ArithmeticOverflow
+    env.ledger().set_timestamp(0);
+    let result = client.try_withdraw_treasury_fees(&recipient, &token, &1000i128);
+    assert_eq!(result, Err(Ok(ContractError::ArithmeticOverflow)));
+}

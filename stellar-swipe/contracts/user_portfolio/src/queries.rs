@@ -126,7 +126,10 @@ fn roi_basis_points(total_pnl: i128, total_invested: i128) -> i32 {
         Some(n) => n,
         None => return 0,
     };
-    let q = num / total_invested;
+    let q = match num.checked_div(total_invested) {
+        Some(v) => v,
+        None => return 0,
+    };
     if q > i32::MAX as i128 {
         i32::MAX
     } else if q < i32::MIN as i128 {

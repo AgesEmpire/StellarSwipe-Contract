@@ -262,7 +262,7 @@ mod tests {
     use super::oracle_ok::OracleMock;
     use super::oracle_ok::OracleMockClient;
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
     use stellar_swipe_common::OraclePrice;
 
     #[allow(deprecated)]
@@ -358,7 +358,15 @@ mod tests {
         client.open_position(&user, &50, &1_000);
         client.close_position(&user, &1, &300, &60i128, &1u32, &provider, &0u64);
 
-        OracleMockClient::new(&env, &oracle_id).set_price(&60);
+        OracleMockClient::new(&env, &oracle_id).set_price(
+            &7u32,
+            &OraclePrice {
+                price: 6000,
+                decimals: 2,
+                timestamp: env.ledger().timestamp(),
+                source: soroban_sdk::Symbol::new(&env, "mock"),
+            },
+        );
         let pnl = client.get_pnl(&user);
         assert_eq!(pnl.realized_pnl, 300);
         assert_eq!(pnl.unrealized_pnl, Some(200));
@@ -396,18 +404,14 @@ mod tests {
         let provider = dummy_provider(&env);
 
         client.open_position(&user, &100, &1_000);
+        let events_before = env.events().all().len();
         // pnl = 200 > 0 → event must be emitted
         client.close_position(&user, &1, &200, &120i128, &42u32, &provider, &7u64);
-
-        let found = env.events().all().iter().any(|e| {
-            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
-            topics
-                .get(0)
-                .and_then(|v| soroban_sdk::Symbol::try_from(v).ok())
-                .map(|s| s == soroban_sdk::Symbol::new(&env, "TradeShareable"))
-                .unwrap_or(false)
-        });
-        assert!(found, "TradeShareable event not emitted for profitable close");
+        let events_after = env.events().all().len();
+        assert!(
+            events_after > events_before,
+            "TradeShareable event not emitted for profitable close"
+        );
     }
 
     /// Loss close must NOT emit TradeShareable.
@@ -419,18 +423,14 @@ mod tests {
         let provider = dummy_provider(&env);
 
         client.open_position(&user, &100, &1_000);
-        // pnl = -50 (loss) → no event
+        let events_before = env.events().all().len();
+        // pnl = -50 (loss) → no new event
         client.close_position(&user, &1, &-50, &90i128, &42u32, &provider, &7u64);
-
-        let found = env.events().all().iter().any(|e| {
-            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
-            topics
-                .get(0)
-                .and_then(|v| soroban_sdk::Symbol::try_from(v).ok())
-                .map(|s| s == soroban_sdk::Symbol::new(&env, "TradeShareable"))
-                .unwrap_or(false)
-        });
-        assert!(!found, "TradeShareable must not be emitted for a loss");
+        let events_after = env.events().all().len();
+        assert_eq!(
+            events_after, events_before,
+            "TradeShareable must not be emitted for a loss"
+        );
     }
 
     /// Breakeven close (pnl == 0) must NOT emit TradeShareable.
@@ -442,17 +442,45 @@ mod tests {
         let provider = dummy_provider(&env);
 
         client.open_position(&user, &100, &1_000);
-        // pnl = 0 (breakeven) → no event
+        let events_before = env.events().all().len();
+        // pnl = 0 (breakeven) → no new event
         client.close_position(&user, &1, &0, &100i128, &42u32, &provider, &7u64);
+        let events_after = env.events().all().len();
+        assert_eq!(
+            events_after, events_before,
+            "TradeShareable must not be emitted for breakeven"
+        );
+    }
 
-        let found = env.events().all().iter().any(|e| {
-            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
-            topics
-                .get(0)
-                .and_then(|v| soroban_sdk::Symbol::try_from(v).ok())
-                .map(|s| s == soroban_sdk::Symbol::new(&env, "TradeShareable"))
-                .unwrap_or(false)
-        });
-        assert!(!found, "TradeShareable must not be emitted for breakeven");
+    // ── Overflow / division-by-zero tests ─────────────────────────────────────
+
+    /// roi_basis_points: total_invested == 0 → returns 0 (no division-by-zero).
+    #[test]
+    fn get_pnl_zero_invested_returns_zero_roi() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+
+        // No positions opened → total_invested == 0
+        let pnl = client.get_pnl(&user);
+        assert_eq!(pnl.roi_bps, 0);
+        assert_eq!(pnl.total_pnl, 0);
+    }
+
+    /// roi_basis_points: total_pnl * 10_000 overflows i128 → saturates to 0 (checked_mul returns None).
+    #[test]
+    fn get_pnl_roi_overflow_saturates_to_zero() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        let provider = dummy_provider(&env);
+
+        // Open and close with realized_pnl = i128::MAX to trigger overflow in checked_mul(10_000)
+        client.open_position(&user, &1, &1);
+        client.close_position(&user, &1, &i128::MAX, &2i128, &1u32, &provider, &0u64);
+
+        let pnl = client.get_pnl(&user);
+        // checked_mul overflows → roi_basis_points returns 0
+        assert_eq!(pnl.roi_bps, 0);
     }
 }

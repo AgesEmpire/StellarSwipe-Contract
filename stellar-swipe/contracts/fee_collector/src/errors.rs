@@ -18,4 +18,5 @@ pub enum ContractError {
     OracleConversionFailed = 12,
     FeeRoundedToZero = 13,
     BurnRateTooHigh = 14,
+    DivisionByZero = 15,
 }

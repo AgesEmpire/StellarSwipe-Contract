@@ -166,7 +166,9 @@ pub fn get_fee_analytics(env: &Env, period: AnalyticsPeriod) -> FeeAnalytics {
     let avg_fee_per_trade = if trade_count == 0 {
         0i128
     } else {
-        total_fees / (trade_count as i128)
+        total_fees
+            .checked_div(trade_count as i128)
+            .unwrap_or(0)
     };
 
     let mut top_token = no_trades_top_token_placeholder(env);
