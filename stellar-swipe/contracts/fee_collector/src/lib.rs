@@ -31,6 +31,38 @@ mod test;
 #[contract]
 pub struct FeeCollector;
 
+// ── Rounding helpers ──────────────────────────────────────────────────────────
+//
+// All fee arithmetic uses these two functions so the rounding strategy is
+// centralised and easy to audit.
+//
+// • `fee_amount_floor` — truncates (rounds DOWN).  Used when charging the user.
+//   The user never pays more than their exact fractional share.
+//
+// • `fee_amount_ceil`  — rounds UP.  Reserved for future provider-reward splits
+//   where the protocol should not lose sub-unit amounts to rounding.
+//
+// Neither function can produce unwithdrawable dust:
+//   - floor: the foregone sub-unit stays with the user (never enters the contract).
+//   - ceil:  the extra sub-unit is collected from the user and fully credited to
+//            the recipient, so the contract balance is always exactly the sum of
+//            all credited amounts.
+
+/// `amount * rate_bps / 10_000`, truncated (user-favorable).
+pub(crate) fn fee_amount_floor(amount: i128, rate_bps: u32) -> Option<i128> {
+    amount
+        .checked_mul(rate_bps as i128)?
+        .checked_div(10_000)
+}
+
+/// `ceil(amount * rate_bps / 10_000)` — rounds UP (protocol-favorable).
+/// Use for provider reward splits to avoid sub-unit loss.
+pub(crate) fn fee_amount_ceil(amount: i128, rate_bps: u32) -> Option<i128> {
+    let numerator = amount.checked_mul(rate_bps as i128)?;
+    // ceil(a/b) = (a + b - 1) / b  for positive a, b
+    numerator.checked_add(10_000 - 1)?.checked_div(10_000)
+}
+
 #[contractimpl]
 impl FeeCollector {
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
@@ -215,9 +247,13 @@ impl FeeCollector {
         }
 
         let fee_rate = rebates::get_fee_rate_for_user(&env, &trader);
-        let fee_amount = trade_amount
-            .checked_mul(fee_rate as i128)
-            .and_then(|amount| amount.checked_div(10_000))
+        // Rounding strategy: fee charged to the user truncates (rounds DOWN).
+        // This is user-favorable: the user never pays more than their exact share.
+        // Any sub-unit remainder stays with the user, not the protocol.
+        // Consequence: at most (fee_rate / 10_000) units of dust per trade are
+        // foregone by the protocol — this is intentional and not withdrawable dust.
+        // See docs/security/fee_rounding_analysis.md for full analysis.
+        let fee_amount = fee_amount_floor(trade_amount, fee_rate)
             .ok_or(ContractError::ArithmeticOverflow)?;
 
         if fee_amount <= 0 {

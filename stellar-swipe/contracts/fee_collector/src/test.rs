@@ -764,3 +764,109 @@ fn test_collect_fee_zero_trade_amount_rejected() {
     let result = client.try_collect_fee(&trader, &token, &0, &asset);
     assert_eq!(result, Err(Ok(ContractError::InvalidAmount)));
 }
+
+// ---------------------------------------------------------------------------
+// Fee rounding tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fee_floor_exact_division_no_remainder() {
+    // 10_000 * 30 / 10_000 = 30 exactly
+    assert_eq!(crate::fee_amount_floor(10_000, 30), Some(30));
+}
+
+#[test]
+fn fee_floor_truncates_remainder() {
+    // 9_999 * 30 = 299_970 / 10_000 = 29 (remainder 9_970 discarded)
+    assert_eq!(crate::fee_amount_floor(9_999, 30), Some(29));
+}
+
+#[test]
+fn fee_floor_minimum_nonzero() {
+    // Smallest amount that yields fee >= 1 at rate 1 bps: 10_000
+    assert_eq!(crate::fee_amount_floor(10_000, 1), Some(1));
+    // One below: 9_999 * 1 / 10_000 = 0
+    assert_eq!(crate::fee_amount_floor(9_999, 1), Some(0));
+}
+
+#[test]
+fn fee_ceil_exact_division_same_as_floor() {
+    assert_eq!(crate::fee_amount_ceil(10_000, 30), Some(30));
+}
+
+#[test]
+fn fee_ceil_rounds_up_remainder() {
+    // 9_999 * 30 = 299_970; ceil(299_970 / 10_000) = 30
+    assert_eq!(crate::fee_amount_ceil(9_999, 30), Some(30));
+}
+
+#[test]
+fn fee_ceil_minimum_nonzero() {
+    // ceil(1 * 1 / 10_000) = ceil(0.0001) = 1
+    assert_eq!(crate::fee_amount_ceil(1, 1), Some(1));
+}
+
+#[test]
+fn fee_floor_and_ceil_differ_only_when_remainder_nonzero() {
+    for amount in [1i128, 333, 9_999, 10_001, 99_997] {
+        let floor = crate::fee_amount_floor(amount, 30).unwrap();
+        let ceil = crate::fee_amount_ceil(amount, 30).unwrap();
+        let remainder = (amount * 30) % 10_000;
+        if remainder == 0 {
+            assert_eq!(floor, ceil, "amount={amount}");
+        } else {
+            assert_eq!(ceil, floor + 1, "amount={amount}");
+        }
+    }
+}
+
+#[test]
+fn collect_fee_rounds_down_user_favorable() {
+    // trade_amount=9_999, rate=30 bps → floor=29, not 30
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 1);
+    client.set_oracle_contract(&oracle_id);
+
+    StellarAssetClient::new(&env, &token).mint(&trader, &9_999);
+    let fee = client.collect_fee(&trader, &token, &9_999, &asset);
+    assert_eq!(fee, 29); // floor, not 30
+}
+
+#[test]
+fn collect_fee_no_dust_in_contract() {
+    // Every collected fee is fully credited to treasury — no sub-unit dust remains.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 1);
+    client.set_oracle_contract(&oracle_id);
+
+    let trade_amount = 9_999i128;
+    StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
+    let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
+
+    // Treasury balance must equal exactly the fee collected — no hidden dust
+    assert_eq!(client.treasury_balance(&token), fee);
+}
