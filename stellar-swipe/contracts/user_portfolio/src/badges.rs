@@ -1,7 +1,7 @@
 //! Verifiable on-chain badges: milestones evaluated from `open_position` / `close_position`.
 
 use crate::storage::DataKey;
-use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Env, Vec};
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,10 +159,10 @@ fn try_grant(env: &Env, user: &Address, badge_type: BadgeType, metadata: Symbol)
 
 #[allow(deprecated)]
 fn emit_badge_awarded(env: &Env, user: &Address, badge_type: BadgeType) {
-    let topics = (
-        Symbol::new(env, "BadgeAwarded"),
-        user.clone(),
-        badge_type as u32,
-    );
-    env.events().publish(topics, ());
+    stellar_swipe_common::EvtBadgeAwarded {
+        user: user.clone(),
+        badge_type: badge_type as u32,
+        awarded_at: env.ledger().timestamp(),
+    }
+    .publish(env);
 }

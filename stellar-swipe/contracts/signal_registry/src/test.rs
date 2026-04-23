@@ -1117,3 +1117,37 @@ fn test_share_template_and_submit_from_another_provider() {
     assert_eq!(signal.asset_pair, String::from_str(&env, "BTC/USDC"));
     assert_eq!(signal.action, SignalAction::Sell);
 }
+
+// ---------------------------------------------------------------------------
+// Event format tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn event_signal_adopted_two_topic_format() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let adopter = Address::generate(&env);
+    client.initialize(&admin);
+
+    let signal_id = client.submit_signal(
+        &provider,
+        &100i128,
+        &(env.ledger().sequence() + 1000),
+        &1u32,
+    );
+    client.adopt_signal(&adopter, &signal_id);
+
+    let found = env.events().all().iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        let t0 = topics.get(0).and_then(|v| soroban_sdk::Symbol::try_from(v).ok());
+        let t1 = topics.get(1).and_then(|v| soroban_sdk::Symbol::try_from(v).ok());
+        t0.map(|s| s == soroban_sdk::Symbol::new(&env, "signal_registry")).unwrap_or(false)
+            && t1.map(|s| s == soroban_sdk::Symbol::new(&env, "signal_adopted")).unwrap_or(false)
+    });
+    assert!(found, "signal_adopted must use (signal_registry, signal_adopted) topics");
+}

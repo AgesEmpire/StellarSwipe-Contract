@@ -306,6 +306,27 @@ mod tests {
         assert_eq!(pnl.roi_bps, 1666);
     }
 
+    /// badge_awarded event uses (user_portfolio, badge_awarded) two-topic format.
+    #[test]
+    fn event_badge_awarded_two_topic_format() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        client.open_position(&user, &100, &1_000);
+        client.close_position(&user, &1, &10);
+
+        let events = env.events().all();
+        let found = events.iter().any(|e| {
+            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+            let t0 = topics.get(0).and_then(|v| soroban_sdk::Symbol::try_from(v).ok());
+            let t1 = topics.get(1).and_then(|v| soroban_sdk::Symbol::try_from(v).ok());
+            t0.map(|s| s == soroban_sdk::Symbol::new(&env, "user_portfolio")).unwrap_or(false)
+                && t1.map(|s| s == soroban_sdk::Symbol::new(&env, "badge_awarded")).unwrap_or(false)
+        });
+        assert!(found, "badge_awarded must use (user_portfolio, badge_awarded) topics");
+    }
+
     /// roi_basis_points: zero invested → roi_bps = 0 (no division-by-zero).
     #[test]
     fn get_pnl_zero_invested_no_div_by_zero() {

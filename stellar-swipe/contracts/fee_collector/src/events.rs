@@ -1,31 +1,6 @@
-use soroban_sdk::{contractevent, Address};
-
-#[contractevent]
-pub struct WithdrawalQueued {
-    pub recipient: Address,
-    pub token: Address,
-    pub amount: i128,
-    pub available_at: u64,
-}
-
-#[contractevent]
-pub struct FeeRateUpdated {
-    pub old_rate: u32,
-    pub new_rate: u32,
-    pub updated_by: Address,
-}
-
-#[contractevent]
-pub struct TreasuryWithdrawal {
-    pub recipient: Address,
-    pub token: Address,
-    pub amount: i128,
-    pub remaining_balance: i128,
-}
-
-#[contractevent]
-pub struct FeesClaimed {
-    pub provider: Address,
-    pub token: Address,
-    pub amount: i128,
-}
+// All fee_collector event structs are defined in the shared common crate.
+// Re-export them here for backward compatibility within this crate.
+pub use stellar_swipe_common::{
+    EvtFeeRateUpdated as FeeRateUpdated, EvtFeesClaimed as FeesClaimed,
+    EvtTreasuryWithdrawal as TreasuryWithdrawal, EvtWithdrawalQueued as WithdrawalQueued,
+};

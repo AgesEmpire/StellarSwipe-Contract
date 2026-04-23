@@ -3,6 +3,7 @@
 pub mod assets;
 pub mod constants;
 pub mod emergency;
+pub mod events;
 pub mod health;
  refactor/157-shared-constants
 
@@ -27,6 +28,7 @@ pub use constants::{
     STELLAR_AMOUNT_SCALE,
 };
 pub use emergency::PauseState;
+pub use events::*;
 pub use health::{health_uninitialized, placeholder_admin, HealthStatus};
 pub use oracle::{IOracleClient, MockOracleClient, OnChainOracleClient, OracleError, OraclePrice};
 pub use rate_limit::{

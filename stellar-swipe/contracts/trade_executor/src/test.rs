@@ -744,3 +744,21 @@ fn lock_cleared_after_successful_execution() {
     );
  main
 }
+
+/// trade_cancelled event uses (trade_executor, trade_cancelled) two-topic format.
+#[test]
+fn event_trade_cancelled_two_topic_format() {
+    let (env, exec_id, portfolio_id, user, token_a, token_b, _) = setup_cancel(1_100_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position(&user, &1u64);
+    exec.cancel_copy_trade(&user, &user, &1u64, &token_a, &token_b, &1_000_000, &900_000);
+
+    let found = env.events().all().iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        let t0 = topics.get(0).and_then(|v| soroban_sdk::Symbol::try_from(v).ok());
+        let t1 = topics.get(1).and_then(|v| soroban_sdk::Symbol::try_from(v).ok());
+        t0.map(|s| s == soroban_sdk::Symbol::new(&env, "trade_executor")).unwrap_or(false)
+            && t1.map(|s| s == soroban_sdk::Symbol::new(&env, "trade_cancelled")).unwrap_or(false)
+    });
+    assert!(found, "trade_cancelled must use (trade_executor, trade_cancelled) topics");
+}

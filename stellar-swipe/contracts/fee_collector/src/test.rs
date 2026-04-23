@@ -870,3 +870,52 @@ fn collect_fee_no_dust_in_contract() {
     // Treasury balance must equal exactly the fee collected — no hidden dust
     assert_eq!(client.treasury_balance(&token), fee);
 }
+
+// ---------------------------------------------------------------------------
+// Event format tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn event_fee_rate_updated_two_topic_format() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    client.set_fee_rate(&30u32);
+
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        let t0 = topics.get(0).and_then(|v| soroban_sdk::Symbol::try_from(v).ok());
+        let t1 = topics.get(1).and_then(|v| soroban_sdk::Symbol::try_from(v).ok());
+        t0.map(|s| s == soroban_sdk::Symbol::new(&env, "fee_collector")).unwrap_or(false)
+            && t1.map(|s| s == soroban_sdk::Symbol::new(&env, "fee_rate_updated")).unwrap_or(false)
+    });
+    assert!(found, "fee_rate_updated event must use (fee_collector, fee_rate_updated) topics");
+}
+
+#[test]
+fn event_fees_claimed_two_topic_format() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    client.claim_fees(&provider, &token);
+
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        let t0 = topics.get(0).and_then(|v| soroban_sdk::Symbol::try_from(v).ok());
+        let t1 = topics.get(1).and_then(|v| soroban_sdk::Symbol::try_from(v).ok());
+        t0.map(|s| s == soroban_sdk::Symbol::new(&env, "fee_collector")).unwrap_or(false)
+            && t1.map(|s| s == soroban_sdk::Symbol::new(&env, "fees_claimed")).unwrap_or(false)
+    });
+    assert!(found, "fees_claimed event must use (fee_collector, fees_claimed) topics");
+}

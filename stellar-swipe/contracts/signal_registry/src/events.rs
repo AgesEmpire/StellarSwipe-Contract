@@ -1,5 +1,45 @@
 use crate::types::Asset;
 use soroban_sdk::{contracttype, Address, Env, String, Symbol, Vec};
+use stellar_swipe_common::{
+    EvtReputationUpdated, EvtSignalAdopted, EvtSignalExpired, EvtTradeExecuted,
+};
+
+pub fn emit_signal_adopted(env: &Env, signal_id: u64, adopter: Address, new_count: u32) {
+    EvtSignalAdopted {
+        signal_id,
+        adopter,
+        new_count,
+    }
+    .publish(env);
+}
+
+pub fn emit_signal_expired(env: &Env, signal_id: u64, provider: Address, expired_at_ledger: u64) {
+    EvtSignalExpired {
+        signal_id,
+        provider,
+        expired_at_ledger,
+    }
+    .publish(env);
+}
+
+pub fn emit_trade_executed(env: &Env, signal_id: u64, executor: Address, roi: i128, volume: i128) {
+    EvtTradeExecuted {
+        signal_id,
+        executor,
+        roi,
+        volume,
+    }
+    .publish(env);
+}
+
+pub fn emit_reputation_updated(env: &Env, provider: Address, old_score: u32, new_score: u32) {
+    EvtReputationUpdated {
+        provider,
+        old_score,
+        new_score,
+    }
+    .publish(env);
+}
 
 pub fn emit_admin_transfer_proposed(
     env: &Env,
@@ -77,36 +117,6 @@ pub fn emit_fee_collected(
     );
     env.events()
         .publish(topics, (total_fee, platform_fee, provider_fee));
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct SignalAdoptedEvent {
-    pub signal_id: u64,
-    pub adopter: Address,
-    pub new_count: u32,
-}
-
-pub fn emit_signal_adopted(env: &Env, signal_id: u64, adopter: Address, new_count: u32) {
-    let topics = (Symbol::new(env, "signal_adopted"), signal_id);
-    env.events().publish(
-        topics,
-        SignalAdoptedEvent {
-            signal_id,
-            adopter,
-            new_count,
-        },
-    );
-}
-
-pub fn emit_signal_expired(env: &Env, signal_id: u64, provider: Address, expired_at_ledger: u64) {
-    let topics = (Symbol::new(env, "signal_expired"), provider, signal_id);
-    env.events().publish(topics, expired_at_ledger);
-}
-
-pub fn emit_trade_executed(env: &Env, signal_id: u64, executor: Address, roi: i128, volume: i128) {
-    let topics = (Symbol::new(env, "trade_executed"), signal_id, executor);
-    env.events().publish(topics, (roi, volume));
 }
 
 pub fn emit_signal_status_changed(
@@ -315,26 +325,6 @@ pub fn emit_guardian_set(env: &Env, guardian: Address) {
 pub fn emit_guardian_revoked(env: &Env, guardian: Address) {
     let topics = (Symbol::new(env, "guardian_revoked"), guardian);
     env.events().publish(topics, ());
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct ReputationUpdatedEvent {
-    pub provider: Address,
-    pub old_score: u32,
-    pub new_score: u32,
-}
-
-pub fn emit_reputation_updated(env: &Env, provider: Address, old_score: u32, new_score: u32) {
-    let topics = (Symbol::new(env, "reputation_updated"), provider.clone());
-    env.events().publish(
-        topics,
-        ReputationUpdatedEvent {
-            provider,
-            old_score,
-            new_score,
-        },
-    );
 }
 
 pub fn emit_admin_transfer_proposed(env: &Env, current_admin: Address, new_admin: Address, expires_at: u64) {
