@@ -4,18 +4,19 @@ mod errors;
 pub use errors::ContractError;
 
 mod events;
-pub use events::{FeeRateUpdated, FeesClaimed, TreasuryWithdrawal, WithdrawalQueued};
+pub use events::{FeeRateUpdated, FeesBurned, FeesClaimed, TreasuryWithdrawal, WithdrawalQueued};
 
 mod rebates;
 
 mod storage;
 pub use storage::{
-    get_admin, get_fee_rate, get_monthly_trade_volume, get_oracle_contract, get_pending_fees,
-    get_queued_withdrawal, get_treasury_balance, is_initialized, remove_monthly_trade_volume,
-    remove_queued_withdrawal, set_admin, set_fee_rate as set_fee_rate_storage, set_initialized,
+    get_admin, get_burn_rate, get_fee_rate, get_monthly_trade_volume, get_oracle_contract,
+    get_pending_fees, get_queued_withdrawal, get_treasury_balance, is_initialized,
+    remove_monthly_trade_volume, remove_queued_withdrawal, set_admin,
+    set_burn_rate as set_burn_rate_storage, set_fee_rate as set_fee_rate_storage, set_initialized,
     set_monthly_trade_volume, set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
     set_queued_withdrawal, set_treasury_balance, MonthlyTradeVolume, QueuedWithdrawal, StorageKey,
-    MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS,
+    MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS,
 };
 
 use soroban_sdk::{contract, contractimpl, token, Address, Env};
@@ -196,6 +197,29 @@ impl FeeCollector {
         Ok(())
     }
 
+    /// Returns the current burn rate in basis points (default: 1000 = 10%).
+    pub fn burn_rate(env: Env) -> Result<u32, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        Ok(get_burn_rate(&env))
+    }
+
+    /// Admin-only: set the percentage of collected fees to burn (in basis points).
+    /// Max is 10_000 (100%). Change takes effect on the next fee collection.
+    pub fn set_burn_rate(env: Env, new_rate_bps: u32) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        if new_rate_bps > MAX_BURN_RATE_BPS {
+            return Err(ContractError::BurnRateTooHigh);
+        }
+        set_burn_rate_storage(&env, new_rate_bps);
+        Ok(())
+    }
+
     pub fn collect_fee(
         env: Env,
         trader: Address,
@@ -228,8 +252,27 @@ impl FeeCollector {
             &fee_amount,
         );
 
+        // Burn slice
+        let burn_rate = get_burn_rate(&env);
+        let burn_amount = fee_amount
+            .checked_mul(burn_rate as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        let distributable = fee_amount
+            .checked_sub(burn_amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+
+        if burn_amount > 0 {
+            token::Client::new(&env, &token).burn(&env.current_contract_address(), &burn_amount);
+            FeesBurned {
+                amount: burn_amount,
+                token: token.clone(),
+            }
+            .publish(&env);
+        }
+
         let updated_treasury_balance = get_treasury_balance(&env, &token)
-            .checked_add(fee_amount)
+            .checked_add(distributable)
             .ok_or(ContractError::ArithmeticOverflow)?;
         set_treasury_balance(&env, &token, updated_treasury_balance);
 

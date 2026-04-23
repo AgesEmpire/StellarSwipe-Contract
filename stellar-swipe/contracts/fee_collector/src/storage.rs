@@ -3,6 +3,8 @@ use soroban_sdk::{contracttype, Address, Env};
 pub const MAX_FEE_RATE_BPS: u32 = 100; // 1%
 pub const MIN_FEE_RATE_BPS: u32 = 1; // 0.01%
 pub const DEFAULT_FEE_RATE_BPS: u32 = 30; // 0.3%
+pub const DEFAULT_BURN_RATE_BPS: u32 = 1_000; // 10%
+pub const MAX_BURN_RATE_BPS: u32 = 10_000; // 100%
 pub const LEDGERS_PER_MONTH_APPROX: u32 = 518_400; // ~30 days at ~5 seconds per ledger
 pub const SILVER_TIER_VOLUME_USD: i128 = 10_000 * 10_000_000; // $10k, 7 decimals
 pub const GOLD_TIER_VOLUME_USD: i128 = 50_000 * 10_000_000; // $50k, 7 decimals
@@ -17,6 +19,7 @@ pub enum StorageKey {
     TreasuryBalance(Address),              // persistent, per-token
     QueuedWithdrawal,                      // instance, single-slot
     FeeRate,                               // instance, current fee rate in bps
+    BurnRate,                              // instance, burn rate in bps
     ProviderPendingFees(Address, Address), // persistent, per (provider, token)
     MonthlyTradeVolume(Address),           // persistent, per user
 }
@@ -118,6 +121,19 @@ pub fn get_fee_rate(env: &Env) -> u32 {
 
 pub fn set_fee_rate(env: &Env, rate: u32) {
     env.storage().instance().set(&StorageKey::FeeRate, &rate);
+}
+
+// --- Burn Rate ---
+
+pub fn get_burn_rate(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::BurnRate)
+        .unwrap_or(DEFAULT_BURN_RATE_BPS)
+}
+
+pub fn set_burn_rate(env: &Env, rate: u32) {
+    env.storage().instance().set(&StorageKey::BurnRate, &rate);
 }
 
 // --- Provider Pending Fees ---

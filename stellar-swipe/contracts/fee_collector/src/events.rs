@@ -29,3 +29,9 @@ pub struct FeesClaimed {
     pub token: Address,
     pub amount: i128,
 }
+
+#[contractevent]
+pub struct FeesBurned {
+    pub amount: i128,
+    pub token: Address,
+}

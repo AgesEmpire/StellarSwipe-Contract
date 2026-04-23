@@ -12,6 +12,9 @@ use crate::{
     set_pending_fees, set_treasury_balance, ContractError, FeeCollector, FeeCollectorClient,
 };
 
+// Stellar burn address (all-zeros public key encoded as strkey)
+const _BURN_ADDRESS: &str = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
+
 #[contract]
 struct MockOracleContract;
 
@@ -448,7 +451,8 @@ fn test_collect_fee_tracks_volume_and_applies_rebate_tiers() {
 
     assert_eq!(
         client.treasury_balance(&token),
-        fee_one + fee_two + fee_three
+        // default burn_rate = 10%, so treasury receives 90% of each fee
+        (fee_one + fee_two + fee_three) * 9 / 10
     );
 }
 
@@ -605,6 +609,181 @@ fn test_claim_fees_unauthorized() {
         .try_claim_fees(&provider, &token_id);
 
     assert!(result.is_err(), "claim with wrong auth must fail");
+}
+
+// ---------------------------------------------------------------------------
+// burn_rate / set_burn_rate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_burn_rate_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    assert_eq!(client.burn_rate(), 1_000u32); // 10% default
+}
+
+#[test]
+fn test_set_burn_rate_configurable_by_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    client.set_burn_rate(&500u32); // 5%
+    assert_eq!(client.burn_rate(), 500u32);
+}
+
+#[test]
+fn test_set_burn_rate_too_high() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    let result = client.try_set_burn_rate(&10_001u32);
+    assert_eq!(result, Err(Ok(ContractError::BurnRateTooHigh)));
+}
+
+#[test]
+fn test_set_burn_rate_max_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    client.set_burn_rate(&10_000u32); // 100% — valid boundary
+    assert_eq!(client.burn_rate(), 10_000u32);
+}
+
+#[test]
+fn test_collect_fee_burn_amount_calculation() {
+    // fee_amount = 1_000_000 * 30 / 10_000 = 3_000
+    // burn = 3_000 * 1_000 / 10_000 = 300  (10%)
+    // treasury receives 2_700
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+    client.set_fee_rate(&30u32);
+    client.set_burn_rate(&1_000u32); // 10%
+
+    let trade_amount: i128 = 1_000_000;
+    StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
+
+    let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
+    assert_eq!(fee, 3_000); // total fee collected from trader
+
+    // treasury should hold fee minus burn: 3_000 - 300 = 2_700
+    assert_eq!(client.treasury_balance(&token), 2_700);
+}
+
+#[test]
+fn test_collect_fee_zero_burn_rate_full_treasury() {
+    // burn_rate = 0 → nothing burned, full fee goes to treasury
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+    client.set_fee_rate(&30u32);
+    client.set_burn_rate(&0u32);
+
+    let trade_amount: i128 = 1_000_000;
+    StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
+
+    let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
+    assert_eq!(fee, 3_000);
+    assert_eq!(client.treasury_balance(&token), 3_000); // nothing burned
+}
+
+#[test]
+fn test_collect_fee_full_burn_rate_zero_treasury() {
+    // burn_rate = 10_000 (100%) → all fee burned, treasury gets 0
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+    client.set_fee_rate(&30u32);
+    client.set_burn_rate(&10_000u32);
+
+    let trade_amount: i128 = 1_000_000;
+    StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
+
+    let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
+    assert_eq!(fee, 3_000);
+    assert_eq!(client.treasury_balance(&token), 0); // all burned
+}
+
+#[test]
+fn test_collect_fee_emits_fees_burned_event() {
+    use soroban_sdk::testutils::Events;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+    client.set_fee_rate(&30u32);
+    client.set_burn_rate(&1_000u32);
+
+    StellarAssetClient::new(&env, &token).mint(&trader, &1_000_000i128);
+    client.collect_fee(&trader, &token, &1_000_000i128, &asset);
+
+    let events = env.events().all();
+    assert!(!events.is_empty(), "FeesBurned event must be emitted");
 }
 
 // ---------------------------------------------------------------------------
