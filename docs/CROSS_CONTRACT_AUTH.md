@@ -1,4 +1,4 @@
-# Cross-Contract Call Graph — Auth Annotations
+ # Cross-Contract Call Graph — Auth Annotations
 
 All `invoke_contract` / `try_invoke_contract` calls across the five StellarSwipe contracts,
 with their auth requirements and verification status.
