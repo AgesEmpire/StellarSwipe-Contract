@@ -497,12 +497,58 @@ impl MockPortfolioWithPositions {
             .instance()
             .set(&PortfolioKey::LastClosed, &trade_id);
     }
+    /// Auth-propagation-safe entrypoint: executor passes itself as first arg.
+    pub fn close_position_by_executor(env: Env, _executor: Address, user: Address, trade_id: u64, _pnl: i128) {
+        env.storage()
+            .instance()
+            .remove(&PortfolioKey::Position(user, trade_id));
+        env.storage()
+            .instance()
+            .set(&PortfolioKey::LastClosed, &trade_id);
+    }
     pub fn last_closed(env: Env) -> Option<u64> {
         env.storage().instance().get(&PortfolioKey::LastClosed)
     }
     // Satisfy execute_copy_trade path (unused in cancel tests).
     pub fn get_open_position_count(_env: Env, _user: Address) -> u32 { 0 }
     pub fn record_copy_position(_env: Env, _user: Address) {}
+}
+
+// ── Auth propagation tests ────────────────────────────────────────────────────
+
+/// cancel_copy_trade: executor calls close_position_by_executor (not close_position).
+/// Verifies the position is closed without requiring user auth on the portfolio call.
+#[test]
+fn cancel_copy_trade_uses_executor_close_entrypoint() {
+    let (env, exec_id, portfolio_id, user, token_a, token_b, _) = setup_cancel(1_100_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+
+    MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position(&user, &42u64);
+    exec.cancel_copy_trade(&user, &user, &42u64, &token_a, &token_b, &1_000_000, &900_000);
+
+    assert_eq!(
+        MockPortfolioWithPositionsClient::new(&env, &portfolio_id).last_closed(),
+        Some(42u64)
+    );
+}
+
+/// cancel_copy_trade: attacker cannot close another user's position.
+#[test]
+fn cancel_copy_trade_attacker_cannot_close_other_user_position() {
+    let (env, exec_id, portfolio_id, user, token_a, token_b, _) = setup_cancel(1_000_000);
+    let attacker = Address::generate(&env);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+
+    MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position(&user, &1u64);
+
+    let err = env.as_contract(&exec_id, || {
+        TradeExecutorContract::cancel_copy_trade(
+            env.clone(), attacker.clone(), user.clone(), 1u64,
+            token_a.clone(), token_b.clone(), 1_000_000, 900_000,
+        )
+    });
+    assert_eq!(err, Err(ContractError::Unauthorized));
+    assert!(MockPortfolioWithPositionsClient::new(&env, &portfolio_id).has_position(&user, &1u64));
 }
 
 fn setup_cancel(

@@ -59,6 +59,19 @@ impl UserPortfolio {
         env.storage().instance().set(&DataKey::Oracle, &oracle);
     }
 
+    /// Admin-only: set the contract address permitted to call `close_position` on behalf
+    /// of a user (e.g. TradeExecutorContract for stop-loss / cancel flows).
+    pub fn set_authorized_executor(env: Env, executor: Address) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::AuthorizedExecutor, &executor);
+    }
+
+    pub fn get_authorized_executor(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::AuthorizedExecutor)
+    }
+
     /// Opens a position for `user` (caller must be `user`). `amount` is invested notional at entry.
     pub fn open_position(env: Env, user: Address, entry_price: i128, amount: i128) -> u64 {
         user.require_auth();
@@ -94,8 +107,36 @@ impl UserPortfolio {
     }
 
     /// Closes an open position and records realized P&L for that leg.
+    /// Caller must be `user` directly.
     pub fn close_position(env: Env, user: Address, position_id: u64, realized_pnl: i128) {
         user.require_auth();
+        Self::do_close_position(&env, &user, position_id, realized_pnl);
+    }
+
+    /// Closes an open position on behalf of `user`, called by the authorized executor contract
+    /// (e.g. TradeExecutorContract for stop-loss / cancel flows).
+    /// Requires the executor's own auth — the executor must have called `require_auth()` before
+    /// invoking this, which it satisfies as the transaction invoker.
+    pub fn close_position_by_executor(
+        env: Env,
+        executor: Address,
+        user: Address,
+        position_id: u64,
+        realized_pnl: i128,
+    ) {
+        executor.require_auth();
+        let stored_executor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuthorizedExecutor)
+            .expect("no authorized executor configured");
+        if executor != stored_executor {
+            panic!("caller is not the authorized executor");
+        }
+        Self::do_close_position(&env, &user, position_id, realized_pnl);
+    }
+
+    fn do_close_position(env: &Env, user: &Address, position_id: u64, realized_pnl: i128) {
         let key = DataKey::UserPositions(user.clone());
         let list: Vec<u64> = env
             .storage()
@@ -290,6 +331,71 @@ mod tests {
         let pnl = client.get_pnl(&user);
         // Either saturated or 0 — must not panic
         assert!(pnl.roi_bps >= 0 || pnl.roi_bps == i32::MIN);
+    }
+
+    /// close_position_by_executor: authorized executor can close without user auth.
+    #[test]
+    fn close_position_by_executor_authorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let executor = Address::generate(&env);
+        let oracle_id = env.register_contract(None, OracleMock);
+        OracleMockClient::new(&env, &oracle_id).set_price(&100_i128);
+        let portfolio_id = env.register_contract(None, UserPortfolio);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        client.initialize(&admin, &oracle_id);
+        client.set_authorized_executor(&executor);
+
+        let pos_id = client.open_position(&user, &100, &1_000);
+        // Executor closes the position — no user auth required
+        client.close_position_by_executor(&executor, &user, &pos_id, &50);
+
+        let pnl = client.get_pnl(&user);
+        assert_eq!(pnl.realized_pnl, 50);
+    }
+
+    /// close_position_by_executor: wrong executor address is rejected.
+    #[test]
+    #[should_panic]
+    fn close_position_by_executor_wrong_executor_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let executor = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let oracle_id = env.register_contract(None, OracleMock);
+        OracleMockClient::new(&env, &oracle_id).set_price(&100_i128);
+        let portfolio_id = env.register_contract(None, UserPortfolio);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        client.initialize(&admin, &oracle_id);
+        client.set_authorized_executor(&executor);
+
+        let pos_id = client.open_position(&user, &100, &1_000);
+        // Attacker tries to use close_position_by_executor — must panic
+        client.close_position_by_executor(&attacker, &user, &pos_id, &0);
+    }
+
+    /// close_position: user can still close their own position directly.
+    #[test]
+    fn close_position_direct_user_auth_still_works() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let oracle_id = env.register_contract(None, OracleMock);
+        OracleMockClient::new(&env, &oracle_id).set_price(&100_i128);
+        let portfolio_id = env.register_contract(None, UserPortfolio);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        client.initialize(&admin, &oracle_id);
+
+        let pos_id = client.open_position(&user, &100, &1_000);
+        client.close_position(&user, &pos_id, &-20);
+
+        let pnl = client.get_pnl(&user);
+        assert_eq!(pnl.realized_pnl, -20);
     }
 
     /// Oracle fails: partial result, unrealized None, total = realized only.

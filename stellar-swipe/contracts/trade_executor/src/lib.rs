@@ -428,8 +428,10 @@ main
 
         // Compute realized P&L and close position in UserPortfolio.
         let realized_pnl = exit_price - amount;
-        let close_sym = Symbol::new(&env, "close_position");
+        let close_sym = Symbol::new(&env, "close_position_by_executor");
+        let executor = env.current_contract_address();
         let mut close_args = Vec::<Val>::new(&env);
+        close_args.push_back(executor.clone().into_val(&env));
         close_args.push_back(user.clone().into_val(&env));
         close_args.push_back(trade_id.into_val(&env));
         close_args.push_back(realized_pnl.into_val(&env));

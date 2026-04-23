@@ -98,8 +98,13 @@ pub fn check_and_trigger_stop_loss(
 }
 
 fn close_position(env: &Env, portfolio: &Address, user: &Address, trade_id: u64) {
-    let close_sym = Symbol::new(env, "close_position");
+    // Use close_position_by_executor so the portfolio accepts this call without user auth.
+    // The TradeExecutor (current contract) must be registered as the authorized executor
+    // in the UserPortfolio via `set_authorized_executor`.
+    let close_sym = Symbol::new(env, "close_position_by_executor");
+    let executor = env.current_contract_address();
     let mut args = Vec::<Val>::new(env);
+    args.push_back(executor.clone().into_val(env));
     args.push_back(user.clone().into_val(env));
     args.push_back(trade_id.into_val(env));
     args.push_back(0i128.into_val(env));
@@ -141,9 +146,11 @@ pub fn check_and_trigger_stop_loss(
  feature/take-profit-trigger
         close_position(env, &portfolio, &user, trade_id);
 
-        // Close the position via UserPortfolio (realized_pnl = 0; portfolio computes it).
-        let close_sym = Symbol::new(env, "close_position");
+        // Close the position via UserPortfolio using the executor entrypoint.
+        let close_sym = Symbol::new(env, "close_position_by_executor");
+        let executor = env.current_contract_address();
         let mut args = Vec::<Val>::new(env);
+        args.push_back(executor.clone().into_val(env));
         args.push_back(user.clone().into_val(env));
         args.push_back(trade_id.into_val(env));
         args.push_back(0i128.into_val(env));
