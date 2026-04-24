@@ -616,6 +616,70 @@ mod tests {
         });
     }
 
+    // ── Issue #268: Flash Loan Attack Surface Tests ────────────────────────────
+
+    /// Flash loan pumps SDEX spot above stop-loss, but oracle price (below stop-loss)
+    /// still triggers the stop-loss. SDEX spot cannot suppress the trigger.
+    #[test]
+    fn test_oracle_price_triggers_stop_loss_despite_high_sdex_spot() {
+        let env = setup_env();
+        let user = test_user(&env);
+        let contract_addr = env.register(TestContract, ());
+
+        env.as_contract(&contract_addr, || {
+            let config = RiskConfig::default();
+            // Entry 100, stop-loss threshold = 85
+            update_position(&env, &user, 1, 1_000, 100);
+
+            // SDEX spot = 95 (above stop-loss) — flash loan pumped it
+            // Oracle TWAP = 80 (below stop-loss) — manipulation-resistant
+            let triggered = check_stop_loss(&env, &user, 1, 95, Some(80), &config);
+            assert!(triggered, "oracle price below stop-loss must trigger even if SDEX spot is high");
+        });
+    }
+
+    /// Flash loan dumps SDEX spot below stop-loss, but oracle price (above stop-loss)
+    /// prevents a false trigger. SDEX spot cannot force a premature stop-loss.
+    #[test]
+    fn test_oracle_price_prevents_false_stop_loss_from_sdex_dump() {
+        let env = setup_env();
+        let user = test_user(&env);
+        let contract_addr = env.register(TestContract, ());
+
+        env.as_contract(&contract_addr, || {
+            let config = RiskConfig::default();
+            // Entry 100, stop-loss threshold = 85
+            update_position(&env, &user, 1, 1_000, 100);
+
+            // SDEX spot = 70 (below stop-loss) — flash loan dumped it
+            // Oracle TWAP = 92 (above stop-loss) — manipulation-resistant
+            let triggered = check_stop_loss(&env, &user, 1, 70, Some(92), &config);
+            assert!(!triggered, "oracle price above stop-loss must not trigger even if SDEX spot is low");
+        });
+    }
+
+    /// When no oracle is configured, stop-loss falls back to signal price (not live SDEX spot).
+    #[test]
+    fn test_stop_loss_fallback_uses_signal_price_not_live_sdex() {
+        let env = setup_env();
+        let user = test_user(&env);
+        let contract_addr = env.register(TestContract, ());
+
+        env.as_contract(&contract_addr, || {
+            let config = RiskConfig::default();
+            update_position(&env, &user, 1, 1_000, 100);
+
+            // No oracle (None) — fallback to current_price (signal.price, not live SDEX)
+            // Signal price = 80 (below stop-loss at 85) → triggers
+            let triggered = check_stop_loss(&env, &user, 1, 80, None, &config);
+            assert!(triggered);
+
+            // Signal price = 90 (above stop-loss at 85) → no trigger
+            let not_triggered = check_stop_loss(&env, &user, 1, 90, None, &config);
+            assert!(!not_triggered);
+        });
+    }
+
     #[test]
     fn test_calculate_portfolio_value() {
         let env = setup_env();
