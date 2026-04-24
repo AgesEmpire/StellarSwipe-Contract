@@ -1,5 +1,6 @@
 use soroban_sdk::{Address, Env, Map};
 
+use crate::admin;
 use crate::errors::FeeError;
 use crate::events::emit_fee_collected;
 use crate::types::{Asset, FeeBreakdown, FeeStorageKey};
@@ -106,7 +107,8 @@ pub fn get_all_treasury_balances(env: &Env) -> Map<Asset, i128> {
 }
 
 /// Collect and distribute fee for a trade
-/// This is the main entry point for fee processing
+/// This is the main entry point for fee processing.
+/// Returns a zero-fee breakdown when fee collection is paused (Issue #189).
 pub fn collect_and_distribute_fee(
     env: &Env,
     trade_amount: i128,
@@ -114,6 +116,16 @@ pub fn collect_and_distribute_fee(
     provider: Address,
     platform_treasury: Address,
 ) -> Result<FeeBreakdown, FeeError> {
+    // Issue #189: skip fee collection when paused
+    if admin::is_fee_collection_paused(env) {
+        return Ok(FeeBreakdown {
+            total_fee: 0,
+            platform_fee: 0,
+            provider_fee: 0,
+            trade_amount_after_fee: trade_amount,
+        });
+    }
+
     // Validate provider address (should not be a contract for safety)
     if provider == platform_treasury {
         return Err(FeeError::InvalidProviderAddress);

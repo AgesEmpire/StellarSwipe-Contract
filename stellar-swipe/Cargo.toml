@@ -4,11 +4,21 @@ members = [
   "contracts/common",
   "contracts/signal_registry",
   "contracts/auto_trade",
+  "contracts/trade_executor",
+  "contracts/governance",
+  "contracts/oracle",
+  "contracts/stake_vault",
+  "contracts/shared",
+  "contracts/fee_collector",
+  "contracts/user_portfolio",
 ]
 
 [workspace.dependencies]
 soroban-sdk = "23"
 
+# Smaller WASM for Soroban deploys (lower upload cost + instruction footprint).
+# Build:  cargo build --workspace --target wasm32-unknown-unknown --release
+# Then:   ./scripts/build.sh   (runs `stellar contract optimize` on each *.wasm)
 [profile.release]
 opt-level = "z"
 overflow-checks = true

@@ -1,10 +1,10 @@
 use crate::types::{ProviderPerformance, Signal, SignalAction, SignalStatus, TradeExecution};
+use stellar_swipe_common::BASIS_POINTS_DENOMINATOR_I128;
 
 /// ROI calculation constants
-const BASIS_POINTS_100_PERCENT: i128 = 10000;
 const SUCCESS_THRESHOLD_BPS: i128 = 200; // 2% in basis points
 const FAILURE_THRESHOLD_BPS: i128 = -500; // -5% in basis points
-const MIN_ROI_BPS: i128 = -10000; // -100% cap
+const MIN_ROI_BPS: i128 = -BASIS_POINTS_DENOMINATOR_I128; // -100% cap
 
 /// Calculate ROI in basis points from entry and exit prices
 ///
@@ -31,7 +31,7 @@ pub fn calculate_roi(entry_price: i128, exit_price: i128, action: &SignalAction)
 
     // Calculate ROI: (price_diff / entry_price) * 10000
     let roi = price_diff
-        .checked_mul(BASIS_POINTS_100_PERCENT)
+        .checked_mul(BASIS_POINTS_DENOMINATOR_I128)
         .expect("ROI calculation overflow")
         .checked_div(entry_price)
         .expect("division by zero in ROI calculation");
@@ -55,6 +55,14 @@ pub fn update_signal_stats(signal: &mut Signal, trade: &TradeExecution) {
         .executions
         .checked_add(1)
         .expect("executions overflow");
+
+    // Increment successful validations if ROI > 0
+    if trade.roi > 0 {
+        signal.successful_executions = signal
+            .successful_executions
+            .checked_add(1)
+            .expect("successful executions overflow");
+    }
 
     // Add trade volume
     signal.total_volume = signal
@@ -176,7 +184,7 @@ pub fn update_provider_performance(
     // Recalculate success rate: (successful_signals / total_signals) * 10000
     if provider_stats.total_signals > 0 {
         provider_stats.success_rate = ((provider_stats.successful_signals as i128)
-            * BASIS_POINTS_100_PERCENT
+            * BASIS_POINTS_DENOMINATOR_I128
             / (provider_stats.total_signals as i128)) as u32;
     }
 
@@ -246,6 +254,16 @@ mod tests {
             executions: 0,
             total_volume: 0,
             total_roi: 0,
+            category: crate::categories::SignalCategory::SWING,
+            risk_level: crate::categories::RiskLevel::Medium,
+            is_collaborative: false,
+            tags: soroban_sdk::vec![&soroban_sdk::Env::default()],
+            successful_executions: 0,
+            submitted_at: 1000,
+            rationale_hash: soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "Test"),
+            confidence: 50,
+            adoption_count: 0,
+            ai_validation_score: None,
         };
 
         let status = evaluate_signal_status(&signal, 2001);
@@ -267,6 +285,16 @@ mod tests {
             executions: 0,
             total_volume: 0,
             total_roi: 0,
+            category: crate::categories::SignalCategory::SWING,
+            risk_level: crate::categories::RiskLevel::Medium,
+            is_collaborative: false,
+            tags: soroban_sdk::vec![&soroban_sdk::Env::default()],
+            successful_executions: 0,
+            submitted_at: 1000,
+            rationale_hash: soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "Test"),
+            confidence: 50,
+            adoption_count: 0,
+            ai_validation_score: None,
         };
 
         assert_eq!(get_signal_average_roi(&signal), 0);

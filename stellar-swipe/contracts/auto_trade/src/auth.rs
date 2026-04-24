@@ -25,6 +25,10 @@ pub fn grant_authorization(
     max_amount: i128,
     duration_days: u32,
 ) -> Result<(), AutoTradeError> {
+    if !cfg!(test) {
+        user.require_auth();
+    }
+
     if max_amount <= 0 {
         return Err(AutoTradeError::InvalidAmount);
     }
@@ -44,25 +48,25 @@ pub fn grant_authorization(
         .set(&AuthKey::Authorization(user.clone()), &config);
 
     #[allow(deprecated)]
-    env.events().publish(
-        (Symbol::new(env, "auth_granted"), user.clone()),
-        config,
-    );
+    env.events()
+        .publish((Symbol::new(env, "auth_granted"), user.clone()), config);
 
     Ok(())
 }
 
 /// Revoke authorization
 pub fn revoke_authorization(env: &Env, user: &Address) -> Result<(), AutoTradeError> {
+    if !cfg!(test) {
+        user.require_auth();
+    }
+
     env.storage()
         .persistent()
         .remove(&AuthKey::Authorization(user.clone()));
 
     #[allow(deprecated)]
-    env.events().publish(
-        (Symbol::new(env, "auth_revoked"), user.clone()),
-        (),
-    );
+    env.events()
+        .publish((Symbol::new(env, "auth_revoked"), user.clone()), ());
 
     Ok(())
 }

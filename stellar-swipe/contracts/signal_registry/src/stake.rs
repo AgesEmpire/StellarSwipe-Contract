@@ -110,6 +110,16 @@ pub fn can_submit_signal(
     Ok(())
 }
 
+/// Get stake information for a provider from instance storage.
+pub fn get_stake_info(env: &Env, provider: &Address) -> Option<StakeInfo> {
+    let map: Map<Address, StakeInfo> = env
+        .storage()
+        .instance()
+        .get(&crate::StorageKey::ProviderStakes)
+        .unwrap_or(Map::new(env));
+    map.get(provider.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
