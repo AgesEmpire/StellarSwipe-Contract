@@ -2,13 +2,21 @@
 #![allow(clippy::too_many_arguments)]
 
 mod committees;
+mod conviction_voting;
 mod distribution;
 mod errors;
+mod proposals;
+mod quadratic_voting;
+mod reputation;
+mod timelock;
 mod token;
 mod treasury;
+mod voting;
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_health;
 
 use committees::{
     list_committees as list_registered_committees, CommitteeAction, CommitteeElection,
@@ -20,6 +28,12 @@ pub use committees::{
     ParameterAdjustmentAuthority, PerformanceMetrics, RewardConfigUpdateAction,
     TreasurySpendAction, TreasurySpendAuthority, VetoAuthority, VetoPayload,
 };
+use conviction_voting::{
+    analyze_conviction_proposal, change_conviction_vote, create_conviction_pool,
+    create_conviction_proposal, execute_conviction_funding, get_conviction_growth_curve,
+    refill_conviction_pool, update_proposal_conviction, vote_conviction, withdraw_conviction_vote,
+    ConvictionAnalytics, ConvictionStatus, ConvictionVotingPool,
+};
 use distribution::{
     circulating_supply as calculate_circulating_supply, create_vesting_schedule as create_schedule,
     distribution_state as load_distribution_state, get_schedule, initialize_distribution,
@@ -27,14 +41,39 @@ use distribution::{
     DistributionRecipients, DistributionState, VestingCategory, VestingSchedule,
 };
 pub use errors::GovernanceError;
+pub use proposals::GovernanceConfig;
+use proposals::{
+    calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
+    default_governance_config, execute_proposal, finalize_proposal, get_all_proposals,
+    get_governance_config, get_proposal, Proposal, ProposalStatistics, ProposalStatus,
+    ProposalType, Vote, VoteDelegation, VoteType as GovernanceVoteType,
+};
+use reputation::{
+    calculate_reputation_score, cast_reputation_weighted_vote, distribute_reputation_rewards,
+    get_governance_reputation, get_reputation_leaderboard, record_proposal_creation,
+    record_proposal_outcome, record_vote, Badge, GovernanceReputation,
+};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, Map, String, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Map, String, Symbol,
+    Vec,
 };
 use stellar_swipe_common::Asset;
+use timelock::{
+    cancel_queued_action, emergency_execute, execute_multiple_actions, execute_queued_action,
+    extend_execution_window, generate_timelock_analytics, initialize_timelock, queue_action,
+    update_timelock_delay, ActionType, Timelock, TimelockAnalytics,
+};
 pub use token::{HolderAnalytics, HolderBalance, TokenMetadata};
 pub use treasury::{
     Budget, BudgetReport, RebalanceAction, RecurringPayment, Treasury, TreasuryReport,
     TreasurySpend,
+};
+use quadratic_voting::{
+    allocate_vote_credits, cast_quadratic_vote, compare_voting_systems, reallocate_quadratic_votes,
+    refund_credits_on_failure, verify_identity, get_vote_credits, get_quadratic_vote,
+    get_quadratic_voting_config, set_quadratic_voting_config, calculate_marginal_cost,
+    QuadraticVotingConfig, VoteCredits, QuadraticVote, VerificationMethod,
+    VotingComparison,
 };
 
 const DEFAULT_LIQUIDITY_REWARD_BPS: u32 = 100;
@@ -58,11 +97,44 @@ pub enum StorageKey {
     VoteLocks,
     Treasury,
     Committees,
+    GovernanceConfig,
+    ProposalsState,
+    Delegations,
+    TimelockState,
+    Guardian,
+    GovernanceParameters,
+    GovernanceFeatures,
+    GovernanceUpgrades,
+    ReputationState,
+    VoteRecords,
+    ConvictionState,
+    /// Global pause flag surfaced by `health_check` (admin-controlled).
+    ContractPaused,
 }
 
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl GovernanceContract {
+    /// # Summary
+    /// One-time governance contract initialization. Sets admin, token metadata,
+    /// initial token distribution, and all governance subsystem state.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `admin`: Address that will hold admin privileges (must authorize).
+    /// - `name`: Token name (e.g. `"StellarSwipe Gov"`).
+    /// - `symbol`: Token symbol (e.g. `"SSG"`).
+    /// - `decimals`: Token decimal places.
+    /// - `total_supply`: Total token supply (must be > 0).
+    /// - `recipients`: Addresses for each distribution category.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::AlreadyInitialized`] — contract already initialized.
+    /// - [`GovernanceError::InvalidSupply`] — total_supply <= 0.
+    /// - [`GovernanceError::InvalidMetadata`] — name or symbol is empty.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -122,6 +194,41 @@ impl GovernanceContract {
             &StorageKey::Committees,
             &committees::empty_committees_state(&env),
         );
+        env.storage()
+            .instance()
+            .set(&StorageKey::GovernanceConfig, &default_governance_config());
+        env.storage().instance().set(
+            &StorageKey::ProposalsState,
+            &proposals::empty_proposals_state(&env),
+        );
+        env.storage().instance().set(
+            &StorageKey::Delegations,
+            &proposals::empty_delegation_state(&env),
+        );
+        env.storage().instance().set(
+            &StorageKey::ReputationState,
+            &reputation::empty_reputation_state(&env),
+        );
+        env.storage().instance().set(
+            &StorageKey::ConvictionState,
+            &conviction_voting::empty_conviction_state(&env),
+        );
+        env.storage().instance().set(
+            &StorageKey::GovernanceParameters,
+            &Map::<String, i128>::new(&env),
+        );
+        env.storage().instance().set(
+            &StorageKey::GovernanceFeatures,
+            &Map::<String, bool>::new(&env),
+        );
+        env.storage().instance().set(
+            &StorageKey::GovernanceUpgrades,
+            &Map::<String, Bytes>::new(&env),
+        );
+        env.storage().instance().set(
+            &StorageKey::VoteRecords,
+            &Map::<(Address, u64), GovernanceVoteType>::new(&env),
+        );
 
         let distribution = initialize_distribution(
             &env,
@@ -134,6 +241,9 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .set(&StorageKey::Initialized, &true);
+        env.storage()
+            .instance()
+            .set(&StorageKey::ContractPaused, &false);
         track_holder(&env, &recipients.team);
         track_holder(&env, &recipients.early_investors);
         track_holder(&env, &recipients.community_rewards);
@@ -142,6 +252,39 @@ impl GovernanceContract {
 
         emit_initialized(&env, &admin, &name, &symbol, total_supply);
         emit_distribution_initialized(&env, &distribution);
+        Ok(())
+    }
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> stellar_swipe_common::HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        if !is_initialized(&env) {
+            return stellar_swipe_common::health_uninitialized(&env, version);
+        }
+        let admin = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| stellar_swipe_common::placeholder_admin(&env));
+        let is_paused = env
+            .storage()
+            .instance()
+            .get(&StorageKey::ContractPaused)
+            .unwrap_or(false);
+        stellar_swipe_common::HealthStatus {
+            is_initialized: true,
+            is_paused,
+            version,
+            admin,
+        }
+    }
+
+    /// Sets the global pause flag read by `health_check` (admin only).
+    pub fn set_contract_paused(env: Env, admin: Address, paused: bool) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::ContractPaused, &paused);
         Ok(())
     }
 
@@ -172,6 +315,387 @@ impl GovernanceContract {
     pub fn voting_power(env: Env, holder: Address) -> Result<i128, GovernanceError> {
         require_initialized(&env)?;
         Ok(get_staked_balance(&env, &holder))
+    }
+
+    pub fn governance_config(env: Env) -> Result<GovernanceConfig, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(get_governance_config(&env))
+    }
+
+    pub fn configure_governance(
+        env: Env,
+        admin: Address,
+        config: GovernanceConfig,
+    ) -> Result<GovernanceConfig, GovernanceError> {
+        require_initialized(&env)?;
+        proposals::configure_governance(&env, &admin, config)
+    }
+
+    /// # Summary
+    /// Create a new governance proposal. Proposer must have staked voting power
+    /// >= `min_proposal_threshold`.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `proposer`: Address creating the proposal (must authorize).
+    /// - `proposal_type`: Type and parameters of the proposal.
+    /// - `title`: Short human-readable title.
+    /// - `description`: Full proposal description.
+    /// - `execution_payload`: Arbitrary bytes attached to the proposal (e.g. migration notes hash).
+    ///
+    /// # Returns
+    /// The new proposal ID.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::NotInitialized`] — contract not initialized.
+    /// - [`GovernanceError::NoVotingPower`] — proposer has insufficient staked balance.
+    /// - [`GovernanceError::InvalidProposal`] — title/description empty or proposal validation failed.
+    /// - [`GovernanceError::BudgetExceeded`] — TreasurySpend amount exceeds 10% of treasury.
+    pub fn create_proposal(
+        env: Env,
+        proposer: Address,
+        proposal_type: ProposalType,
+        title: String,
+        description: String,
+        execution_payload: Bytes,
+    ) -> Result<u64, GovernanceError> {
+        require_initialized(&env)?;
+        let proposal_id = proposals::create_proposal(
+            &env,
+            proposer.clone(),
+            proposal_type,
+            title,
+            description,
+            execution_payload,
+        )?;
+        let _ = record_proposal_creation(&env, proposer);
+        Ok(proposal_id)
+    }
+
+    pub fn proposal(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
+        require_initialized(&env)?;
+        get_proposal(&env, proposal_id)
+    }
+
+    pub fn proposals(env: Env) -> Result<Vec<Proposal>, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(get_all_proposals(&env))
+    }
+
+    /// # Summary
+    /// Cast a vote on an active proposal. Voter must have staked voting power > 0.
+    /// Each address may vote only once per proposal.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `proposal_id`: ID of the proposal to vote on.
+    /// - `voter`: Address casting the vote (must authorize).
+    /// - `vote_type`: [`GovernanceVoteType::For`], [`GovernanceVoteType::Against`], or [`GovernanceVoteType::Abstain`].
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::NotInitialized`] — contract not initialized.
+    /// - [`GovernanceError::ProposalNotFound`] — proposal_id does not exist.
+    /// - [`GovernanceError::VotingNotStarted`] — voting period has not begun.
+    /// - [`GovernanceError::VotingEnded`] — voting period has closed.
+    /// - [`GovernanceError::AlreadyVoted`] — voter has already cast a vote.
+    /// - [`GovernanceError::NoVotingPower`] — voter has no staked balance.
+    pub fn cast_vote(
+        env: Env,
+        proposal_id: u64,
+        voter: Address,
+        vote_type: GovernanceVoteType,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        voting::cast_vote(&env, proposal_id, voter.clone(), vote_type.clone())?;
+        let _ = record_vote(&env, voter, proposal_id, vote_type);
+        Ok(())
+    }
+
+    pub fn finalize_proposal(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        let status = proposals::finalize_proposal(&env, proposal_id)?;
+        let _ = record_proposal_outcome(&env, proposal_id);
+        Ok(status)
+    }
+
+    pub fn execute_proposal(
+        env: Env,
+        proposal_id: u64,
+        executor: Address,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        proposals::execute_proposal(&env, proposal_id, executor)
+    }
+
+    pub fn cancel_proposal(
+        env: Env,
+        proposal_id: u64,
+        canceller: Address,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        proposals::cancel_proposal(&env, proposal_id, canceller)
+    }
+
+    pub fn proposal_statistics(env: Env) -> Result<ProposalStatistics, GovernanceError> {
+        require_initialized(&env)?;
+        calculate_proposal_statistics(&env)
+    }
+
+    pub fn delegate_voting_power(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        voting::delegate_voting_power(&env, delegator, delegate)
+    }
+
+    pub fn undelegate_voting_power(env: Env, delegator: Address) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        voting::undelegate_voting_power(&env, delegator)
+    }
+
+    pub fn effective_voting_power(env: Env, user: Address) -> Result<i128, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(voting::get_effective_voting_power(&env, user))
+    }
+
+    pub fn initialize_timelock(
+        env: Env,
+        admin: Address,
+        min_delay: u64,
+        max_delay: u64,
+        guardian: Address,
+    ) -> Result<Timelock, GovernanceError> {
+        require_admin(&env, &admin)?;
+        initialize_timelock(&env, min_delay, max_delay, guardian)
+    }
+
+    pub fn queue_action(env: Env, proposal_id: u64) -> Result<u64, GovernanceError> {
+        require_initialized(&env)?;
+        timelock::queue_action(&env, proposal_id)
+    }
+
+    pub fn execute_queued_action(
+        env: Env,
+        action_id: u64,
+        executor: Address,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        timelock::execute_queued_action(&env, action_id, executor)
+    }
+
+    pub fn cancel_queued_action(
+        env: Env,
+        action_id: u64,
+        canceller: Address,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        timelock::cancel_queued_action(&env, action_id, canceller)
+    }
+
+    pub fn update_timelock_delay(
+        env: Env,
+        admin: Address,
+        action_type: ActionType,
+        new_delay: u64,
+    ) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        timelock::update_timelock_delay(&env, action_type, new_delay)
+    }
+
+    pub fn emergency_execute(
+        env: Env,
+        action_id: u64,
+        guardian: Address,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        timelock::emergency_execute(&env, action_id, guardian)
+    }
+
+    pub fn timelock_analytics(env: Env) -> Result<TimelockAnalytics, GovernanceError> {
+        require_initialized(&env)?;
+        timelock::generate_timelock_analytics(&env)
+    }
+
+    pub fn extend_execution_window(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        extension_seconds: u64,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        timelock::extend_execution_window(&env, action_id, extension_seconds)
+    }
+
+    pub fn execute_multiple_actions(
+        env: Env,
+        action_ids: Vec<u64>,
+        executor: Address,
+    ) -> Result<Vec<u64>, GovernanceError> {
+        require_initialized(&env)?;
+        timelock::execute_multiple_actions(&env, action_ids, executor)
+    }
+
+    pub fn governance_reputation(
+        env: Env,
+        user: Address,
+    ) -> Result<GovernanceReputation, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(get_governance_reputation(&env, user))
+    }
+
+    pub fn calculate_reputation_score(env: Env, user: Address) -> Result<u32, GovernanceError> {
+        require_initialized(&env)?;
+        reputation::calculate_reputation_score(&env, user)
+    }
+
+    pub fn cast_reputation_weighted_vote(
+        env: Env,
+        proposal_id: u64,
+        voter: Address,
+        vote_type: GovernanceVoteType,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        reputation::cast_reputation_weighted_vote(&env, proposal_id, voter, vote_type)
+    }
+
+    pub fn reputation_leaderboard(
+        env: Env,
+        limit: u32,
+    ) -> Result<Vec<(Address, u32)>, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(get_reputation_leaderboard(&env, limit))
+    }
+
+    pub fn distribute_reputation_rewards(
+        env: Env,
+        admin: Address,
+        reward_pool: i128,
+    ) -> Result<Vec<(Address, i128)>, GovernanceError> {
+        require_admin(&env, &admin)?;
+        reputation::distribute_reputation_rewards(&env, reward_pool)
+    }
+
+    pub fn create_conviction_pool(
+        env: Env,
+        admin: Address,
+        funding_amount: i128,
+        refill_rate: i128,
+        refill_period: u64,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        conviction_voting::create_conviction_pool(&env, funding_amount, refill_rate, refill_period)
+    }
+
+    pub fn conviction_pool(
+        env: Env,
+        pool_id: u64,
+    ) -> Result<ConvictionVotingPool, GovernanceError> {
+        require_initialized(&env)?;
+        conviction_voting::get_conviction_state(&env)
+            .pools
+            .get(pool_id)
+            .ok_or(GovernanceError::ConvictionPoolNotFound)
+    }
+
+    pub fn create_conviction_proposal(
+        env: Env,
+        pool_id: u64,
+        proposer: Address,
+        title: String,
+        requested_amount: i128,
+        beneficiary: Address,
+    ) -> Result<u64, GovernanceError> {
+        require_initialized(&env)?;
+        conviction_voting::create_conviction_proposal(
+            &env,
+            pool_id,
+            proposer,
+            title,
+            requested_amount,
+            beneficiary,
+        )
+    }
+
+    pub fn vote_conviction(
+        env: Env,
+        pool_id: u64,
+        proposal_id: u64,
+        voter: Address,
+        tokens_to_commit: i128,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        conviction_voting::vote_conviction(&env, pool_id, proposal_id, voter, tokens_to_commit)
+    }
+
+    pub fn update_proposal_conviction(
+        env: Env,
+        pool_id: u64,
+        proposal_id: u64,
+    ) -> Result<i128, GovernanceError> {
+        require_initialized(&env)?;
+        conviction_voting::update_proposal_conviction(&env, pool_id, proposal_id)
+    }
+
+    pub fn execute_conviction_funding(
+        env: Env,
+        pool_id: u64,
+        proposal_id: u64,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        conviction_voting::execute_conviction_funding(&env, pool_id, proposal_id)
+    }
+
+    pub fn change_conviction_vote(
+        env: Env,
+        pool_id: u64,
+        from_proposal: u64,
+        to_proposal: u64,
+        voter: Address,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        conviction_voting::change_conviction_vote(&env, pool_id, from_proposal, to_proposal, voter)
+    }
+
+    pub fn refill_conviction_pool(env: Env, pool_id: u64) -> Result<i128, GovernanceError> {
+        require_initialized(&env)?;
+        conviction_voting::refill_conviction_pool(&env, pool_id)
+    }
+
+    pub fn withdraw_conviction_vote(
+        env: Env,
+        pool_id: u64,
+        proposal_id: u64,
+        voter: Address,
+    ) -> Result<i128, GovernanceError> {
+        require_initialized(&env)?;
+        conviction_voting::withdraw_conviction_vote(&env, pool_id, proposal_id, voter)
+    }
+
+    pub fn analyze_conviction_proposal(
+        env: Env,
+        pool_id: u64,
+        proposal_id: u64,
+    ) -> Result<ConvictionAnalytics, GovernanceError> {
+        require_initialized(&env)?;
+        conviction_voting::analyze_conviction_proposal(&env, pool_id, proposal_id)
+    }
+
+    pub fn conviction_growth_curve(
+        env: Env,
+        pool_id: u64,
+        proposal_id: u64,
+        days: u32,
+    ) -> Result<Vec<(u64, i128)>, GovernanceError> {
+        require_initialized(&env)?;
+        conviction_voting::get_conviction_growth_curve(&env, pool_id, proposal_id, days)
     }
 
     pub fn distribution(env: Env) -> Result<DistributionState, GovernanceError> {
@@ -1087,17 +1611,24 @@ fn emit_vesting_created(
 
 #[allow(deprecated)]
 fn emit_vesting_released(env: &Env, beneficiary: &Address, amount: i128) {
-    env.events().publish(
-        (symbol_short!("gov"), symbol_short!("vestrel")),
-        (beneficiary.clone(), amount),
+    shared::events::emit_vesting_released(
+        env,
+        shared::events::EvtVestingReleased {
+            beneficiary: beneficiary.clone(),
+            amount,
+        },
     );
 }
 
 #[allow(deprecated)]
 fn emit_stake_changed(env: &Env, holder: &Address, amount: i128, is_stake: bool) {
-    env.events().publish(
-        (symbol_short!("gov"), symbol_short!("stake")),
-        (holder.clone(), amount, is_stake),
+    shared::events::emit_stake_changed(
+        env,
+        shared::events::EvtStakeChanged {
+            holder: holder.clone(),
+            amount,
+            is_stake,
+        },
     );
 }
 
@@ -1111,9 +1642,12 @@ fn emit_reward_accrued(env: &Env, beneficiary: &Address, volume: i128, reward: i
 
 #[allow(deprecated)]
 fn emit_reward_claimed(env: &Env, beneficiary: &Address, amount: i128) {
-    env.events().publish(
-        (symbol_short!("gov"), symbol_short!("claim")),
-        (beneficiary.clone(), amount),
+    shared::events::emit_reward_claimed(
+        env,
+        shared::events::EvtRewardClaimed {
+            beneficiary: beneficiary.clone(),
+            amount,
+        },
     );
 }
 

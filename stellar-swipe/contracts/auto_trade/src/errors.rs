@@ -2,7 +2,6 @@ use soroban_sdk::contracterror;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
 pub enum AutoTradeError {
     InvalidAmount = 1,
     Unauthorized = 2,
@@ -16,15 +15,9 @@ pub enum AutoTradeError {
     TradingPaused = 10,
     StrategyNotFound = 11,
     PositionAlreadyExists = 12,
-<<<<<<< Updated upstream
     RankingDisabled = 13,
     InvalidBasketSize = 14,
     InsufficientPriceHistory = 15,
-=======
-    InsufficientPriceHistory = 13,
-    RankingDisabled = 14,
-    InvalidBasketSize = 15,
->>>>>>> Stashed changes
     InvalidPriceData = 16,
     NonCointegratedBasket = 17,
     ActivePortfolioExists = 18,
@@ -32,10 +25,49 @@ pub enum AutoTradeError {
     NoTradeSignal = 20,
     InvalidStatArbConfig = 21,
     ExitStrategyNotFound = 22,
-<<<<<<< Updated upstream
     InvalidExitConfig = 23,
     InsuranceNotConfigured = 24,
     InvalidInsuranceConfig = 25,
-=======
->>>>>>> Stashed changes
+    SelfReferral = 26,
+    ReferralAlreadySet = 27,
+    CircularReferral = 28,
+    ReferralLimitExceeded = 29,
+    InvalidTWAPDuration = 30,
+    TWAPOrderNotFound = 31,
+    NotTWAPOwner = 32,
+    TWAPNotActive = 33,
+    CorrelationLimitExceeded = 34,
+    TooManyCorrelatedPositions = 35,
+    ConditionalOrderNotFound = 36,
+    ConditionalOrderNotPending = 37,
+    ConditionalOrderNotTriggered = 38,
+    InvalidConditionalConfig = 39,
+    RateLimitPenalty = 40,
+    BelowMinTransfer = 41,
+    CooldownNotElapsed = 42,
+    HourlyTransferLimitExceeded = 43,
+    HourlyVolumeLimitExceeded = 44,
+    DailyTransferLimitExceeded = 45,
+    DailyVolumeLimitExceeded = 46,
+    GlobalCapacityExceeded = 47,
+    PairsStrategyNotFound = 48,
+    PairsActivePositionExists = 49,
+    PairsNoActivePosition = 50,
+    InsufficientCorrelation = 51,
+    PairNotCointegrated = 52,
+    InvalidPairsConfig = 53,
+    ArbitrageOpportunityExpired = 54,
+    ArbitrageUnprofitable = 55,
+    ArbTooLarge = 56,
+    FrontRunningRisk = 57,
+    OracleUnavailable = 58,
+    LastOracleForPair = 59,
+    DcaStrategyNotFound = 60,
+    DcaStrategyInactive = 61,
+    DcaEndTimeReached = 62,
+    MrStrategyNotFound = 63,
+    MrInsufficientHistory = 64,
+    MrLowVolatility = 65,
+    PendingAdminNotFound = 66,
+    PendingAdminExpired = 67,
 }

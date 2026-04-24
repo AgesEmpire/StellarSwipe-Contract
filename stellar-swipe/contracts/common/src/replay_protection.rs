@@ -11,7 +11,7 @@
 
 #![allow(dead_code)]
 
-use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env};
+use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env, Symbol};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -106,8 +106,9 @@ pub fn verify_and_commit(
 // ── Event ─────────────────────────────────────────────────────────────────────
 
 fn emit_replay(env: &Env, user: &Address, tx_hash: &Bytes, reason: soroban_sdk::Symbol) {
-    let topics = (symbol_short!("replay"), user.clone(), reason);
-    env.events().publish(topics, tx_hash.clone());
+    let topics = (Symbol::new(env, "replay_detected"),);
+    env.events()
+        .publish(topics, (user.clone(), reason, tx_hash.clone()));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

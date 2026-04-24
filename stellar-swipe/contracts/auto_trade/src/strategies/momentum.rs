@@ -99,8 +99,8 @@ fn calculate_rate_of_change(prices: &Vec<i128>, period_days: u32) -> Result<i128
         return Err(AutoTradeError::InsufficientPriceHistory);
     }
 
-    let current_price = prices.last().copied().unwrap_or(0);
-    let old_price = prices.first().copied().unwrap_or(1);
+    let current_price = prices.last().unwrap_or(0);
+    let old_price = prices.first().unwrap_or(1);
 
     if old_price == 0 {
         return Err(AutoTradeError::InsufficientPriceHistory);
@@ -116,7 +116,7 @@ fn calculate_rate_of_change(prices: &Vec<i128>, period_days: u32) -> Result<i128
 /// Returns value in 0-10000 range (0-100%)
 fn calculate_rsi_from_prices(prices: &Vec<i128>, period: u32) -> Result<u32, AutoTradeError> {
     let period_len = period as usize;
-    if prices.len() < period_len + 1 {
+    if prices.len() < (period_len as u32) + 1 {
         return Err(AutoTradeError::InsufficientPriceHistory);
     }
 
@@ -124,11 +124,11 @@ fn calculate_rsi_from_prices(prices: &Vec<i128>, period: u32) -> Result<u32, Aut
     let mut losses = 0i128;
 
     // Calculate average gains and losses over period
-    for i in (prices.len() - period_len)..prices.len() {
+    for i in (prices.len() - period_len as u32)..prices.len() {
         if i == 0 {
             continue;
         }
-        let change = prices[i] - prices[i - 1];
+        let change = prices.get(i).unwrap() - prices.get(i - 1).unwrap();
         if change > 0 {
             gains += change;
         } else {
@@ -166,13 +166,13 @@ fn calculate_macd_from_prices(
 
     // Calculate 12-period average
     for i in (prices.len() - 12)..prices.len() {
-        sum_12 += prices[i];
+        sum_12 += prices.get(i).unwrap();
     }
     let avg_12 = sum_12 / 12;
 
     // Calculate 26-period average
     for i in (prices.len() - 26)..prices.len() {
-        sum_26 += prices[i];
+        sum_26 += prices.get(i).unwrap();
     }
     let avg_26 = sum_26 / 26;
 
@@ -197,7 +197,7 @@ fn calculate_trend_strength(prices: &Vec<i128>) -> Result<u32, AutoTradeError> {
     // Count how many of the last 20 prices are higher than previous
     for i in 1..lookback {
         let idx = prices.len() - i;
-        if idx > 0 && prices[idx] > prices[idx - 1] {
+        if idx > 0 && prices.get(idx).unwrap() > prices.get(idx - 1).unwrap() {
             increasing_count += 1;
         }
     }
@@ -476,12 +476,10 @@ pub fn rank_assets_by_momentum(
 ) -> Result<Vec<(AssetPair, i128)>, AutoTradeError> {
     let mut ranked = Vec::new(env);
 
-    let keys = strategy.asset_pairs.keys();
-    for i in 0..keys.len() {
-        if let Some(idx) = keys.get(i) {
-            if let Some(asset_pair) = strategy.asset_pairs.get(idx) {
-                if let Some(prices) = prices_map.get(asset_pair.base) {
-                    let indicators = calculate_momentum_indicators(env, &prices, strategy.momentum_period_days)?;
+    for i in 0..strategy.asset_pairs.len() {
+        if let Some(asset_pair) = strategy.asset_pairs.get(i) {
+            if let Some(prices) = prices_map.get(asset_pair.base) {
+                let indicators = calculate_momentum_indicators(env, &prices, strategy.momentum_period_days)?;
 
                     // Composite score: ROC + trend strength component
                     let score = indicators.rate_of_change
@@ -491,7 +489,6 @@ pub fn rank_assets_by_momentum(
                 }
             }
         }
-    }
 
     // Sort by score descending (bubble sort for Soroban compatibility)
     let len = ranked.len();
@@ -530,7 +527,7 @@ pub fn rebalance_by_momentum_rank(
 
     // Collect top N assets
     let mut top_assets = Vec::new(env);
-    for i in 0..top_n.min(ranked_assets.len()) {
+    for i in 0..(top_n.min(ranked_assets.len() as usize)) {
         if let Some((pair, _)) = ranked_assets.get(i as u32) {
             top_assets.push_back(pair);
         }

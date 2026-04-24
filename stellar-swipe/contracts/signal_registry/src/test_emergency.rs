@@ -34,7 +34,7 @@ fn test_granular_pause() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &Vec::new(&env),
         &RiskLevel::Medium,
     );
@@ -51,7 +51,7 @@ fn test_granular_pause() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &Vec::new(&env),
         &RiskLevel::Medium,
     );
@@ -88,7 +88,7 @@ fn test_pause_all_blocks_everything() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &Vec::new(&env),
         &RiskLevel::Medium,
     );
@@ -126,7 +126,7 @@ fn test_circuit_breaker_trigger() {
         &100_000,
         &String::from_str(&env, "Test"),
         &(env.ledger().timestamp() + 3600),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &Vec::new(&env),
         &RiskLevel::Medium,
     );
@@ -138,4 +138,117 @@ fn test_circuit_breaker_trigger() {
     
     // For now, let's just test that the logic works if called.
     // In my implementation, I didn't yet call update_circuit_breaker_stats in SignalRegistry::record_trade_execution correctly for failures.
+}
+
+// ── Guardian role tests ───────────────────────────────────────────────────────
+
+#[test]
+fn test_guardian_can_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    client.initialize(&admin);
+    client.set_guardian(&admin, &guardian);
+
+    // Guardian can pause
+    client.pause_category(
+        &guardian,
+        &String::from_str(&env, CAT_SIGNALS),
+        &None,
+        &String::from_str(&env, "Guardian emergency"),
+    );
+
+    let states = client.get_pause_states();
+    assert!(states.contains_key(String::from_str(&env, CAT_SIGNALS)));
+}
+
+#[test]
+fn test_guardian_cannot_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    client.initialize(&admin);
+    client.set_guardian(&admin, &guardian);
+
+    // Admin pauses first
+    client.pause_category(
+        &admin,
+        &String::from_str(&env, CAT_SIGNALS),
+        &None,
+        &String::from_str(&env, "Admin pause"),
+    );
+
+    // Guardian tries to unpause — must fail
+    let result = client.try_unpause_category(
+        &guardian,
+        &String::from_str(&env, CAT_SIGNALS),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_admin_can_unpause_after_guardian_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    client.initialize(&admin);
+    client.set_guardian(&admin, &guardian);
+
+    client.pause_category(
+        &guardian,
+        &String::from_str(&env, CAT_SIGNALS),
+        &None,
+        &String::from_str(&env, "Guardian emergency"),
+    );
+
+    // Admin can unpause
+    client.unpause_category(&admin, &String::from_str(&env, CAT_SIGNALS));
+
+    let states = client.get_pause_states();
+    assert!(!states.contains_key(String::from_str(&env, CAT_SIGNALS)));
+}
+
+#[test]
+fn test_admin_set_and_revoke_guardian() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    client.initialize(&admin);
+
+    // Set guardian
+    client.set_guardian(&admin, &guardian);
+    assert_eq!(client.get_guardian(), Some(guardian.clone()));
+
+    // Revoke guardian
+    client.revoke_guardian(&admin);
+    assert_eq!(client.get_guardian(), None);
+
+    // After revocation, former guardian cannot pause
+    let result = client.try_pause_category(
+        &guardian,
+        &String::from_str(&env, CAT_SIGNALS),
+        &None,
+        &String::from_str(&env, "Should fail"),
+    );
+    assert!(result.is_err());
 }

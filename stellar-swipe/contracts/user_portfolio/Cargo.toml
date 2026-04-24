@@ -1,0 +1,17 @@
+[package]
+name = "user_portfolio"
+version = "0.1.0"
+description = "Stellar Swipe user portfolio — positions and P&L queries"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+stellar_swipe_common = { path = "../common" }
+shared = { path = "../shared" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

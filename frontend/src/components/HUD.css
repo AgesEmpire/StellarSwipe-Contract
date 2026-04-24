@@ -46,6 +46,19 @@
 .income-widget .stat-value { color: #60a5fa; }
 .boost-widget .stat-value { color: #f59e0b; }
 
+.cash-widget .stat-value {
+  color: #4ade80;
+}
+
+.income-widget .stat-value {
+  color: #60a5fa;
+}
+
+.boost-widget .stat-value {
+  color: #f59e0b;
+}
+
+/* Mobile responsive */
 @media (max-width: 768px) {
   .hud {
     position: fixed;
@@ -108,3 +121,29 @@
 
 .hud-retry-btn:hover:not(:disabled) { background: rgba(99, 102, 241, 1); }
 .hud-retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  
+  .stat-widget {
+    flex: 1;
+    min-width: auto;
+    padding: 0.5rem 0.25rem;
+  }
+  
+  .stat-label {
+    font-size: 0.625rem;
+  }
+  
+  .stat-value {
+    font-size: 0.875rem;
+  }
+}
+
+/* Empty/zero states */
+.stat-widget.empty .stat-value {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.stat-widget.empty .stat-value::after {
+  content: " (empty)";
+  font-size: 0.75rem;
+  opacity: 0.7;
+}

@@ -28,8 +28,14 @@ pub fn set_signal(env: &Env, id: u64, signal: &Signal) {
     env.storage().persistent().set(&DataKey::Signal(id), signal);
 }
 
-<<<<<<< Updated upstream
-=======
+/// Test helper: auth plus max temporary SDEX balance.
+pub fn authorize_user(env: &Env, user: &Address) {
+    authorize_user_with_limits(env, user, i128::MAX / 4, 30);
+    env.storage()
+        .temporary()
+        .set(&(user.clone(), symbol_short!("balance")), &i128::MAX);
+}
+
 /// Authorize a user with default limits (test helper).
 #[cfg(test)]
 pub fn authorize_user(env: &Env, user: &Address) {
@@ -45,7 +51,6 @@ pub fn authorize_user(env: &Env, user: &Address) {
 }
 
 /// Authorize a user with explicit limits.
->>>>>>> Stashed changes
 pub fn authorize_user_with_limits(
     env: &Env,
     user: &Address,
@@ -61,18 +66,18 @@ pub fn authorize_user_with_limits(
     env.storage()
         .persistent()
         .set(&AuthKey::Authorization(user.clone()), &config);
+    env.storage()
+        .temporary()
+        .set(&(user.clone(), symbol_short!("balance")), &i128::MAX);
 }
 
 pub fn revoke_user_authorization(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&AuthKey::Authorization(user.clone()));
-<<<<<<< Updated upstream
 }
 
 #[cfg(test)]
 pub fn authorize_user(env: &Env, user: &Address) {
     authorize_user_with_limits(env, user, 1_000_000_000_000, 30);
-=======
->>>>>>> Stashed changes
 }

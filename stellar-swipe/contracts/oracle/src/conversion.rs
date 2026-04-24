@@ -2,10 +2,9 @@
 
 use crate::errors::OracleError;
 use crate::storage::{get_base_currency, get_price};
-use common::{Asset, AssetPair};
 use soroban_sdk::{contracttype, vec, Env, Map, Vec};
+use stellar_swipe_common::{Asset, AssetPair, STELLAR_AMOUNT_SCALE};
 
-const PRECISION: i128 = 10_000_000; // 7 decimals for Stellar
 const MAX_PATH_LENGTH: u32 = 3;
 
 #[contracttype]
@@ -42,7 +41,7 @@ fn convert_direct(env: &Env, amount: i128, from: &Asset, to: &Asset) -> Result<i
 
     Ok(amount
         .checked_mul(price)
-        .and_then(|v| v.checked_div(PRECISION))
+        .and_then(|v| v.checked_div(STELLAR_AMOUNT_SCALE))
         .ok_or(OracleError::ConversionOverflow)?)
 }
 
@@ -89,9 +88,10 @@ fn find_conversion_path(
         let current = path.last().ok_or(OracleError::InvalidPath)?;
 
         if current == *to {
+            let total_hops = path.len().saturating_sub(1);
             return Ok(ConversionPath {
                 assets: path,
-                total_hops: path.len() - 1,
+                total_hops,
             });
         }
 
@@ -133,7 +133,7 @@ fn get_available_pairs(env: &Env) -> Vec<AssetPair> {
 mod tests {
     use super::*;
     use crate::storage::{set_base_currency, set_price};
-    use soroban_sdk::{testutils::Address as _, String};
+    use soroban_sdk::{testutils::Address as _, Address, String};
 
     fn xlm(env: &Env) -> Asset {
         Asset {
@@ -172,7 +172,7 @@ mod tests {
             base: usdc.clone(),
             quote: xlm.clone(),
         };
-        set_price(&env, &pair, 10 * PRECISION);
+        set_price(&env, &pair, 10 * STELLAR_AMOUNT_SCALE);
 
         // Convert 100 USDC to XLM
         let result = convert_to_base(&env, 100_0000000, usdc).unwrap();

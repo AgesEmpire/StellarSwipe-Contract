@@ -1,11 +1,11 @@
 use soroban_sdk::{Address, Env, Map};
+use stellar_swipe_common::{BASIS_POINTS_DENOMINATOR_I128, SECONDS_PER_WEEK};
 
 use crate::types::{OracleReputation, StorageKey};
 
 const ACCURACY_THRESHOLD_TIGHT: i128 = 100; // 1% in basis points
 const ACCURACY_THRESHOLD_MODERATE: i128 = 500; // 5% in basis points
 const MAJOR_DEVIATION_THRESHOLD: i128 = 2000; // 20% in basis points
-const WEEK_IN_SECONDS: u64 = 86400 * 7;
 
 pub fn get_oracle_stats(env: &Env, oracle: &Address) -> OracleReputation {
     let stats_map: Map<Address, OracleReputation> = env
@@ -52,7 +52,7 @@ pub fn calculate_reputation(env: &Env, oracle: &Address) -> u32 {
     let deviation_score = 30_i128.saturating_sub(deviation_penalty);
 
     // 10% based on consistency (no recent slashes)
-    let consistency_score = if env.ledger().timestamp() - stats.last_slash > WEEK_IN_SECONDS {
+    let consistency_score = if env.ledger().timestamp() - stats.last_slash > SECONDS_PER_WEEK {
         10
     } else {
         0
@@ -92,7 +92,8 @@ pub fn track_oracle_accuracy(
     stats.total_submissions += 1;
 
     // Calculate deviation in basis points
-    let deviation = ((submitted_price - consensus_price).abs() * 10000) / consensus_price;
+    let deviation = ((submitted_price - consensus_price).abs() * BASIS_POINTS_DENOMINATOR_I128)
+        / consensus_price;
 
     // Update average deviation
     let total_dev = stats.avg_deviation * (stats.total_submissions - 1) as i128;

@@ -23,6 +23,18 @@ pub enum AdminError {
     ScheduleNotFound = 19,
     NotScheduleOwner = 20,
     CircuitBreakerTriggered = 21,
+    PendingAdminNotFound = 22,
+    PendingAdminExpired = 23,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum AiScoreError {
+    Unauthorized = 600,
+    OracleNotConfigured = 601,
+    InvalidScore = 602,
+    SignalNotFound = 603,
 }
 
 #[contracterror]
@@ -163,4 +175,27 @@ pub enum CrossChainError {
     AddressNotRegistered = 1004,
     InvalidSyncStatus = 1005,
     NotSignalOwner = 1006,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum SignalEditError {
+    EditWindowClosed = 1100,
+    FieldNotEditable = 1101,
+    SignalAlreadyCopied = 1102,
+    SignalNotFound = 1103,
+    NotSignalOwner = 1104,
+    InvalidConfidence = 1105,
+    TradingPaused = 1106,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum SignalOutcomeError {
+    Unauthorized = 1150,
+    SignalNotFound = 1151,
+    SignalNotClosed = 1152,
+    OutcomeAlreadyRecorded = 1153,
 }

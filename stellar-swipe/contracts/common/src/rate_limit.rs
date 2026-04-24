@@ -11,12 +11,11 @@
 
 #![allow(dead_code)]
 
+use crate::constants::{SECONDS_PER_DAY, SECONDS_PER_HOUR};
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const SECONDS_PER_HOUR: u64 = 3_600;
-const SECONDS_PER_DAY: u64 = 86_400;
 const ESTABLISHED_DAYS: u64 = 30;
 const ESTABLISHED_TRUST_SCORE: u32 = 60;
 const MAX_STORED_TIMESTAMPS: u32 = 100;
@@ -53,10 +52,22 @@ pub enum RateLimitKey {
 
 pub fn default_config(action: &ActionType) -> RateLimitConfig {
     match action {
-        ActionType::SignalSubmission => RateLimitConfig { window_secs: SECONDS_PER_HOUR, max_actions: 10 },
-        ActionType::TradeExecution   => RateLimitConfig { window_secs: SECONDS_PER_HOUR, max_actions: 20 },
-        ActionType::StakeChange      => RateLimitConfig { window_secs: SECONDS_PER_DAY,  max_actions: 5  },
-        ActionType::FollowAction     => RateLimitConfig { window_secs: SECONDS_PER_DAY,  max_actions: 50 },
+        ActionType::SignalSubmission => RateLimitConfig {
+            window_secs: SECONDS_PER_HOUR,
+            max_actions: 10,
+        },
+        ActionType::TradeExecution => RateLimitConfig {
+            window_secs: SECONDS_PER_HOUR,
+            max_actions: 20,
+        },
+        ActionType::StakeChange => RateLimitConfig {
+            window_secs: SECONDS_PER_DAY,
+            max_actions: 5,
+        },
+        ActionType::FollowAction => RateLimitConfig {
+            window_secs: SECONDS_PER_DAY,
+            max_actions: 50,
+        },
     }
 }
 
@@ -123,7 +134,12 @@ fn effective_max(config: &RateLimitConfig, first_action: u64, now: u64, trust_sc
 /// Check whether `user` may perform `action`.
 /// Returns `Err(())` when the rate limit is exceeded and emits a `rate_limit_hit` event.
 /// `trust_score`: caller should pass the user's current trust score (0-100).
-pub fn check_rate_limit(env: &Env, user: &Address, action: ActionType, trust_score: u32) -> Result<(), ()> {
+pub fn check_rate_limit(
+    env: &Env,
+    user: &Address,
+    action: ActionType,
+    trust_score: u32,
+) -> Result<(), ()> {
     let now = env.ledger().timestamp();
     let config = get_config(env, &action);
     let first_action = get_first_action(env, user);
@@ -133,7 +149,7 @@ pub fn check_rate_limit(env: &Env, user: &Address, action: ActionType, trust_sco
     let timestamps = get_timestamps(env, user, &action);
     let recent_count = timestamps
         .iter()
-        .filter(|t| now.saturating_sub(t) < config.window_secs)
+        .filter(|t| now.saturating_sub(*t) < config.window_secs)
         .count() as u32;
 
     if recent_count >= max {
@@ -180,12 +196,13 @@ pub fn record_action(env: &Env, user: &Address, action: ActionType) {
 fn emit_rate_limit_hit(env: &Env, user: Address, action: ActionType, count: u32, limit: u32) {
     let action_sym: Symbol = match action {
         ActionType::SignalSubmission => symbol_short!("sig_sub"),
-        ActionType::TradeExecution   => symbol_short!("trade"),
-        ActionType::StakeChange      => symbol_short!("stake"),
-        ActionType::FollowAction     => symbol_short!("follow"),
+        ActionType::TradeExecution => symbol_short!("trade"),
+        ActionType::StakeChange => symbol_short!("stake"),
+        ActionType::FollowAction => symbol_short!("follow"),
     };
-    let topics = (Symbol::new(env, "rate_limit_hit"), user, action_sym);
-    env.events().publish(topics, (count, limit));
+    let topics = (Symbol::new(env, "rate_limit_hit"),);
+    env.events()
+        .publish(topics, (user, action_sym, count, limit));
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -193,7 +210,10 @@ fn emit_rate_limit_hit(env: &Env, user: Address, action: ActionType, count: u32,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Env,
+    };
 
     fn setup() -> (Env, Address) {
         let env = Env::default();
@@ -221,7 +241,8 @@ mod tests {
             record_action(&env, &user, ActionType::SignalSubmission);
         }
         // Advance time past the 1-hour window
-        env.ledger().set_timestamp(env.ledger().timestamp() + SECONDS_PER_HOUR + 1);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + SECONDS_PER_HOUR + 1);
         // Should succeed again
         assert!(check_rate_limit(&env, &user, ActionType::SignalSubmission, 0).is_ok());
     }
@@ -278,10 +299,14 @@ mod tests {
     fn test_admin_config_update_applies_immediately() {
         let (env, user) = setup();
         // Lower the limit to 3
-        set_config(&env, ActionType::SignalSubmission, RateLimitConfig {
-            window_secs: SECONDS_PER_HOUR,
-            max_actions: 3,
-        });
+        set_config(
+            &env,
+            ActionType::SignalSubmission,
+            RateLimitConfig {
+                window_secs: SECONDS_PER_HOUR,
+                max_actions: 3,
+            },
+        );
         for _ in 0..3 {
             assert!(check_rate_limit(&env, &user, ActionType::SignalSubmission, 0).is_ok());
             record_action(&env, &user, ActionType::SignalSubmission);

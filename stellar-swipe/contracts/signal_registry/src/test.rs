@@ -3,8 +3,14 @@
 extern crate std;
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env, vec, String};
-use crate::categories::{SignalCategory, RiskLevel};
+use crate::categories::{RiskLevel, SignalCategory};
+use crate::errors::AdminError;
+use crate::migration::test_seed_v1_signals;
+use soroban_sdk::{
+    testutils::Address as _,
+    testutils::Ledger,
+    vec, Env, Map, String,
+};
 
 #[test]
 fn test_initialize_and_admin() {
@@ -61,7 +67,7 @@ fn create_and_read_signal() {
         &100_000,
         &String::from_str(&env, "Breakout confirmed"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -93,7 +99,7 @@ fn test_invalid_asset_pair_rejected() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -106,7 +112,7 @@ fn test_invalid_asset_pair_rejected() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -119,7 +125,7 @@ fn test_invalid_asset_pair_rejected() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -151,7 +157,7 @@ fn test_custom_asset_pair_with_issuer() {
         &100_000,
         &String::from_str(&env, "Full format"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -186,7 +192,7 @@ fn test_pause_blocks_signals() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -205,7 +211,7 @@ fn test_pause_blocks_signals() {
         &100_000,
         &String::from_str(&env, "Test"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -290,12 +296,12 @@ fn test_unauthorized_admin_actions() {
 
     // Attacker tries to transfer admin
     let new_admin = Address::generate(&env);
-    let result = client.try_transfer_admin(&attacker, &new_admin);
+    let result = client.try_propose_admin_transfer(&attacker, &new_admin);
     assert!(result.is_err());
 }
 
 #[test]
-fn test_transfer_admin() {
+fn test_two_step_admin_transfer_flow() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -307,7 +313,14 @@ fn test_transfer_admin() {
     let admin2 = Address::generate(&env);
 
     client.initialize(&admin1);
-    client.transfer_admin(&admin1, &admin2);
+    client.propose_admin_transfer(&admin1, &admin2);
+
+    // Old admin remains active until the pending admin accepts.
+    client.pause_trading(&admin1);
+    assert!(client.is_paused());
+    client.unpause_trading(&admin1);
+
+    client.accept_admin_transfer(&admin2);
 
     let current_admin = client.get_admin();
     assert_eq!(current_admin, admin2);
@@ -319,6 +332,72 @@ fn test_transfer_admin() {
     // New admin should work
     client.pause_trading(&admin2);
     assert!(client.is_paused());
+}
+
+#[test]
+fn test_admin_transfer_expires() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let pending_admin = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.propose_admin_transfer(&admin, &pending_admin);
+
+    use soroban_sdk::testutils::Ledger;
+    env.ledger()
+        .with_mut(|ledger| ledger.sequence_number += 34_560 + 1);
+
+    let result = client.try_accept_admin_transfer(&pending_admin);
+    assert_eq!(result, Err(Ok(AdminError::PendingAdminExpired)));
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_admin_transfer_can_be_cancelled() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let pending_admin = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.propose_admin_transfer(&admin, &pending_admin);
+    client.cancel_admin_transfer(&admin);
+
+    let result = client.try_accept_admin_transfer(&pending_admin);
+    assert_eq!(result, Err(Ok(AdminError::PendingAdminNotFound)));
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_only_pending_admin_can_accept_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let pending_admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.propose_admin_transfer(&admin, &pending_admin);
+
+    let result = client.try_accept_admin_transfer(&attacker);
+    assert_eq!(result, Err(Ok(AdminError::Unauthorized)));
+    assert_eq!(client.get_admin(), admin);
 }
 
 #[test]
@@ -434,7 +513,7 @@ fn provider_stats_initialized() {
         &200_000,
         &String::from_str(&env, "Resistance hit"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -558,7 +637,7 @@ fn test_get_active_signals_excludes_expired() {
             &100_000,
             &String::from_str(&env, "Active"),
             &(current_time + 10000),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -573,7 +652,7 @@ fn test_get_active_signals_excludes_expired() {
             &200_000,
             &String::from_str(&env, "Expired"),
             &(current_time + 10),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -584,7 +663,7 @@ fn test_get_active_signals_excludes_expired() {
 
     // Get active signals - should only return 3 (followed_only = false)
     let any_user = Address::generate(&env);
-    let active = client.get_active_signals(&any_user, &false);
+    let active = client.get_active_signals_archived(&any_user, &false);
     assert_eq!(active.len(), 3);
 
     // All returned signals should be active
@@ -622,7 +701,7 @@ fn test_cleanup_batch_limit() {
             &100_000,
             &String::from_str(&env, "Test"),
             &(current_time + 10),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -671,7 +750,7 @@ fn test_pending_expiry_count() {
             &100_000,
             &String::from_str(&env, "Test"),
             &(current_time + 10),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -824,7 +903,7 @@ fn test_feed_filtered_by_followed() {
         &100_000,
         &String::from_str(&env, "A1"),
         &(current_time + 10000),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "A")],
         &RiskLevel::Medium,
     );
@@ -835,7 +914,7 @@ fn test_feed_filtered_by_followed() {
         &100_000,
         &String::from_str(&env, "B1"),
         &(current_time + 10000),
-        &SignalCategory::DayTrade,
+        &SignalCategory::SCALP,
         &vec![&env, String::from_str(&env, "B")],
         &RiskLevel::High,
     );
@@ -844,11 +923,11 @@ fn test_feed_filtered_by_followed() {
     client.follow_provider(&user, &provider_a);
 
     // All signals (followed_only = false)
-    let all_active = client.get_active_signals(&user, &false);
+    let all_active = client.get_active_signals_archived(&user, &false);
     assert_eq!(all_active.len(), 2);
 
     // Filtered feed (followed_only = true) - only provider_a
-    let followed_active = client.get_active_signals(&user, &true);
+    let followed_active = client.get_active_signals_archived(&user, &true);
     assert_eq!(followed_active.len(), 1);
     assert_eq!(followed_active.get(0).unwrap().provider, provider_a);
 }
@@ -1042,4 +1121,52 @@ fn test_share_template_and_submit_from_another_provider() {
     assert_eq!(signal.provider, other_provider);
     assert_eq!(signal.asset_pair, String::from_str(&env, "BTC/USDC"));
     assert_eq!(signal.action, SignalAction::Sell);
+}
+
+/// Hundred v1 records, ten batches of ten; all readable as v2; extra admin runs are no-ops (idempotent).
+#[test]
+fn migration_v1_to_v2_batches() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    env.as_contract(&contract_id, || {
+        test_seed_v1_signals(&env, 100);
+    });
+
+    for _ in 0..10 {
+        client.migrate_signals_v1_to_v2(&admin, &10u32);
+    }
+
+    for sid in 1u64..=100u64 {
+        let s = client.get_signal(&sid).expect("migrated v2");
+        assert_eq!(s.id, sid);
+        assert_eq!(s.confidence, 50u32);
+        assert_eq!(s.adoption_count, 0u32);
+        assert_eq!(s.submitted_at, 1_000u64);
+    }
+
+    env.as_contract(&contract_id, || {
+        let m: Map<u64, crate::types::SignalV1> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SignalsV1)
+            .unwrap_or(Map::new(&env));
+        assert_eq!(m.len(), 0u32);
+    });
+
+    for _ in 0..2 {
+        client.migrate_signals_v1_to_v2(&admin, &10u32);
+    }
+    for sid in 1u64..=100u64 {
+        let s = client.get_signal(&sid).expect("still v2");
+        assert_eq!(s.id, sid);
+    }
 }

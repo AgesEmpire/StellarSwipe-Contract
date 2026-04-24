@@ -42,7 +42,44 @@ pub enum SignalAction {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// TradeSignal struct for storing trading signals with category tags for filtering.
+/// Category: SCALP (ultra-short), SWING (short-term), LONG_TERM (position), ARBITRAGE (inefficiencies).
 pub struct Signal {
+    pub id: u64,
+    pub provider: Address,
+    pub asset_pair: String,
+    pub action: SignalAction,
+    pub price: i128,
+    pub rationale: String,
+    pub timestamp: u64,
+    pub expiry: u64,
+    pub status: SignalStatus,
+    pub executions: u32,
+    pub successful_executions: u32,
+    pub total_volume: i128,
+    pub total_roi: i128,
+    /// Required SignalCategory tag: SCALP, SWING, LONG_TERM, ARBITRAGE for feed filtering.
+    pub category: SignalCategory,
+    pub tags: Vec<String>,
+    pub risk_level: RiskLevel,
+    pub is_collaborative: bool,
+    /// Ledger time when the signal was submitted (edit window anchor; Issue #168).
+    pub submitted_at: u64,
+    /// Editable fingerprint of rationale (Issue #168).
+    pub rationale_hash: String,
+    /// Provider confidence 0-100.
+    pub confidence: u32,
+    /// Number of unique adoptions/trades copying this signal
+    pub adoption_count: u32,
+    /// Optional xAI (or other) off-chain validation score, 0–100; set only by the configured AI oracle.
+    pub ai_validation_score: Option<u32>,
+}
+
+/// Legacy on-chain format (v1) before v2 added `submitted_at`, `rationale_hash`,
+/// `confidence`, and `adoption_count`. Used only for admin migration to [`Signal`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalV1 {
     pub id: u64,
     pub provider: Address,
     pub asset_pair: String,
@@ -61,6 +98,38 @@ pub struct Signal {
     pub risk_level: RiskLevel,
     pub is_collaborative: bool,
 }
+
+/// Emitted each time `migrate_signals_v1_to_v2` processes a batch.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationProgress {
+    /// How many v1 records were written to v2 in this batch.
+    pub migrated_count: u32,
+    /// Total v1 records that existed at the start of migration (constant across batches).
+    pub total_count: u32,
+}
+
+/// Outcome reported by TradeExecutor when a signal is closed (Issue #170).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignalOutcome {
+    Profit,
+    Loss,
+    Neutral,
+}
+
+/// Partial update payload for `update_signal` (Issue #168). Only flags that are true are applied.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SignalEditInput {
+    pub set_price: bool,
+    pub price: i128,
+    pub set_rationale_hash: bool,
+    pub rationale_hash: String,
+    pub set_confidence: bool,
+    pub confidence: u32,
+}
+
 
 #[contracttype]
 #[derive(Clone, Debug, Default)]

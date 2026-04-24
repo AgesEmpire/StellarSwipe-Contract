@@ -37,7 +37,7 @@ fn test_create_collaborative_signal() {
         &1000000,
         &String::from_str(&env, "Bullish signal"),
         &(env.ledger().timestamp() + 86400),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &Vec::new(&env),
         &RiskLevel::Medium,
     );
@@ -76,7 +76,7 @@ fn test_approve_collaborative_signal() {
         &1000000,
         &String::from_str(&env, "Bullish signal"),
         &(env.ledger().timestamp() + 86400),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &Vec::new(&env),
         &RiskLevel::Medium,
     );
@@ -118,7 +118,7 @@ fn test_invalid_contribution_percentages() {
         &1000000,
         &String::from_str(&env, "Bullish signal"),
         &(env.ledger().timestamp() + 86400),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &Vec::new(&env),
         &RiskLevel::Medium,
     );

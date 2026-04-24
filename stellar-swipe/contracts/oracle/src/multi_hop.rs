@@ -1,7 +1,7 @@
 use crate::errors::OracleError;
 use crate::sdex;
 use crate::storage;
-use common::{Asset, AssetPair};
+use stellar_swipe_common::{Asset, AssetPair};
 use soroban_sdk::{vec, Env, Map, Vec};
 
 const PRECISION: i128 = 10_000_000;

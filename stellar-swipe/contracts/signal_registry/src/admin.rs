@@ -1,5 +1,8 @@
-use soroban_sdk::{contracttype, Address, Env, Vec, Map, String};
-use stellar_swipe_common::emergency::{PauseState, CAT_ALL, CAT_SIGNALS, CAT_TRADING, CAT_STAKES, CircuitBreakerStats, CircuitBreakerConfig};
+use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
+use stellar_swipe_common::emergency::{
+    CircuitBreakerConfig, CircuitBreakerStats, PauseState, CAT_ALL, CAT_SIGNALS, CAT_STAKES,
+    CAT_TRADING,
+};
 
 use crate::errors::AdminError;
 use crate::events::*;
@@ -7,6 +10,8 @@ use crate::events::*;
 // Constants
 pub const MAX_FEE_BPS: u32 = 100; // 1% max fee
 pub const MAX_RISK_PERCENTAGE: u32 = 100; // 100% max
+/// Wall-clock admin transfer validity (matches admin transfer tests).
+const ADMIN_TRANSFER_EXPIRY_SECS: u64 = 48 * 60 * 60;
 
 // Default values
 pub const DEFAULT_MIN_STAKE: i128 = 100_000_000; // 100 XLM (7 decimals)
@@ -18,6 +23,8 @@ pub const DEFAULT_POSITION_LIMIT: u32 = 20; // 20%
 #[derive(Clone)]
 pub enum AdminStorageKey {
     Admin,
+    PendingAdminTransfer,
+    Guardian,
     MinStake,
     TradeFee,
     StopLoss,
@@ -28,6 +35,17 @@ pub enum AdminStorageKey {
     MultiSigEnabled,
     MultiSigSigners,
     MultiSigThreshold,
+    FeeCollectionPaused,
+    PendingAdmin,
+    PendingAdminExpiry,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminTransfer {
+    pub pending_admin: Address,
+    /// Unix timestamp (seconds) after which the proposal cannot be accepted.
+    pub expires_at: u64,
 }
 
 #[contracttype]
@@ -98,6 +116,41 @@ pub fn get_admin(env: &Env) -> Result<Address, AdminError> {
         .ok_or(AdminError::NotInitialized)
 }
 
+/// Set guardian address (admin only)
+pub fn set_guardian(env: &Env, caller: &Address, guardian: Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::Guardian, &guardian);
+    emit_guardian_set(env, guardian);
+    Ok(())
+}
+
+/// Revoke guardian (admin only)
+pub fn revoke_guardian(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+    let guardian: Address = env
+        .storage()
+        .instance()
+        .get(&AdminStorageKey::Guardian)
+        .ok_or(AdminError::NotInitialized)?;
+    env.storage().instance().remove(&AdminStorageKey::Guardian);
+    emit_guardian_revoked(env, guardian);
+    Ok(())
+}
+
+/// Get current guardian, if any
+pub fn get_guardian(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&AdminStorageKey::Guardian)
+}
+
+/// Check if caller is the guardian
+fn is_guardian(env: &Env, caller: &Address) -> bool {
+    get_guardian(env).map(|g| &g == caller).unwrap_or(false)
+}
+
 /// Verify caller is admin
 pub fn require_admin(env: &Env, caller: &Address) -> Result<(), AdminError> {
     let admin = get_admin(env)?;
@@ -117,17 +170,76 @@ pub fn require_admin(env: &Env, caller: &Address) -> Result<(), AdminError> {
     }
 }
 
-/// Transfer admin to new address
-pub fn transfer_admin(env: &Env, caller: &Address, new_admin: Address) -> Result<(), AdminError> {
+fn get_pending_admin_transfer(env: &Env) -> Option<PendingAdminTransfer> {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::PendingAdminTransfer)
+}
+
+fn require_active_pending_admin_transfer(env: &Env) -> Result<PendingAdminTransfer, AdminError> {
+    let pending = get_pending_admin_transfer(env).ok_or(AdminError::PendingAdminNotFound)?;
+    if env.ledger().sequence() > pending.expires_at_ledger {
+        env.storage()
+            .instance()
+            .remove(&AdminStorageKey::PendingAdminTransfer);
+        return Err(AdminError::PendingAdminExpired);
+    }
+    Ok(pending)
+}
+
+pub fn propose_admin_transfer(
+    env: &Env,
+    caller: &Address,
+    new_admin: Address,
+) -> Result<(), AdminError> {
     require_admin(env, caller)?;
     caller.require_auth();
+
+    let expires_at = env
+        .ledger()
+        .timestamp()
+        .saturating_add(ADMIN_TRANSFER_EXPIRY_SECS);
+    let pending = PendingAdminTransfer {
+        pending_admin: new_admin.clone(),
+        expires_at,
+    };
+
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::PendingAdminTransfer, &pending);
+
+    emit_admin_transfer_proposed(env, caller.clone(), new_admin, expires_at_ledger as u64);
+    Ok(())
+}
+
+pub fn accept_admin_transfer(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    caller.require_auth();
+
+    let pending = require_active_pending_admin_transfer(env)?;
+    if caller != &pending.pending_admin {
+        return Err(AdminError::Unauthorized);
+    }
 
     let old_admin = get_admin(env)?;
     env.storage()
         .instance()
-        .set(&AdminStorageKey::Admin, &new_admin);
+        .set(&AdminStorageKey::Admin, caller);
+    env.storage()
+        .instance()
+        .remove(&AdminStorageKey::PendingAdminTransfer);
 
-    emit_admin_transferred(env, old_admin, new_admin);
+    emit_admin_transfer_completed(env, old_admin.clone(), caller.clone());
+    emit_admin_transferred(env, old_admin, caller.clone());
+    Ok(())
+}
+
+pub fn cancel_admin_transfer(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+    require_active_pending_admin_transfer(env)?;
+    env.storage()
+        .instance()
+        .remove(&AdminStorageKey::PendingAdminTransfer);
     Ok(())
 }
 
@@ -268,7 +380,7 @@ pub fn get_default_position_limit(env: &Env) -> u32 {
         .unwrap_or(DEFAULT_POSITION_LIMIT)
 }
 
-/// Pause a category
+/// Pause a category (admin or guardian)
 pub fn pause_category(
     env: &Env,
     caller: &Address,
@@ -276,8 +388,12 @@ pub fn pause_category(
     duration: Option<u64>,
     reason: String,
 ) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
-    caller.require_auth();
+    if is_guardian(env, caller) {
+        caller.require_auth();
+    } else {
+        require_admin(env, caller)?;
+        caller.require_auth();
+    }
 
     let now = env.ledger().timestamp();
     let auto_unpause_at = duration.map(|d| now + d);
@@ -583,6 +699,42 @@ pub fn remove_multisig_signer(
 
     emit_multisig_signer_removed(env, signer_to_remove, caller.clone());
     Ok(())
+}
+
+// ==================== Fee Collection Pause (Issue #189) ====================
+
+/// Pause fee collection. Read operations and position closures continue.
+pub fn pause_fee_collection(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::FeeCollectionPaused, &true);
+
+    emit_parameter_updated(env, soroban_sdk::Symbol::new(env, "fee_paused"), 0, 1);
+    Ok(())
+}
+
+/// Resume fee collection.
+pub fn resume_fee_collection(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::FeeCollectionPaused, &false);
+
+    emit_parameter_updated(env, soroban_sdk::Symbol::new(env, "fee_paused"), 1, 0);
+    Ok(())
+}
+
+/// Check if fee collection is paused.
+pub fn is_fee_collection_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::FeeCollectionPaused)
+        .unwrap_or(false)
 }
 
 /// Set circuit breaker configuration

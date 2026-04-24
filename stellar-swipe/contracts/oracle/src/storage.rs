@@ -1,13 +1,9 @@
 //! Oracle storage layer
 
- feature/emergency-pause-circuit-breaker
 use soroban_sdk::{contracttype, Env, Map};
 use stellar_swipe_common::{Asset, AssetPair};
 
- main
 use crate::errors::OracleError;
-use common::{Asset, AssetPair};
-use soroban_sdk::{contracttype, Env, Map};
 
 const DAY_IN_LEDGERS: u32 = 17280; // ~24 hours
 
@@ -81,8 +77,7 @@ pub fn get_cached_conversion(env: &Env, from: &Asset, to: &Asset) -> Option<Cach
     let cached: Option<CachedConversion> = env.storage().temporary().get(&key);
 
     if let Some(ref c) = cached {
-        // Cache valid for 5 minutes (60 ledgers)
-        if env.ledger().timestamp() - c.timestamp < 300 {
+        if env.ledger().timestamp().saturating_sub(c.timestamp) < 300 {
             return cached;
         }
     }
@@ -97,7 +92,7 @@ pub fn set_cached_conversion(env: &Env, from: &Asset, to: &Asset, rate: i128) {
         timestamp: env.ledger().timestamp(),
     };
     env.storage().temporary().set(&key, &cached);
-    env.storage().temporary().extend_ttl(&key, 60, 60); // 5 minutes
+    env.storage().temporary().extend_ttl(&key, 60, 60);
 }
 
 /// Get available trading pairs

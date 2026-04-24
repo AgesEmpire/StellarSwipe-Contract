@@ -27,4 +27,6 @@ pub enum OracleError {
     Overflow = 20,
     CircuitBreakerTripped = 21,
     PriceStaleTradeBlocked = 22,
+    PendingAdminNotFound = 23,
+    PendingAdminExpired = 24,
 }

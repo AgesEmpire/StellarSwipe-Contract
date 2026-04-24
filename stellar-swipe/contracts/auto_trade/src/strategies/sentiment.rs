@@ -11,10 +11,10 @@ use soroban_sdk::{contracttype, Address, Env, Map, String, Symbol, Vec};
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum SentimentSource {
-    Twitter { handle: String },
-    Reddit { subreddit: String },
-    OnChainMetrics { metric_type: MetricType },
-    NewsFeeds { feed_url: String },
+    Twitter(String),
+    Reddit(String),
+    OnChainMetrics(MetricType),
+    NewsFeeds(String),
     SignalRationale,
 }
 
@@ -53,11 +53,22 @@ pub struct SentimentStrategy {
     pub asset_pair: AssetPair,
     pub sentiment_sources: Vec<SentimentSource>,
     pub sentiment_threshold: i32,
-    pub technical_confirmation_required: bool,
+    pub tech_confirmation_required: bool,
     pub position_size_pct: u32,
     pub sentiment_decay_hours: u32,
-    pub active_position: Option<SentimentPosition>,
+    /// `position_id == 0` means no active position.
+    pub active_position: SentimentPosition,
     pub created_at: u64,
+}
+
+fn sentiment_position_absent() -> SentimentPosition {
+    SentimentPosition {
+        position_id: 0,
+        entry_sentiment: 0,
+        entry_price: 0,
+        amount: 0,
+        entry_time: 0,
+    }
 }
 
 /// Sentiment score aggregation
@@ -101,7 +112,7 @@ pub struct SentimentAccuracy {
     pub accurate_predictions: u32,
     pub false_positives: u32,
     pub false_negatives: u32,
-    pub avg_sentiment_to_price_correlation: i32,
+    pub avg_sentiment_price_corr: i32,
 }
 
 /// Storage keys
@@ -131,7 +142,7 @@ pub fn create_sentiment_strategy(
     asset_pair: AssetPair,
     sentiment_sources: Vec<SentimentSource>,
     sentiment_threshold: i32,
-    technical_confirmation_required: bool,
+    tech_confirmation_required: bool,
     position_size_pct: u32,
     sentiment_decay_hours: u32,
 ) -> Result<u64, String> {
@@ -162,10 +173,10 @@ pub fn create_sentiment_strategy(
         asset_pair: asset_pair.clone(),
         sentiment_sources,
         sentiment_threshold,
-        technical_confirmation_required,
+        tech_confirmation_required,
         position_size_pct,
         sentiment_decay_hours,
-        active_position: None,
+        active_position: sentiment_position_absent(),
         created_at: env.ledger().timestamp(),
     };
     
@@ -178,7 +189,7 @@ pub fn create_sentiment_strategy(
         accurate_predictions: 0,
         false_positives: 0,
         false_negatives: 0,
-        avg_sentiment_to_price_correlation: 0,
+        avg_sentiment_price_corr: 0,
     };
     store_accuracy(env, strategy_id, &accuracy);
     
@@ -205,23 +216,23 @@ pub fn aggregate_sentiment(env: &Env, strategy_id: u64) -> Result<SentimentScore
     // Collect sentiment from each source
     for source in strategy.sentiment_sources.iter() {
         let (score, weight) = match source {
-            SentimentSource::Twitter { handle } => {
-                collect_twitter_sentiment(env, &handle)?
+            SentimentSource::Twitter(ref handle) => {
+                collect_twitter_sentiment(env, handle)?
             }
-            SentimentSource::Reddit { subreddit } => {
-                collect_reddit_sentiment(env, &subreddit)?
+            SentimentSource::Reddit(ref subreddit) => {
+                collect_reddit_sentiment(env, subreddit)?
             }
-            SentimentSource::OnChainMetrics { metric_type } => {
+            SentimentSource::OnChainMetrics(metric_type) => {
                 collect_onchain_sentiment(env, &strategy.asset_pair, metric_type)?
             }
-            SentimentSource::NewsFeeds { feed_url } => {
-                collect_news_sentiment(env, &feed_url)?
+            SentimentSource::NewsFeeds(ref feed_url) => {
+                collect_news_sentiment(env, feed_url)?
             }
             SentimentSource::SignalRationale => {
                 collect_signal_sentiment(env, &strategy.asset_pair)?
             }
         };
-        
+
         let source_name = format_source_name(env, &source);
         source_scores.set(source_name, score);
         weighted_sum += score * weight as i32;
@@ -284,10 +295,10 @@ fn calculate_sentiment_confidence(
 
 fn format_source_name(env: &Env, source: &SentimentSource) -> String {
     match source {
-        SentimentSource::Twitter { .. } => String::from_str(env, "twitter"),
-        SentimentSource::Reddit { .. } => String::from_str(env, "reddit"),
-        SentimentSource::OnChainMetrics { .. } => String::from_str(env, "onchain"),
-        SentimentSource::NewsFeeds { .. } => String::from_str(env, "news"),
+        SentimentSource::Twitter(..) => String::from_str(env, "twitter"),
+        SentimentSource::Reddit(..) => String::from_str(env, "reddit"),
+        SentimentSource::OnChainMetrics(..) => String::from_str(env, "onchain"),
+        SentimentSource::NewsFeeds(..) => String::from_str(env, "news"),
         SentimentSource::SignalRationale => String::from_str(env, "signals"),
     }
 }
@@ -424,7 +435,19 @@ fn collect_signal_sentiment(env: &Env, _asset_pair: &AssetPair) -> Result<(i32, 
 
 /// Analyze sentiment from text rationale
 fn analyze_rationale_sentiment(env: &Env, rationale: &String) -> Result<i32, String> {
-    let text = rationale.to_string().to_lowercase();
+    let n = rationale.len() as usize;
+    if n > 256 {
+        return Ok(0);
+    }
+    let mut buf = [0u8; 256];
+    rationale.copy_into_slice(&mut buf[..n]);
+    for b in &mut buf[..n] {
+        if *b >= b'A' && *b <= b'Z' {
+            *b += 32;
+        }
+    }
+    let text = core::str::from_utf8(&buf[..n])
+        .map_err(|_| String::from_str(env, "invalid utf8"))?;
     
     // Bullish keywords
     let bullish_keywords = ["bullish", "buy", "breakout", "moon", "pump", "strong", 
@@ -490,7 +513,7 @@ pub fn check_sentiment_signal(
     let strategy = get_strategy(env, strategy_id)?;
     
     // Don't open new position if one exists
-    if strategy.active_position.is_some() {
+    if strategy.active_position.position_id != 0 {
         return Ok(None);
     }
     
@@ -508,7 +531,7 @@ pub fn check_sentiment_signal(
     }
     
     // Check technical confirmation if required
-    if strategy.technical_confirmation_required {
+    if strategy.tech_confirmation_required {
         let technical_confirmed = check_technical_confirmation(
             env,
             &strategy.asset_pair,
@@ -586,7 +609,7 @@ pub fn execute_sentiment_trade(
         entry_time: env.ledger().timestamp(),
     };
     
-    strategy.active_position = Some(position);
+    strategy.active_position = position;
     store_strategy(env, strategy_id, &strategy);
     
     env.events().publish(
@@ -608,10 +631,10 @@ pub fn check_sentiment_exit(
 ) -> Result<Option<u64>, String> {
     let mut strategy = get_strategy(env, strategy_id)?;
     
-    let position = match &strategy.active_position {
-        Some(pos) => pos.clone(),
-        None => return Ok(None),
-    };
+    if strategy.active_position.position_id == 0 {
+        return Ok(None);
+    }
+    let position = strategy.active_position.clone();
     
     // Get current sentiment
     let mut current_sentiment = aggregate_sentiment(env, strategy_id)?;
@@ -650,7 +673,7 @@ pub fn check_sentiment_exit(
         );
         
         let position_id = position.position_id;
-        strategy.active_position = None;
+        strategy.active_position = sentiment_position_absent();
         store_strategy(env, strategy_id, &strategy);
         
         return Ok(Some(position_id));
@@ -692,7 +715,7 @@ fn track_sentiment_accuracy(
     } else {
         0
     };
-    accuracy.avg_sentiment_to_price_correlation = correlation;
+    accuracy.avg_sentiment_price_corr = correlation;
     
     store_accuracy(env, strategy_id, &accuracy);
     
@@ -817,7 +840,7 @@ fn sqrt(n: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{testutils::{Address as _, Ledger as _}, Env};
 
     fn setup_env() -> Env {
         let env = Env::default();
@@ -834,12 +857,8 @@ mod tests {
 
     fn create_test_sources(env: &Env) -> Vec<SentimentSource> {
         let mut sources = Vec::new(env);
-        sources.push_back(SentimentSource::Twitter {
-            handle: String::from_str(env, "stellar"),
-        });
-        sources.push_back(SentimentSource::OnChainMetrics {
-            metric_type: MetricType::ActiveAddresses,
-        });
+        sources.push_back(SentimentSource::Twitter(String::from_str(env, "stellar")));
+        sources.push_back(SentimentSource::OnChainMetrics(MetricType::ActiveAddresses));
         sources.push_back(SentimentSource::SignalRationale);
         sources
     }
@@ -1038,9 +1057,9 @@ mod tests {
         assert_eq!(position_id, 1);
         
         let strategy = get_strategy(&env, strategy_id).unwrap();
-        assert!(strategy.active_position.is_some());
-        
-        let position = strategy.active_position.unwrap();
+        assert_ne!(strategy.active_position.position_id, 0);
+
+        let position = strategy.active_position;
         assert_eq!(position.entry_sentiment, 7000);
     }
 
