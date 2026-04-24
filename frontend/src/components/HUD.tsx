@@ -1,3 +1,4 @@
+import React, { useState, useCallback } from 'react';
 import React, { useState, useEffect, useCallback } from 'react';
 import { useDebouncedPolling } from '../hooks/useDebouncedPolling';
 
@@ -14,6 +15,11 @@ interface StatWidgetProps {
   className?: string;
 }
 
+const StatWidget: React.FC<StatWidgetProps> = ({
+  label,
+  value,
+  format = (v) => v.toLocaleString(),
+  className = '',
 const StatWidget: React.FC<StatWidgetProps> = ({ 
   label, 
   value, 
@@ -32,6 +38,10 @@ interface HUDProps {
   initialStats?: TycoonStats;
 }
 
+export const HUD: React.FC<HUDProps> = ({
+  onStatsUpdate,
+  pollInterval = 5000,
+  initialStats = { cash: 0, incomeRate: 0, boosts: 0 },
 export const HUD: React.FC<HUDProps> = ({ 
   onStatsUpdate,
   pollInterval = 5000,
@@ -56,6 +66,11 @@ export const HUD: React.FC<HUDProps> = ({
 
   useDebouncedPolling(fetchStats, pollInterval);
 
+  return (
+    <div className={`hud ${isLoading ? 'loading' : ''}`}>
+      <StatWidget label="Cash" value={stats.cash} format={(v) => `$${v.toLocaleString()}`} className="cash-widget" />
+      <StatWidget label="Income Rate" value={stats.incomeRate} format={(v) => `$${v.toLocaleString()}/min`} className="income-widget" />
+      <StatWidget label="Boosts" value={stats.boosts} format={(v) => `${v}x`} className="boost-widget" />
   const formatCash = (value: number) => `$${value.toLocaleString()}`;
   const formatRate = (value: number) => `$${value.toLocaleString()}/min`;
   const formatBoosts = (value: number) => `${value}x`;
@@ -84,4 +99,5 @@ export const HUD: React.FC<HUDProps> = ({
   );
 };
 
+export default HUD;
 export default HUD;

@@ -16,6 +16,9 @@ export class StellarSwipeHUDAdapter {
 
   async fetchTycoonStats(): Promise<StellarSwipeStats> {
     try {
+      const response = await fetch(`${this.networkUrl}/contracts/${this.contractAddress}/stats`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      const data = await response.json();
       // Mock implementation - replace with actual Soroban contract calls
       const response = await fetch(`${this.networkUrl}/contracts/${this.contractAddress}/stats`);
       
@@ -45,6 +48,7 @@ export class StellarSwipeHUDAdapter {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ requests }),
       });
+      if (!batchResponse.ok) throw new Error(`Batch request failed: ${batchResponse.status}`);
 
       if (!batchResponse.ok) {
         throw new Error(`Batch request failed: ${batchResponse.status}`);
@@ -56,4 +60,5 @@ export class StellarSwipeHUDAdapter {
       return requests.map(() => ({ cash: 0, incomeRate: 0, boosts: 0 }));
     }
   }
+}
 }

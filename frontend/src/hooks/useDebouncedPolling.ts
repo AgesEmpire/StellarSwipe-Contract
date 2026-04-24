@@ -5,6 +5,9 @@ export const useDebouncedPolling = (
   interval: number,
   immediate: boolean = true
 ) => {
+  const timeoutRef = useRef<ReturnType<typeof setTimeout>>();
+  const callbackRef = useRef(callback);
+
   const timeoutRef = useRef<NodeJS.Timeout>();
   const callbackRef = useRef(callback);
 
@@ -30,6 +33,17 @@ export const useDebouncedPolling = (
     } else {
       timeoutRef.current = setTimeout(debouncedCallback, interval);
     }
+    return () => {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    };
+  }, [debouncedCallback, immediate, interval]);
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    };
+  }, []);
+};
 
     return () => {
       if (timeoutRef.current) {

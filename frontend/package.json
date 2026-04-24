@@ -1,4 +1,19 @@
 {
+  "name": "stellar-swipe-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build"
+  },
+  "dependencies": {
+    "@stellar/freighter-api": "^2.0.0",
+    "next": "^14.2.35",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
   "name": "stellarswipe-hud",
   "version": "1.0.0",
   "private": true,
@@ -10,6 +25,12 @@
   "devDependencies": {
     "@storybook/addon-essentials": "^7.0.0",
     "@storybook/react": "^7.0.0",
+    "@types/node": "^20",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "typescript": "^5"
+  }
+}
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0"
   },
