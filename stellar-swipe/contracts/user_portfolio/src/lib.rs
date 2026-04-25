@@ -5,6 +5,9 @@
 mod queries;
 mod storage;
 mod subscriptions;
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod portfolio_tests;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 use storage::DataKey;

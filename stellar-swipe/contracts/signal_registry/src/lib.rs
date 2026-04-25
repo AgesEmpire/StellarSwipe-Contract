@@ -2250,6 +2250,8 @@ mod test;
 #[cfg(test)]
 mod test_adoption;
 #[cfg(test)]
+mod tests;
+#[cfg(test)]
 mod test_combos;
 #[cfg(test)]
 mod test_contests;
