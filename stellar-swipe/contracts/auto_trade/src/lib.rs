@@ -16,7 +16,10 @@ mod oracle;
 mod portfolio;
 mod portfolio_insurance;
 mod positions;
+#[cfg(not(feature = "testutils"))]
 mod rate_limit;
+#[cfg(feature = "testutils")]
+pub mod rate_limit;
 mod referral;
 mod risk;
 mod risk_parity;
@@ -30,7 +33,7 @@ pub use errors::AutoTradeError;
 pub use risk::RiskConfig;
 
 #[cfg(feature = "testutils")]
-pub use storage::{set_signal, Signal};
+pub use storage::{authorize_user_with_limits, set_signal, Signal};
 
 use crate::storage::DataKey;
 use advanced_risk::AutoSellResult;
@@ -90,6 +93,16 @@ pub struct TradeResult {
 
 #[contract]
 pub struct AutoTradeContract;
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoTradeStorageStats {
+    pub total_signals: u32,
+    pub total_positions: u32,
+    pub total_providers: u32,
+    /// Estimated rent in stroops (1 XLM = 10_000_000 stroops).
+    pub estimated_rent_xlm: i128,
+}
 
 /// ==========================
 /// Implementation
@@ -738,7 +751,7 @@ impl AutoTradeContract {
     pub fn get_user_rate_history(
         env: Env,
         user: Address,
-    )  rate_limit::UserTransferHistory {
+    ) -> rate_limit::UserTransferHistory {
         rate_limit::get_user_history(&env, &user)
     }
 
@@ -790,17 +803,6 @@ impl AutoTradeContract {
             estimated_rent_xlm,
         }
     }
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AutoTradeStorageStats {
-    pub total_signals: u32,
-    pub total_positions: u32,
-    pub total_providers: u32,
-    /// Estimated rent in stroops (1 XLM = 10_000_000 stroops).
-    pub estimated_rent_xlm: i128,
-}
 
     // ── DCA ──────────────────────────────────────────────────────────────────
 
@@ -1125,8 +1127,6 @@ pub struct AutoTradeStorageStats {
         portfolio_insurance::get_insurance(&env, &user)
     }
 
-    // ── Exit Strategy (tiered TP + trailing stops) ─────────────────────────
-
     // ── Exit Strategy ────────────────────────────────────────────────────────
 
     /// Create a custom exit strategy with explicit TP and stop-loss tiers.
@@ -1137,9 +1137,6 @@ pub struct AutoTradeStorageStats {
         signal_id: u64,
         entry_price: i128,
         position_size: i128,
-        take_profit_tiers: soroban_sdk::Vec<exit_strategy::TakeProfitTier>,
-        stop_loss_tiers: soroban_sdk::Vec<exit_strategy::StopLossTier>,
-
         take_profit_tiers: Vec<exit_strategy::TakeProfitTier>,
         stop_loss_tiers: Vec<exit_strategy::StopLossTier>,
     ) -> Result<u64, AutoTradeError> {
@@ -1156,7 +1153,7 @@ pub struct AutoTradeStorageStats {
     }
 
     /// Create a conservative preset exit strategy (3 TPs + 10% trail).
-    pub fn create_exit_strategy_conservative(
+    pub fn exit_strategy_conservative(
         env: Env,
         user: Address,
         signal_id: u64,
@@ -1195,13 +1192,14 @@ pub struct AutoTradeStorageStats {
         env: Env,
         strategy_id: u64,
         current_price: i128,
-    ) -> Result<Vec<exit_strategy::ExecutedExit>, AutoTradeError> {
+    ) -> Result<Vec<u64>, AutoTradeError> {
         exit_strategy::check_and_execute_exits(&env, strategy_id, current_price)
     }
 
     /// Get exit strategy state.
     pub fn get_exit_strategy(
         env: Env,
+        strategy_id: u64,
     ) -> Result<exit_strategy::ExitStrategy, AutoTradeError> {
         exit_strategy::get_exit_strategy(&env, strategy_id)
     }
@@ -1276,8 +1274,6 @@ pub struct AutoTradeStorageStats {
         strategy_id: u64,
     ) -> Result<strategies::grid::GridPerformance, AutoTradeError> {
         strategies::grid::calculate_grid_performance(&env, strategy_id)
-
-        exit_strategy::adjust_position_size(&env, strategy_id, &user, new_size)
     }
 
     // ── Pairs Trading Strategy (Issue #106) ───────────────────────────────────
