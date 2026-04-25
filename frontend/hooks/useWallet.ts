@@ -10,12 +10,12 @@ export interface WalletState {
 
 async function getFreighterAddress(): Promise<string> {
   // Dynamic import so SSR doesn't break when Freighter is absent
-  const { isConnected, getAddress } = await import("@stellar/freighter-api");
+  const { isConnected, getPublicKey } = await import("@stellar/freighter-api");
   const connected = await isConnected();
-  if (!connected.isConnected) throw new Error("Freighter not installed");
-  const result = await getAddress();
-  if (result.error) throw new Error(result.error);
-  return result.address;
+  if (!connected) throw new Error("Freighter not installed");
+  const address = await getPublicKey();
+  if (!address) throw new Error("Could not retrieve public key");
+  return address;
 }
 
 export function useWallet(): WalletState {

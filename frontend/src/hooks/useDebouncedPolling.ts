@@ -3,6 +3,7 @@ import { useEffect, useRef, useCallback } from 'react';
 export const useDebouncedPolling = (
   callback: () => Promise<void> | void,
   interval: number,
+  enabled: boolean = true,
   immediate: boolean = true
 ) => {
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>();
@@ -28,6 +29,10 @@ export const useDebouncedPolling = (
   }, [interval]);
 
   useEffect(() => {
+    if (!enabled) {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      return;
+    }
     if (immediate) {
       debouncedCallback();
     } else {
@@ -36,7 +41,7 @@ export const useDebouncedPolling = (
     return () => {
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
     };
-  }, [debouncedCallback, immediate, interval]);
+  }, [debouncedCallback, enabled, immediate, interval]);
 
   useEffect(() => {
     return () => {

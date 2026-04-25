@@ -1,6 +1,7 @@
 import React, { useState, useCallback } from 'react';
 import React, { useState, useEffect, useCallback } from 'react';
 import { useDebouncedPolling } from '../hooks/useDebouncedPolling';
+import { FetchError } from '../utils/stellarswipe-adapter';
 
 interface TycoonStats {
   cash: number;
@@ -49,22 +50,42 @@ export const HUD: React.FC<HUDProps> = ({
 }) => {
   const [stats, setStats] = useState<TycoonStats>(initialStats);
   const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<{ message: string; kind: 'network' | 'server' | 'unknown' } | null>(null);
 
   const fetchStats = useCallback(async () => {
     if (!onStatsUpdate) return;
     
     setIsLoading(true);
+    setError(null);
     try {
       const newStats = await onStatsUpdate();
       setStats(newStats);
-    } catch (error) {
-      console.error('Failed to fetch stats:', error);
+    } catch (err) {
+      if (err instanceof FetchError) {
+        setError({ message: err.message, kind: err.kind });
+      } else {
+        setError({ message: 'An unexpected error occurred.', kind: 'unknown' });
+      }
     } finally {
       setIsLoading(false);
     }
   }, [onStatsUpdate]);
 
-  useDebouncedPolling(fetchStats, pollInterval);
+  useDebouncedPolling(fetchStats, pollInterval, !error);
+
+  if (error) {
+    return (
+      <div className="hud hud-error" role="alert">
+        <span className={`hud-error-badge hud-error-badge--${error.kind}`}>
+          {error.kind === 'network' ? 'Network Error' : 'Server Error'}
+        </span>
+        <span className="hud-error-message">{error.message}</span>
+        <button className="hud-retry-btn" onClick={fetchStats} disabled={isLoading}>
+          {isLoading ? 'Retrying…' : 'Retry'}
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className={`hud ${isLoading ? 'loading' : ''}`}>
