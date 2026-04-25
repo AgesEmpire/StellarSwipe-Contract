@@ -22,7 +22,7 @@
 //! (e.g. `TradeExecuted`, `StopLossTriggered`). One-time events such as
 //! `ContractInitialized` are **not** wrapped — they are emitted directly.
 
-use soroban_sdk::{contracttype, Env, Symbol};
+use soroban_sdk::{contracttype, Address, Env, Symbol};
 
 /// Discriminant for events that may be emitted more than once per entity.
 ///
@@ -76,6 +76,68 @@ pub fn emit_once<F: FnOnce()>(
     env.storage().temporary().extend_ttl(&key, 1, 1);
 
     true
+}
+
+// ── Typed event helpers ───────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EvtStopLossTriggered {
+    pub user: Address,
+    pub trade_id: u64,
+    pub stop_loss_price: i128,
+    pub current_price: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EvtTakeProfitTriggered {
+    pub user: Address,
+    pub trade_id: u64,
+    pub take_profit_price: i128,
+    pub current_price: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EvtTradeCancelled {
+    pub user: Address,
+    pub trade_id: u64,
+    pub exit_price: i128,
+    pub realized_pnl: i128,
+}
+
+pub fn emit_stop_loss_triggered(env: &Env, evt: EvtStopLossTriggered) {
+    #[allow(deprecated)]
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "stop_loss_triggered"),
+        ),
+        evt,
+    );
+}
+
+pub fn emit_take_profit_triggered(env: &Env, evt: EvtTakeProfitTriggered) {
+    #[allow(deprecated)]
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "take_profit_triggered"),
+        ),
+        evt,
+    );
+}
+
+pub fn emit_trade_cancelled(env: &Env, evt: EvtTradeCancelled) {
+    #[allow(deprecated)]
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "trade_cancelled"),
+        ),
+        evt,
+    );
 }
 
 #[cfg(test)]

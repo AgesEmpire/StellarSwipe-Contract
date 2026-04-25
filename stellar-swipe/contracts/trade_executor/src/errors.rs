@@ -22,4 +22,6 @@ pub enum ContractError {
     TradeNotFound = 7,
     SlippageExceeded = 8,
     PositionPctTooHigh = 9,
+    OraclePriceStale = 10,
+    OracleUnavailable = 11,
 }

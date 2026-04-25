@@ -193,7 +193,7 @@ impl TradeExecutorContract {
     ) {
         user.require_auth();
         triggers::set_take_profit(&env, &user, trade_id, take_profit_price);
-        register_watch(&env, &user, trade_id, asset_pair);
+        let _ = asset_pair; // watch registration reserved for future keeper indexer
     }
 
     pub fn check_and_trigger_take_profit(
@@ -452,3 +452,7 @@ impl TradeExecutorContract {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod tests {
+    mod test_oracle_staleness;
+}

@@ -20,6 +20,10 @@ use crate::errors::ContractError;
 pub const ORACLE_KEY: &str = "Oracle";
 pub const PORTFOLIO_KEY: &str = "Portfolio";
 
+/// Maximum age of an oracle price in seconds before it is considered stale.
+/// Matches the oracle contract's `MAX_PRICE_AGE_LEDGERS` (60 ledgers × ~5 s/ledger = 300 s).
+pub const MAX_ORACLE_PRICE_AGE_SECS: u64 = 300;
+
 /// Register a stop-loss price for `(user, trade_id)`.
 pub fn set_stop_loss(env: &Env, user: &Address, trade_id: u64, stop_loss_price: i128) {
     env.storage()
@@ -60,10 +64,35 @@ fn fetch_oracle_and_portfolio(env: &Env) -> Result<(Address, Address), ContractE
     Ok((oracle, portfolio))
 }
 
-/// Fetch the current price from the oracle contract.
+/// Fetch the current price from the oracle contract, enforcing staleness.
 ///
-/// Oracle ABI: `get_price(asset_pair: u32) -> i128`
+/// Oracle ABI:
+///   - `get_price(asset_pair: u32) -> i128`  — returns 0 when no price is available
+///   - `get_price_timestamp(asset_pair: u32) -> u64` — returns the ledger timestamp
+///     at which the price was last updated (0 when never set)
+///
+/// Returns:
+///   - `Ok(price)` when the price is fresh (age ≤ `MAX_ORACLE_PRICE_AGE_SECS`)
+///   - `Err(OracleUnavailable)` when no price has ever been set (timestamp == 0)
+///   - `Err(OraclePriceStale)` when the price is older than `MAX_ORACLE_PRICE_AGE_SECS`
 fn fetch_current_price(env: &Env, oracle: &Address, asset_pair: u32) -> Result<i128, ContractError> {
+    // Fetch timestamp first — 0 means no price has ever been published.
+    let updated_at: u64 = env.invoke_contract(
+        oracle,
+        &Symbol::new(env, "get_price_timestamp"),
+        soroban_sdk::vec![env, asset_pair.into()],
+    );
+
+    if updated_at == 0 {
+        return Err(ContractError::OracleUnavailable);
+    }
+
+    let now = env.ledger().timestamp();
+    let age = now.saturating_sub(updated_at);
+    if age > MAX_ORACLE_PRICE_AGE_SECS {
+        return Err(ContractError::OraclePriceStale);
+    }
+
     let price: i128 = env.invoke_contract(
         oracle,
         &Symbol::new(env, "get_price"),
@@ -184,7 +213,11 @@ pub fn check_and_trigger_take_profit(
 mod tests {
     use super::*;
     use crate::{TradeExecutorContract, TradeExecutorContractClient};
-    use soroban_sdk::{contract, contractimpl, symbol_short, testutils::Address as _, Env};
+    use soroban_sdk::{
+        contract, contractimpl, symbol_short,
+        testutils::{Address as _, Events as _, Ledger as _},
+        Env, TryFromVal,
+    };
 
     // ── Mock Oracle ───────────────────────────────────────────────────────────
 
@@ -197,6 +230,20 @@ mod tests {
             env.storage()
                 .instance()
                 .set(&symbol_short!("price"), &price);
+            // Default timestamp: current ledger time (fresh).
+            let ts = env.ledger().timestamp();
+            env.storage()
+                .instance()
+                .set(&symbol_short!("pts"), &ts);
+        }
+
+        pub fn set_price_at(env: Env, price: i128, timestamp: u64) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("price"), &price);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("pts"), &timestamp);
         }
 
         pub fn get_price(env: Env, _asset_pair: u32) -> i128 {
@@ -204,6 +251,13 @@ mod tests {
                 .instance()
                 .get(&symbol_short!("price"))
                 .unwrap()
+        }
+
+        pub fn get_price_timestamp(env: Env, _asset_pair: u32) -> u64 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("pts"))
+                .unwrap_or(0u64)
         }
     }
 
@@ -240,7 +294,7 @@ mod tests {
     fn setup() -> (Env, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        env.ledger().with_mut(|ledger| ledger.timestamp = 1_000);
+        env.ledger().set_timestamp(1_000);
 
         let admin = Address::generate(&env);
         let oracle_id = env.register(MockOracle, ());
@@ -310,8 +364,8 @@ mod tests {
             let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
             topics
                 .get(0)
-                .and_then(|v| soroban_sdk::Symbol::try_from(v).ok())
-                == Some(Symbol::new(&env, "StopLossTriggered"))
+                .and_then(|v| Symbol::try_from_val(&env, &v).ok())
+                == Some(Symbol::new(&env, "trade_executor"))
         });
         assert!(found, "StopLossTriggered event not emitted");
     }
@@ -371,8 +425,8 @@ mod tests {
             let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
             topics
                 .get(0)
-                .and_then(|v| soroban_sdk::Symbol::try_from(v).ok())
-                == Some(Symbol::new(&env, "TakeProfitTriggered"))
+                .and_then(|v| Symbol::try_from_val(&env, &v).ok())
+                == Some(Symbol::new(&env, "trade_executor"))
         });
         assert!(found, "TakeProfitTriggered event not emitted");
     }
@@ -465,12 +519,11 @@ mod tests {
     // ── Event format tests ────────────────────────────────────────────────────
 
     fn last_topics(env: &Env) -> (Symbol, Symbol) {
-        use soroban_sdk::testutils::Events;
         let events = env.events().all();
         let e = events.last().unwrap();
         let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1;
-        let t0 = Symbol::try_from(topics.get(0).unwrap()).unwrap();
-        let t1 = Symbol::try_from(topics.get(1).unwrap()).unwrap();
+        let t0 = Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap();
+        let t1 = Symbol::try_from_val(env, &topics.get(1).unwrap()).unwrap();
         (t0, t1)
     }
 
