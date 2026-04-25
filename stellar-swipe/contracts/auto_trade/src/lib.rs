@@ -4,7 +4,10 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Sy
 
 mod admin;
 mod advanced_risk;
+#[cfg(not(feature = "testutils"))]
 mod auth;
+#[cfg(feature = "testutils")]
+pub mod auth;
 mod conditional;
 mod correlation;
 mod errors;
@@ -15,7 +18,10 @@ mod multi_asset;
 mod oracle;
 mod portfolio;
 mod portfolio_insurance;
+#[cfg(not(feature = "testutils"))]
 mod positions;
+#[cfg(feature = "testutils")]
+pub mod positions;
 #[cfg(not(feature = "testutils"))]
 mod rate_limit;
 #[cfg(feature = "testutils")]
@@ -25,7 +31,10 @@ mod risk;
 mod risk_parity;
 mod sdex;
 mod smart_routing;
+#[cfg(not(feature = "testutils"))]
 mod storage;
+#[cfg(feature = "testutils")]
+pub mod storage;
 mod strategies;
 mod twap;
 
@@ -34,6 +43,8 @@ pub use risk::RiskConfig;
 
 #[cfg(feature = "testutils")]
 pub use storage::{authorize_user_with_limits, set_signal, Signal};
+#[cfg(feature = "testutils")]
+pub use auth::AuthConfig;
 
 use crate::storage::DataKey;
 use advanced_risk::AutoSellResult;
