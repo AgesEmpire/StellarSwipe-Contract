@@ -32,6 +32,8 @@ fn create_test_signal(env: &Env, provider: Address, signal_id: u64) -> Signal {
         confidence: 50,
         adoption_count: 0,
         ai_validation_score: None,
+        avg_copier_roi_bps: 0,
+        copier_closed_count: 0,
     }
 }
 

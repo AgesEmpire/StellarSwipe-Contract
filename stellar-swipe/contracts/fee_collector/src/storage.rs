@@ -22,6 +22,10 @@ pub enum StorageKey {
     BurnRate,                              // instance, burn rate in bps
     ProviderPendingFees(Address, Address), // persistent, per (provider, token)
     MonthlyTradeVolume(Address),           // persistent, per user
+    /// Accumulated fee shares per provider per day (day = unix_timestamp / SECONDS_PER_DAY).
+    ProviderDailyFeeShares(Address, u64),
+    /// Day number of the provider's first recorded earnings (for ALL_TIME period_start).
+    ProviderEarningsFirstDay(Address),
 }
 
 #[contracttype]
@@ -173,4 +177,32 @@ pub fn remove_monthly_trade_volume(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&StorageKey::MonthlyTradeVolume(user.clone()));
+}
+
+// --- Provider Daily Fee Shares (Issue #366) ---
+
+pub fn get_provider_daily_fee_shares(env: &Env, provider: &Address, day: u64) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::ProviderDailyFeeShares(provider.clone(), day))
+        .unwrap_or(0i128)
+}
+
+pub fn add_provider_daily_fee_shares(env: &Env, provider: &Address, day: u64, amount: i128) {
+    let key = StorageKey::ProviderDailyFeeShares(provider.clone(), day);
+    let current: i128 = env.storage().persistent().get(&key).unwrap_or(0i128);
+    let updated = current.saturating_add(amount);
+    env.storage().persistent().set(&key, &updated);
+
+    // Record first earnings day if not yet set
+    let first_key = StorageKey::ProviderEarningsFirstDay(provider.clone());
+    if !env.storage().persistent().has(&first_key) {
+        env.storage().persistent().set(&first_key, &day);
+    }
+}
+
+pub fn get_provider_earnings_first_day(env: &Env, provider: &Address) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::ProviderEarningsFirstDay(provider.clone()))
 }
