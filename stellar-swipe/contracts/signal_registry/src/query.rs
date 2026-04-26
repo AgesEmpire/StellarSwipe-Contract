@@ -303,6 +303,9 @@ mod feed_tests {
                 rationale_hash: String::from_str(env, "q"),
                 confidence: 50,
                 adoption_count: 0,
+                ai_validation_score: None,
+                avg_copier_roi_bps: 0,
+                copier_closed_count: 0,
             };
             m.set(id, s);
         }

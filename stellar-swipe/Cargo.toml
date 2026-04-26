@@ -11,6 +11,7 @@ members = [
   "contracts/shared",
   "contracts/fee_collector",
   "contracts/user_portfolio",
+  "contracts/analytics",
   "contracts/integration_tests",
 ]
 

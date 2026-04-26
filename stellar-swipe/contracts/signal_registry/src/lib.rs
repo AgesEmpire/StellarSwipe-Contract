@@ -578,6 +578,8 @@ impl SignalRegistry {
         risk_level: RiskLevel,
     ) -> Result<u64, AdminError> {
         provider.require_auth();
+        // Analytics: session start on first call by this provider
+        shared::events::emit_session_started_once(&env, &provider);
         Self::create_signal_internal(
             &env, provider, asset_pair, action, price, rationale, expiry, category, tags,
             risk_level,
@@ -652,6 +654,8 @@ impl SignalRegistry {
             confidence: 50,
             adoption_count: 0,
             ai_validation_score: None,
+            avg_copier_roi_bps: 0,
+            copier_closed_count: 0,
         };
 
         // Auto-enter signal into active contests (before moving signal)
@@ -701,6 +705,18 @@ impl SignalRegistry {
     ) -> Option<Signal> {
         let signals = Self::get_signals_map(&env);
         let signal = signals.get(signal_id)?;
+
+        // Analytics: emit session + signal-viewed events (no state changes)
+        shared::events::emit_session_started_once(&env, &viewer);
+        shared::events::emit_signal_viewed(
+            &env,
+            shared::events::EvtSignalViewed {
+                schema_version: shared::events::SCHEMA_VERSION,
+                user: viewer.clone(),
+                signal_id,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
         if signal.category != SignalCategory::PREMIUM {
             return Some(signal);
         }
@@ -1018,8 +1034,9 @@ impl SignalRegistry {
         // Store old status for comparison
         let old_status = signal.status.clone();
 
-        // Update signal stats
+        // Update signal stats (general perf) and copier ROI (Issue #367)
         performance::update_signal_stats(&mut signal, &trade);
+        performance::update_copier_roi_stats(&mut signal, roi.clamp(i32::MIN as i128, i32::MAX as i128) as i32);
 
         // Evaluate new status
         let now = env.ledger().timestamp();
@@ -1034,6 +1051,18 @@ impl SignalRegistry {
 
         // Emit trade executed event
         events::emit_trade_executed(&env, signal_id, executor.clone(), roi, volume);
+
+        // Analytics: session + trade executed
+        shared::events::emit_session_started_once(&env, &executor);
+        shared::events::emit_analytics_trade_executed(
+            &env,
+            shared::events::EvtTradeExecuted {
+                schema_version: shared::events::SCHEMA_VERSION,
+                user: executor.clone(),
+                signal_id,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
 
         // Check if status changed and update provider stats
         if performance::should_update_provider_stats(&old_status, &new_status) {
@@ -1232,6 +1261,17 @@ impl SignalRegistry {
         env.storage()
             .instance()
             .set(&StorageKey::AdoptionNonces, &nonces);
+
+        // Analytics: signal swiped (copy-trade initiation, before execution)
+        shared::events::emit_signal_swiped(
+            &env,
+            shared::events::EvtSignalSwiped {
+                schema_version: shared::events::SCHEMA_VERSION,
+                user: caller.clone(),
+                signal_id,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
 
         // Emit event
         events::emit_signal_adopted(&env, signal_id, caller.clone(), signal.adoption_count);

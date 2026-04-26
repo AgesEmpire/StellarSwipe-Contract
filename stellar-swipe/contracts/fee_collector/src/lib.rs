@@ -8,6 +8,9 @@ pub use events::{FeeRateUpdated, FeesBurned, FeesClaimed, TreasuryWithdrawal, Wi
 
 mod rebates;
 
+mod reports;
+pub use reports::{EarningsReport, ReportPeriod};
+
 mod storage;
 pub use storage::{
     get_admin, get_burn_rate, get_fee_rate, get_monthly_trade_volume, get_oracle_contract,
@@ -479,5 +482,45 @@ impl FeeCollector {
         );
 
         Ok(amount)
+    }
+
+    // ── Issue #366: Provider Earnings Report ─────────────────────────────────
+
+    /// Record fee shares distributed to a provider for the current day.
+    ///
+    /// Called by the fee distribution system when allocating fee shares to a
+    /// signal provider. Updates the per-day earnings bucket used by
+    /// `get_provider_earnings_report`.
+    pub fn record_provider_fee_share(
+        env: Env,
+        provider: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+        let day = env.ledger().timestamp() / SECONDS_PER_DAY;
+        storage::add_provider_daily_fee_shares(&env, &provider, day, amount);
+        Ok(())
+    }
+
+    /// Returns an earnings report for the provider over the requested period.
+    ///
+    /// Categories:
+    /// - `fee_shares_earned`: from on-chain daily buckets (this contract)
+    /// - `stake_rewards_earned`: 0 (StakeVault cross-contract aggregation)
+    /// - `subscription_fees_earned`: 0 (UserPortfolio cross-contract aggregation)
+    pub fn get_provider_earnings_report(
+        env: Env,
+        provider: Address,
+        period: ReportPeriod,
+    ) -> Result<EarningsReport, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        Ok(reports::get_provider_earnings_report(&env, &provider, period))
     }
 }

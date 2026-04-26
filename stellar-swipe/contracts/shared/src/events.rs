@@ -266,6 +266,85 @@ pub fn emit_vesting_released(env: &Env, evt: EvtVestingReleased) {
     );
 }
 
+// ── Analytics event structs (Issue #365) ─────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtUserSessionStarted {
+    pub schema_version: u32,
+    pub user: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtSignalViewed {
+    pub schema_version: u32,
+    pub user: Address,
+    pub signal_id: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtSignalSwiped {
+    pub schema_version: u32,
+    pub user: Address,
+    pub signal_id: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtTradeExecuted {
+    pub schema_version: u32,
+    pub user: Address,
+    pub signal_id: u64,
+    pub timestamp: u64,
+}
+
+// ── Analytics emit helpers (Issue #365) ──────────────────────────────────────
+
+pub fn emit_user_session_started(env: &Env, evt: EvtUserSessionStarted) {
+    env.events().publish(
+        (
+            Symbol::new(env, "analytics"),
+            Symbol::new(env, "session_started"),
+        ),
+        evt,
+    );
+}
+
+pub fn emit_signal_viewed(env: &Env, evt: EvtSignalViewed) {
+    env.events().publish(
+        (
+            Symbol::new(env, "analytics"),
+            Symbol::new(env, "signal_viewed"),
+        ),
+        evt,
+    );
+}
+
+pub fn emit_signal_swiped(env: &Env, evt: EvtSignalSwiped) {
+    env.events().publish(
+        (
+            Symbol::new(env, "analytics"),
+            Symbol::new(env, "signal_swiped"),
+        ),
+        evt,
+    );
+}
+
+pub fn emit_analytics_trade_executed(env: &Env, evt: EvtTradeExecuted) {
+    env.events().publish(
+        (
+            Symbol::new(env, "analytics"),
+            Symbol::new(env, "trade_executed"),
+        ),
+        evt,
+    );
+}
+
 // ── Event deduplication guard ─────────────────────────────────────────────────
 
 /// Discriminant for events that may be emitted more than once per entity.
@@ -278,6 +357,7 @@ pub enum EventType {
     SignalAdopted,
     SignalExpired,
     FeeCollected,
+    UserSession,
 }
 
 /// Temporary-storage key for the deduplication nonce.
@@ -285,6 +365,36 @@ pub enum EventType {
 #[derive(Clone)]
 pub enum StorageKey {
     EventNonce(EventType, u64),
+    /// Per-user session guard: set in temporary storage for SESSION_TTL_LEDGERS to prevent
+    /// re-emitting UserSessionStarted within the same session window.
+    UserSession(Address),
+}
+
+/// Session window in ledgers (~10 minutes at 5 s/ledger).
+pub const SESSION_TTL_LEDGERS: u32 = 120;
+
+/// Emit `UserSessionStarted` for `user` at most once per session window.
+///
+/// Uses temporary storage keyed by `StorageKey::UserSession(user)` with a
+/// `SESSION_TTL_LEDGERS` TTL so repeated calls within the same session are
+/// suppressed. No business-logic state is changed.
+pub fn emit_session_started_once(env: &Env, user: &Address) {
+    let key = StorageKey::UserSession(user.clone());
+    if env.storage().temporary().has(&key) {
+        return;
+    }
+    emit_user_session_started(
+        env,
+        EvtUserSessionStarted {
+            schema_version: SCHEMA_VERSION,
+            user: user.clone(),
+            timestamp: env.ledger().timestamp(),
+        },
+    );
+    env.storage().temporary().set(&key, &true);
+    env.storage()
+        .temporary()
+        .extend_ttl(&key, SESSION_TTL_LEDGERS, SESSION_TTL_LEDGERS);
 }
 
 /// Emit `emit_fn` at most once per `(event_type, entity_id)` per ledger.
@@ -561,6 +671,139 @@ mod tests {
             assert!(a);
             assert!(b);
             assert_eq!(env.events().all().len(), 2);
+        });
+    }
+
+    // ── Analytics event struct tests (Issue #365) ────────────────────────────
+
+    #[test]
+    fn evt_user_session_started_has_schema_version() {
+        let env = Env::default();
+        let user = soroban_sdk::Address::generate(&env);
+        let evt = EvtUserSessionStarted {
+            schema_version: SCHEMA_VERSION,
+            user,
+            timestamp: 12345,
+        };
+        assert_eq!(evt.schema_version, 1);
+    }
+
+    #[test]
+    fn evt_signal_viewed_has_schema_version() {
+        let env = Env::default();
+        let user = soroban_sdk::Address::generate(&env);
+        let evt = EvtSignalViewed {
+            schema_version: SCHEMA_VERSION,
+            user,
+            signal_id: 42,
+            timestamp: 12345,
+        };
+        assert_eq!(evt.schema_version, 1);
+        assert_eq!(evt.signal_id, 42);
+    }
+
+    #[test]
+    fn evt_signal_swiped_has_schema_version() {
+        let env = Env::default();
+        let user = soroban_sdk::Address::generate(&env);
+        let evt = EvtSignalSwiped {
+            schema_version: SCHEMA_VERSION,
+            user,
+            signal_id: 7,
+            timestamp: 99999,
+        };
+        assert_eq!(evt.schema_version, 1);
+        assert_eq!(evt.signal_id, 7);
+    }
+
+    #[test]
+    fn evt_trade_executed_has_schema_version() {
+        let env = Env::default();
+        let user = soroban_sdk::Address::generate(&env);
+        let evt = EvtTradeExecuted {
+            schema_version: SCHEMA_VERSION,
+            user,
+            signal_id: 1,
+            timestamp: 5000,
+        };
+        assert_eq!(evt.schema_version, 1);
+    }
+
+    #[test]
+    fn emit_session_started_once_emits_on_first_call() {
+        let (env, contract_id) = setup();
+        let user = soroban_sdk::Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            emit_session_started_once(&env, &user);
+            let all = env.events().all();
+            assert_eq!(all.len(), 1);
+        });
+    }
+
+    #[test]
+    fn emit_session_started_once_deduplicates_within_session() {
+        let (env, contract_id) = setup();
+        let user = soroban_sdk::Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            emit_session_started_once(&env, &user);
+            emit_session_started_once(&env, &user);
+            emit_session_started_once(&env, &user);
+            // Only 1 event emitted despite 3 calls
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+
+    #[test]
+    fn emit_signal_viewed_emits_event_with_user_and_signal_id() {
+        let (env, contract_id) = setup();
+        let user = soroban_sdk::Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            emit_signal_viewed(
+                &env,
+                EvtSignalViewed {
+                    schema_version: SCHEMA_VERSION,
+                    user: user.clone(),
+                    signal_id: 55,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+
+    #[test]
+    fn emit_signal_swiped_emits_event_with_user_and_signal_id() {
+        let (env, contract_id) = setup();
+        let user = soroban_sdk::Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            emit_signal_swiped(
+                &env,
+                EvtSignalSwiped {
+                    schema_version: SCHEMA_VERSION,
+                    user: user.clone(),
+                    signal_id: 3,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+
+    #[test]
+    fn emit_analytics_trade_executed_emits_event() {
+        let (env, contract_id) = setup();
+        let user = soroban_sdk::Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            emit_analytics_trade_executed(
+                &env,
+                EvtTradeExecuted {
+                    schema_version: SCHEMA_VERSION,
+                    user: user.clone(),
+                    signal_id: 9,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            assert_eq!(env.events().all().len(), 1);
         });
     }
 
