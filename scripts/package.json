@@ -4,7 +4,9 @@
   "type": "module",
   "description": "Off-chain scripts (deploy, event parsing tests) for StellarSwipe contracts",
   "scripts": {
-    "test:events": "npx tsx test_event_parsing.ts"
+    "test:events": "npx tsx test_event_parsing.ts",
+    "fund": "npx tsx testnet_utils.ts fund",
+    "monitor": "npx tsx monitor.ts"
   },
   "devDependencies": {
     "@stellar/stellar-sdk": "^13.3.0",

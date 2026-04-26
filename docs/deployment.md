@@ -127,6 +127,11 @@ If deployment fails:
    - Rotate compromised keys.
    - Prepare and execute a multisig-approved redeploy/migration plan.
 
+## Additional Resources
+
+- [Testnet Deployment Checklist](./testnet_checklist.md) — step-by-step checklist for testnet deployments
+- [Mainnet Deployment Checklist](./mainnet_checklist.md) — enhanced checklist with security sign-offs for mainnet
+
 ## Release Checklist (Done Criteria)
 
 Before merge/release, confirm:
