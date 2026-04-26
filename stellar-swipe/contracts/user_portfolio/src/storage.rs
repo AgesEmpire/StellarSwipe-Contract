@@ -12,4 +12,8 @@ pub enum DataKey {
     UserPositions(Address),
     /// Registered TradeExecutor contract allowed to call `close_position_keeper`.
     TradeExecutor,
+    /// Per-user KYC verification flag (bool). No PII stored — boolean only.
+    KycVerified(Address),
+    /// Global KYC-required mode (bool). When true, only KYC-verified users can trade.
+    KycRequiredMode,
 }

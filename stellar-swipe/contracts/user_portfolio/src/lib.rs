@@ -90,6 +90,49 @@ impl UserPortfolio {
         env.storage().instance().get(&DataKey::TradeExecutor)
     }
 
+    /// Admin: set or clear the KYC-verified flag for a user.
+    /// No PII is stored — only a boolean.
+    /// Emits `KYCStatusUpdated { user, verified }`.
+    pub fn set_kyc_status(env: Env, user: Address, verified: bool) {
+        Self::require_admin(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::KycVerified(user.clone()), &verified);
+        shared::events::emit_kyc_status_updated(
+            &env,
+            shared::events::EvtKycStatusUpdated {
+                schema_version: shared::events::SCHEMA_VERSION,
+                user,
+                verified,
+            },
+        );
+    }
+
+    /// Returns the KYC-verified status for a user (defaults to false if never set).
+    pub fn is_kyc_verified(env: Env, user: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::KycVerified(user))
+            .unwrap_or(false)
+    }
+
+    /// Admin: enable or disable KYC-required mode.
+    /// When true, only KYC-verified users can open positions.
+    pub fn set_kyc_required_mode(env: Env, required: bool) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::KycRequiredMode, &required);
+    }
+
+    /// Returns whether KYC-required mode is active (defaults to false).
+    pub fn get_kyc_required_mode(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::KycRequiredMode)
+            .unwrap_or(false)
+    }
+
     pub fn set_oracle_asset_pair(env: Env, asset_pair: u32) {
         Self::require_admin(&env);
         env.storage()
@@ -102,6 +145,22 @@ impl UserPortfolio {
         user.require_auth();
         if entry_price <= 0 || amount <= 0 {
             panic!("invalid entry_price or amount");
+        }
+        // KYC gate: if KYC-required mode is active, only verified users may open positions.
+        let kyc_required: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycRequiredMode)
+            .unwrap_or(false);
+        if kyc_required {
+            let verified: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::KycVerified(user.clone()))
+                .unwrap_or(false);
+            if !verified {
+                panic!("KYC verification required to open a position");
+            }
         }
         let id: u64 = env
             .storage()
@@ -344,6 +403,140 @@ impl UserPortfolio {
             .get(&DataKey::Admin)
             .expect("admin");
         admin.require_auth();
+    }
+}
+
+// ── KYC unit tests ────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod kyc_tests {
+    use super::oracle_ok::OracleMock;
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup(env: &Env) -> (Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let oracle = env.register_contract(None, OracleMock);
+        let contract_id = env.register_contract(None, UserPortfolio);
+        let client = UserPortfolioClient::new(env, &contract_id);
+        client.initialize(&admin, &oracle);
+        (admin, contract_id)
+    }
+
+    // KYC flag is readable and defaults to false.
+    #[test]
+    fn kyc_flag_defaults_to_false() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+        assert!(!client.is_kyc_verified(&user));
+    }
+
+    // Admin can set and clear the KYC flag.
+    #[test]
+    fn admin_can_set_and_clear_kyc_flag() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+
+        client.set_kyc_status(&user, &true);
+        assert!(client.is_kyc_verified(&user));
+
+        client.set_kyc_status(&user, &false);
+        assert!(!client.is_kyc_verified(&user));
+    }
+
+    // set_kyc_status emits KYCStatusUpdated event.
+    #[test]
+    fn set_kyc_status_emits_event() {
+        use soroban_sdk::testutils::Events;
+        use soroban_sdk::TryFromVal;
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+
+        client.set_kyc_status(&user, &true);
+
+        let has_kyc_event = env.events().all().iter().any(|e| {
+            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+            if topics.len() < 2 {
+                return false;
+            }
+            soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
+                .map(|s| s == soroban_sdk::Symbol::new(&env, "kyc_status_updated"))
+                .unwrap_or(false)
+        });
+        assert!(has_kyc_event, "kyc_status_updated event not emitted");
+    }
+
+    // KYC-required mode defaults to false.
+    #[test]
+    fn kyc_required_mode_defaults_to_false() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        assert!(!client.get_kyc_required_mode());
+    }
+
+    // Non-required mode: unverified user can open a position.
+    #[test]
+    fn non_required_mode_allows_unverified_user() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+
+        // KYC-required mode is off by default — unverified user should succeed.
+        let id = client.open_position(&user, &100, &1_000);
+        assert_eq!(id, 1);
+    }
+
+    // KYC-required mode: verified user can open a position.
+    #[test]
+    fn required_mode_allows_verified_user() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+
+        client.set_kyc_required_mode(&true);
+        client.set_kyc_status(&user, &true);
+
+        let id = client.open_position(&user, &100, &1_000);
+        assert_eq!(id, 1);
+    }
+
+    // KYC-required mode: unverified user cannot open a position.
+    #[test]
+    #[should_panic(expected = "KYC verification required to open a position")]
+    fn required_mode_blocks_unverified_user() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+
+        client.set_kyc_required_mode(&true);
+        // user is not KYC-verified — should panic
+        client.open_position(&user, &100, &1_000);
+    }
+
+    // Disabling KYC-required mode re-allows unverified users.
+    #[test]
+    fn disabling_required_mode_allows_unverified_user() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+
+        client.set_kyc_required_mode(&true);
+        client.set_kyc_required_mode(&false);
+
+        // Mode is now off — unverified user should succeed.
+        let id = client.open_position(&user, &100, &1_000);
+        assert_eq!(id, 1);
     }
 }
 

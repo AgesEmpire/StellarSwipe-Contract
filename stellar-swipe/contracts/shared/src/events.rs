@@ -300,6 +300,26 @@ pub fn emit_vesting_released(env: &Env, evt: EvtVestingReleased) {
     );
 }
 
+// ── KYC event structs ─────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtKycStatusUpdated {
+    pub schema_version: u32,
+    pub user: Address,
+    pub verified: bool,
+}
+
+pub fn emit_kyc_status_updated(env: &Env, evt: EvtKycStatusUpdated) {
+    env.events().publish(
+        (
+            Symbol::new(env, "user_portfolio"),
+            Symbol::new(env, "kyc_status_updated"),
+        ),
+        evt,
+    );
+}
+
 // ── Analytics event structs (Issue #365) ─────────────────────────────────────
 
 #[contracttype]
