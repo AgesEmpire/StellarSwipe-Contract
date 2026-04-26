@@ -300,6 +300,28 @@ pub fn emit_vesting_released(env: &Env, evt: EvtVestingReleased) {
     );
 }
 
+// ── Geographic restriction event structs ─────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtUserRestricted {
+    pub schema_version: u32,
+    pub user: Address,
+    /// IPFS hash of the restriction reason document. No reason text stored on-chain.
+    pub reason_hash: String,
+    pub restricted: bool,
+}
+
+pub fn emit_user_restricted(env: &Env, evt: EvtUserRestricted) {
+    env.events().publish(
+        (
+            Symbol::new(env, "user_portfolio"),
+            Symbol::new(env, "user_restricted"),
+        ),
+        evt,
+    );
+}
+
 // ── KYC event structs ─────────────────────────────────────────────────────────
 
 #[contracttype]

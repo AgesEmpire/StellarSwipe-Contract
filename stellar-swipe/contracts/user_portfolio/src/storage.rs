@@ -16,4 +16,6 @@ pub enum DataKey {
     KycVerified(Address),
     /// Global KYC-required mode (bool). When true, only KYC-verified users can trade.
     KycRequiredMode,
+    /// Per-user geographic restriction flag (bool). Restricted users cannot trade.
+    Restricted(Address),
 }

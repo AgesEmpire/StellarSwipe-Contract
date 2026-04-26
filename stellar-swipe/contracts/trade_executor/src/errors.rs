@@ -24,4 +24,5 @@ pub enum ContractError {
     PositionPctTooHigh = 9,
     OraclePriceStale = 10,
     OracleUnavailable = 11,
+    DailyVolumeLimitExceeded = 12,
 }

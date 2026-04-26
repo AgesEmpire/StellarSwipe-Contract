@@ -34,6 +34,12 @@ pub enum StorageKey {
     /// Last balance shortfall for a user (cleared after a successful `execute_copy_trade`).
     LastInsufficientBalance(Address),
     SdexRouter,
+    /// Global daily trade volume limit in USD-equivalent units (0 = no limit).
+    DailyVolumeLimit,
+    /// Accumulated trade volume for `user` on the current day.
+    DailyVolume(Address),
+    /// The ledger-day (timestamp / 86400) when `DailyVolume(user)` was last reset.
+    DailyVolumeDay(Address),
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -270,6 +276,32 @@ impl TradeExecutorContract {
         }
         env.storage().temporary().set(&lock_key, &true);
 
+        // ── Daily volume limit check ───────────────────────────────────────────
+        let limit: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::DailyVolumeLimit)
+            .unwrap_or(0i128);
+        if limit > 0 {
+            let today: u64 = env.ledger().timestamp() / 86_400;
+            let day_key = StorageKey::DailyVolumeDay(user.clone());
+            let vol_key = StorageKey::DailyVolume(user.clone());
+            let stored_day: u64 = env.storage().persistent().get(&day_key).unwrap_or(0u64);
+            let current_vol: i128 = if stored_day == today {
+                env.storage().persistent().get(&vol_key).unwrap_or(0i128)
+            } else {
+                0i128
+            };
+            let new_vol = current_vol.checked_add(amount).unwrap_or(i128::MAX);
+            if new_vol > limit {
+                env.storage().temporary().remove(&lock_key);
+                return Err(ContractError::DailyVolumeLimitExceeded);
+            }
+            // Record updated volume and day.
+            env.storage().persistent().set(&vol_key, &new_vol);
+            env.storage().persistent().set(&day_key, &today);
+        }
+
         // ── Read cached config from instance storage (no cross-contract call) ─
         let portfolio: Address = env
             .storage()
@@ -333,6 +365,30 @@ impl TradeExecutorContract {
 
     pub fn get_sdex_router(env: Env) -> Option<Address> {
         env.storage().instance().get(&StorageKey::SdexRouter)
+    }
+
+    /// Admin: set the global daily trade volume limit (USD-equivalent units).
+    /// `0` means no limit.
+    pub fn set_daily_volume_limit(env: Env, limit: i128) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if limit < 0 {
+            panic!("limit must be non-negative");
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::DailyVolumeLimit, &limit);
+    }
+
+    pub fn get_daily_volume_limit(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DailyVolumeLimit)
+            .unwrap_or(0i128)
     }
 
     /// # Summary

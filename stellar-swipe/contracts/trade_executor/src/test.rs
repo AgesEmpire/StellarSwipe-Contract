@@ -775,3 +775,64 @@ fn trade_cancelled_event_has_two_topic_format() {
     assert_eq!(contract, soroban_sdk::Symbol::new(&env, "trade_executor"));
     assert_eq!(event, soroban_sdk::Symbol::new(&env, "trade_cancelled"));
 }
+
+// ── Daily volume limit tests ──────────────────────────────────────────────────
+
+// Helper: set up executor with a funded user and a volume limit.
+fn setup_with_limit(limit: i128) -> (Env, Address, Address, Address, Address) {
+    let (env, exec_id, _portfolio_id, user, _admin, token) =
+        setup_with_balance(10_000_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    exec.set_daily_volume_limit(&limit);
+    (env, exec_id, user, _admin, token)
+}
+
+/// Zero limit means no restriction — trade succeeds.
+#[test]
+fn volume_limit_zero_means_no_restriction() {
+    let (env, exec_id, user, _admin, token) = setup_with_limit(0);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    assert!(exec.execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None).is_ok());
+}
+
+/// Trade under the daily limit succeeds.
+#[test]
+fn volume_under_limit_succeeds() {
+    let (env, exec_id, user, _admin, token) = setup_with_limit(TRADE_AMOUNT * 2);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    assert!(exec.execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None).is_ok());
+}
+
+/// Trade exactly at the daily limit succeeds.
+#[test]
+fn volume_at_limit_succeeds() {
+    let (env, exec_id, user, _admin, token) = setup_with_limit(TRADE_AMOUNT);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    assert!(exec.execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None).is_ok());
+}
+
+/// Trade that would exceed the daily limit returns DailyVolumeLimitExceeded.
+#[test]
+fn volume_over_limit_returns_error() {
+    let (env, exec_id, user, _admin, token) = setup_with_limit(TRADE_AMOUNT - 1);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    let result = exec.try_execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None);
+    assert_eq!(result, Err(Ok(ContractError::DailyVolumeLimitExceeded)));
+}
+
+/// Volume resets on a new day (simulated by advancing the ledger timestamp).
+#[test]
+fn volume_resets_on_new_day() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, exec_id, user, _admin, token) = setup_with_limit(TRADE_AMOUNT);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+
+    // Day 0: use up the full limit.
+    assert!(exec.execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None).is_ok());
+
+    // Advance to day 1.
+    env.ledger().with_mut(|l| l.timestamp = 86_400);
+
+    // Day 1: limit resets — trade should succeed again.
+    assert!(exec.execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None).is_ok());
+}

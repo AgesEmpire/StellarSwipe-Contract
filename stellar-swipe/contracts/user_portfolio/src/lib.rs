@@ -133,6 +133,33 @@ impl UserPortfolio {
             .unwrap_or(false)
     }
 
+    /// Admin: set or clear the geographic restriction flag for a user.
+    /// `reason_hash` is an IPFS CID of the reason document — no reason text stored on-chain.
+    /// Emits `UserRestricted { user, reason_hash, restricted }`.
+    pub fn set_user_restriction(env: Env, user: Address, restricted: bool, reason_hash: soroban_sdk::String) {
+        Self::require_admin(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Restricted(user.clone()), &restricted);
+        shared::events::emit_user_restricted(
+            &env,
+            shared::events::EvtUserRestricted {
+                schema_version: shared::events::SCHEMA_VERSION,
+                user,
+                reason_hash,
+                restricted,
+            },
+        );
+    }
+
+    /// Returns whether a user is geographically restricted (defaults to false).
+    pub fn is_restricted(env: Env, user: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Restricted(user))
+            .unwrap_or(false)
+    }
+
     pub fn set_oracle_asset_pair(env: Env, asset_pair: u32) {
         Self::require_admin(&env);
         env.storage()
@@ -161,6 +188,15 @@ impl UserPortfolio {
             if !verified {
                 panic!("KYC verification required to open a position");
             }
+        }
+        // Restriction gate: restricted users cannot open positions.
+        let restricted: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Restricted(user.clone()))
+            .unwrap_or(false);
+        if restricted {
+            panic!("user is geographically restricted");
         }
         let id: u64 = env
             .storage()
@@ -879,5 +915,96 @@ mod tests {
         let (contract, event) = last_topics(&env);
         assert_eq!(contract, soroban_sdk::Symbol::new(&env, "user_portfolio"));
         assert_eq!(event, soroban_sdk::Symbol::new(&env, "subscription_created"));
+    }
+}
+
+// ── Geographic restriction unit tests ─────────────────────────────────────────
+#[cfg(test)]
+mod restriction_tests {
+    use super::oracle_ok::OracleMock;
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup(env: &Env) -> (Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let oracle = env.register_contract(None, OracleMock);
+        let contract_id = env.register_contract(None, UserPortfolio);
+        let client = UserPortfolioClient::new(env, &contract_id);
+        client.initialize(&admin, &oracle);
+        (admin, contract_id)
+    }
+
+    fn reason(env: &Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(env, "QmFakeIpfsHash")
+    }
+
+    // Restriction flag defaults to false.
+    #[test]
+    fn restriction_defaults_to_false() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+        assert!(!client.is_restricted(&user));
+    }
+
+    // Unrestricted user can open a position.
+    #[test]
+    fn unrestricted_user_can_open_position() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+        let id = client.open_position(&user, &100, &1_000);
+        assert_eq!(id, 1);
+    }
+
+    // Restricted user cannot open a position.
+    #[test]
+    #[should_panic(expected = "user is geographically restricted")]
+    fn restricted_user_cannot_open_position() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+        client.set_user_restriction(&user, &true, &reason(&env));
+        client.open_position(&user, &100, &1_000);
+    }
+
+    // Admin can remove restriction and user can trade again.
+    #[test]
+    fn admin_can_remove_restriction() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+        client.set_user_restriction(&user, &true, &reason(&env));
+        assert!(client.is_restricted(&user));
+        client.set_user_restriction(&user, &false, &reason(&env));
+        assert!(!client.is_restricted(&user));
+        // Should succeed now.
+        let id = client.open_position(&user, &100, &1_000);
+        assert_eq!(id, 1);
+    }
+
+    // set_user_restriction emits user_restricted event.
+    #[test]
+    fn set_user_restriction_emits_event() {
+        use soroban_sdk::testutils::Events;
+        use soroban_sdk::TryFromVal;
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+        client.set_user_restriction(&user, &true, &reason(&env));
+        let has_event = env.events().all().iter().any(|e| {
+            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+            if topics.len() < 2 { return false; }
+            soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
+                .map(|s| s == soroban_sdk::Symbol::new(&env, "user_restricted"))
+                .unwrap_or(false)
+        });
+        assert!(has_event, "user_restricted event not emitted");
     }
 }
