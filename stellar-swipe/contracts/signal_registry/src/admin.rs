@@ -49,6 +49,13 @@ pub struct PendingAdminTransfer {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminTransfer {
+    pub pending_admin: Address,
+    pub expires_at_ledger: u32,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct AdminConfig {
     pub min_stake: i128,

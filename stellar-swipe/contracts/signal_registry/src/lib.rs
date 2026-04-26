@@ -58,6 +58,7 @@ use reputation::{
     TrustScoreDetails, TrustScoreTier,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
+use stellar_swipe_common::{health_uninitialized, placeholder_admin, HealthStatus};
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
 use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
 use types::{
@@ -2252,9 +2253,9 @@ mod test_adoption;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod test_combos;
+mod test_admin_transfer;
 #[cfg(test)]
-mod test_contests;
+mod test_adoption;
 #[cfg(test)]
 mod test_emergency;
 #[cfg(test)]
