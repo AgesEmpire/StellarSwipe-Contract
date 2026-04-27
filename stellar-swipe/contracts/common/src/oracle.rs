@@ -5,7 +5,7 @@
 //! prices.  The real implementation calls an on-chain oracle contract via
 //! `soroban_sdk::invoke`; the mock implementation is used in unit tests.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contracttype, symbol_short, vec, Address, Env, Symbol};
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -38,6 +38,9 @@ pub enum OracleError {
     CallFailed = 4,
 }
 
+/// Default heartbeat/freshness window for externally sourced prices.
+pub const MAX_PRICE_AGE_SECS: u64 = 300;
+
 // ── Trait ────────────────────────────────────────────────────────────────────
 
 /// Minimal oracle interface.  Implement this trait to swap between the real
@@ -57,13 +60,14 @@ pub struct OnChainOracleClient {
 impl IOracleClient for OnChainOracleClient {
     fn get_price(&self, env: &Env, asset_pair: u32) -> Result<OraclePrice, OracleError> {
         // Cross-contract call: oracle_contract.get_price(asset_pair) -> OraclePrice
-        let result: Option<OraclePrice> = env
-            .invoke_contract(
-                &self.address,
-                &Symbol::new(env, "get_price"),
-                soroban_sdk::vec![env, asset_pair.into()],
-            );
-        result.ok_or(OracleError::PriceNotFound)
+        match env.try_invoke_contract::<OraclePrice, soroban_sdk::Error>(
+            &self.address,
+            &Symbol::new(env, "get_price"),
+            vec![env, asset_pair.into()],
+        ) {
+            Ok(Ok(price)) => Ok(price),
+            Ok(Err(_)) | Err(_) => Err(OracleError::CallFailed),
+        }
     }
 }
 
@@ -97,5 +101,22 @@ impl IOracleClient for MockOracleClient {
             .temporary()
             .get(&(symbol_short!("mock_orc"), asset_pair))
             .ok_or(OracleError::PriceNotFound)
+    }
+}
+
+pub fn validate_freshness(env: &Env, price: &OraclePrice) -> Result<(), OracleError> {
+    let now = env.ledger().timestamp();
+    if price.timestamp == 0 || now.saturating_sub(price.timestamp) > MAX_PRICE_AGE_SECS {
+        return Err(OracleError::PriceStale);
+    }
+    Ok(())
+}
+
+pub fn oracle_price_to_i128(price: &OraclePrice) -> i128 {
+    let scale = 10i128.pow(price.decimals);
+    if scale == 0 {
+        price.price
+    } else {
+        price.price / scale
     }
 }

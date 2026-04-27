@@ -1,9 +1,9 @@
 use crate::social::get_follower_count;
 use crate::types::{Signal, SignalStatus};
 use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
+use stellar_swipe_common::{SECONDS_PER_DAY, SECONDS_PER_HOUR};
 
 const MIN_SIGNALS_FOR_ANALYTICS: u32 = 10;
-const HOURS_24: u64 = 86400;
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -63,7 +63,10 @@ pub fn get_trending_assets(
     signals_map: &Map<u64, Signal>,
     window_hours: u64,
 ) -> Vec<(String, u32)> {
-    let cutoff = env.ledger().timestamp().saturating_sub(window_hours * 3600);
+    let cutoff = env
+        .ledger()
+        .timestamp()
+        .saturating_sub(window_hours * SECONDS_PER_HOUR);
     let mut pair_counts: Map<String, u32> = Map::new(env);
 
     for i in 0..signals_map.keys().len() {
@@ -106,7 +109,7 @@ pub fn get_trending_assets(
 }
 
 pub fn calculate_global_analytics(env: &Env, signals_map: &Map<u64, Signal>) -> GlobalAnalytics {
-    let cutoff = env.ledger().timestamp().saturating_sub(HOURS_24);
+    let cutoff = env.ledger().timestamp().saturating_sub(SECONDS_PER_DAY);
     let mut total_signals_24h = 0u32;
     let mut total_volume_24h = 0i128;
     let mut successful = 0u32;

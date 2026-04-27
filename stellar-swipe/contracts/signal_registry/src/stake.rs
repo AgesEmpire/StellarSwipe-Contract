@@ -110,12 +110,14 @@ pub fn can_submit_signal(
     Ok(())
 }
 
-/// Get stake information for a provider
-/// TODO: Integrate with main contract storage once stake functionality is added
-pub fn get_stake_info(_env: &Env, _provider: &Address) -> Option<StakeInfo> {
-    // For now, return None until stake functionality is integrated
-    // This will result in stake component scoring as 0
-    None
+/// Get stake information for a provider from instance storage.
+pub fn get_stake_info(env: &Env, provider: &Address) -> Option<StakeInfo> {
+    let map: Map<Address, StakeInfo> = env
+        .storage()
+        .instance()
+        .get(&crate::StorageKey::ProviderStakes)
+        .unwrap_or(Map::new(env));
+    map.get(provider.clone())
 }
 
 #[cfg(test)]

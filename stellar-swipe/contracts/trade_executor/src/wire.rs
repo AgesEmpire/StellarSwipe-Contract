@@ -19,6 +19,20 @@ pub enum TradeStatus {
     Failed,
 }
 
+/// Default timeout: 120 ledgers ≈ 10 minutes (5-second ledger close time).
+pub const TRADE_TIMEOUT_LEDGERS: u32 = 120;
+
+/// A pending limit order stored on-chain, subject to expiry.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TradeOrder {
+    pub trade_id: u64,
+    pub user: Address,
+    pub amount: i128,
+    pub expires_at_ledger: u32,
+    pub status: TradeStatus,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trade {

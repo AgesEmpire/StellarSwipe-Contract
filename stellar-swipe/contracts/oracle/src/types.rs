@@ -34,6 +34,7 @@ pub struct PriceData {
 #[derive(Clone)]
 pub enum StorageKey {
     Admin,
+    Guardian,
     PriceMap(AssetPair),
     OracleStats,
     Oracles,
@@ -41,6 +42,8 @@ pub enum StorageKey {
     ConsensusPrice,
     PauseStates,
     OracleWeight(Address),
+    PendingAdmin,
+    PendingAdminExpiry,
 }
 
 #[contracttype]

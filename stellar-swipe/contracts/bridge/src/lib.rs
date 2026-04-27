@@ -1,15 +1,13 @@
 #![no_std]
 
-feat/cross-chain-bridge-91
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
+use stellar_swipe_common::SECONDS_PER_DAY;
 
 mod validators;
 
 pub use validators::{ValidatorApproval, ValidatorApprovalKind, ValidatorSet};
-
-const DAY_SECONDS: u64 = 86_400;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,147 +119,16 @@ pub enum DataKey {
     DailyVolume,
 }
 
-feat/bridge-liquidity-pools-96
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
-
-use soroban_sdk::{contract, contractimpl, Env};
-use stellar_swipe_common::HealthStatus;
+const DAY_SECONDS: u64 = 86_400;
 
 pub mod monitoring;
 pub mod governance;
 pub mod analytics;
 pub mod fees;
 pub mod messaging;
-
-pub use monitoring::{
-    ChainFinalityConfig, ChainId, MonitoredTransaction, MonitoringStatus, VerificationMethod,
-    BridgeTransfer, TransferStatus,
-    monitor_source_transaction, get_monitored_tx, check_for_reorg, handle_reorg,
-    update_transaction_confirmation_count, mark_transaction_failed, create_bridge_transfer,
-    add_validator_signature, approve_transfer_for_minting, complete_transfer,
-    get_chain_finality_config, set_chain_finality_config,
-main
-};
-
 mod liquidity;
-mod validators;
 
 pub use liquidity::{LiquidityPool, LiquidityPosition, PoolHealth, PoolType, SwapResult};
-pub use validators::{ValidatorApproval, ValidatorApprovalKind, ValidatorSet};
-
-const DAY_SECONDS: u64 = 86_400;
-
-feat/bridge-liquidity-pools-96
-#[contracterror]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum BridgeError {
-    AlreadyInitialized = 1,
-    InvalidAmount = 2,
-    InvalidValidatorSet = 3,
-    UnauthorizedValidator = 4,
-    TransferNotFound = 5,
-    TransferAlreadyExecuted = 6,
-    ReplayDetected = 7,
-    SignatureAlreadyUsed = 8,
-    NotEnoughValidatorApprovals = 9,
-    DailyLimitExceeded = 10,
-    MaxTransferExceeded = 11,
-    InsufficientWrappedBalance = 12,
-    WithdrawalNotReady = 13,
-    InvalidOperation = 14,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ChainId {
-    Ethereum,
-    Polygon,
-    Bnb,
-    Bitcoin,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransferKind {
-    LockMint,
-    BurnUnlock,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransferStatus {
-    PendingValidators,
-    ReadyToExecute,
-    Completed,
-    Cancelled,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SecurityConfig {
-    pub max_transfer_amount: i128,
-    pub daily_transfer_limit: i128,
-    pub required_validator_signatures: u32,
-    pub withdraw_delay_seconds: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WrappedAsset {
-    pub source_chain: ChainId,
-    pub source_asset: String,
-    pub wrapped_asset: String,
-    pub decimals: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BridgeConfig {
-    pub admin: Address,
-    pub validator_set: ValidatorSet,
-    pub security: SecurityConfig,
-    pub next_transfer_id: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BridgeTransfer {
-    pub id: u64,
-    pub kind: TransferKind,
-    pub user: Address,
-    pub source_chain: ChainId,
-    pub destination_chain: ChainId,
-    pub source_asset: String,
-    pub wrapped_asset: String,
-    pub amount: i128,
-    pub source_tx_hash: String,
-    pub source_nonce: u64,
-    pub destination_recipient: String,
-    pub approvals: Vec<ValidatorApproval>,
-    pub status: TransferStatus,
-    pub created_at: u64,
-    pub executed_at: Option<u64>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DailyVolume {
-    pub day_start: u64,
-    pub total_amount: i128,
-}
-
-#[contracttype]
-pub enum DataKey {
-    Config,
-    WrappedAsset(String),
-    Transfer(u64),
-    ReplayLock(ChainId, String, u64),
-    UsedSignature(Address, u64, ValidatorApprovalKind, String),
-    WrappedBalance(Address, String),
-    DailyVolume,
-}
 
 pub use messaging::{
     CrossChainMessage, MessageStatus,
@@ -276,18 +143,12 @@ pub use messaging::{
     expire_timed_out_message,
     get_cross_chain_message,
 };
- main
- main
 
 #[contract]
 pub struct BridgeContract;
 
 #[contractimpl]
 impl BridgeContract {
-feat/cross-chain-bridge-91
-
-feat/bridge-liquidity-pools-96
-main
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -660,8 +521,6 @@ main
             .get(&DataKey::WrappedBalance(user, wrapped_asset))
             .unwrap_or(0)
     }
- feat/cross-chain-bridge-91
-
 
     pub fn create_liquidity_pool(
         env: Env,
@@ -738,7 +597,11 @@ main
     pub fn get_pool_health(env: Env, pool_id: u64) -> Result<PoolHealth, BridgeError> {
         liquidity::get_pool_health(&env, pool_id)
     }
-main
+
+    /// Read-only health for ops / frontends.
+    pub fn health_check(env: Env) -> stellar_swipe_common::HealthStatus {
+        crate::governance::bridge_health_check(&env)
+    }
 }
 
 fn get_config(env: &Env) -> Result<BridgeConfig, BridgeError> {
@@ -1100,16 +963,6 @@ mod test {
         });
     }
 }
- feat/cross-chain-bridge-91
-
-
-    /// Read-only health for ops / frontends; no auth, no storage writes.
-    pub fn health_check(env: Env) -> HealthStatus {
-        crate::governance::bridge_health_check(&env)
-    }
-}
 
 #[cfg(test)]
 mod test_health;
- main
- main

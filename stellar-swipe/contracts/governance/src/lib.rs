@@ -115,6 +115,26 @@ pub enum StorageKey {
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl GovernanceContract {
+    /// # Summary
+    /// One-time governance contract initialization. Sets admin, token metadata,
+    /// initial token distribution, and all governance subsystem state.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `admin`: Address that will hold admin privileges (must authorize).
+    /// - `name`: Token name (e.g. `"StellarSwipe Gov"`).
+    /// - `symbol`: Token symbol (e.g. `"SSG"`).
+    /// - `decimals`: Token decimal places.
+    /// - `total_supply`: Total token supply (must be > 0).
+    /// - `recipients`: Addresses for each distribution category.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::AlreadyInitialized`] — contract already initialized.
+    /// - [`GovernanceError::InvalidSupply`] — total_supply <= 0.
+    /// - [`GovernanceError::InvalidMetadata`] — name or symbol is empty.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -311,6 +331,26 @@ impl GovernanceContract {
         proposals::configure_governance(&env, &admin, config)
     }
 
+    /// # Summary
+    /// Create a new governance proposal. Proposer must have staked voting power
+    /// >= `min_proposal_threshold`.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `proposer`: Address creating the proposal (must authorize).
+    /// - `proposal_type`: Type and parameters of the proposal.
+    /// - `title`: Short human-readable title.
+    /// - `description`: Full proposal description.
+    /// - `execution_payload`: Arbitrary bytes attached to the proposal (e.g. migration notes hash).
+    ///
+    /// # Returns
+    /// The new proposal ID.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::NotInitialized`] — contract not initialized.
+    /// - [`GovernanceError::NoVotingPower`] — proposer has insufficient staked balance.
+    /// - [`GovernanceError::InvalidProposal`] — title/description empty or proposal validation failed.
+    /// - [`GovernanceError::BudgetExceeded`] — TreasurySpend amount exceeds 10% of treasury.
     pub fn create_proposal(
         env: Env,
         proposer: Address,
@@ -342,6 +382,26 @@ impl GovernanceContract {
         Ok(get_all_proposals(&env))
     }
 
+    /// # Summary
+    /// Cast a vote on an active proposal. Voter must have staked voting power > 0.
+    /// Each address may vote only once per proposal.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `proposal_id`: ID of the proposal to vote on.
+    /// - `voter`: Address casting the vote (must authorize).
+    /// - `vote_type`: [`GovernanceVoteType::For`], [`GovernanceVoteType::Against`], or [`GovernanceVoteType::Abstain`].
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::NotInitialized`] — contract not initialized.
+    /// - [`GovernanceError::ProposalNotFound`] — proposal_id does not exist.
+    /// - [`GovernanceError::VotingNotStarted`] — voting period has not begun.
+    /// - [`GovernanceError::VotingEnded`] — voting period has closed.
+    /// - [`GovernanceError::AlreadyVoted`] — voter has already cast a vote.
+    /// - [`GovernanceError::NoVotingPower`] — voter has no staked balance.
     pub fn cast_vote(
         env: Env,
         proposal_id: u64,
@@ -1551,17 +1611,26 @@ fn emit_vesting_created(
 
 #[allow(deprecated)]
 fn emit_vesting_released(env: &Env, beneficiary: &Address, amount: i128) {
-    env.events().publish(
-        (symbol_short!("gov"), symbol_short!("vestrel")),
-        (beneficiary.clone(), amount),
+    shared::events::emit_vesting_released(
+        env,
+        shared::events::EvtVestingReleased {
+            schema_version: shared::events::SCHEMA_VERSION,
+            beneficiary: beneficiary.clone(),
+            amount,
+        },
     );
 }
 
 #[allow(deprecated)]
 fn emit_stake_changed(env: &Env, holder: &Address, amount: i128, is_stake: bool) {
-    env.events().publish(
-        (symbol_short!("gov"), symbol_short!("stake")),
-        (holder.clone(), amount, is_stake),
+    shared::events::emit_stake_changed(
+        env,
+        shared::events::EvtStakeChanged {
+            schema_version: shared::events::SCHEMA_VERSION,
+            holder: holder.clone(),
+            amount,
+            is_stake,
+        },
     );
 }
 
@@ -1575,9 +1644,13 @@ fn emit_reward_accrued(env: &Env, beneficiary: &Address, volume: i128, reward: i
 
 #[allow(deprecated)]
 fn emit_reward_claimed(env: &Env, beneficiary: &Address, amount: i128) {
-    env.events().publish(
-        (symbol_short!("gov"), symbol_short!("claim")),
-        (beneficiary.clone(), amount),
+    shared::events::emit_reward_claimed(
+        env,
+        shared::events::EvtRewardClaimed {
+            schema_version: shared::events::SCHEMA_VERSION,
+            beneficiary: beneficiary.clone(),
+            amount,
+        },
     );
 }
 

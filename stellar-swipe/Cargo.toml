@@ -7,21 +7,12 @@ members = [
   "contracts/trade_executor",
   "contracts/governance",
   "contracts/oracle",
-  "contracts/bridge",
- main
-
- feature/reputation-score
-  "contracts/fee_collector",
-
- main
- main
+  "contracts/stake_vault",
+  "contracts/shared",
   "contracts/fee_collector",
   "contracts/user_portfolio",
- main
-
- main
- main
- main
+  "contracts/analytics",
+  "contracts/integration_tests",
 ]
 
 [workspace.dependencies]

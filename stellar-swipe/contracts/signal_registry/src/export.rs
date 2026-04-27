@@ -7,6 +7,7 @@ use soroban_sdk::{Address, Bytes, Env, Map};
 use crate::errors::ExportError;
 use crate::types::{Signal, SignalAction, SignalStatus, TradeExecution};
 use crate::StorageKey;
+use stellar_swipe_common::{SECONDS_PER_30_DAY_MONTH, SECONDS_PER_DAY, SECONDS_PER_WEEK};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -16,11 +17,11 @@ use crate::StorageKey;
 const MAX_EXPORT_RECORDS: u32 = 500;
 
 /// 7 days in seconds
-pub const PRESET_7_DAYS: u64 = 7 * 24 * 60 * 60;
+pub const PRESET_7_DAYS: u64 = SECONDS_PER_WEEK;
 /// 30 days in seconds
-pub const PRESET_30_DAYS: u64 = 30 * 24 * 60 * 60;
+pub const PRESET_30_DAYS: u64 = SECONDS_PER_30_DAY_MONTH;
 /// 365 days in seconds
-pub const PRESET_365_DAYS: u64 = 365 * 24 * 60 * 60;
+pub const PRESET_365_DAYS: u64 = 365 * SECONDS_PER_DAY;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -156,10 +157,7 @@ pub fn get_executor_trades(env: &Env, executor: &Address) -> alloc::vec::Vec<Tra
 }
 
 /// Return all `TradeExecution` records for signals owned by a provider.
-pub fn get_provider_trades(
-    env: &Env,
-    provider: &Address,
-) -> alloc::vec::Vec<TradeExecution> {
+pub fn get_provider_trades(env: &Env, provider: &Address) -> alloc::vec::Vec<TradeExecution> {
     let signals_map: Map<u64, Signal> = env
         .storage()
         .instance()
@@ -369,7 +367,8 @@ pub fn export_trades_csv(
     for (trade_id, trade, signal) in &trades {
         let asset_pair = sdk_str_to_rust(&signal.asset_pair);
         // PnL = volume * roi / 10000
-        let pnl = trade.volume
+        let pnl = trade
+            .volume
             .checked_mul(trade.roi)
             .unwrap_or(i128::MAX)
             .checked_div(10000)
@@ -408,7 +407,8 @@ pub fn export_trades_json(
             push_str(&mut buf, ",");
         }
         let asset_pair = sdk_str_to_rust(&signal.asset_pair);
-        let pnl = trade.volume
+        let pnl = trade
+            .volume
             .checked_mul(trade.roi)
             .unwrap_or(i128::MAX)
             .checked_div(10000)
@@ -486,9 +486,8 @@ fn calculate_performance_summary(
 
         total_roi_bps = total_roi_bps.saturating_add(avg_roi);
         total_volume = total_volume.saturating_add(signal.total_volume);
-        total_lifetime_secs = total_lifetime_secs.saturating_add(
-            signal.expiry.saturating_sub(signal.timestamp),
-        );
+        total_lifetime_secs =
+            total_lifetime_secs.saturating_add(signal.expiry.saturating_sub(signal.timestamp));
         total_trades = total_trades.saturating_add(signal.executions);
 
         let pair_key = sdk_str_to_rust(&signal.asset_pair);
@@ -589,10 +588,7 @@ pub fn export_performance_csv(
     let success_rate_str = alloc::format!("{}.{:02}%", sr_whole, sr_frac);
 
     let mut buf: RustVec<u8> = RustVec::new();
-    push_str(
-        &mut buf,
-        "metric,value\n",
-    );
+    push_str(&mut buf, "metric,value\n");
 
     let rows = [
         alloc::format!("total_signals,{}\n", s.total_signals),
@@ -605,7 +601,10 @@ pub fn export_performance_csv(
         alloc::format!("total_trades,{}\n", s.total_trades),
         alloc::format!("best_pair,{}\n", csv_escape(&s.best_pair)),
         alloc::format!("worst_pair,{}\n", csv_escape(&s.worst_pair)),
-        alloc::format!("avg_signal_lifetime_hours,{}\n", s.avg_signal_lifetime_secs / 3600),
+        alloc::format!(
+            "avg_signal_lifetime_hours,{}\n",
+            s.avg_signal_lifetime_secs / 3600
+        ),
     ];
 
     for row in &rows {
@@ -677,9 +676,7 @@ pub fn export_data(
         (ExportEntity::Signals, ExportFormat::Json) => {
             export_signals_json(env, requester, date_range)
         }
-        (ExportEntity::Trades, ExportFormat::Csv) => {
-            export_trades_csv(env, requester, date_range)
-        }
+        (ExportEntity::Trades, ExportFormat::Csv) => export_trades_csv(env, requester, date_range),
         (ExportEntity::Trades, ExportFormat::Json) => {
             export_trades_json(env, requester, date_range)
         }

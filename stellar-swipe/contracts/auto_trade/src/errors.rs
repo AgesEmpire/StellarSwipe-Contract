@@ -1,8 +1,14 @@
 use soroban_sdk::contracterror;
 
+/// AutoTrade contract errors (≤ 50 variants — Soroban XDR limit).
+///
+/// Related sub-errors are collapsed into a single variant; the emitted event
+/// carries the fine-grained reason.  Aliases in the `impl` block keep all
+/// existing call-sites compiling without changes.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AutoTradeError {
+    // ── Core trade errors ────────────────────────────────────────────────────
     InvalidAmount = 1,
     Unauthorized = 2,
     SignalNotFound = 3,
@@ -15,155 +21,107 @@ pub enum AutoTradeError {
     TradingPaused = 10,
     StrategyNotFound = 11,
     PositionAlreadyExists = 12,
- Updated upstream
-    RankingDisabled = 13,
-    InvalidBasketSize = 14,
-    InsufficientPriceHistory = 15,
- main
-
-    InsufficientPriceHistory = 13,
-    RankingDisabled = 14,
-    InvalidBasketSize = 15,
- Stashed changes
-
-    DcaStrategyNotFound = 10,
-    DcaStrategyInactive = 11,
-    DcaEndTimeReached = 12,
-    MrStrategyNotFound = 13,
-    MrInsufficientHistory = 14,
-    MrLowVolatility = 15,
-docs/contract-events-documentation
-    TradingPaused = 16,
-    StrategyNotFound = 17,
-    PositionAlreadyExists = 18,
-    RankingDisabled = 19,
-    InvalidBasketSize = 20,
-    InsufficientPriceHistory = 21,
-    InvalidPriceData = 22,
-    NonCointegratedBasket = 23,
-    ActivePortfolioExists = 24,
-    NoActivePortfolio = 25,
-    NoTradeSignal = 26,
-    InvalidStatArbConfig = 27,
-    PairsStrategyNotFound = 28,
-    PairsActivePositionExists = 29,
-    PairsNoActivePosition = 30,
-    InsufficientCorrelation = 31,
-    PairNotCointegrated = 32,
-    InvalidPairsConfig = 33,
-    ArbitrageOpportunityExpired = 34,
-    ArbitrageUnprofitable = 35,
-    ArbTooLarge = 36,
-    FrontRunningRisk = 37,
-    InvalidInsuranceConfig = 38,
-    InsuranceNotConfigured = 39,
-    SelfReferral = 40,
-    ReferralAlreadySet = 41,
-    CircularReferral = 42,
-    ReferralLimitExceeded = 43,
-    InvalidTWAPDuration = 44,
-    TWAPOrderNotFound = 45,
-    NotTWAPOwner = 46,
-    TWAPNotActive = 47,
-    CorrelationLimitExceeded = 48,
-    TooManyCorrelatedPositions = 49,
-    ConditionalOrderNotFound = 50,
-    ConditionalOrderNotPending = 51,
-    ConditionalOrderNotTriggered = 52,
-    InvalidConditionalConfig = 53,
-    RateLimitPenalty = 54,
-    BelowMinTransfer = 55,
-    CooldownNotElapsed = 56,
-    HourlyTransferLimitExceeded = 57,
-    HourlyVolumeLimitExceeded = 58,
-    DailyTransferLimitExceeded = 59,
-    DailyVolumeLimitExceeded = 60,
-    GlobalCapacityExceeded = 61,
-
-
-feature/dca-strategy
-    DcaStrategyNotFound = 10,
-    DcaStrategyInactive = 11,
-    DcaEndTimeReached = 12,
- main
-
-    TradingPaused = 10,
-    StrategyNotFound = 11,
-    PositionAlreadyExists = 12,
- feat/smart-order-routing-84
-    InsufficientPriceHistory = 13,
-    RankingDisabled = 14,
-    InvalidBasketSize = 15,
-
-    RankingDisabled = 13,
-    InvalidBasketSize = 14,
-    InsufficientPriceHistory = 15,
- main
- main
-    InvalidPriceData = 16,
-    NonCointegratedBasket = 17,
-    ActivePortfolioExists = 18,
-    NoActivePortfolio = 19,
-    NoTradeSignal = 20,
-    InvalidStatArbConfig = 21,
-    ExitStrategyNotFound = 22,
- Updated upstream
-    InvalidExitConfig = 23,
-    InsuranceNotConfigured = 24,
-    InvalidInsuranceConfig = 25,
- main
-
- Stashed changes
-
- feat/smart-order-routing-84
-    InvalidInsuranceConfig = 22,
+    // ── Portfolio / stat-arb ─────────────────────────────────────────────────
+    InvalidBasketSize = 13,
+    InsufficientPriceHistory = 14,
+    InvalidPriceData = 15,
+    NonCointegratedBasket = 16,
+    ActivePortfolioExists = 17,
+    NoActivePortfolio = 18,
+    NoTradeSignal = 19,
+    InvalidStatArbConfig = 20,
+    // ── Exit / insurance ─────────────────────────────────────────────────────
+    ExitStrategyNotFound = 21,
+    InvalidExitConfig = 22,
     InsuranceNotConfigured = 23,
-    SelfReferral = 24,
-    ReferralAlreadySet = 25,
-    CircularReferral = 26,
-    ReferralLimitExceeded = 27,
-    SlippageExceeded = 28,
-    RoutingPlanNotFound = 29,
-    AtomicExecutionFailed = 30,
+    InvalidInsuranceConfig = 24,
+    // ── Referral (SelfReferral / AlreadySet / Circular / LimitExceeded) ──────
+    ReferralError = 25,
+    // ── TWAP (InvalidDuration / NotFound / NotOwner / NotActive) ─────────────
+    TWAPError = 26,
+    // ── Correlation ──────────────────────────────────────────────────────────
+    CorrelationLimitExceeded = 27,
+    TooManyCorrelatedPositions = 28,
+    // ── Conditional orders (NotFound / NotPending / NotTriggered / Config) ───
+    ConditionalOrderError = 29,
+    InvalidConditionalConfig = 30,
+    // ── Rate limits (all sub-types collapsed) ────────────────────────────────
+    RateLimitExceeded = 31,
+    // ── Pairs trading ────────────────────────────────────────────────────────
+    PairsStrategyNotFound = 32,
+    PairsPositionError = 33,
+    InsufficientCorrelation = 34,
+    PairNotCointegrated = 35,
+    InvalidPairsConfig = 36,
+    // ── Oracle ───────────────────────────────────────────────────────────────
+    OracleUnavailable = 37,
+    // ── DCA (NotFound / Inactive / EndTimeReached) ────────────────────────────
+    DcaError = 38,
+    // ── Mean-reversion (NotFound / InsufficientHistory / LowVolatility) ──────
+    MrStrategyError = 39,
+    // ── Admin transfer ───────────────────────────────────────────────────────
+    AdminTransferError = 40,
+    // ── Routing ──────────────────────────────────────────────────────────────
+    RoutingPlanNotFound = 41,
+    // ── Arbitrage ────────────────────────────────────────────────────────────
+    ArbitrageError = 42,
+    FrontRunningRisk = 43,
+    // ── System / bridge / recovery ───────────────────────────────────────────
+    SystemError = 44,
+    SlippageExceeded = 45,
+    // ── Misc ─────────────────────────────────────────────────────────────────
+    RankingDisabled = 46,
+    LastOracleForPair = 47,
+    NotPaused = 48,
+}
 
-    PairsStrategyNotFound = 22,
-    PairsActivePositionExists = 23,
-    PairsNoActivePosition = 24,
-    InsufficientCorrelation = 25,
-    PairNotCointegrated = 26,
-    InvalidPairsConfig = 27,
-    ArbitrageOpportunityExpired = 28,
-    ArbitrageUnprofitable = 29,
-    ArbTooLarge = 30,
-    FrontRunningRisk = 31,
-    InvalidInsuranceConfig = 32,
-    InsuranceNotConfigured = 33,
-    SelfReferral = 34,
-    ReferralAlreadySet = 35,
-    CircularReferral = 36,
-    ReferralLimitExceeded = 37,
-    InvalidTWAPDuration = 38,
-    TWAPOrderNotFound = 39,
-    NotTWAPOwner = 40,
-    TWAPNotActive = 41,
-    CorrelationLimitExceeded = 42,
-    TooManyCorrelatedPositions = 43,
-    ConditionalOrderNotFound = 44,
-    ConditionalOrderNotPending = 45,
-    ConditionalOrderNotTriggered = 46,
-    InvalidConditionalConfig = 47,
+// ── Backward-compatible aliases ───────────────────────────────────────────────
+// These keep all existing call-sites compiling without modification.
+#[allow(non_upper_case_globals)]
+impl AutoTradeError {
+    pub const SelfReferral: AutoTradeError = AutoTradeError::ReferralError;
+    pub const ReferralAlreadySet: AutoTradeError = AutoTradeError::ReferralError;
+    pub const CircularReferral: AutoTradeError = AutoTradeError::ReferralError;
+    pub const ReferralLimitExceeded: AutoTradeError = AutoTradeError::ReferralError;
 
-    // Oracle circuit breaker
-    OracleUnavailable = 48,
+    pub const InvalidTWAPDuration: AutoTradeError = AutoTradeError::TWAPError;
+    pub const TWAPOrderNotFound: AutoTradeError = AutoTradeError::TWAPError;
+    pub const NotTWAPOwner: AutoTradeError = AutoTradeError::TWAPError;
+    pub const TWAPNotActive: AutoTradeError = AutoTradeError::TWAPError;
 
-    // Oracle whitelist
-    LastOracleForPair = 49,
+    pub const ConditionalOrderNotFound: AutoTradeError = AutoTradeError::ConditionalOrderError;
+    pub const ConditionalOrderNotPending: AutoTradeError = AutoTradeError::ConditionalOrderError;
+    pub const ConditionalOrderNotTriggered: AutoTradeError = AutoTradeError::ConditionalOrderError;
 
- main
- main
-main
- main
- main
- main
- main
+    pub const RateLimitPenalty: AutoTradeError = AutoTradeError::RateLimitExceeded;
+    pub const BelowMinTransfer: AutoTradeError = AutoTradeError::RateLimitExceeded;
+    pub const CooldownNotElapsed: AutoTradeError = AutoTradeError::RateLimitExceeded;
+    pub const HourlyTransferLimitExceeded: AutoTradeError = AutoTradeError::RateLimitExceeded;
+    pub const HourlyVolumeLimitExceeded: AutoTradeError = AutoTradeError::RateLimitExceeded;
+    pub const DailyTransferLimitExceeded: AutoTradeError = AutoTradeError::RateLimitExceeded;
+    pub const DailyVolumeLimitExceeded: AutoTradeError = AutoTradeError::RateLimitExceeded;
+    pub const GlobalCapacityExceeded: AutoTradeError = AutoTradeError::RateLimitExceeded;
+
+    pub const PairsActivePositionExists: AutoTradeError = AutoTradeError::PairsPositionError;
+    pub const PairsNoActivePosition: AutoTradeError = AutoTradeError::PairsPositionError;
+
+    pub const DcaStrategyNotFound: AutoTradeError = AutoTradeError::DcaError;
+    pub const DcaStrategyInactive: AutoTradeError = AutoTradeError::DcaError;
+    pub const DcaEndTimeReached: AutoTradeError = AutoTradeError::DcaError;
+
+    pub const MrStrategyNotFound: AutoTradeError = AutoTradeError::MrStrategyError;
+    pub const MrInsufficientHistory: AutoTradeError = AutoTradeError::MrStrategyError;
+    pub const MrLowVolatility: AutoTradeError = AutoTradeError::MrStrategyError;
+
+    pub const PendingAdminNotFound: AutoTradeError = AutoTradeError::AdminTransferError;
+    pub const PendingAdminExpired: AutoTradeError = AutoTradeError::AdminTransferError;
+
+    pub const ArbitrageOpportunityExpired: AutoTradeError = AutoTradeError::ArbitrageError;
+    pub const ArbitrageUnprofitable: AutoTradeError = AutoTradeError::ArbitrageError;
+    pub const ArbTooLarge: AutoTradeError = AutoTradeError::ArbitrageError;
+
+    pub const AtomicExecutionFailed: AutoTradeError = AutoTradeError::SystemError;
+    pub const BridgePaused: AutoTradeError = AutoTradeError::SystemError;
+    pub const RecoveryNotFound: AutoTradeError = AutoTradeError::SystemError;
+    pub const RecoveryIncomplete: AutoTradeError = AutoTradeError::SystemError;
 }

@@ -8,12 +8,20 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  STELLAR_NETWORK: testnet
 
 jobs:
   ci:
     runs-on: ubuntu-latest
 
     steps:
+      # Safety: ensure mainnet config is never loaded in CI
+      - name: Guard — reject mainnet in CI
+        run: |
+          if [ "${STELLAR_NETWORK}" = "mainnet" ]; then
+            echo "ERROR: STELLAR_NETWORK=mainnet is not allowed in CI" && exit 1
+          fi
+
       # Checkout repository
       - uses: actions/checkout@v4
 

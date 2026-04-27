@@ -5,14 +5,15 @@
 
 #![allow(dead_code)]
 
-use soroban_sdk::{contracttype, Address, Bytes, Env, String, Symbol};
 use crate::governance::get_bridge_validators;
 use crate::monitoring::ChainId;
+use soroban_sdk::{contracttype, Address, Bytes, Env, String, Symbol};
+use stellar_swipe_common::SECONDS_PER_DAY;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 pub const MAX_MESSAGE_SIZE: u32 = 4096;
-pub const MESSAGE_TIMEOUT: u64 = 86400; // 24 h
+pub const MESSAGE_TIMEOUT: u64 = SECONDS_PER_DAY; // 24 h
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -102,7 +103,12 @@ fn bridge_id_for_chain(env: &Env, chain_id: ChainId) -> Result<u64, String> {
 // In production these verify Merkle / ZK proofs from the target chain.
 // Here any non-empty Bytes is accepted so the logic can be exercised in tests.
 
-fn verify_delivery_proof(env: &Env, _chain: ChainId, _id: u64, proof: &Bytes) -> Result<(), String> {
+fn verify_delivery_proof(
+    env: &Env,
+    _chain: ChainId,
+    _id: u64,
+    proof: &Bytes,
+) -> Result<(), String> {
     if proof.is_empty() {
         return Err(String::from_str(env, "Empty delivery proof"));
     }
@@ -191,10 +197,8 @@ pub fn relay_message_to_target_chain(
     msg.status = MessageStatus::Relayed;
     save_message(env, &msg);
 
-    env.events().publish(
-        (Symbol::new(env, "msg_relayed"), message_id),
-        validator,
-    );
+    env.events()
+        .publish((Symbol::new(env, "msg_relayed"), message_id), validator);
 
     Ok(())
 }
@@ -218,10 +222,8 @@ pub fn confirm_message_delivery(
     msg.delivered_at = Some(now);
     save_message(env, &msg);
 
-    env.events().publish(
-        (Symbol::new(env, "msg_delivered"), message_id),
-        now,
-    );
+    env.events()
+        .publish((Symbol::new(env, "msg_delivered"), message_id), now);
 
     if !msg.callback_required {
         remove_message(env, message_id);
@@ -341,9 +343,9 @@ pub fn get_cross_chain_message(env: &Env, message_id: u64) -> Option<CrossChainM
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::governance::{initialize_bridge, BridgeSecurityConfig};
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::Env;
-    use crate::governance::{initialize_bridge, BridgeSecurityConfig};
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -391,8 +393,15 @@ mod tests {
     fn test_send_message_ok() {
         let (env, sender, _) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(id, 1);
         let msg = get_cross_chain_message(&env, id).unwrap();
@@ -405,11 +414,25 @@ mod tests {
     fn test_send_increments_id() {
         let (env, sender, _) = setup();
         let id1 = send_cross_chain_message(
-            &env, sender.clone(), ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender.clone(),
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
         let id2 = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
         assert_eq!(id2, id1 + 1);
     }
 
@@ -418,7 +441,13 @@ mod tests {
         let (env, sender, _) = setup();
         let big = Bytes::from_slice(&env, &[0u8; 4097]);
         let result = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), big, 100_000, false,
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            big,
+            100_000,
+            false,
         );
         assert!(result.is_err());
     }
@@ -429,22 +458,40 @@ mod tests {
     fn test_relay_ok() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Relayed);
+        assert_eq!(
+            get_cross_chain_message(&env, id).unwrap().status,
+            MessageStatus::Relayed
+        );
     }
 
     #[test]
     fn test_relay_already_relayed_fails() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        let result = relay_message_to_target_chain(&env, id, validators.get(1).unwrap(), proof(&env));
+        let result =
+            relay_message_to_target_chain(&env, id, validators.get(1).unwrap(), proof(&env));
         assert!(result.is_err());
     }
 
@@ -452,8 +499,15 @@ mod tests {
     fn test_relay_unauthorized_validator_fails() {
         let (env, sender, _) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
 
         let rogue = Address::generate(&env);
         assert!(relay_message_to_target_chain(&env, id, rogue, proof(&env)).is_err());
@@ -465,8 +519,15 @@ mod tests {
     fn test_confirm_delivery_no_callback_cleans_up() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
         confirm_message_delivery(&env, id, proof(&env)).unwrap();
@@ -477,8 +538,15 @@ mod tests {
     fn test_confirm_delivery_with_callback_keeps_message() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, true,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            true,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
         confirm_message_delivery(&env, id, proof(&env)).unwrap();
@@ -492,8 +560,15 @@ mod tests {
     fn test_confirm_delivery_empty_proof_fails() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
         assert!(confirm_message_delivery(&env, id, empty(&env)).is_err());
@@ -503,8 +578,15 @@ mod tests {
     fn test_confirm_delivery_without_relay_fails() {
         let (env, sender, _) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
         assert!(confirm_message_delivery(&env, id, proof(&env)).is_err());
     }
 
@@ -514,8 +596,15 @@ mod tests {
     fn test_receive_callback_ok() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, true,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            true,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
         confirm_message_delivery(&env, id, proof(&env)).unwrap();
@@ -527,15 +616,24 @@ mod tests {
     fn test_callback_not_expected_fails() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
 
         // Manually force Delivered state without callback_required
         let mut msg = get_cross_chain_message(&env, id).unwrap();
         msg.status = MessageStatus::Delivered;
-        env.storage().persistent().set(&MessagingKey::Message(id), &msg);
+        env.storage()
+            .persistent()
+            .set(&MessagingKey::Message(id), &msg);
 
         assert!(receive_message_callback(&env, id, payload(&env), proof(&env)).is_err());
     }
@@ -544,8 +642,15 @@ mod tests {
     fn test_callback_before_delivery_fails() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, true,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            true,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
         // Skip confirm_message_delivery
@@ -556,8 +661,15 @@ mod tests {
     fn test_callback_empty_proof_fails() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, true,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            true,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
         confirm_message_delivery(&env, id, proof(&env)).unwrap();
@@ -570,23 +682,43 @@ mod tests {
     fn test_retry_failed_message_ok() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
         mark_message_failed(&env, id).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Failed);
+        assert_eq!(
+            get_cross_chain_message(&env, id).unwrap().status,
+            MessageStatus::Failed
+        );
 
         retry_failed_message(&env, id).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Pending);
+        assert_eq!(
+            get_cross_chain_message(&env, id).unwrap().status,
+            MessageStatus::Pending
+        );
     }
 
     #[test]
     fn test_retry_non_failed_message_fails() {
         let (env, sender, _) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
         assert!(retry_failed_message(&env, id).is_err());
     }
 
@@ -594,8 +726,15 @@ mod tests {
     fn test_mark_completed_message_failed_fails() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
         confirm_message_delivery(&env, id, proof(&env)).unwrap();
@@ -609,20 +748,37 @@ mod tests {
     fn test_expire_timed_out_message() {
         let (env, sender, _) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
 
         env.ledger().set_timestamp(1000 + MESSAGE_TIMEOUT + 1);
         expire_timed_out_message(&env, id).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Failed);
+        assert_eq!(
+            get_cross_chain_message(&env, id).unwrap().status,
+            MessageStatus::Failed
+        );
     }
 
     #[test]
     fn test_expire_not_timed_out_fails() {
         let (env, sender, _) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
         assert!(expire_timed_out_message(&env, id).is_err());
     }
 
@@ -632,14 +788,27 @@ mod tests {
     fn test_full_flow_with_callback() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, true,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            true,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Relayed);
+        assert_eq!(
+            get_cross_chain_message(&env, id).unwrap().status,
+            MessageStatus::Relayed
+        );
 
         confirm_message_delivery(&env, id, proof(&env)).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Delivered);
+        assert_eq!(
+            get_cross_chain_message(&env, id).unwrap().status,
+            MessageStatus::Delivered
+        );
 
         receive_message_callback(&env, id, payload(&env), proof(&env)).unwrap();
         assert!(get_cross_chain_message(&env, id).is_none());
@@ -649,13 +818,23 @@ mod tests {
     fn test_full_flow_fail_then_retry_then_deliver() {
         let (env, sender, validators) = setup();
         let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+            &env,
+            sender,
+            ChainId::Ethereum,
+            target(&env),
+            payload(&env),
+            100_000,
+            false,
+        )
+        .unwrap();
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
         mark_message_failed(&env, id).unwrap();
         retry_failed_message(&env, id).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Pending);
+        assert_eq!(
+            get_cross_chain_message(&env, id).unwrap().status,
+            MessageStatus::Pending
+        );
 
         relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
         confirm_message_delivery(&env, id, proof(&env)).unwrap();
@@ -670,8 +849,15 @@ mod tests {
         let mut ids = soroban_sdk::Vec::new(&env);
         for _ in 0..5u32 {
             let id = send_cross_chain_message(
-                &env, sender.clone(), ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-            ).unwrap();
+                &env,
+                sender.clone(),
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
             ids.push_back(id);
         }
 

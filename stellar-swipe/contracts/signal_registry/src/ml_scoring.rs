@@ -1,6 +1,6 @@
 //! ML scoring types (feature extraction / scoring pipeline is deferred).
 
-use soroban_sdk::{contracttype, Map, String};
+use soroban_sdk::{contracttype, Env, Map, String};
 
 /// Signal features for ML model
 #[contracttype]

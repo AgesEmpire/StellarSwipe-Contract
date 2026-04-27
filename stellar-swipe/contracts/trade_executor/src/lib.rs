@@ -1,44 +1,73 @@
 #![no_std]
 
 mod errors;
- feature/copy-trade-balance-check
+pub mod keeper;
+mod oracle;
 pub mod risk_gates;
+pub mod sdex;
+pub mod triggers;
 
 use errors::{ContractError, InsufficientBalanceDetail};
 use risk_gates::{
-    check_position_limit, check_user_balance, DEFAULT_ESTIMATED_COPY_TRADE_FEE,
+    check_user_balance, resolve_trade_amount, validate_and_record_position,
+    DEFAULT_ESTIMATED_COPY_TRADE_FEE, MAX_BATCH_SIZE,
 };
-
-feature/position-limit-copy-trade
-pub mod risk_gates;
-
-use errors::ContractError;
-use risk_gates::check_position_limit;
- main
+use sdex::{execute_sdex_swap, min_received_from_slippage};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Val, Vec};
+
+use triggers::{ORACLE_KEY, PORTFOLIO_KEY};
 
 /// Instance storage keys.
 #[contracttype]
 #[derive(Clone)]
 pub enum StorageKey {
     Admin,
-    /// Contract implementing `get_open_position_count(user) -> u32` (UserPortfolio).
+    /// Contract implementing `validate_and_record(user, max_positions) -> u32` (UserPortfolio).
     UserPortfolio,
-    /// When set to `true`, this user bypasses [`risk_gates::MAX_POSITIONS_PER_USER`].
+    /// When set to `true`, this user bypasses the per-user position cap.
     PositionLimitExempt(Address),
- feature/copy-trade-balance-check
+    /// Oracle contract used by stop-loss/take-profit triggers (`get_price(asset_pair) -> i128`).
+    Oracle,
+    /// Portfolio contract used by stop-loss/take-profit close calls (`close_position(user, trade_id, pnl)`).
+    StopLossPortfolio,
     /// Overrides default estimated fee used in balance checks (`None` = use default constant).
     CopyTradeEstimatedFee,
-    /// Last balance shortfall for `user` (cleared after a successful `execute_copy_trade`).
+    /// Last balance shortfall for a user (cleared after a successful `execute_copy_trade`).
     LastInsufficientBalance(Address),
-
- main
+    SdexRouter,
+    /// Global daily trade volume limit in USD-equivalent units (0 = no limit).
+    DailyVolumeLimit,
+    /// Accumulated trade volume for `user` on the current day.
+    DailyVolume(Address),
+    /// The ledger-day (timestamp / 86400) when `DailyVolume(user)` was last reset.
+    DailyVolumeDay(Address),
+    /// Oracle contracts allowed to feed stop-loss / take-profit triggers.
+    OracleWhitelisted(Address),
+    OracleWhitelistCount,
 }
 
-/// Symbol invoked on the portfolio after a successful limit check (test / integration hook).
-pub const RECORD_COPY_POSITION_FN: &str = "record_copy_position";
+/// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
+const EXECUTION_LOCK: &str = "ExecLock";
 
- feature/copy-trade-balance-check
+/// A single trade input for [`TradeExecutorContract::batch_execute`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchTradeInput {
+    pub user: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
+/// Per-trade outcome returned by [`TradeExecutorContract::batch_execute`].
+/// `ok = true` means the trade succeeded; `ok = false` means it failed with `error_code`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchTradeResult {
+    pub ok: bool,
+    /// `ContractError` discriminant when `ok == false`; 0 when `ok == true`.
+    pub error_code: u32,
+}
+
 #[contract]
 pub struct TradeExecutorContract;
 
@@ -49,36 +78,21 @@ fn effective_estimated_fee(env: &Env) -> i128 {
         .unwrap_or(DEFAULT_ESTIMATED_COPY_TRADE_FEE)
 }
 
-#[contractimpl]
-impl TradeExecutorContract {
-
-
-
-pub mod sdex;
-
-use errors::ContractError;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
-
-use sdex::{execute_sdex_swap, min_received_from_slippage};
-
-#[contracttype]
-#[derive(Clone)]
-enum StorageKey {
-    Admin,
-    SdexRouter,
+fn require_admin(env: &Env) -> Result<Address, ContractError> {
+    oracle::require_admin(env)
 }
 
- main
-#[contract]
-pub struct TradeExecutorContract;
-
 #[contractimpl]
 impl TradeExecutorContract {
-  feature/position-limit-copy-trade
-
-    /// One-time init; stores admin who may configure the SDEX router address.
-main
-main
+    /// # Summary
+    /// One-time contract initialization. Stores the admin address.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `admin`: Address that will hold admin privileges.
+    ///
+    /// # Returns
+    /// Nothing. Panics if already initialized.
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&StorageKey::Admin) {
             panic!("already initialized");
@@ -86,11 +100,16 @@ main
         env.storage().instance().set(&StorageKey::Admin, &admin);
     }
 
- feature/copy-trade-balance-check
-
- feature/position-limit-copy-trade
- main
-    /// Configure the portfolio contract used for open-position counts and copy-trade recording.
+    /// # Summary
+    /// Configure the portfolio contract used for position validation and
+    /// copy-trade recording. Admin auth required.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `portfolio`: Address of the UserPortfolio contract.
+    ///
+    /// # Returns
+    /// Nothing. Panics if not initialized.
     pub fn set_user_portfolio(env: Env, portfolio: Address) {
         let admin: Address = env
             .storage()
@@ -107,8 +126,7 @@ main
         env.storage().instance().get(&StorageKey::UserPortfolio)
     }
 
- feature/copy-trade-balance-check
-    /// Set the fee term used in `amount + estimated_fee` balance checks (admin). Use `0` for no fee cushion.
+    /// Set the fee term used in `amount + estimated_fee` balance checks (admin).
     pub fn set_copy_trade_estimated_fee(env: Env, fee: i128) {
         let admin: Address = env
             .storage()
@@ -130,24 +148,12 @@ main
 
     /// Admin override: exempt `user` from the per-user position cap (or clear exemption).
     pub fn set_position_limit_exempt(env: Env, user: Address, exempt: bool) {
-
-    /// Admin override: exempt `user` from the per-user position cap (or clear exemption).
-    pub fn set_position_limit_exempt(env: Env, user: Address, exempt: bool) {
-
-    /// Set the router contract invoked by [`sdex::execute_sdex_swap`].
-    pub fn set_sdex_router(env: Env, router: Address) {
- main
-main
         let admin: Address = env
             .storage()
             .instance()
             .get(&StorageKey::Admin)
             .expect("not initialized");
         admin.require_auth();
-feature/copy-trade-balance-check
-
-feature/position-limit-copy-trade
-main
         let key = StorageKey::PositionLimitExempt(user);
         if exempt {
             env.storage().instance().set(&key, &true);
@@ -161,7 +167,94 @@ main
         env.storage().instance().get(&key).unwrap_or(false)
     }
 
-feature/copy-trade-balance-check
+    // ── Stop-loss / take-profit configuration ─────────────────────────────────
+
+    pub fn add_oracle(env: Env, oracle: Address) -> Result<(), ContractError> {
+        oracle::add(&env, oracle)
+    }
+
+    pub fn remove_oracle(env: Env, oracle: Address) -> Result<(), ContractError> {
+        oracle::remove(&env, oracle)
+    }
+
+    pub fn is_oracle_whitelisted(env: Env, oracle: Address) -> bool {
+        oracle::is_whitelisted(&env, &oracle)
+    }
+
+    pub fn get_oracle_whitelist_count(env: Env) -> u32 {
+        oracle::count(&env)
+    }
+
+    /// Set the oracle contract used by stop-loss/take-profit checks (admin only).
+    pub fn set_oracle(env: Env, oracle: Address) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        oracle::require_whitelisted(&env, &oracle)?;
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, ORACLE_KEY), &oracle);
+        Ok(())
+    }
+
+    pub fn get_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&Symbol::new(&env, ORACLE_KEY))
+    }
+
+    /// Set the portfolio contract used by stop-loss/take-profit close calls (admin only).
+    pub fn set_stop_loss_portfolio(env: Env, portfolio: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, PORTFOLIO_KEY), &portfolio);
+    }
+
+    /// Register a stop-loss price for `(user, trade_id)`.
+    pub fn set_stop_loss_price(env: Env, user: Address, trade_id: u64, stop_loss_price: i128) {
+        user.require_auth();
+        triggers::set_stop_loss(&env, &user, trade_id, stop_loss_price);
+    }
+
+    /// Check oracle price and trigger stop-loss if breached. Returns `true` when triggered.
+    pub fn check_and_trigger_stop_loss(
+        env: Env,
+        user: Address,
+        trade_id: u64,
+        asset_pair: u32,
+    ) -> Result<bool, ContractError> {
+        triggers::check_and_trigger_stop_loss(&env, user, trade_id, asset_pair)
+    }
+
+    /// Register a take-profit price for `(user, trade_id)`.
+    pub fn set_take_profit_price(env: Env, user: Address, trade_id: u64, take_profit_price: i128) {
+        user.require_auth();
+        triggers::set_take_profit(&env, &user, trade_id, take_profit_price);
+    }
+
+    pub fn set_take_profit_price_with_pair(
+        env: Env,
+        user: Address,
+        trade_id: u64,
+        take_profit_price: i128,
+        asset_pair: u32,
+    ) {
+        user.require_auth();
+        triggers::set_take_profit(&env, &user, trade_id, take_profit_price);
+        keeper::register_watch(&env, &user, trade_id, asset_pair);
+    }
+
+    pub fn check_and_trigger_take_profit(
+        env: Env,
+        user: Address,
+        trade_id: u64,
+        asset_pair: u32,
+    ) -> Result<bool, ContractError> {
+        triggers::check_and_trigger_take_profit(&env, user, trade_id, asset_pair)
+    }
+
     /// Structured shortfall after the last `InsufficientBalance` from [`Self::execute_copy_trade`].
     pub fn get_insufficient_balance_detail(
         env: Env,
@@ -171,71 +264,181 @@ feature/copy-trade-balance-check
         env.storage().instance().get(&key)
     }
 
-    /// Runs copy trade: balance check (incl. fee), position limit, then portfolio `record_copy_position`.
+    /// Execute a copy trade.
+    ///
+    /// ## Cross-contract call budget (Issue #306 optimization)
+    /// | # | Callee            | Purpose                                      |
+    /// |---|-------------------|----------------------------------------------|
+    /// | 1 | SEP-41 token SAC  | Balance check (`token.balance(user)`)        |
+    /// | 2 | UserPortfolio     | `validate_and_record(user, max_positions)`   |
+    ///
+    /// Previously 3 calls (balance + get_open_position_count + record_copy_position).
+    /// Now 2 calls — calls #2 and #3 are batched into a single portfolio entrypoint.
     pub fn execute_copy_trade(
         env: Env,
         user: Address,
         token: Address,
         amount: i128,
+        portfolio_pct_bps: Option<u32>,
     ) -> Result<(), ContractError> {
+        // ── Auth ──────────────────────────────────────────────────────────────
         user.require_auth();
 
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
 
+        // ── Reentrancy guard ──────────────────────────────────────────────────
+        let lock_key = Symbol::new(&env, EXECUTION_LOCK);
+        if env
+            .storage()
+            .temporary()
+            .get::<_, bool>(&lock_key)
+            .unwrap_or(false)
+        {
+            return Err(ContractError::ReentrancyDetected);
+        }
+        env.storage().temporary().set(&lock_key, &true);
 
-    /// Runs copy trade: position limit check first, then portfolio `record_copy_position`.
-    pub fn execute_copy_trade(env: Env, user: Address) -> Result<(), ContractError> {
-        user.require_auth();
+        // ── Daily volume limit check ───────────────────────────────────────────
+        let limit: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::DailyVolumeLimit)
+            .unwrap_or(0i128);
+        if limit > 0 {
+            let today: u64 = env.ledger().timestamp() / 86_400;
+            let day_key = StorageKey::DailyVolumeDay(user.clone());
+            let vol_key = StorageKey::DailyVolume(user.clone());
+            let stored_day: u64 = env.storage().persistent().get(&day_key).unwrap_or(0u64);
+            let current_vol: i128 = if stored_day == today {
+                env.storage().persistent().get(&vol_key).unwrap_or(0i128)
+            } else {
+                0i128
+            };
+            let new_vol = current_vol.checked_add(amount).unwrap_or(i128::MAX);
+            if new_vol > limit {
+                env.storage().temporary().remove(&lock_key);
+                return Err(ContractError::DailyVolumeLimitExceeded);
+            }
+            // Record updated volume and day.
+            env.storage().persistent().set(&vol_key, &new_vol);
+            env.storage().persistent().set(&day_key, &today);
+        }
 
-main
+        // ── Read cached config from instance storage (no cross-contract call) ─
         let portfolio: Address = env
             .storage()
             .instance()
             .get(&StorageKey::UserPortfolio)
             .ok_or(ContractError::NotInitialized)?;
 
-feature/copy-trade-balance-check
-        let fee = effective_estimated_fee(&env);
-        let bal_key = StorageKey::LastInsufficientBalance(user.clone());
-        match check_user_balance(&env, &user, &token, amount, fee) {
-            Ok(()) => {
-                env.storage().instance().remove(&bal_key);
-            }
-            Err(detail) => {
-                env.storage().instance().set(&bal_key, &detail);
-                return Err(ContractError::InsufficientBalance);
-            }
-        }
-
-
-main
         let exempt = {
             let key = StorageKey::PositionLimitExempt(user.clone());
             env.storage().instance().get(&key).unwrap_or(false)
         };
 
-        check_position_limit(&env, &portfolio, &user, exempt)?;
+        // ── Resolve effective amount (portfolio % or explicit) ─────────────────
+        let oracle: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, triggers::ORACLE_KEY));
+        let effective_amount =
+            match resolve_trade_amount(&env, &user, &token, amount, portfolio_pct_bps, oracle) {
+                Ok(a) => a,
+                Err(e) => {
+                    env.storage().temporary().remove(&lock_key);
+                    return Err(e);
+                }
+            };
 
-        let sym = Symbol::new(&env, RECORD_COPY_POSITION_FN);
-        let mut args = Vec::<Val>::new(&env);
-        args.push_back(user.into_val(&env));
-        env.invoke_contract::<()>(&portfolio, &sym, args);
+        // ── Cross-contract call #1: SEP-41 balance check ──────────────────────
+        let fee = effective_estimated_fee(&env);
+        let bal_key = StorageKey::LastInsufficientBalance(user.clone());
+        match check_user_balance(&env, &user, &token, effective_amount, fee) {
+            Ok(()) => {
+                env.storage().instance().remove(&bal_key);
+            }
+            Err(detail) => {
+                env.storage().instance().set(&bal_key, &detail);
+                env.storage().temporary().remove(&lock_key);
+                return Err(ContractError::InsufficientBalance);
+            }
+        }
 
+        // ── Cross-contract call #2: batched position-limit check + record ─────
+        validate_and_record_position(&env, &portfolio, &user, exempt)?;
+
+        env.storage().temporary().remove(&lock_key);
         Ok(())
-feature/copy-trade-balance-check
-
-
-        env.storage().instance().set(&StorageKey::SdexRouter, &router);
     }
 
-    /// Read configured router (for off-chain tooling).
+    // ── SDEX router configuration ─────────────────────────────────────────────
+
+    /// Set the router contract invoked by [`sdex::execute_sdex_swap`].
+    pub fn set_sdex_router(env: Env, router: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::SdexRouter, &router);
+    }
+
     pub fn get_sdex_router(env: Env) -> Option<Address> {
         env.storage().instance().get(&StorageKey::SdexRouter)
     }
 
-    /// Swap using a caller-supplied minimum output (already includes slippage tolerance).
+    /// Admin: set the global daily trade volume limit (USD-equivalent units).
+    /// `0` means no limit.
+    pub fn set_daily_volume_limit(env: Env, limit: i128) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if limit < 0 {
+            panic!("limit must be non-negative");
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::DailyVolumeLimit, &limit);
+    }
+
+    pub fn get_daily_volume_limit(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DailyVolumeLimit)
+            .unwrap_or(0i128)
+    }
+
+    /// # Summary
+    /// Execute a swap via the configured SDEX router with an explicit minimum
+    /// received amount. Enforces slippage at the balance-delta level.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `from_token`: SEP-41 token to sell.
+    /// - `to_token`: SEP-41 token to buy.
+    /// - `amount`: Amount of `from_token` to sell (must be > 0).
+    /// - `min_received`: Minimum acceptable amount of `to_token` (must be >= 0).
+    ///
+    /// # Returns
+    /// Actual amount of `to_token` received.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — SDEX router not configured.
+    /// - [`ContractError::InvalidAmount`] — amount <= 0 or min_received < 0.
+    /// - [`ContractError::SlippageExceeded`] — actual received < min_received.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// client.swap(&xlm_token, &usdc_token, &1_000_0000000i128, &990_0000000i128);
+    /// ```
     pub fn swap(
         env: Env,
         from_token: Address,
@@ -248,17 +451,28 @@ feature/copy-trade-balance-check
             .instance()
             .get(&StorageKey::SdexRouter)
             .ok_or(ContractError::NotInitialized)?;
-        execute_sdex_swap(
-            &env,
-            &router,
-            &from_token,
-            &to_token,
-            amount,
-            min_received,
-        )
+        execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received)
     }
 
-    /// Swap with `min_received = amount * (10000 - max_slippage_bps) / 10000`.
+    /// # Summary
+    /// Execute a swap with automatic slippage protection. Computes
+    /// `min_received = amount * (10_000 - max_slippage_bps) / 10_000`
+    /// and delegates to [`Self::swap`].
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `from_token`: SEP-41 token to sell.
+    /// - `to_token`: SEP-41 token to buy.
+    /// - `amount`: Amount of `from_token` to sell.
+    /// - `max_slippage_bps`: Maximum acceptable slippage in basis points (e.g. `100` = 1%).
+    ///
+    /// # Returns
+    /// Actual amount of `to_token` received.
+    ///
+    /// # Errors
+    /// - [`ContractError::InvalidAmount`] — amount <= 0 or slippage calculation overflows.
+    /// - [`ContractError::NotInitialized`] — SDEX router not configured.
+    /// - [`ContractError::SlippageExceeded`] — actual received < computed min_received.
     pub fn swap_with_slippage(
         env: Env,
         from_token: Address,
@@ -266,13 +480,118 @@ feature/copy-trade-balance-check
         amount: i128,
         max_slippage_bps: u32,
     ) -> Result<i128, ContractError> {
-        let min_received =
-            min_received_from_slippage(amount, max_slippage_bps).ok_or(ContractError::InvalidAmount)?;
+        let min_received = min_received_from_slippage(amount, max_slippage_bps)
+            .ok_or(ContractError::InvalidAmount)?;
         Self::swap(env, from_token, to_token, amount, min_received)
-main
- main
+    }
+
+    // ── Manual position exit ──────────────────────────────────────────────────
+
+    /// Cancel a copy trade manually: executes a SDEX swap to close the position,
+    /// records exit in UserPortfolio, and emits `TradeCancelled`.
+    pub fn cancel_copy_trade(
+        env: Env,
+        caller: Address,
+        user: Address,
+        trade_id: u64,
+        from_token: Address,
+        to_token: Address,
+        amount: i128,
+        min_received: i128,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if caller != user {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let portfolio: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UserPortfolio)
+            .ok_or(ContractError::NotInitialized)?;
+
+        let exists: bool = {
+            let sym = Symbol::new(&env, "has_position");
+            let mut args = Vec::<Val>::new(&env);
+            args.push_back(user.clone().into_val(&env));
+            args.push_back(trade_id.into_val(&env));
+            env.invoke_contract(&portfolio, &sym, args)
+        };
+        if !exists {
+            return Err(ContractError::TradeNotFound);
+        }
+
+        let router: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SdexRouter)
+            .ok_or(ContractError::NotInitialized)?;
+
+        let exit_price =
+            execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received)?;
+
+        let realized_pnl = exit_price - amount;
+        let close_sym = Symbol::new(&env, "close_position");
+        let mut close_args = Vec::<Val>::new(&env);
+        close_args.push_back(user.clone().into_val(&env));
+        close_args.push_back(trade_id.into_val(&env));
+        close_args.push_back(realized_pnl.into_val(&env));
+        env.invoke_contract::<()>(&portfolio, &close_sym, close_args);
+
+        shared::events::emit_trade_cancelled(
+            &env,
+            shared::events::EvtTradeCancelled {
+                schema_version: shared::events::SCHEMA_VERSION,
+                user: user.clone(),
+                trade_id,
+                exit_price,
+                realized_pnl,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Execute a batch of copy trades. Each trade is attempted independently;
+    /// a failure in one trade does NOT roll back successful trades.
+    ///
+    /// Returns a `Vec<BatchTradeResult>` with one entry per input trade, in order.
+    ///
+    /// # Errors
+    /// - [`ContractError::InvalidAmount`] — batch is empty or exceeds `MAX_BATCH_SIZE`.
+    pub fn batch_execute(
+        env: Env,
+        trades: Vec<BatchTradeInput>,
+    ) -> Result<Vec<BatchTradeResult>, ContractError> {
+        let len = trades.len();
+        if len == 0 || len > MAX_BATCH_SIZE {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let mut results: Vec<BatchTradeResult> = Vec::new(&env);
+
+        for i in 0..len {
+            let trade = trades.get(i).unwrap();
+            let outcome =
+                Self::execute_copy_trade(env.clone(), trade.user, trade.token, trade.amount, None);
+            let result = match outcome {
+                Ok(()) => BatchTradeResult {
+                    ok: true,
+                    error_code: 0,
+                },
+                Err(e) => BatchTradeResult {
+                    ok: false,
+                    error_code: e as u32,
+                },
+            };
+            results.push_back(result);
+        }
+
+        Ok(results)
     }
 }
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod tests;

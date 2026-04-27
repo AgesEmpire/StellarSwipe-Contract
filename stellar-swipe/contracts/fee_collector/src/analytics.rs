@@ -1,10 +1,6 @@
 use crate::{Error, StorageKey};
 use soroban_sdk::{contracttype, panic_with_error, Address, Env, Vec};
-
-pub const SECONDS_PER_DAY: u64 = 86400;
-
-/// Target ledgers per UTC day at ~5s per ledger (used only for temporary-entry TTL budget).
-pub const LEDGERS_PER_DAY: u32 = 17_280;
+use stellar_swipe_common::{LEDGERS_PER_DAY, PLACEHOLDER_ADMIN_STR, SECONDS_PER_DAY};
 /// Temporary daily buckets are extended toward this horizon (~30 days of ledgers).
 pub const TEMP_FEE_BUCKET_TTL_LEDGERS: u32 = LEDGERS_PER_DAY * 30;
 
@@ -52,7 +48,7 @@ fn current_day_number(env: &Env) -> u64 {
 }
 
 fn no_trades_top_token_placeholder(env: &Env) -> Address {
-    Address::from_str(env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
+    Address::from_str(env, PLACEHOLDER_ADMIN_STR)
 }
 
 pub(crate) fn load_bucket(env: &Env, day: u64) -> DailyFeeBucket {
@@ -83,7 +79,9 @@ fn upsert_day_token(env: &Env, bucket: &mut DailyFeeBucket, token: Address, add:
         i += 1;
     }
     if bucket.by_token.len() < MAX_TOKEN_SLOTS_PER_DAY {
-        bucket.by_token.push_back(TokenFeeVol { token, amount: add });
+        bucket
+            .by_token
+            .push_back(TokenFeeVol { token, amount: add });
     }
 }
 
@@ -168,7 +166,9 @@ pub fn get_fee_analytics(env: &Env, period: AnalyticsPeriod) -> FeeAnalytics {
     let avg_fee_per_trade = if trade_count == 0 {
         0i128
     } else {
-        total_fees / (trade_count as i128)
+        total_fees
+            .checked_div(trade_count as i128)
+            .unwrap_or(0)
     };
 
     let mut top_token = no_trades_top_token_placeholder(env);

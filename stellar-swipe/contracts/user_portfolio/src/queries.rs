@@ -2,11 +2,12 @@
 
 use crate::storage::DataKey;
 use crate::{PnlSummary, Position, PositionStatus};
-use soroban_sdk::{symbol_short, Address, Env, Val, Vec};
+use soroban_sdk::{Address, Env, Vec};
+use stellar_swipe_common::{
+    oracle_price_to_i128, validate_freshness, IOracleClient, OnChainOracleClient,
+};
 
-const GET_PRICE: soroban_sdk::Symbol = symbol_short!("get_price");
-
-/// Sum closed `realized_pnl`, optionally sum open unrealized using oracle `get_price() -> i128`.
+/// Sum closed `realized_pnl`, optionally sum open unrealized using oracle `get_price(asset_pair) -> OraclePrice`.
 /// If the oracle call fails, returns realized-only totals with `unrealized_pnl: None`.
 pub fn compute_get_pnl(env: &Env, user: Address) -> PnlSummary {
     let oracle: Address = env
@@ -14,6 +15,11 @@ pub fn compute_get_pnl(env: &Env, user: Address) -> PnlSummary {
         .instance()
         .get(&DataKey::Oracle)
         .expect("oracle not configured");
+    let asset_pair: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::OracleAssetPair)
+        .unwrap_or(0);
 
     let ids: Vec<u64> = env
         .storage()
@@ -52,13 +58,14 @@ pub fn compute_get_pnl(env: &Env, user: Address) -> PnlSummary {
         }
     }
 
-    let empty_args: Vec<Val> = Vec::new(env);
-    let current_price: Option<i128> =
-        match env.try_invoke_contract::<i128, soroban_sdk::Error>(&oracle, &GET_PRICE, empty_args)
-        {
-            Ok(Ok(p)) => Some(p),
-            Ok(Err(_)) | Err(_) => None,
-        };
+    let current_price = OnChainOracleClient { address: oracle }
+        .get_price(env, asset_pair)
+        .ok()
+        .and_then(|price| {
+            validate_freshness(env, &price)
+                .ok()
+                .map(|_| oracle_price_to_i128(&price))
+        });
 
     let unrealized_pnl: Option<i128> = if !has_open {
         Some(0_i128)
@@ -111,6 +118,85 @@ pub fn compute_get_pnl(env: &Env, user: Address) -> PnlSummary {
     }
 }
 
+pub fn get_trade_history(
+    env: &Env,
+    user: Address,
+    cursor: Option<u64>,
+    limit: u32,
+) -> Vec<TradeHistoryEntry> {
+    let page_limit = limit.min(MAX_TRADE_HISTORY_LIMIT);
+    let mut page = Vec::new(env);
+    if page_limit == 0 {
+        return page;
+    }
+
+    let closed_ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UserClosedPositions(user.clone()))
+        .unwrap_or_else(|| rebuild_closed_position_index(env, user));
+
+    let mut next_index = closed_ids.len();
+    if let Some(cursor_id) = cursor {
+        for i in 0..closed_ids.len() {
+            if closed_ids.get(i) == Some(cursor_id) {
+                next_index = i;
+                break;
+            }
+        }
+    }
+
+    while next_index > 0 && page.len() < page_limit {
+        next_index -= 1;
+        let Some(trade_id) = closed_ids.get(next_index) else {
+            continue;
+        };
+        let Some(position) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Position>(&DataKey::Position(trade_id))
+        else {
+            continue;
+        };
+        if position.status != PositionStatus::Closed {
+            continue;
+        }
+        page.push_back(TradeHistoryEntry { trade_id, position });
+    }
+
+    page
+}
+
+fn rebuild_closed_position_index(env: &Env, user: Address) -> Vec<u64> {
+    let ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UserPositions(user.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    let mut closed_ids = Vec::new(env);
+
+    for i in 0..ids.len() {
+        let Some(id) = ids.get(i) else {
+            continue;
+        };
+        let Some(position) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Position>(&DataKey::Position(id))
+        else {
+            continue;
+        };
+        if position.status == PositionStatus::Closed {
+            closed_ids.push_back(id);
+        }
+    }
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserClosedPositions(user), &closed_ids);
+    closed_ids
+}
+
 fn roi_basis_points(total_pnl: i128, total_invested: i128) -> i32 {
     if total_invested == 0 {
         return 0;
@@ -119,7 +205,10 @@ fn roi_basis_points(total_pnl: i128, total_invested: i128) -> i32 {
         Some(n) => n,
         None => return 0,
     };
-    let q = num / total_invested;
+    let q = match num.checked_div(total_invested) {
+        Some(v) => v,
+        None => return 0,
+    };
     if q > i32::MAX as i128 {
         i32::MAX
     } else if q < i32::MIN as i128 {

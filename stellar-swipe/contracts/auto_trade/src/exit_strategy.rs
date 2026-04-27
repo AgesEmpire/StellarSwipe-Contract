@@ -1,18 +1,10 @@
 #![allow(dead_code)]
-<<<<<<< Updated upstream
 
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 use crate::errors::AutoTradeError;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-=======
-use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
-
-use crate::errors::AutoTradeError;
-
-// ─── Types ───────────────────────────────────────────────────────────────────
->>>>>>> Stashed changes
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,22 +17,13 @@ pub struct TakeProfitTier {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopLossTier {
-<<<<<<< Updated upstream
     pub trigger_profit_pct: u32, // activate after this % profit (0-based)
     pub trail_pct: u32,          // trail distance in %
-=======
-    pub trigger_profit_pct: u32, // activate after this % profit (0-based, e.g. 20 = 20%)
-    pub trail_pct: u32,          // trail distance in % (e.g. 10 = 10%)
->>>>>>> Stashed changes
     pub active: bool,
 }
 
 #[contracttype]
-<<<<<<< Updated upstream
 #[derive(Clone, Debug, PartialEq, Eq)]
-=======
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
->>>>>>> Stashed changes
 pub enum StrategyStatus {
     Active,
     StopHit,
@@ -56,7 +39,6 @@ pub struct ExitStrategy {
     pub current_position_size: i128,
     pub take_profit_tiers: Vec<TakeProfitTier>,
     pub stop_loss_tiers: Vec<StopLossTier>,
-<<<<<<< Updated upstream
     pub highest_price: i128, // tracks peak for trailing stop
     pub status: StrategyStatus,
 }
@@ -246,56 +228,6 @@ pub fn check_and_execute_exits(
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
-=======
-    pub status: StrategyStatus,
-    pub highest_price: i128, // tracks peak for trailing stop
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutedExit {
-    pub strategy_id: u64,
-    pub kind: ExitKind,
-    pub amount: i128,
-    pub price: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExitKind {
-    TakeProfit,
-    TrailingStop,
-}
-
-// ─── Storage ─────────────────────────────────────────────────────────────────
-
-#[contracttype]
-pub enum ExitStrategyKey {
-    Strategy(u64),
-    Counter,
-}
-
-fn next_id(env: &Env) -> u64 {
-    let key = ExitStrategyKey::Counter;
-    let id: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-    env.storage().persistent().set(&key, &(id + 1));
-    id
-}
-
-pub fn get_strategy(env: &Env, id: u64) -> Option<ExitStrategy> {
-    env.storage()
-        .persistent()
-        .get(&ExitStrategyKey::Strategy(id))
-}
-
-fn save_strategy(env: &Env, id: u64, strategy: &ExitStrategy) {
-    env.storage()
-        .persistent()
-        .set(&ExitStrategyKey::Strategy(id), strategy);
-}
-
-// ─── Create ──────────────────────────────────────────────────────────────────
->>>>>>> Stashed changes
 
 pub fn create_exit_strategy(
     env: &Env,
@@ -309,7 +241,6 @@ pub fn create_exit_strategy(
     if entry_price <= 0 || position_size <= 0 {
         return Err(AutoTradeError::InvalidAmount);
     }
-<<<<<<< Updated upstream
     if take_profit_tiers.is_empty() {
         return Err(AutoTradeError::InvalidExitConfig);
     }
@@ -317,18 +248,11 @@ pub fn create_exit_strategy(
     let id = next_id(env);
     let strategy = ExitStrategy {
         user: user.clone(),
-=======
-
-    let id = next_id(env);
-    let strategy = ExitStrategy {
-        user,
->>>>>>> Stashed changes
         signal_id,
         entry_price,
         current_position_size: position_size,
         take_profit_tiers,
         stop_loss_tiers,
-<<<<<<< Updated upstream
         highest_price: entry_price,
         status: StrategyStatus::Active,
     };
@@ -381,18 +305,6 @@ pub fn adjust_position_size(
 // ── Preset strategies ─────────────────────────────────────────────────────────
 
 /// Conservative: TP at +20%/+50%/+100%, trail 10% from start.
-=======
-        status: StrategyStatus::Active,
-        highest_price: entry_price,
-    };
-    save_strategy(env, id, &strategy);
-    Ok(id)
-}
-
-// ─── Preset Factories ────────────────────────────────────────────────────────
-
-/// Conservative: TP at +20%/+50%/+100%, trail 10%
->>>>>>> Stashed changes
 pub fn preset_conservative(
     env: &Env,
     user: Address,
@@ -403,29 +315,17 @@ pub fn preset_conservative(
     let mut tps = Vec::new(env);
     tps.push_back(TakeProfitTier {
         price: entry_price * 120 / 100,
-<<<<<<< Updated upstream
         position_pct: 3_333,
-=======
-        position_pct: 3333,
->>>>>>> Stashed changes
         executed: false,
     });
     tps.push_back(TakeProfitTier {
         price: entry_price * 150 / 100,
-<<<<<<< Updated upstream
         position_pct: 5_000,
-=======
-        position_pct: 5000,
->>>>>>> Stashed changes
         executed: false,
     });
     tps.push_back(TakeProfitTier {
         price: entry_price * 200 / 100,
-<<<<<<< Updated upstream
         position_pct: 10_000,
-=======
-        position_pct: 10000,
->>>>>>> Stashed changes
         executed: false,
     });
 
@@ -439,11 +339,7 @@ pub fn preset_conservative(
     create_exit_strategy(env, user, signal_id, entry_price, position_size, tps, sls)
 }
 
-<<<<<<< Updated upstream
 /// Balanced: TP at +30%/+80%, tiered trails 10%→7%.
-=======
-/// Balanced: TP at +30%/+80%, tiered trail 10%/7%
->>>>>>> Stashed changes
 pub fn preset_balanced(
     env: &Env,
     user: Address,
@@ -454,20 +350,12 @@ pub fn preset_balanced(
     let mut tps = Vec::new(env);
     tps.push_back(TakeProfitTier {
         price: entry_price * 130 / 100,
-<<<<<<< Updated upstream
         position_pct: 5_000,
-=======
-        position_pct: 5000,
->>>>>>> Stashed changes
         executed: false,
     });
     tps.push_back(TakeProfitTier {
         price: entry_price * 180 / 100,
-<<<<<<< Updated upstream
         position_pct: 10_000,
-=======
-        position_pct: 10000,
->>>>>>> Stashed changes
         executed: false,
     });
 
@@ -478,11 +366,7 @@ pub fn preset_balanced(
         active: true,
     });
     sls.push_back(StopLossTier {
-<<<<<<< Updated upstream
         trigger_profit_pct: 20,
-=======
-        trigger_profit_pct: 30,
->>>>>>> Stashed changes
         trail_pct: 7,
         active: false,
     });
@@ -490,11 +374,7 @@ pub fn preset_balanced(
     create_exit_strategy(env, user, signal_id, entry_price, position_size, tps, sls)
 }
 
-<<<<<<< Updated upstream
 /// Aggressive: TP at +15%/+30%/+60%/+150%, tight trail 5% after 50% profit.
-=======
-/// Aggressive: TP at +15%/+30%/+60%/+150%, tight trail 5%
->>>>>>> Stashed changes
 pub fn preset_aggressive(
     env: &Env,
     user: Address,
@@ -505,45 +385,28 @@ pub fn preset_aggressive(
     let mut tps = Vec::new(env);
     tps.push_back(TakeProfitTier {
         price: entry_price * 115 / 100,
-<<<<<<< Updated upstream
         position_pct: 2_500,
-=======
-        position_pct: 2500,
->>>>>>> Stashed changes
         executed: false,
     });
     tps.push_back(TakeProfitTier {
         price: entry_price * 130 / 100,
-<<<<<<< Updated upstream
         position_pct: 3_333,
-=======
-        position_pct: 3333,
->>>>>>> Stashed changes
         executed: false,
     });
     tps.push_back(TakeProfitTier {
         price: entry_price * 160 / 100,
-<<<<<<< Updated upstream
         position_pct: 5_000,
-=======
-        position_pct: 5000,
->>>>>>> Stashed changes
         executed: false,
     });
     tps.push_back(TakeProfitTier {
         price: entry_price * 250 / 100,
-<<<<<<< Updated upstream
         position_pct: 10_000,
-=======
-        position_pct: 10000,
->>>>>>> Stashed changes
         executed: false,
     });
 
     let mut sls = Vec::new(env);
     sls.push_back(StopLossTier {
         trigger_profit_pct: 0,
-<<<<<<< Updated upstream
         trail_pct: 10,
         active: true,
     });
@@ -556,194 +419,27 @@ pub fn preset_aggressive(
         trigger_profit_pct: 50,
         trail_pct: 5,
         active: false,
-=======
-        trail_pct: 5,
-        active: true,
->>>>>>> Stashed changes
     });
 
     create_exit_strategy(env, user, signal_id, entry_price, position_size, tps, sls)
 }
 
-<<<<<<< Updated upstream
 // ── Tests ─────────────────────────────────────────────────────────────────────
-=======
-// ─── Trailing Stop Calculation ───────────────────────────────────────────────
-
-/// Returns the current trailing stop price based on the peak price seen.
-fn trailing_stop_price(highest_price: i128, trail_pct: u32) -> i128 {
-    highest_price * (100 - trail_pct as i128) / 100
-}
-
-// ─── Core Execution ──────────────────────────────────────────────────────────
-
-pub fn check_and_execute_exits(
-    env: &Env,
-    strategy_id: u64,
-    current_price: i128,
-) -> Result<Vec<ExecutedExit>, AutoTradeError> {
-    let mut strategy = get_strategy(env, strategy_id)
-        .ok_or(AutoTradeError::ExitStrategyNotFound)?;
-
-    if strategy.status != StrategyStatus::Active {
-        return Ok(Vec::new(env));
-    }
-
-    let mut executed = Vec::new(env);
-
-    // Update peak price for trailing stop
-    if current_price > strategy.highest_price {
-        strategy.highest_price = current_price;
-    }
-
-    // ── Take-profit tiers ────────────────────────────────────────────────────
-    let tp_len = strategy.take_profit_tiers.len();
-    for i in 0..tp_len {
-        let tp = strategy.take_profit_tiers.get(i).unwrap();
-        if tp.executed || current_price < tp.price {
-            continue;
-        }
-
-        let close_amount =
-            (strategy.current_position_size * tp.position_pct as i128) / 10000;
-
-        if close_amount > 0 {
-            strategy.current_position_size -= close_amount;
-
-            let mut updated_tp = tp.clone();
-            updated_tp.executed = true;
-            strategy.take_profit_tiers.set(i, updated_tp);
-
-            executed.push_back(ExecutedExit {
-                strategy_id,
-                kind: ExitKind::TakeProfit,
-                amount: close_amount,
-                price: current_price,
-            });
-
-            #[allow(deprecated)]
-            env.events().publish(
-                (
-                    Symbol::new(env, "tp_hit"),
-                    strategy.user.clone(),
-                    strategy_id,
-                ),
-                (current_price, close_amount),
-            );
-        }
-    }
-
-    // ── Trailing stop tiers ──────────────────────────────────────────────────
-    if strategy.current_position_size > 0 {
-        let current_profit_pct =
-            ((current_price - strategy.entry_price) * 100) / strategy.entry_price;
-
-        // Activate tiers whose profit threshold has been crossed
-        let sl_len = strategy.stop_loss_tiers.len();
-        for i in 0..sl_len {
-            let mut tier = strategy.stop_loss_tiers.get(i).unwrap();
-            if !tier.active && current_profit_pct >= tier.trigger_profit_pct as i128 {
-                tier.active = true;
-                strategy.stop_loss_tiers.set(i, tier);
-            }
-        }
-
-        // Find tightest active trail
-        let mut tightest: Option<u32> = None;
-        for i in 0..strategy.stop_loss_tiers.len() {
-            let tier = strategy.stop_loss_tiers.get(i).unwrap();
-            if tier.active {
-                tightest = Some(match tightest {
-                    None => tier.trail_pct,
-                    Some(prev) => prev.min(tier.trail_pct),
-                });
-            }
-        }
-
-        if let Some(trail_pct) = tightest {
-            let stop_price = trailing_stop_price(strategy.highest_price, trail_pct);
-            if current_price <= stop_price {
-                let remaining = strategy.current_position_size;
-                strategy.current_position_size = 0;
-                strategy.status = StrategyStatus::StopHit;
-
-                executed.push_back(ExecutedExit {
-                    strategy_id,
-                    kind: ExitKind::TrailingStop,
-                    amount: remaining,
-                    price: current_price,
-                });
-
-                #[allow(deprecated)]
-                env.events().publish(
-                    (
-                        Symbol::new(env, "trail_stop_hit"),
-                        strategy.user.clone(),
-                        strategy_id,
-                    ),
-                    (current_price, remaining),
-                );
-            }
-        }
-    }
-
-    // Mark complete when fully exited
-    if strategy.current_position_size == 0 && strategy.status == StrategyStatus::Active {
-        strategy.status = StrategyStatus::Complete;
-    }
-
-    save_strategy(env, strategy_id, &strategy);
-    Ok(executed)
-}
-
-/// Adjust remaining position size (e.g. after a manual partial close).
-pub fn adjust_position_size(
-    env: &Env,
-    strategy_id: u64,
-    caller: &Address,
-    new_size: i128,
-) -> Result<(), AutoTradeError> {
-    let mut strategy = get_strategy(env, strategy_id)
-        .ok_or(AutoTradeError::ExitStrategyNotFound)?;
-
-    if &strategy.user != caller {
-        return Err(AutoTradeError::Unauthorized);
-    }
-    if new_size < 0 {
-        return Err(AutoTradeError::InvalidAmount);
-    }
-
-    strategy.current_position_size = new_size;
-    if new_size == 0 {
-        strategy.status = StrategyStatus::Complete;
-    }
-    save_strategy(env, strategy_id, &strategy);
-    Ok(())
-}
-
-// ─── Tests ───────────────────────────────────────────────────────────────────
->>>>>>> Stashed changes
 
 #[cfg(test)]
 mod tests {
     use super::*;
-<<<<<<< Updated upstream
     use soroban_sdk::{
         contract,
         testutils::{Address as _, Ledger as _},
         Env,
     };
-=======
-    use soroban_sdk::testutils::Address as TestAddress;
-    use soroban_sdk::{contract, Env};
->>>>>>> Stashed changes
 
     #[contract]
     struct TestContract;
 
     fn setup() -> (Env, Address) {
         let env = Env::default();
-<<<<<<< Updated upstream
         env.ledger().set_timestamp(1_000);
         let cid = env.register(TestContract, ());
         (env, cid)
@@ -766,45 +462,11 @@ mod tests {
             let s = get_exit_strategy(&env, id).unwrap();
             // 33.33% of 10_000 = 3_333 closed
             assert_eq!(s.current_position_size, 10_000 - 3_333);
-=======
-        env.ledger().with_mut(|l| l.timestamp = 1000);
-        let user = Address::generate(&env);
-        (env, user)
-    }
-
-    fn register(env: &Env) -> Address {
-        env.register(TestContract, ())
-    }
-
-    // ── Preset: conservative 3-tier TP + trailing stop ───────────────────────
-
-    #[test]
-    fn test_conservative_tp1_partial_close() {
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            // Entry $0.10 (scaled ×10000 = 1000), position 10_000
-            let entry = 1000i128;
-            let size = 10_000i128;
-            let id = preset_conservative(&env, user.clone(), 1, entry, size).unwrap();
-
-            // Price hits TP1: $0.12 → 1200
-            let exits = check_and_execute_exits(&env, id, 1200).unwrap();
-            assert_eq!(exits.len(), 1);
-            let e = exits.get(0).unwrap();
-            assert_eq!(e.kind, ExitKind::TakeProfit);
-            // 33.33% of 10_000 = 3333
-            assert_eq!(e.amount, 3333);
-
-            let s = get_strategy(&env, id).unwrap();
-            assert_eq!(s.current_position_size, 10_000 - 3333);
->>>>>>> Stashed changes
             assert_eq!(s.status, StrategyStatus::Active);
         });
     }
 
     #[test]
-<<<<<<< Updated upstream
     fn test_conservative_tp2_closes_half_remaining() {
         let (env, cid) = setup();
         env.as_contract(&cid, || {
@@ -819,33 +481,10 @@ mod tests {
             // TP1: close 3333 → remaining 6667
             // TP2: close 50% of 6667 = 3333 → remaining 3334
             assert_eq!(s.current_position_size, 3_334);
-=======
-    fn test_conservative_tp2_partial_close() {
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let entry = 1000i128;
-            let size = 10_000i128;
-            let id = preset_conservative(&env, user.clone(), 1, entry, size).unwrap();
-
-            // Hit TP1 first
-            check_and_execute_exits(&env, id, 1200).unwrap();
-            // Hit TP2: $0.15 → 1500
-            let exits = check_and_execute_exits(&env, id, 1500).unwrap();
-            assert_eq!(exits.len(), 1);
-            let e = exits.get(0).unwrap();
-            assert_eq!(e.kind, ExitKind::TakeProfit);
-            // 50% of remaining 6667 = 3333
-            assert_eq!(e.amount, 3333);
-
-            let s = get_strategy(&env, id).unwrap();
-            assert_eq!(s.current_position_size, 6667 - 3333);
->>>>>>> Stashed changes
         });
     }
 
     #[test]
-<<<<<<< Updated upstream
     fn test_conservative_all_tps_complete() {
         let (env, cid) = setup();
         env.as_contract(&cid, || {
@@ -857,31 +496,11 @@ mod tests {
             assert_eq!(trades.len(), 3);
 
             let s = get_exit_strategy(&env, id).unwrap();
-=======
-    fn test_conservative_tp3_closes_all() {
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let entry = 1000i128;
-            let size = 10_000i128;
-            let id = preset_conservative(&env, user.clone(), 1, entry, size).unwrap();
-
-            check_and_execute_exits(&env, id, 1200).unwrap();
-            check_and_execute_exits(&env, id, 1500).unwrap();
-            // Hit TP3: $0.20 → 2000
-            let exits = check_and_execute_exits(&env, id, 2000).unwrap();
-            assert_eq!(exits.len(), 1);
-            let e = exits.get(0).unwrap();
-            assert_eq!(e.kind, ExitKind::TakeProfit);
-
-            let s = get_strategy(&env, id).unwrap();
->>>>>>> Stashed changes
             assert_eq!(s.current_position_size, 0);
             assert_eq!(s.status, StrategyStatus::Complete);
         });
     }
 
-<<<<<<< Updated upstream
     // ── Trailing stop ─────────────────────────────────────────────────────────
 
     #[test]
@@ -900,49 +519,11 @@ mod tests {
             let s = get_exit_strategy(&env, id).unwrap();
             assert_eq!(s.current_position_size, 0);
             assert_eq!(s.status, StrategyStatus::StopHit);
-=======
-    #[test]
-    fn test_multiple_tps_hit_same_update() {
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let entry = 1000i128;
-            let size = 10_000i128;
-            let id = preset_conservative(&env, user.clone(), 1, entry, size).unwrap();
-
-            // Price gaps past TP1 and TP2 in one update
-            let exits = check_and_execute_exits(&env, id, 1600).unwrap();
-            assert_eq!(exits.len(), 2); // both TP1 and TP2 executed
-        });
-    }
-
-    #[test]
-    fn test_trailing_stop_before_any_tp() {
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let entry = 1000i128;
-            let size = 10_000i128;
-            let id = preset_conservative(&env, user.clone(), 1, entry, size).unwrap();
-
-            // Price rises to 1050 (peak), then drops 10% → stop at 945
-            check_and_execute_exits(&env, id, 1050).unwrap();
-            let exits = check_and_execute_exits(&env, id, 945).unwrap();
-
-            assert_eq!(exits.len(), 1);
-            assert_eq!(exits.get(0).unwrap().kind, ExitKind::TrailingStop);
-            assert_eq!(exits.get(0).unwrap().amount, 10_000);
-
-            let s = get_strategy(&env, id).unwrap();
-            assert_eq!(s.status, StrategyStatus::StopHit);
-            assert_eq!(s.current_position_size, 0);
->>>>>>> Stashed changes
         });
     }
 
     #[test]
     fn test_trailing_stop_tightens_after_profit_threshold() {
-<<<<<<< Updated upstream
         let (env, cid) = setup();
         env.as_contract(&cid, || {
             let user = Address::generate(&env);
@@ -996,64 +577,11 @@ mod tests {
             adjust_position_size(&env, &user, id, 5_000).unwrap();
             let s = get_exit_strategy(&env, id).unwrap();
             assert_eq!(s.current_position_size, 5_000);
-=======
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let entry = 1000i128;
-            let size = 10_000i128;
-            // Balanced: trail 10% initially, tightens to 7% after 30% profit
-            let id = preset_balanced(&env, user.clone(), 1, entry, size).unwrap();
-
-            // Price rises 40% above entry → activates 7% trail tier
-            // Peak = 1400, 7% trail stop = 1400 * 93 / 100 = 1302
-            check_and_execute_exits(&env, id, 1400).unwrap();
-
-            // Drop to 1302 → should trigger 7% trail (not 10%)
-            let exits = check_and_execute_exits(&env, id, 1302).unwrap();
-            assert_eq!(exits.len(), 1);
-            assert_eq!(exits.get(0).unwrap().kind, ExitKind::TrailingStop);
-        });
-    }
-
-    #[test]
-    fn test_stop_not_triggered_above_trail() {
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let entry = 1000i128;
-            let size = 10_000i128;
-            let id = preset_conservative(&env, user.clone(), 1, entry, size).unwrap();
-
-            // Peak 1100, trail 10% → stop at 990. Price at 1000 → no stop
-            check_and_execute_exits(&env, id, 1100).unwrap();
-            let exits = check_and_execute_exits(&env, id, 1000).unwrap();
-            assert!(exits.is_empty());
-
-            let s = get_strategy(&env, id).unwrap();
-            assert_eq!(s.status, StrategyStatus::Active);
-        });
-    }
-
-    #[test]
-    fn test_adjust_position_size() {
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let entry = 1000i128;
-            let size = 10_000i128;
-            let id = preset_conservative(&env, user.clone(), 1, entry, size).unwrap();
-
-            adjust_position_size(&env, id, &user, 7000).unwrap();
-            let s = get_strategy(&env, id).unwrap();
-            assert_eq!(s.current_position_size, 7000);
->>>>>>> Stashed changes
         });
     }
 
     #[test]
     fn test_adjust_position_to_zero_marks_complete() {
-<<<<<<< Updated upstream
         let (env, cid) = setup();
         env.as_contract(&cid, || {
             let user = Address::generate(&env);
@@ -1061,22 +589,10 @@ mod tests {
 
             adjust_position_size(&env, &user, id, 0).unwrap();
             let s = get_exit_strategy(&env, id).unwrap();
-=======
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let entry = 1000i128;
-            let size = 10_000i128;
-            let id = preset_conservative(&env, user.clone(), 1, entry, size).unwrap();
-
-            adjust_position_size(&env, id, &user, 0).unwrap();
-            let s = get_strategy(&env, id).unwrap();
->>>>>>> Stashed changes
             assert_eq!(s.status, StrategyStatus::Complete);
         });
     }
 
-<<<<<<< Updated upstream
     // ── Edge cases ────────────────────────────────────────────────────────────
 
     #[test]
@@ -1092,25 +608,10 @@ mod tests {
             // Further price checks should return empty
             let trades = check_and_execute_exits(&env, id, 5_000).unwrap();
             assert_eq!(trades.len(), 0);
-=======
-    #[test]
-    fn test_no_execution_on_inactive_strategy() {
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let entry = 1000i128;
-            let size = 10_000i128;
-            let id = preset_conservative(&env, user.clone(), 1, entry, size).unwrap();
-
-            adjust_position_size(&env, id, &user, 0).unwrap(); // marks Complete
-            let exits = check_and_execute_exits(&env, id, 2000).unwrap();
-            assert!(exits.is_empty());
->>>>>>> Stashed changes
         });
     }
 
     #[test]
-<<<<<<< Updated upstream
     fn test_get_user_strategies() {
         let (env, cid) = setup();
         env.as_contract(&cid, || {
@@ -1120,57 +621,16 @@ mod tests {
 
             let ids = get_user_exit_strategies(&env, &user);
             assert_eq!(ids.len(), 2);
-=======
-    fn test_aggressive_four_tiers() {
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let entry = 1000i128;
-            let size = 10_000i128;
-            let id = preset_aggressive(&env, user.clone(), 1, entry, size).unwrap();
-
-            // Hit all 4 TPs in one price update (price gaps to 2600)
-            let exits = check_and_execute_exits(&env, id, 2600).unwrap();
-            assert_eq!(exits.len(), 4);
-
-            let s = get_strategy(&env, id).unwrap();
-            assert_eq!(s.current_position_size, 0);
-            assert_eq!(s.status, StrategyStatus::Complete);
->>>>>>> Stashed changes
         });
     }
 
     #[test]
-<<<<<<< Updated upstream
     fn test_invalid_entry_price_rejected() {
         let (env, cid) = setup();
         env.as_contract(&cid, || {
             let user = Address::generate(&env);
             let err = preset_conservative(&env, user, 1, 0, 10_000).unwrap_err();
             assert_eq!(err, AutoTradeError::InvalidAmount);
-=======
-    fn test_unauthorized_adjust() {
-        let (env, user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let entry = 1000i128;
-            let size = 10_000i128;
-            let id = preset_conservative(&env, user.clone(), 1, entry, size).unwrap();
-
-            let other = Address::generate(&env);
-            let err = adjust_position_size(&env, id, &other, 5000).unwrap_err();
-            assert_eq!(err, AutoTradeError::Unauthorized);
-        });
-    }
-
-    #[test]
-    fn test_invalid_strategy_id() {
-        let (env, _user) = setup();
-        let addr = register(&env);
-        env.as_contract(&addr, || {
-            let err = check_and_execute_exits(&env, 999, 1200).unwrap_err();
-            assert_eq!(err, AutoTradeError::ExitStrategyNotFound);
->>>>>>> Stashed changes
         });
     }
 }

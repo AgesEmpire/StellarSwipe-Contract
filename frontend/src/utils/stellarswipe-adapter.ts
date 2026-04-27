@@ -5,6 +5,15 @@ export interface StellarSwipeStats {
   boosts: number;
 }
 
+export type FetchErrorKind = 'network' | 'server';
+
+export class FetchError extends Error {
+  constructor(public kind: FetchErrorKind, message: string) {
+    super(message);
+    this.name = 'FetchError';
+  }
+}
+
 export class StellarSwipeHUDAdapter {
   private contractAddress: string;
   private networkUrl: string;
@@ -15,7 +24,17 @@ export class StellarSwipeHUDAdapter {
   }
 
   async fetchTycoonStats(): Promise<StellarSwipeStats> {
+    let response: Response;
     try {
+      response = await fetch(`${this.networkUrl}/contracts/${this.contractAddress}/stats`);
+    } catch {
+      throw new FetchError('network', 'Unable to reach the server. Check your connection.');
+    }
+    if (!response.ok) {
+      throw new FetchError('server', `Server error ${response.status}: ${response.statusText}`);
+      const response = await fetch(`${this.networkUrl}/contracts/${this.contractAddress}/stats`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      const data = await response.json();
       // Mock implementation - replace with actual Soroban contract calls
       const response = await fetch(`${this.networkUrl}/contracts/${this.contractAddress}/stats`);
       
@@ -35,16 +54,29 @@ export class StellarSwipeHUDAdapter {
       // Return empty state on error
       return { cash: 0, incomeRate: 0, boosts: 0 };
     }
+    const data = await response.json();
+    return {
+      cash: data.cash || 0,
+      incomeRate: data.income_rate || 0,
+      boosts: data.active_boosts || 0,
+    };
   }
 
   // Batch multiple stat requests to reduce network calls
   async batchFetchStats(requests: string[]): Promise<StellarSwipeStats[]> {
+    let batchResponse: Response;
     try {
-      const batchResponse = await fetch(`${this.networkUrl}/batch`, {
+      batchResponse = await fetch(`${this.networkUrl}/batch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ requests }),
       });
+    } catch {
+      throw new FetchError('network', 'Unable to reach the server. Check your connection.');
+    }
+    if (!batchResponse.ok) {
+      throw new FetchError('server', `Batch request failed: ${batchResponse.status}`);
+      if (!batchResponse.ok) throw new Error(`Batch request failed: ${batchResponse.status}`);
 
       if (!batchResponse.ok) {
         throw new Error(`Batch request failed: ${batchResponse.status}`);
@@ -55,5 +87,7 @@ export class StellarSwipeHUDAdapter {
       console.error('Batch fetch failed:', error);
       return requests.map(() => ({ cash: 0, incomeRate: 0, boosts: 0 }));
     }
+    return batchResponse.json();
   }
+}
 }

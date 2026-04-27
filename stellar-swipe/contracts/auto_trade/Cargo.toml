@@ -18,3 +18,13 @@ stellar_swipe_common = { path = "../common" }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 
+[[test]]
+name = "test_high_volume"
+path = "tests/load/test_high_volume.rs"
+required-features = ["testutils"]
+
+[[test]]
+name = "test_contract_upgrade"
+path = "tests/integration/test_contract_upgrade.rs"
+required-features = ["testutils"]
+

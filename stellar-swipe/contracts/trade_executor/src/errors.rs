@@ -1,9 +1,7 @@
-feature/copy-trade-balance-check
 use soroban_sdk::{contracterror, contracttype};
 
-/// Populated when [`crate::ContractError::InsufficientBalance`] is returned from
-/// [`crate::TradeExecutorContract::execute_copy_trade`]; query via
-/// [`crate::TradeExecutorContract::get_insufficient_balance_detail`].
+/// Populated when [`ContractError::InsufficientBalance`] is returned from
+/// [`crate::TradeExecutorContract::execute_copy_trade`].
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InsufficientBalanceDetail {
@@ -11,24 +9,22 @@ pub struct InsufficientBalanceDetail {
     pub available: i128,
 }
 
-use soroban_sdk::contracterror;
- main
-
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ContractError {
     NotInitialized = 1,
- feature/copy-trade-balance-check
     PositionLimitReached = 2,
     InsufficientBalance = 3,
     InvalidAmount = 4,
-
-feature/position-limit-copy-trade
-    PositionLimitReached = 2,
-
-    InvalidAmount = 2,
-    SlippageExceeded = 3,
-main
- main
+    ReentrancyDetected = 5,
+    Unauthorized = 6,
+    TradeNotFound = 7,
+    SlippageExceeded = 8,
+    PositionPctTooHigh = 9,
+    OraclePriceStale = 10,
+    OracleUnavailable = 11,
+    DailyVolumeLimitExceeded = 12,
+    OracleNotWhitelisted = 13,
+    CannotRemoveLastOracle = 14,
 }

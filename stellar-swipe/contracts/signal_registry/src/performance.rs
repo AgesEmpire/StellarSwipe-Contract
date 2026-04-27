@@ -1,10 +1,10 @@
 use crate::types::{ProviderPerformance, Signal, SignalAction, SignalStatus, TradeExecution};
+use stellar_swipe_common::BASIS_POINTS_DENOMINATOR_I128;
 
 /// ROI calculation constants
-const BASIS_POINTS_100_PERCENT: i128 = 10000;
 const SUCCESS_THRESHOLD_BPS: i128 = 200; // 2% in basis points
 const FAILURE_THRESHOLD_BPS: i128 = -500; // -5% in basis points
-const MIN_ROI_BPS: i128 = -10000; // -100% cap
+const MIN_ROI_BPS: i128 = -BASIS_POINTS_DENOMINATOR_I128; // -100% cap
 
 /// Calculate ROI in basis points from entry and exit prices
 ///
@@ -31,7 +31,7 @@ pub fn calculate_roi(entry_price: i128, exit_price: i128, action: &SignalAction)
 
     // Calculate ROI: (price_diff / entry_price) * 10000
     let roi = price_diff
-        .checked_mul(BASIS_POINTS_100_PERCENT)
+        .checked_mul(BASIS_POINTS_DENOMINATOR_I128)
         .expect("ROI calculation overflow")
         .checked_div(entry_price)
         .expect("division by zero in ROI calculation");
@@ -184,7 +184,7 @@ pub fn update_provider_performance(
     // Recalculate success rate: (successful_signals / total_signals) * 10000
     if provider_stats.total_signals > 0 {
         provider_stats.success_rate = ((provider_stats.successful_signals as i128)
-            * BASIS_POINTS_100_PERCENT
+            * BASIS_POINTS_DENOMINATOR_I128
             / (provider_stats.total_signals as i128)) as u32;
     }
 
@@ -202,6 +202,25 @@ pub fn update_provider_performance(
         .total_volume
         .checked_add(signal_volume)
         .expect("total volume overflow");
+}
+
+/// Update the running average copier ROI on a position close (Issue #367).
+///
+/// Uses a running-average formula so only closed positions are counted:
+///   new_avg = (old_avg * old_count + new_roi) / (old_count + 1)
+///
+/// `roi_bps` is the copier's realized ROI in basis points for the closed position.
+/// Only closed positions should be passed here (not open ones).
+pub fn update_copier_roi_stats(signal: &mut Signal, roi_bps: i32) {
+    let n = signal.copier_closed_count as i64;
+    let new_avg = if n == 0 {
+        roi_bps as i64
+    } else {
+        ((signal.avg_copier_roi_bps as i64 * n) + roi_bps as i64) / (n + 1)
+    };
+    // Clamp to i32 range (practically bounded by ±10_000 bps = ±100%)
+    signal.avg_copier_roi_bps = new_avg.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    signal.copier_closed_count = signal.copier_closed_count.saturating_add(1);
 }
 
 /// Check if a status change should trigger provider stats update
@@ -254,15 +273,103 @@ mod tests {
             executions: 0,
             total_volume: 0,
             total_roi: 0,
-            category: crate::categories::SignalCategory::SwingTrade,
+            category: crate::categories::SignalCategory::SWING,
             risk_level: crate::categories::RiskLevel::Medium,
             is_collaborative: false,
             tags: soroban_sdk::vec![&soroban_sdk::Env::default()],
             successful_executions: 0,
+            submitted_at: 1000,
+            rationale_hash: soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "Test"),
+            confidence: 50,
+            adoption_count: 0,
+            ai_validation_score: None,
+            avg_copier_roi_bps: 0,
+            copier_closed_count: 0,
         };
 
         let status = evaluate_signal_status(&signal, 2001);
         assert_eq!(status, SignalStatus::Failed);
+    }
+
+    // ── Copier ROI tests (Issue #367) ─────────────────────────────────────────
+
+    fn base_signal() -> Signal {
+        Signal {
+            id: 1,
+            provider: soroban_sdk::Address::generate(&soroban_sdk::Env::default()),
+            asset_pair: soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "XLM/USDC"),
+            action: SignalAction::Buy,
+            price: 100,
+            rationale: soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "Test"),
+            timestamp: 1000,
+            expiry: 9999,
+            status: SignalStatus::Active,
+            executions: 0,
+            successful_executions: 0,
+            total_volume: 0,
+            total_roi: 0,
+            category: crate::categories::SignalCategory::SWING,
+            risk_level: crate::categories::RiskLevel::Medium,
+            is_collaborative: false,
+            tags: soroban_sdk::vec![&soroban_sdk::Env::default()],
+            submitted_at: 1000,
+            rationale_hash: soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "Test"),
+            confidence: 50,
+            adoption_count: 0,
+            ai_validation_score: None,
+            avg_copier_roi_bps: 0,
+            copier_closed_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_copier_roi_first_copier() {
+        let mut signal = base_signal();
+        update_copier_roi_stats(&mut signal, 500); // 5% ROI
+        assert_eq!(signal.avg_copier_roi_bps, 500);
+        assert_eq!(signal.copier_closed_count, 1);
+    }
+
+    #[test]
+    fn test_copier_roi_running_average_five_copiers() {
+        let mut signal = base_signal();
+        // 5 copiers with known ROIs: 200, 400, -100, 600, 300
+        // Expected average: (200+400-100+600+300)/5 = 1400/5 = 280
+        update_copier_roi_stats(&mut signal, 200);
+        update_copier_roi_stats(&mut signal, 400);
+        update_copier_roi_stats(&mut signal, -100);
+        update_copier_roi_stats(&mut signal, 600);
+        update_copier_roi_stats(&mut signal, 300);
+
+        assert_eq!(signal.copier_closed_count, 5);
+        assert_eq!(signal.avg_copier_roi_bps, 280);
+    }
+
+    #[test]
+    fn test_copier_roi_only_closed_positions() {
+        // Verify the count strictly increases only when update_copier_roi_stats is called
+        // (representing closed positions only)
+        let mut signal = base_signal();
+        assert_eq!(signal.copier_closed_count, 0);
+        assert_eq!(signal.avg_copier_roi_bps, 0);
+
+        update_copier_roi_stats(&mut signal, 1000);
+        assert_eq!(signal.copier_closed_count, 1);
+
+        // A second open position that hasn't closed yet is NOT passed here
+        // The count stays at 1 until that position closes
+        assert_eq!(signal.copier_closed_count, 1);
+        assert_eq!(signal.avg_copier_roi_bps, 1000);
+    }
+
+    #[test]
+    fn test_copier_roi_negative_average() {
+        let mut signal = base_signal();
+        update_copier_roi_stats(&mut signal, -500);
+        update_copier_roi_stats(&mut signal, -300);
+        // avg = (-500 + -300) / 2 = -400
+        assert_eq!(signal.copier_closed_count, 2);
+        assert_eq!(signal.avg_copier_roi_bps, -400);
     }
 
     #[test]
@@ -280,11 +387,18 @@ mod tests {
             executions: 0,
             total_volume: 0,
             total_roi: 0,
-            category: crate::categories::SignalCategory::SwingTrade,
+            category: crate::categories::SignalCategory::SWING,
             risk_level: crate::categories::RiskLevel::Medium,
             is_collaborative: false,
             tags: soroban_sdk::vec![&soroban_sdk::Env::default()],
             successful_executions: 0,
+            submitted_at: 1000,
+            rationale_hash: soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "Test"),
+            confidence: 50,
+            adoption_count: 0,
+            ai_validation_score: None,
+            avg_copier_roi_bps: 0,
+            copier_closed_count: 0,
         };
 
         assert_eq!(get_signal_average_roi(&signal), 0);

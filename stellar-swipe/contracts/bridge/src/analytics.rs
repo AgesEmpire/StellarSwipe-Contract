@@ -1,6 +1,7 @@
-use soroban_sdk::{contracttype, Address, Env, Map, Vec, String};
+use crate::governance::{get_bridge, get_bridge_validators, is_validator};
 use crate::monitoring::{BridgeTransfer, TransferStatus};
-use crate::governance::{get_bridge, is_validator, get_bridge_validators};
+use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
+use stellar_swipe_common::{BASIS_POINTS_DENOMINATOR, SECONDS_PER_DAY, SECONDS_PER_HOUR};
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -134,10 +135,17 @@ fn store_bridge_analytics(env: &Env, bridge_id: u64, analytics: &BridgeAnalytics
         .set(&AnalyticsDataKey::BridgeAnalytics(bridge_id), analytics);
 }
 
-pub fn get_validator_analytics(env: &Env, validator: Address, bridge_id: u64) -> ValidatorAnalytics {
+pub fn get_validator_analytics(
+    env: &Env,
+    validator: Address,
+    bridge_id: u64,
+) -> ValidatorAnalytics {
     env.storage()
         .persistent()
-        .get(&AnalyticsDataKey::ValidatorAnalytics(validator.clone(), bridge_id))
+        .get(&AnalyticsDataKey::ValidatorAnalytics(
+            validator.clone(),
+            bridge_id,
+        ))
         .unwrap_or(ValidatorAnalytics {
             validator,
             bridge_id,
@@ -150,10 +158,16 @@ pub fn get_validator_analytics(env: &Env, validator: Address, bridge_id: u64) ->
         })
 }
 
-fn store_validator_analytics(env: &Env, validator: &Address, bridge_id: u64, analytics: &ValidatorAnalytics) {
-    env.storage()
-        .persistent()
-        .set(&AnalyticsDataKey::ValidatorAnalytics(validator.clone(), bridge_id), analytics);
+fn store_validator_analytics(
+    env: &Env,
+    validator: &Address,
+    bridge_id: u64,
+    analytics: &ValidatorAnalytics,
+) {
+    env.storage().persistent().set(
+        &AnalyticsDataKey::ValidatorAnalytics(validator.clone(), bridge_id),
+        analytics,
+    );
 }
 
 pub fn update_transfer_analytics(
@@ -170,7 +184,9 @@ pub fn update_transfer_analytics(
     // Update per-asset volume
     let asset = transfer.stellar_asset.clone();
     let current_asset_volume = analytics.volume_by_asset.get(asset.clone()).unwrap_or(0);
-    analytics.volume_by_asset.set(asset, current_asset_volume + transfer.amount);
+    analytics
+        .volume_by_asset
+        .set(asset, current_asset_volume + transfer.amount);
 
     // Calculate transfer time
     if let Some(completed_at) = transfer.completed_at {
@@ -180,18 +196,23 @@ pub fn update_transfer_analytics(
 
     // Update success rate
     if transfer.status == TransferStatus::Complete {
-        // Since we only call this on success or some state changes, 
+        // Since we only call this on success or some state changes,
         // we might need a better way to count fails if we want a real success rate.
         // For now, let's assume we can calculate it from total vs successfully completed.
         // But Soroban storage doesn't easily let us query all transfers.
         // Let's stick to the prompt's logic if possible or adapt.
-        
-        // The prompt uses `count_failed_transfers(bridge_id)`. 
+
+        // The prompt uses `count_failed_transfers(bridge_id)`.
         // Without an index, this is hard. Let's keep a counter of failed transfers.
     }
 
     // Update time series
-    add_to_time_series(env, &mut analytics.volume_by_period, env.ledger().timestamp(), transfer.amount);
+    add_to_time_series(
+        env,
+        &mut analytics.volume_by_period,
+        env.ledger().timestamp(),
+        transfer.amount,
+    );
 
     store_bridge_analytics(env, bridge_id, &analytics);
 
@@ -206,12 +227,12 @@ fn update_avg_transfer_time(analytics: &mut BridgeAnalytics, new_time: u64) {
 fn add_to_time_series(env: &Env, series: &mut TimeSeries, timestamp: u64, value: i128) {
     // Basic implementation: if last data point is same day/hour, update it. Else push new.
     let interval_seconds = match series.interval {
-        TimeInterval::Hourly => 3600,
-        TimeInterval::Daily => 86400,
+        TimeInterval::Hourly => SECONDS_PER_HOUR,
+        TimeInterval::Daily => SECONDS_PER_DAY,
     };
-    
+
     let period_timestamp = (timestamp / interval_seconds) * interval_seconds;
-    
+
     let mut updated = false;
     if !series.data_points.is_empty() {
         let last_idx = series.data_points.len() - 1;
@@ -222,13 +243,13 @@ fn add_to_time_series(env: &Env, series: &mut TimeSeries, timestamp: u64, value:
             updated = true;
         }
     }
-    
+
     if !updated {
         series.data_points.push_back(DataPoint {
             timestamp: period_timestamp,
             value,
         });
-        
+
         // Pruning: keep last 100 points
         if series.data_points.len() > 100 {
             series.data_points.remove(0);
@@ -245,7 +266,7 @@ pub fn get_bridge_volume_stats(
     let current_time = env.ledger().timestamp();
 
     let start_time = match period {
-        TimePeriod::Last24Hours => current_time.saturating_sub(86400),
+        TimePeriod::Last24Hours => current_time.saturating_sub(SECONDS_PER_DAY),
         TimePeriod::Last7Days => current_time.saturating_sub(604800),
         TimePeriod::Last30Days => current_time.saturating_sub(2592000),
         TimePeriod::AllTime => 0,
@@ -263,10 +284,10 @@ pub fn get_bridge_volume_stats(
         }
     }
 
-    // Since we don't have per-period transfer count in BridgeAnalytics yet, 
+    // Since we don't have per-period transfer count in BridgeAnalytics yet,
     // let's just return what we have in the main counters for now if it's AllTime,
     // or approximate for other periods.
-    
+
     let (total_v, total_c) = if period == TimePeriod::AllTime {
         (analytics.total_volume, analytics.total_transfers)
     } else {
@@ -302,8 +323,10 @@ pub fn update_validator_analytics(
     let response_time = signature_time.saturating_sub(transfer_initiated);
 
     // Update average response time
-    let total_response_time = analytics.avg_response_time_seconds * (analytics.total_signatures_provided - 1);
-    analytics.avg_response_time_seconds = (total_response_time + response_time) / analytics.total_signatures_provided;
+    let total_response_time =
+        analytics.avg_response_time_seconds * (analytics.total_signatures_provided - 1);
+    analytics.avg_response_time_seconds =
+        (total_response_time + response_time) / analytics.total_signatures_provided;
 
     // Classify as on-time or late (threshold: 5 minutes)
     if response_time <= 300 {
@@ -311,7 +334,7 @@ pub fn update_validator_analytics(
     } else {
         analytics.late_signatures += 1;
     }
-    
+
     // Update uptime
     analytics.uptime_pct = calculate_validator_uptime(env, validator.clone(), bridge_id)?;
 
@@ -323,7 +346,7 @@ pub fn update_validator_analytics(
 fn calculate_validator_uptime(
     env: &Env,
     validator: Address,
-    bridge_id: u64
+    bridge_id: u64,
 ) -> Result<u32, String> {
     let analytics = get_validator_analytics(env, validator, bridge_id);
     let bridge_analytics = get_bridge_analytics(env, bridge_id);
@@ -333,9 +356,10 @@ fn calculate_validator_uptime(
 
     // Uptime = signatures provided / total transfers
     let uptime_bps = if total_transfers > 0 {
-        ((analytics.total_signatures_provided * 10000) / total_transfers) as u32
+        ((analytics.total_signatures_provided * BASIS_POINTS_DENOMINATOR as u64) / total_transfers)
+            as u32
     } else {
-        10000 // 100% if no transfers yet
+        BASIS_POINTS_DENOMINATOR // 100% if no transfers yet
     };
 
     Ok(uptime_bps)
@@ -343,16 +367,16 @@ fn calculate_validator_uptime(
 
 pub fn calculate_bridge_health_score(env: &Env, bridge_id: u64) -> Result<u32, String> {
     let analytics = get_bridge_analytics(env, bridge_id);
-    
+
     // 1. Success Rate (40%)
-    let success_component = (analytics.success_rate * 40) / 10000;
+    let success_component = (analytics.success_rate * 40) / BASIS_POINTS_DENOMINATOR;
 
     // 2. Validator Uptime (30%)
     let avg_validator_uptime = calculate_avg_validator_uptime(env, bridge_id)?;
-    let uptime_component = (avg_validator_uptime * 30) / 10000;
+    let uptime_component = (avg_validator_uptime * 30) / BASIS_POINTS_DENOMINATOR;
 
     // 3. Liquidity (20%) - Mock for now as requested
-    let liquidity_score = 80u32; 
+    let liquidity_score = 80u32;
     let liquidity_component = (liquidity_score * 20) / 100;
 
     // 4. Response Time (10%)
@@ -367,13 +391,13 @@ pub fn calculate_bridge_health_score(env: &Env, bridge_id: u64) -> Result<u32, S
     };
     let response_component = (response_score * 10) / 100;
 
-    let health_score = success_component + uptime_component + 
+    let health_score = success_component + uptime_component +
                       ((liquidity_component * 10000) / 100) / 100 + // Adjusted to fit bps if needed, but the formula says 0-100 each
                       response_component;
 
     // Actually, let's keep it simple as in the prompt
-    let health_score = success_component + uptime_component + 
-                      (liquidity_score * 20) / 100 + response_component;
+    let health_score =
+        success_component + uptime_component + (liquidity_score * 20) / 100 + response_component;
 
     Ok(health_score)
 }
@@ -381,27 +405,27 @@ pub fn calculate_bridge_health_score(env: &Env, bridge_id: u64) -> Result<u32, S
 fn calculate_avg_validator_uptime(env: &Env, bridge_id: u64) -> Result<u32, String> {
     let validators = get_bridge_validators(env, bridge_id)?;
     if validators.is_empty() {
-        return Ok(10000);
+        return Ok(BASIS_POINTS_DENOMINATOR);
     }
-    
+
     let mut total_uptime = 0u32;
     for v in validators.iter() {
         total_uptime += calculate_validator_uptime(env, v.clone(), bridge_id)?;
     }
-    
+
     Ok(total_uptime / validators.len())
 }
 
 pub fn compare_bridge_performance(
     env: &Env,
     bridge_ids: Vec<u64>,
-    metric: AnalyticsMetric
+    metric: AnalyticsMetric,
 ) -> Result<Vec<(u64, i128)>, String> {
     let mut results = Vec::new(env);
 
     for bridge_id in bridge_ids.iter() {
         let analytics = get_bridge_analytics(env, bridge_id);
-        
+
         let value = match metric {
             AnalyticsMetric::TotalVolume => analytics.total_volume,
             AnalyticsMetric::TransferCount => analytics.total_transfers as i128,
@@ -412,10 +436,10 @@ pub fn compare_bridge_performance(
                 } else {
                     0
                 }
-            },
+            }
             AnalyticsMetric::HealthScore => calculate_bridge_health_score(env, bridge_id)? as i128,
         };
-        
+
         results.push_back((bridge_id, value));
     }
 
@@ -441,13 +465,12 @@ pub fn compare_bridge_performance(
     Ok(results)
 }
 
-pub fn analyze_volume_trend(
-    env: &Env,
-    bridge_id: u64,
-    days: u32
-) -> Result<TrendAnalysis, String> {
+pub fn analyze_volume_trend(env: &Env, bridge_id: u64, days: u32) -> Result<TrendAnalysis, String> {
     let analytics = get_bridge_analytics(env, bridge_id);
-    let cutoff = env.ledger().timestamp().saturating_sub(days as u64 * 86400);
+    let cutoff = env
+        .ledger()
+        .timestamp()
+        .saturating_sub(days as u64 * SECONDS_PER_DAY);
 
     let mut volumes = Vec::new(env);
     for dp in analytics.volume_by_period.data_points.iter() {
@@ -469,7 +492,7 @@ pub fn analyze_volume_trend(
     let len = volumes.len();
     let first_half_sum: i128 = volumes.iter().take((len / 2) as usize).sum();
     let second_half_sum: i128 = volumes.iter().skip((len / 2) as usize).sum();
-    
+
     let slope = second_half_sum - first_half_sum;
 
     let trend = if slope > 100 {
@@ -483,7 +506,7 @@ pub fn analyze_volume_trend(
     };
 
     let total_v: i128 = volumes.iter().sum();
-    
+
     Ok(TrendAnalysis {
         trend,
         slope,

@@ -149,8 +149,7 @@ pub fn auto_enter_signal(env: &Env, signal: &Signal) -> Result<(), ContestError>
                     });
 
                 entry.signals_submitted.push_back(signal.id);
-                entry.total_roi += signal.total_roi;
-                entry.total_volume += signal.total_volume;
+                // ROI/volume are applied when trades are recorded (see `apply_trade_to_contest_entries`).
 
                 let total_signals = entry.signals_submitted.len() as u32;
                 let successful = signal.successful_executions;
@@ -169,6 +168,67 @@ pub fn auto_enter_signal(env: &Env, signal: &Signal) -> Result<(), ContestError>
 
     env.storage().persistent().set(&contests_key, &contests);
     Ok(())
+}
+
+
+/// Add this trade's ROI and volume to any active contest entry that lists `signal_id` for `provider`.
+pub fn apply_trade_to_contest_entries(
+    env: &Env,
+    signal_id: u64,
+    provider: &Address,
+    trade_roi: i128,
+    volume: i128,
+) {
+    let current_time = env.ledger().timestamp();
+    let active_key = ContestStorageKey::ActiveContests;
+    let active_contests: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&active_key)
+        .unwrap_or(Vec::new(env));
+
+    let contests_key = ContestStorageKey::Contests;
+    let mut contests: Map<u64, Contest> = env
+        .storage()
+        .persistent()
+        .get(&contests_key)
+        .unwrap_or(Map::new(env));
+
+    let mut any = false;
+    for i in 0..active_contests.len() {
+        let contest_id = active_contests.get(i).unwrap();
+        let Some(mut contest) = contests.get(contest_id) else {
+            continue;
+        };
+        if contest.status != ContestStatus::Active {
+            continue;
+        }
+        if current_time < contest.start_time || current_time > contest.end_time {
+            continue;
+        }
+        let Some(mut entry) = contest.entries.get(provider.clone()) else {
+            continue;
+        };
+        let mut lists_signal = false;
+        for j in 0..entry.signals_submitted.len() {
+            if entry.signals_submitted.get(j).unwrap() == signal_id {
+                lists_signal = true;
+                break;
+            }
+        }
+        if !lists_signal {
+            continue;
+        }
+        entry.total_roi = entry.total_roi.saturating_add(trade_roi);
+        entry.total_volume = entry.total_volume.saturating_add(volume);
+        entry.score = calculate_contest_score(&entry, &contest.metric, env);
+        contest.entries.set(provider.clone(), entry);
+        contests.set(contest_id, contest);
+        any = true;
+    }
+    if any {
+        env.storage().persistent().set(&contests_key, &contests);
+    }
 }
 
 fn calculate_contest_score(entry: &ContestEntry, metric: &ContestMetric, _env: &Env) -> i128 {

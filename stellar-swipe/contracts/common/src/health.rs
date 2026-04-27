@@ -1,9 +1,7 @@
 //! Shared contract health reporting for monitoring and front-end probes.
 
+use crate::constants::PLACEHOLDER_ADMIN_STR;
 use soroban_sdk::{contracttype, Address, Env, String};
-
-/// Stellar protocol "dead" account (32 zero bytes) — safe placeholder when admin is unknown.
-pub const PLACEHOLDER_ADMIN_STR: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

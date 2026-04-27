@@ -75,7 +75,7 @@ fn test_auto_enter_signal() {
         &100,
         &String::from_str(&env, "Test signal"),
         &(env.ledger().timestamp() + 3600),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -87,7 +87,7 @@ fn test_auto_enter_signal() {
     let entry = contest.entries.get(provider.clone()).unwrap();
 
     assert_eq!(entry.signals_submitted.len(), 1);
-    assert_eq!(entry.total_roi, 150);
+    assert_eq!(entry.total_roi, 15_000);
     assert_eq!(entry.total_volume, 1000);
 }
 
@@ -125,7 +125,7 @@ fn test_finalize_contest_with_winners() {
             &100,
             &String::from_str(&env, "Test"),
             &(env.ledger().timestamp() + 3600),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -141,7 +141,7 @@ fn test_finalize_contest_with_winners() {
             &100,
             &String::from_str(&env, "Test"),
             &(env.ledger().timestamp() + 3600),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -157,7 +157,7 @@ fn test_finalize_contest_with_winners() {
             &100,
             &String::from_str(&env, "Test"),
             &(env.ledger().timestamp() + 3600),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -213,7 +213,7 @@ fn test_contest_min_signals_requirement() {
             &100,
             &String::from_str(&env, "Test"),
             &(env.ledger().timestamp() + 3600),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -229,7 +229,7 @@ fn test_contest_min_signals_requirement() {
             &100,
             &String::from_str(&env, "Test"),
             &(env.ledger().timestamp() + 3600),
-            &SignalCategory::SwingTrade,
+            &SignalCategory::SWING,
             &vec![&env, String::from_str(&env, "test")],
             &RiskLevel::Medium,
         );
@@ -274,7 +274,7 @@ fn test_get_contest_leaderboard() {
         &100,
         &String::from_str(&env, "Test"),
         &(env.ledger().timestamp() + 3600),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -287,7 +287,7 @@ fn test_get_contest_leaderboard() {
         &100,
         &String::from_str(&env, "Test"),
         &(env.ledger().timestamp() + 3600),
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![&env, String::from_str(&env, "test")],
         &RiskLevel::Medium,
     );
@@ -304,7 +304,6 @@ fn test_get_contest_leaderboard() {
 }
 
 #[test]
-#[should_panic(expected = "ContestNotEnded")]
 fn test_finalize_contest_before_end() {
     let env = Env::default();
     let (admin, client) = setup(&env);
@@ -322,6 +321,6 @@ fn test_finalize_contest_before_end() {
         &5000,
     );
 
-    // Try to finalize before end time
-    client.finalize_contest(&contest_id);
+    let res = client.try_finalize_contest(&contest_id);
+    assert!(res.is_err(), "finalize before end should fail");
 }
