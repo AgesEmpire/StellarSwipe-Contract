@@ -9,6 +9,7 @@ pub enum DataKey {
     OracleAssetPair,
     NextPositionId,
     Position(u64),
+    /// V1: mixed open+closed list (preserved for migration reads).
     UserPositions(Address),
     /// Registered TradeExecutor contract allowed to call `close_position_keeper`.
     TradeExecutor,
