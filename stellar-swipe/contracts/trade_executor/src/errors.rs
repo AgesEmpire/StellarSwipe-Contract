@@ -25,4 +25,6 @@ pub enum ContractError {
     OraclePriceStale = 10,
     OracleUnavailable = 11,
     DailyVolumeLimitExceeded = 12,
+    OracleNotWhitelisted = 13,
+    CannotRemoveLastOracle = 14,
 }

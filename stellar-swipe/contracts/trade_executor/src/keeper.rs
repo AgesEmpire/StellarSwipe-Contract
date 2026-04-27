@@ -191,6 +191,7 @@ mod tests {
 
         let exec = TradeExecutorContractClient::new(&env, &exec_id);
         exec.initialize(&admin);
+        exec.add_oracle(&oracle_id);
         exec.set_oracle(&oracle_id);
 
         (env, exec_id, oracle_id)
@@ -211,9 +212,7 @@ mod tests {
 
         MockOracleClient::new(&env, &oracle_id).set_price(&80); // below stop-loss
 
-        let positions = env.as_contract(&exec_id, || {
-            get_triggerable_positions(&env).unwrap()
-        });
+        let positions = env.as_contract(&exec_id, || get_triggerable_positions(&env).unwrap());
 
         assert_eq!(positions.len(), 1);
         let p = positions.get(0).unwrap();
@@ -236,9 +235,7 @@ mod tests {
 
         MockOracleClient::new(&env, &oracle_id).set_price(&250); // above take-profit
 
-        let positions = env.as_contract(&exec_id, || {
-            get_triggerable_positions(&env).unwrap()
-        });
+        let positions = env.as_contract(&exec_id, || get_triggerable_positions(&env).unwrap());
 
         assert_eq!(positions.len(), 1);
         let p = positions.get(0).unwrap();
@@ -261,9 +258,7 @@ mod tests {
 
         MockOracleClient::new(&env, &oracle_id).set_price(&120); // above stop-loss, not triggered
 
-        let positions = env.as_contract(&exec_id, || {
-            get_triggerable_positions(&env).unwrap()
-        });
+        let positions = env.as_contract(&exec_id, || get_triggerable_positions(&env).unwrap());
 
         assert_eq!(positions.len(), 0);
     }

@@ -2,9 +2,10 @@
 
 mod errors;
 pub mod keeper;
+mod oracle;
 pub mod risk_gates;
-pub mod triggers;
 pub mod sdex;
+pub mod triggers;
 
 use errors::{ContractError, InsufficientBalanceDetail};
 use risk_gates::{
@@ -40,6 +41,9 @@ pub enum StorageKey {
     DailyVolume(Address),
     /// The ledger-day (timestamp / 86400) when `DailyVolume(user)` was last reset.
     DailyVolumeDay(Address),
+    /// Oracle contracts allowed to feed stop-loss / take-profit triggers.
+    OracleWhitelisted(Address),
+    OracleWhitelistCount,
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -74,9 +78,12 @@ fn effective_estimated_fee(env: &Env) -> i128 {
         .unwrap_or(DEFAULT_ESTIMATED_COPY_TRADE_FEE)
 }
 
+fn require_admin(env: &Env) -> Result<Address, ContractError> {
+    oracle::require_admin(env)
+}
+
 #[contractimpl]
 impl TradeExecutorContract {
-
     /// # Summary
     /// One-time contract initialization. Stores the admin address.
     ///
@@ -162,17 +169,34 @@ impl TradeExecutorContract {
 
     // ── Stop-loss / take-profit configuration ─────────────────────────────────
 
+    pub fn add_oracle(env: Env, oracle: Address) -> Result<(), ContractError> {
+        oracle::add(&env, oracle)
+    }
+
+    pub fn remove_oracle(env: Env, oracle: Address) -> Result<(), ContractError> {
+        oracle::remove(&env, oracle)
+    }
+
+    pub fn is_oracle_whitelisted(env: Env, oracle: Address) -> bool {
+        oracle::is_whitelisted(&env, &oracle)
+    }
+
+    pub fn get_oracle_whitelist_count(env: Env) -> u32 {
+        oracle::count(&env)
+    }
+
     /// Set the oracle contract used by stop-loss/take-profit checks (admin only).
-    pub fn set_oracle(env: Env, oracle: Address) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::Admin)
-            .expect("not initialized");
-        admin.require_auth();
+    pub fn set_oracle(env: Env, oracle: Address) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        oracle::require_whitelisted(&env, &oracle)?;
         env.storage()
             .instance()
             .set(&Symbol::new(&env, ORACLE_KEY), &oracle);
+        Ok(())
+    }
+
+    pub fn get_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&Symbol::new(&env, ORACLE_KEY))
     }
 
     /// Set the portfolio contract used by stop-loss/take-profit close calls (admin only).
@@ -319,15 +343,14 @@ impl TradeExecutorContract {
             .storage()
             .instance()
             .get(&Symbol::new(&env, triggers::ORACLE_KEY));
-        let effective_amount = match resolve_trade_amount(
-            &env, &user, &token, amount, portfolio_pct_bps, oracle,
-        ) {
-            Ok(a) => a,
-            Err(e) => {
-                env.storage().temporary().remove(&lock_key);
-                return Err(e);
-            }
-        };
+        let effective_amount =
+            match resolve_trade_amount(&env, &user, &token, amount, portfolio_pct_bps, oracle) {
+                Ok(a) => a,
+                Err(e) => {
+                    env.storage().temporary().remove(&lock_key);
+                    return Err(e);
+                }
+            };
 
         // ── Cross-contract call #1: SEP-41 balance check ──────────────────────
         let fee = effective_estimated_fee(&env);
@@ -360,7 +383,9 @@ impl TradeExecutorContract {
             .get(&StorageKey::Admin)
             .expect("not initialized");
         admin.require_auth();
-        env.storage().instance().set(&StorageKey::SdexRouter, &router);
+        env.storage()
+            .instance()
+            .set(&StorageKey::SdexRouter, &router);
     }
 
     pub fn get_sdex_router(env: Env) -> Option<Address> {
@@ -502,7 +527,8 @@ impl TradeExecutorContract {
             .get(&StorageKey::SdexRouter)
             .ok_or(ContractError::NotInitialized)?;
 
-        let exit_price = execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received)?;
+        let exit_price =
+            execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received)?;
 
         let realized_pnl = exit_price - amount;
         let close_sym = Symbol::new(&env, "close_position");
@@ -546,16 +572,17 @@ impl TradeExecutorContract {
 
         for i in 0..len {
             let trade = trades.get(i).unwrap();
-            let outcome = Self::execute_copy_trade(
-                env.clone(),
-                trade.user,
-                trade.token,
-                trade.amount,
-                None,
-            );
+            let outcome =
+                Self::execute_copy_trade(env.clone(), trade.user, trade.token, trade.amount, None);
             let result = match outcome {
-                Ok(()) => BatchTradeResult { ok: true, error_code: 0 },
-                Err(e) => BatchTradeResult { ok: false, error_code: e as u32 },
+                Ok(()) => BatchTradeResult {
+                    ok: true,
+                    error_code: 0,
+                },
+                Err(e) => BatchTradeResult {
+                    ok: false,
+                    error_code: e as u32,
+                },
             };
             results.push_back(result);
         }

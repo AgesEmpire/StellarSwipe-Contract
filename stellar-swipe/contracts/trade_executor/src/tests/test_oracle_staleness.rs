@@ -32,8 +32,12 @@ pub struct StaleOracle;
 impl StaleOracle {
     /// Store a price together with an explicit publish timestamp.
     pub fn set_price_at(env: Env, price: i128, timestamp: u64) {
-        env.storage().instance().set(&symbol_short!("price"), &price);
-        env.storage().instance().set(&symbol_short!("pts"), &timestamp);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("price"), &price);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("pts"), &timestamp);
     }
 
     pub fn get_price(env: Env, _asset_pair: u32) -> i128 {
@@ -88,6 +92,7 @@ fn setup() -> (Env, Address, Address, Address) {
 
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
     exec.initialize(&admin);
+    exec.add_oracle(&oracle_id);
     exec.set_oracle(&oracle_id);
     exec.set_stop_loss_portfolio(&portfolio_id);
 
@@ -110,8 +115,14 @@ fn fresh_price_trade_proceeds() {
 
     // Price (50) <= stop_loss (100) → would trigger if fresh; must not return an error.
     let result = exec.try_check_and_trigger_stop_loss(&user, &1u64, &0u32);
-    assert!(result.is_ok(), "fresh price must not return an error: {result:?}");
-    assert!(result.unwrap().unwrap(), "stop-loss must trigger on fresh price");
+    assert!(
+        result.is_ok(),
+        "fresh price must not return an error: {result:?}"
+    );
+    assert!(
+        result.unwrap().unwrap(),
+        "stop-loss must trigger on fresh price"
+    );
 }
 
 /// Scenario 2: price published exactly `MAX_ORACLE_PRICE_AGE_SECS` seconds ago — still valid.
@@ -150,10 +161,7 @@ fn price_one_second_past_max_age_returns_stale() {
 
     let result = exec.try_check_and_trigger_stop_loss(&user, &3u64, &0u32);
     assert!(
-        matches!(
-            result,
-            Err(Ok(ContractError::OraclePriceStale))
-        ),
+        matches!(result, Err(Ok(ContractError::OraclePriceStale))),
         "expected OraclePriceStale, got: {result:?}"
     );
 }
@@ -170,10 +178,7 @@ fn no_price_returns_oracle_unavailable() {
 
     let result = exec.try_check_and_trigger_stop_loss(&user, &4u64, &0u32);
     assert!(
-        matches!(
-            result,
-            Err(Ok(ContractError::OracleUnavailable))
-        ),
+        matches!(result, Err(Ok(ContractError::OracleUnavailable))),
         "expected OracleUnavailable, got: {result:?}"
     );
 }

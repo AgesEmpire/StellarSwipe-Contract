@@ -26,9 +26,10 @@ pub const MAX_ORACLE_PRICE_AGE_SECS: u64 = 300;
 
 /// Register a stop-loss price for `(user, trade_id)`.
 pub fn set_stop_loss(env: &Env, user: &Address, trade_id: u64, stop_loss_price: i128) {
-    env.storage()
-        .persistent()
-        .set(&(Symbol::new(env, "StopLoss"), user.clone(), trade_id), &stop_loss_price);
+    env.storage().persistent().set(
+        &(Symbol::new(env, "StopLoss"), user.clone(), trade_id),
+        &stop_loss_price,
+    );
 }
 
 pub fn get_stop_loss(env: &Env, user: &Address, trade_id: u64) -> Option<i128> {
@@ -39,9 +40,10 @@ pub fn get_stop_loss(env: &Env, user: &Address, trade_id: u64) -> Option<i128> {
 
 /// Register a take-profit price for `(user, trade_id)`.
 pub fn set_take_profit(env: &Env, user: &Address, trade_id: u64, take_profit_price: i128) {
-    env.storage()
-        .persistent()
-        .set(&(Symbol::new(env, "TakeProfit"), user.clone(), trade_id), &take_profit_price);
+    env.storage().persistent().set(
+        &(Symbol::new(env, "TakeProfit"), user.clone(), trade_id),
+        &take_profit_price,
+    );
 }
 
 pub fn get_take_profit(env: &Env, user: &Address, trade_id: u64) -> Option<i128> {
@@ -75,7 +77,11 @@ fn fetch_oracle_and_portfolio(env: &Env) -> Result<(Address, Address), ContractE
 ///   - `Ok(price)` when the price is fresh (age ≤ `MAX_ORACLE_PRICE_AGE_SECS`)
 ///   - `Err(OracleUnavailable)` when no price has ever been set (timestamp == 0)
 ///   - `Err(OraclePriceStale)` when the price is older than `MAX_ORACLE_PRICE_AGE_SECS`
-fn fetch_current_price(env: &Env, oracle: &Address, asset_pair: u32) -> Result<i128, ContractError> {
+fn fetch_current_price(
+    env: &Env,
+    oracle: &Address,
+    asset_pair: u32,
+) -> Result<i128, ContractError> {
     // Fetch timestamp first — 0 means no price has ever been published.
     let updated_at: u64 = env.invoke_contract(
         oracle,
@@ -144,8 +150,8 @@ pub fn check_and_trigger_stop_loss(
     asset_pair: u32,
 ) -> Result<bool, ContractError> {
     let (oracle, portfolio) = fetch_oracle_and_portfolio(env)?;
-    let stop_loss_price = get_stop_loss(env, &user, trade_id)
-        .ok_or(ContractError::NotInitialized)?;
+    let stop_loss_price =
+        get_stop_loss(env, &user, trade_id).ok_or(ContractError::NotInitialized)?;
     let current_price = fetch_current_price(env, &oracle, asset_pair)?;
 
     if current_price <= stop_loss_price {
@@ -184,8 +190,8 @@ pub fn check_and_trigger_take_profit(
     asset_pair: u32,
 ) -> Result<bool, ContractError> {
     let (oracle, portfolio) = fetch_oracle_and_portfolio(env)?;
-    let take_profit_price = get_take_profit(env, &user, trade_id)
-        .ok_or(ContractError::NotInitialized)?;
+    let take_profit_price =
+        get_take_profit(env, &user, trade_id).ok_or(ContractError::NotInitialized)?;
     let current_price = fetch_current_price(env, &oracle, asset_pair)?;
 
     // Stop-loss takes priority.
@@ -237,10 +243,8 @@ mod tests {
                 .instance()
                 .set(&symbol_short!("price"), &price);
             // Default timestamp: current ledger time (fresh).
-            let ts = env.ledger().timestamp();
-            env.storage()
-                .instance()
-                .set(&symbol_short!("pts"), &ts);
+            let ts = env.ledger().timestamp().max(1);
+            env.storage().instance().set(&symbol_short!("pts"), &ts);
         }
 
         pub fn set_price_at(env: Env, price: i128, timestamp: u64) {
@@ -300,6 +304,7 @@ mod tests {
     fn setup() -> (Env, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1);
 
         let admin = Address::generate(&env);
         let oracle_id = env.register(MockOracle, ());
@@ -308,6 +313,7 @@ mod tests {
 
         let exec = TradeExecutorContractClient::new(&env, &exec_id);
         exec.initialize(&admin);
+        exec.add_oracle(&oracle_id);
         exec.set_oracle(&oracle_id);
         exec.set_stop_loss_portfolio(&portfolio_id);
 
@@ -359,7 +365,7 @@ mod tests {
 
     #[test]
     fn stop_loss_trigger_emits_event() {
-        let (env, exec_id, oracle_id, _) = setup();
+        let (env, exec_id, oracle_id, portfolio_id) = setup();
         let user = Address::generate(&env);
         MockOracleClient::new(&env, &oracle_id).set_price(&80);
         let exec = TradeExecutorContractClient::new(&env, &exec_id);
@@ -367,7 +373,9 @@ mod tests {
         exec.check_and_trigger_stop_loss(&user, &3u64, &0u32);
         // Just verify the call succeeded and position was closed (event format tested below).
         assert_eq!(
-            MockPortfolioClient::new(&env, &oracle_id.clone()).last_closed().is_none(),
+            MockPortfolioClient::new(&env, &portfolio_id)
+                .last_closed()
+                .is_none(),
             false
         );
         let _ = env.events();
