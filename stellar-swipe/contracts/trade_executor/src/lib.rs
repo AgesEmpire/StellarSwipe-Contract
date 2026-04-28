@@ -8,7 +8,7 @@ pub mod risk_gates;
 pub mod sdex;
 pub mod triggers;
 
-use errors::{ContractError, InsufficientBalanceDetail};
+use errors::{ContractError, InsufficientBalanceDetail, NetworkErrorDetail};
 use risk_gates::{
     check_user_balance, resolve_trade_amount, validate_and_record_position,
     DEFAULT_ESTIMATED_COPY_TRADE_FEE, MAX_BATCH_SIZE,
@@ -47,6 +47,8 @@ pub enum StorageKey {
     OracleWhitelistCount,
     /// DCA plan for (user, signal_id). Stores a `DCAPlan`.
     DCAPlan(Address, u64),
+    /// Last network congestion detail for a user (cleared on successful execute_copy_trade).
+    LastNetworkError(Address),
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -267,6 +269,25 @@ impl TradeExecutorContract {
         env.storage().instance().get(&key)
     }
 
+    /// Detail for the last `NetworkCongestion` error from [`Self::execute_copy_trade`].
+    /// Returns `None` if the last call succeeded or no congestion has occurred.
+    /// Frontend should check `is_transient` before offering a retry option.
+    pub fn get_network_error_detail(env: Env, user: Address) -> Option<NetworkErrorDetail> {
+        let key = StorageKey::LastNetworkError(user);
+        env.storage().instance().get(&key)
+    }
+
+    /// Returns `true` for errors that are transient (network/infrastructure) and
+    /// `false` for permanent logic errors. Used internally and exposed for testing.
+    pub fn is_transient_error(error: ContractError) -> bool {
+        matches!(
+            error,
+            ContractError::NetworkCongestion
+                | ContractError::OracleUnavailable
+                | ContractError::OraclePriceStale
+        )
+    }
+
     /// Execute a copy trade.
     ///
     /// ## Cross-contract call budget (Issue #306 optimization)
@@ -358,6 +379,7 @@ impl TradeExecutorContract {
         // ── Cross-contract call #1: SEP-41 balance check ──────────────────────
         let fee = effective_estimated_fee(&env);
         let bal_key = StorageKey::LastInsufficientBalance(user.clone());
+        let net_key = StorageKey::LastNetworkError(user.clone());
         match check_user_balance(&env, &user, &token, effective_amount, fee) {
             Ok(()) => {
                 env.storage().instance().remove(&bal_key);
@@ -370,7 +392,26 @@ impl TradeExecutorContract {
         }
 
         // ── Cross-contract call #2: batched position-limit check + record ─────
-        validate_and_record_position(&env, &portfolio, &user, exempt)?;
+        let record_result = validate_and_record_position(&env, &portfolio, &user, exempt);
+        match record_result {
+            Ok(()) => {
+                env.storage().instance().remove(&net_key);
+            }
+            Err(ContractError::OracleUnavailable) | Err(ContractError::OraclePriceStale) => {
+                // Transient: infrastructure unavailable — surface as NetworkCongestion
+                let detail = NetworkErrorDetail {
+                    retry_after_ledger: env.ledger().sequence().saturating_add(5),
+                    is_transient: true,
+                };
+                env.storage().instance().set(&net_key, &detail);
+                env.storage().temporary().remove(&lock_key);
+                return Err(ContractError::NetworkCongestion);
+            }
+            Err(e) => {
+                env.storage().temporary().remove(&lock_key);
+                return Err(e);
+            }
+        }
 
         env.storage().temporary().remove(&lock_key);
         Ok(())

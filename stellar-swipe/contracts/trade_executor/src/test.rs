@@ -854,3 +854,125 @@ fn volume_resets_on_new_day() {
     // Day 1: limit resets — trade should succeed again.
     exec.execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None);
 }
+
+// ── Network Congestion Tests ──────────────────────────────────────────────────
+
+/// Mock portfolio that simulates a transient oracle failure (network congestion).
+#[contract]
+pub struct MockCongestedPortfolio;
+
+#[contractimpl]
+impl MockCongestedPortfolio {
+    pub fn validate_and_record(_env: Env, _user: Address, _max_positions: u32) -> u32 {
+        // Simulate oracle unavailable (transient network failure)
+        panic!("oracle unavailable");
+    }
+    pub fn has_position(_env: Env, _user: Address, _trade_id: u64) -> bool {
+        false
+    }
+    pub fn close_position(_env: Env, _user: Address, _trade_id: u64, _pnl: i128) {}
+}
+
+fn setup_with_congested_portfolio(
+    user_balance: i128,
+) -> (Env, Address, Address, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = sac_token(&env);
+    let portfolio_id = env.register(MockCongestedPortfolio, ());
+    let exec_id = env.register(TradeExecutorContract, ());
+
+    StellarAssetClient::new(&env, &token).mint(&user, &user_balance);
+
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    exec.initialize(&admin);
+    exec.set_user_portfolio(&portfolio_id);
+
+    (env, exec_id, user, admin, token)
+}
+
+/// A transient oracle failure during execute_copy_trade returns NetworkCongestion,
+/// not a permanent logic error.
+#[test]
+fn network_congestion_returns_network_congestion_error() {
+    let (env, exec_id, user, _admin, token) = setup_with_congested_portfolio(TRADE_AMOUNT * 10);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+
+    let result = exec.try_execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None);
+    assert_eq!(result, Err(Ok(ContractError::NetworkCongestion)));
+}
+
+/// After a NetworkCongestion error, get_network_error_detail returns a transient detail
+/// with retry_after_ledger set in the future.
+#[test]
+fn network_congestion_persists_retry_detail() {
+    let (env, exec_id, user, _admin, token) = setup_with_congested_portfolio(TRADE_AMOUNT * 10);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+
+    let _ = exec.try_execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None);
+
+    let detail = exec.get_network_error_detail(&user).expect("detail must be set");
+    assert!(detail.is_transient, "network congestion must be transient");
+    assert!(
+        detail.retry_after_ledger > 0,
+        "retry_after_ledger must be non-zero"
+    );
+}
+
+/// A permanent logic error (InsufficientBalance) is NOT classified as transient.
+#[test]
+fn insufficient_balance_is_not_transient() {
+    use crate::errors::ContractError as CE;
+    assert!(
+        !TradeExecutorContract::is_transient_error(CE::InsufficientBalance),
+        "InsufficientBalance must be permanent"
+    );
+    assert!(
+        !TradeExecutorContract::is_transient_error(CE::PositionLimitReached),
+        "PositionLimitReached must be permanent"
+    );
+    assert!(
+        !TradeExecutorContract::is_transient_error(CE::Unauthorized),
+        "Unauthorized must be permanent"
+    );
+}
+
+/// NetworkCongestion and oracle errors are classified as transient.
+#[test]
+fn network_and_oracle_errors_are_transient() {
+    use crate::errors::ContractError as CE;
+    assert!(
+        TradeExecutorContract::is_transient_error(CE::NetworkCongestion),
+        "NetworkCongestion must be transient"
+    );
+    assert!(
+        TradeExecutorContract::is_transient_error(CE::OracleUnavailable),
+        "OracleUnavailable must be transient"
+    );
+    assert!(
+        TradeExecutorContract::is_transient_error(CE::OraclePriceStale),
+        "OraclePriceStale must be transient"
+    );
+}
+
+/// A successful execute_copy_trade clears any previously stored network error detail.
+#[test]
+fn successful_trade_clears_network_error_detail() {
+    // First, trigger a congestion error to populate the detail.
+    let (env, exec_id, user, _admin, token) = setup_with_congested_portfolio(TRADE_AMOUNT * 10);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    let _ = exec.try_execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None);
+    assert!(exec.get_network_error_detail(&user).is_some());
+
+    // Now swap in a healthy portfolio and re-run — detail should be cleared.
+    let healthy_portfolio = env.register(MockUserPortfolio, ());
+    exec.set_user_portfolio(&healthy_portfolio);
+    exec.execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None);
+    assert!(
+        exec.get_network_error_detail(&user).is_none(),
+        "detail must be cleared after success"
+    );
+}
