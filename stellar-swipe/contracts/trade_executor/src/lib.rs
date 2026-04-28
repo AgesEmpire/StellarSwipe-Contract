@@ -44,10 +44,13 @@ pub enum StorageKey {
     /// Oracle contracts allowed to feed stop-loss / take-profit triggers.
     OracleWhitelisted(Address),
     OracleWhitelistCount,
+    CircuitBreakerActive,
+    CircuitBreakerLedger,
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
 const EXECUTION_LOCK: &str = "ExecLock";
+pub const CIRCUIT_BREAKER_DURATION_LEDGERS: u32 = 720;
 
 /// A single trade input for [`TradeExecutorContract::batch_execute`].
 #[contracttype]
@@ -68,6 +71,20 @@ pub struct BatchTradeResult {
     pub error_code: u32,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerActivated {
+    pub activated_by: Address,
+    pub activated_ledger: u32,
+    pub expires_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerReset {
+    pub reset_ledger: u32,
+}
+
 #[contract]
 pub struct TradeExecutorContract;
 
@@ -80,6 +97,66 @@ fn effective_estimated_fee(env: &Env) -> i128 {
 
 fn require_admin(env: &Env) -> Result<Address, ContractError> {
     oracle::require_admin(env)
+}
+
+fn emit_circuit_breaker_activated(env: &Env, activated_by: Address, activated_ledger: u32) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "circuit_breaker_activated"),
+        ),
+        CircuitBreakerActivated {
+            activated_by,
+            activated_ledger,
+            expires_ledger: activated_ledger.saturating_add(CIRCUIT_BREAKER_DURATION_LEDGERS),
+        },
+    );
+}
+
+fn emit_circuit_breaker_reset(env: &Env) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "circuit_breaker_reset"),
+        ),
+        CircuitBreakerReset {
+            reset_ledger: env.ledger().sequence(),
+        },
+    );
+}
+
+fn reset_circuit_breaker(env: &Env) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::CircuitBreakerActive, &false);
+    env.storage()
+        .instance()
+        .remove(&StorageKey::CircuitBreakerLedger);
+    emit_circuit_breaker_reset(env);
+}
+
+fn market_circuit_breaker_active(env: &Env) -> bool {
+    let active = env
+        .storage()
+        .instance()
+        .get(&StorageKey::CircuitBreakerActive)
+        .unwrap_or(false);
+    if !active {
+        return false;
+    }
+
+    let activated_ledger = env
+        .storage()
+        .instance()
+        .get(&StorageKey::CircuitBreakerLedger)
+        .unwrap_or(env.ledger().sequence());
+    if env.ledger().sequence().saturating_sub(activated_ledger) >= CIRCUIT_BREAKER_DURATION_LEDGERS
+    {
+        reset_circuit_breaker(env);
+        return false;
+    }
+
+    true
 }
 
 #[contractimpl]
@@ -264,6 +341,43 @@ impl TradeExecutorContract {
         env.storage().instance().get(&key)
     }
 
+    /// Activate the protocol-wide market circuit breaker. The admin or a whitelisted
+    /// oracle may activate it during extreme volatility.
+    pub fn activate_market_circuit_breaker(env: Env, caller: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(ContractError::NotInitialized)?;
+        if caller != admin && !oracle::is_whitelisted(&env, &caller) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let ledger = env.ledger().sequence();
+        env.storage()
+            .instance()
+            .set(&StorageKey::CircuitBreakerActive, &true);
+        env.storage()
+            .instance()
+            .set(&StorageKey::CircuitBreakerLedger, &ledger);
+        emit_circuit_breaker_activated(&env, caller, ledger);
+        Ok(())
+    }
+
+    /// Admin reset hook; normal trade flow also auto-resets after the configured duration.
+    pub fn reset_market_circuit_breaker(env: Env) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        if market_circuit_breaker_active(&env) {
+            reset_circuit_breaker(&env);
+        }
+        Ok(())
+    }
+
+    pub fn is_market_circuit_breaker_active(env: Env) -> bool {
+        market_circuit_breaker_active(&env)
+    }
+
     /// Execute a copy trade.
     ///
     /// ## Cross-contract call budget (Issue #306 optimization)
@@ -286,6 +400,10 @@ impl TradeExecutorContract {
 
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
+        }
+
+        if market_circuit_breaker_active(&env) {
+            return Err(ContractError::CircuitBreakerActive);
         }
 
         // ── Reentrancy guard ──────────────────────────────────────────────────
