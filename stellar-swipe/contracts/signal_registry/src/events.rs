@@ -333,3 +333,18 @@ pub fn emit_reputation_updated(env: &Env, provider: Address, old_score: u32, new
         },
     );
 }
+
+/// Emitted when a storage type exceeds 80% of its capacity limit.
+/// `storage_type`: 0 = instance, 1 = persistent, 2 = temporary
+/// `entry_count`: current number of entries
+/// `capacity_limit`: the configured limit
+pub fn emit_storage_capacity_warning(
+    env: &Env,
+    storage_type: u32,
+    entry_count: u32,
+    capacity_limit: u32,
+) {
+    let topics = (Symbol::new(env, "storage_cap_warn"),);
+    env.events()
+        .publish(topics, (storage_type, entry_count, capacity_limit));
+}
