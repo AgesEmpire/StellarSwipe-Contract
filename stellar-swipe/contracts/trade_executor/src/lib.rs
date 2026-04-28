@@ -81,6 +81,21 @@ pub struct BatchTradeResult {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllocationTarget {
+    pub asset_pair: u32,
+    pub target_pct_bps: u32,
+}
+
+pub fn rebalance_portfolio(_user: u32, targets: Vec<AllocationTarget>) {
+    for t in targets.iter() {
+        if t.target_pct_bps > 10000 {
+            panic!("invalid allocation");
+        }
+    }
+}
+
+#[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrderType {
     Market,
