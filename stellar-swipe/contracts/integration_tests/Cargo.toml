@@ -14,7 +14,12 @@ stake_vault = { path = "../stake_vault" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+signal_registry = { path = "../signal_registry", features = ["testutils"] }
 
 [[test]]
 name = "test_contract_upgrade"
 path = "tests/integration/test_contract_upgrade.rs"
+
+[[test]]
+name = "test_complete_user_journey"
+path = "tests/integration/test_complete_user_journey.rs"

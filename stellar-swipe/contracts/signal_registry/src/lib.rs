@@ -16,7 +16,7 @@ mod leaderboard;
 mod ml_scoring;
 mod performance;
 mod query;
-mod reputation;
+pub mod reputation;
 mod scheduling;
 mod social;
 mod stake;
@@ -29,6 +29,7 @@ mod versioning;
 
 pub use categories::{RiskLevel, SignalCategory};
 pub use types::SignalAction;
+pub use types::{FeeBreakdown, ProviderPerformance, SignalOutcome, SignalStatus};
 
 use admin::{
     get_admin, get_admin_config, init_admin, is_trading_paused,
