@@ -2,6 +2,7 @@
 
 #![cfg_attr(target_family = "wasm", no_std)]
 
+mod migration;
 mod queries;
 mod storage;
 mod subscriptions;
@@ -573,6 +574,147 @@ mod kyc_tests {
         // Mode is now off — unverified user should succeed.
         let id = client.open_position(&user, &100, &1_000);
         assert_eq!(id, 1);
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::oracle_ok::OracleMock;
+    use super::oracle_ok::OracleMockClient;
+    use super::*;
+    use crate::storage::DataKey;
+    use soroban_sdk::testutils::Address as _;
+
+    /// 20 users × 5 open + 10 closed positions each.
+    /// Verifies all positions are preserved after V1 → V2 migration.
+    #[test]
+    fn migrate_20_users_5_open_10_closed() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let oracle_id = env.register_contract(None, OracleMock);
+        OracleMockClient::new(&env, &oracle_id).set_price(&100);
+        let contract_id = env.register_contract(None, UserPortfolio);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle_id);
+
+        const USERS: usize = 20;
+        const OPEN: usize = 5;
+        const CLOSED: usize = 10;
+
+        let mut users: Vec<Address> = Vec::new(&env);
+        for _ in 0..USERS {
+            let user = Address::generate(&env);
+
+            // Open OPEN + CLOSED positions (all start open).
+            let mut all_ids = soroban_sdk::vec![&env];
+            for _ in 0..(OPEN + CLOSED) {
+                let id = client.open_position(&user, &100, &1_000);
+                all_ids.push_back(id);
+            }
+            // Close the last CLOSED of them.
+            for i in OPEN..(OPEN + CLOSED) {
+                let id = all_ids.get(i as u32).unwrap();
+                client.close_position(&user, &id, &50);
+            }
+
+            users.push_back(user);
+        }
+
+        // Register all users for migration and run in one batch.
+        client.register_migration_users(&users);
+        let processed = client.migrate_portfolio_v1_to_v2(&(USERS as u32));
+        assert_eq!(processed, USERS as u32);
+
+        // Verify V2 storage for every user.
+        for i in 0..USERS {
+            let user = users.get(i as u32).unwrap();
+
+            let open_ids: soroban_sdk::Vec<u64> = env
+                .as_contract(&contract_id, || {
+                    env.storage()
+                        .persistent()
+                        .get(&DataKey::UserOpenPositions(user.clone()))
+                        .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+                });
+            let closed_ids: soroban_sdk::Vec<u64> = env
+                .as_contract(&contract_id, || {
+                    env.storage()
+                        .persistent()
+                        .get(&DataKey::UserClosedPositions(user.clone()))
+                        .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+                });
+
+            assert_eq!(open_ids.len(), OPEN as u32, "user {i}: open count mismatch");
+            assert_eq!(
+                closed_ids.len(),
+                CLOSED as u32,
+                "user {i}: closed count mismatch"
+            );
+
+            // Verify every open position is actually Open.
+            for j in 0..open_ids.len() {
+                let id = open_ids.get(j).unwrap();
+                let pos: Position = env.as_contract(&contract_id, || {
+                    env.storage()
+                        .persistent()
+                        .get(&DataKey::Position(id))
+                        .expect("open position missing")
+                });
+                assert_eq!(pos.status, PositionStatus::Open);
+            }
+
+            // Verify every closed position is actually Closed.
+            for j in 0..closed_ids.len() {
+                let id = closed_ids.get(j).unwrap();
+                let pos: Position = env.as_contract(&contract_id, || {
+                    env.storage()
+                        .persistent()
+                        .get(&DataKey::Position(id))
+                        .expect("closed position missing")
+                });
+                assert_eq!(pos.status, PositionStatus::Closed);
+            }
+        }
+    }
+
+    /// Idempotency: running migration twice on the same users is safe.
+    #[test]
+    fn migrate_idempotent() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let oracle_id = env.register_contract(None, OracleMock);
+        OracleMockClient::new(&env, &oracle_id).set_price(&100);
+        let contract_id = env.register_contract(None, UserPortfolio);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle_id);
+
+        let user = Address::generate(&env);
+        client.open_position(&user, &100, &1_000);
+        client.close_position(&user, &1, &50);
+
+        let mut users: Vec<Address> = Vec::new(&env);
+        users.push_back(user.clone());
+
+        client.register_migration_users(&users);
+        client.migrate_portfolio_v1_to_v2(&1);
+
+        // Second run: queue is empty, nothing to process.
+        client.register_migration_users(&users);
+        // Re-registering same user; migrate_user skips already-migrated.
+        let processed = client.migrate_portfolio_v1_to_v2(&1);
+        assert_eq!(processed, 1); // processed from queue but skipped internally
+
+        let open_ids: soroban_sdk::Vec<u64> = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::UserOpenPositions(user.clone()))
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+        });
+        assert_eq!(open_ids.len(), 0); // position 1 was closed
     }
 }
 
