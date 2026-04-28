@@ -18,6 +18,7 @@ mod performance;
 mod query;
 pub mod reputation;
 mod scheduling;
+mod scoring;
 mod social;
 mod stake;
 mod storage_monitor;
@@ -26,6 +27,7 @@ mod templates;
 mod test_reputation;
 mod types;
 mod migration;
+mod validation;
 mod versioning;
 
 pub use categories::{RiskLevel, SignalCategory};
@@ -731,6 +733,22 @@ impl SignalRegistry {
     pub fn get_signal(env: Env, signal_id: u64) -> Option<Signal> {
         let signals = Self::get_signals_map(&env);
         signals.get(signal_id)
+    }
+
+    /// Get the composite quality score for a signal (0-100).
+    /// 
+    /// Combines success rate, adoption count, stake tier, and AI validation score
+    /// into a single quality metric. If AI score is absent, its weight is redistributed
+    /// to the success rate component.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment
+    /// - `signal_id`: ID of the signal to score
+    ///
+    /// # Returns
+    /// Quality score from 0 to 100, or None if signal not found
+    pub fn get_signal_quality_score(env: Env, signal_id: u64) -> Option<u32> {
+        scoring::get_signal_quality_score(&env, signal_id)
     }
 
     /// Return the signal if `viewer` is allowed to see it. Non-[`SignalCategory::PREMIUM`]
