@@ -632,6 +632,33 @@ impl TradeExecutorContract {
             .unwrap_or(0i128)
     }
 
+    /// Admin: set the per-pair open interest limit. `0` means no limit.
+    pub fn set_max_open_interest_per_pair(env: Env, limit: i128) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if limit < 0 {
+            panic!("limit must be non-negative");
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::MaxOpenInterestPerPair, &limit);
+    }
+
+    pub fn get_max_open_interest_per_pair(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MaxOpenInterestPerPair)
+            .unwrap_or(0i128)
+    }
+
+    pub fn get_open_interest(env: Env, pair: Address) -> i128 {
+        open_interest_for_pair(&env, &pair)
+    }
+
     /// # Summary
     /// Execute a swap via the configured SDEX router with an explicit minimum
     /// received amount. Enforces slippage at the balance-delta level.
@@ -753,6 +780,7 @@ impl TradeExecutorContract {
         close_args.push_back(trade_id.into_val(&env));
         close_args.push_back(realized_pnl.into_val(&env));
         env.invoke_contract::<()>(&portfolio, &close_sym, close_args);
+        decrease_open_interest(&env, &from_token, amount);
 
         shared::events::emit_trade_cancelled(
             &env,
