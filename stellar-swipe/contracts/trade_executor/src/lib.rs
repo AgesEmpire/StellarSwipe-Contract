@@ -57,6 +57,7 @@ pub enum StorageKey {
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
 const EXECUTION_LOCK: &str = "ExecLock";
+pub const CIRCUIT_BREAKER_DURATION_LEDGERS: u32 = 720;
 
 /// A single trade input for [`TradeExecutorContract::batch_execute`].
 #[contracttype]
@@ -429,6 +430,43 @@ impl TradeExecutorContract {
     ) -> Option<InsufficientBalanceDetail> {
         let key = StorageKey::LastInsufficientBalance(user);
         env.storage().instance().get(&key)
+    }
+
+    /// Activate the protocol-wide market circuit breaker. The admin or a whitelisted
+    /// oracle may activate it during extreme volatility.
+    pub fn activate_market_circuit_breaker(env: Env, caller: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(ContractError::NotInitialized)?;
+        if caller != admin && !oracle::is_whitelisted(&env, &caller) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let ledger = env.ledger().sequence();
+        env.storage()
+            .instance()
+            .set(&StorageKey::CircuitBreakerActive, &true);
+        env.storage()
+            .instance()
+            .set(&StorageKey::CircuitBreakerLedger, &ledger);
+        emit_circuit_breaker_activated(&env, caller, ledger);
+        Ok(())
+    }
+
+    /// Admin reset hook; normal trade flow also auto-resets after the configured duration.
+    pub fn reset_market_circuit_breaker(env: Env) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        if market_circuit_breaker_active(&env) {
+            reset_circuit_breaker(&env);
+        }
+        Ok(())
+    }
+
+    pub fn is_market_circuit_breaker_active(env: Env) -> bool {
+        market_circuit_breaker_active(&env)
     }
 
     /// Execute a copy trade.
