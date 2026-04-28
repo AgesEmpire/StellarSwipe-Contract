@@ -10,6 +10,8 @@ pub enum DataKey {
     NextPositionId,
     Position(u64),
     UserPositions(Address),
+    UserOpenPositions(Address),
+    UserClosedPositions(Address),
     /// Registered TradeExecutor contract allowed to call `close_position_keeper`.
     TradeExecutor,
     /// Per-user KYC verification flag (bool). No PII stored — boolean only.
