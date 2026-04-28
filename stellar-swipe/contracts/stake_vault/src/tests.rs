@@ -228,3 +228,105 @@ fn lock_cleared_after_failed_withdrawal() {
     });
     assert!(!lock_still_set, "lock was not cleared after failed withdrawal");
 }
+
+// ── Issue #388: stake-below-minimum tests ─────────────────────────────────────
+
+#[test]
+fn signal_submission_allowed_when_stake_above_minimum() {
+    let (env, vault_id, token, _admin) = setup();
+    let provider = Address::generate(&env);
+    let amount: i128 = 1_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    seed_v2_stake(&env, &vault_id, &provider, amount, 0);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.set_minimum_stake(&500_000i128);
+
+    // Stake (1_000_000) >= minimum (500_000) → allowed.
+    let result = client.check_signal_submission_allowed(&provider);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn notify_stake_below_minimum_emits_event() {
+    use soroban_sdk::testutils::Events;
+    let (env, vault_id, token, _admin) = setup();
+    let provider = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &100_000i128);
+    seed_v2_stake(&env, &vault_id, &provider, 100_000, 0);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.set_minimum_stake(&500_000i128);
+
+    let events_before = env.events().all().len();
+    client.notify_stake_below_minimum(&provider);
+    assert!(env.events().all().len() > events_before, "event not emitted");
+}
+
+#[test]
+fn signal_submission_blocked_after_grace_period_expires() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, vault_id, token, _admin) = setup();
+    let provider = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &100_000i128);
+    seed_v2_stake(&env, &vault_id, &provider, 100_000, 0);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.set_minimum_stake(&500_000i128);
+
+    // Record the drop.
+    client.notify_stake_below_minimum(&provider);
+
+    // Advance time past the 24h grace period.
+    env.ledger().with_mut(|l| l.timestamp += 86_401);
+
+    let result = client.check_signal_submission_allowed(&provider);
+    assert_eq!(result, Err(StakeVaultError::StakeBelowMinimum));
+}
+
+#[test]
+fn signal_submission_allowed_within_grace_period() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, vault_id, token, _admin) = setup();
+    let provider = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &100_000i128);
+    seed_v2_stake(&env, &vault_id, &provider, 100_000, 0);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.set_minimum_stake(&500_000i128);
+
+    client.notify_stake_below_minimum(&provider);
+
+    // Advance time within the grace period (12h).
+    env.ledger().with_mut(|l| l.timestamp += 43_200);
+
+    let result = client.check_signal_submission_allowed(&provider);
+    assert!(result.is_ok(), "should be allowed within grace period");
+}
+
+#[test]
+fn stake_restoration_clears_below_min_flag() {
+    let (env, vault_id, token, _admin) = setup();
+    let provider = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &100_000i128);
+    seed_v2_stake(&env, &vault_id, &provider, 100_000, 0);
+
+    let client = StakeVaultContractClient::new(&env, &vault_id);
+    client.set_minimum_stake(&500_000i128);
+
+    client.notify_stake_below_minimum(&provider);
+    assert!(client.get_stake_below_min_since(&provider).is_some());
+
+    // Restore stake above minimum.
+    seed_v2_stake(&env, &vault_id, &provider, 1_000_000, 0);
+
+    // check_signal_submission_allowed should clear the flag and return Ok.
+    let result = client.check_signal_submission_allowed(&provider);
+    assert!(result.is_ok());
+    assert!(client.get_stake_below_min_since(&provider).is_none());
+}

@@ -88,7 +88,7 @@ fn save_index(env: &Env, key: LeaderboardKey, index: &Vec<IndexEntry>) {
 }
 
 fn is_qualified(entry: &IndexEntry) -> bool {
-    entry.closed_signals >= MIN_CLOSED_SIGNALS
+    entry.closed_signals >= MIN_CLOSED_SIGNALS && entry.total_adopters > 0
 }
 
 fn upsert_sorted<F>(env: &Env, index: &mut Vec<IndexEntry>, entry: IndexEntry, score_fn: F)
@@ -260,6 +260,33 @@ mod tests {
             avg_return,
             total_volume: 0,
         }
+    }
+
+    #[test]
+    fn test_zero_adoption_excluded_from_leaderboard() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p = Address::generate(&env);
+            // 10 closed signals but zero adopters
+            let stats = make_stats(8000, 0, 100, 5, 5);
+            update_leaderboard_index(&env, p, &stats);
+            let lb = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
+            assert_eq!(lb.len(), 0);
+        });
+    }
+
+    #[test]
+    fn test_one_adoption_included_in_leaderboard() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p = Address::generate(&env);
+            let stats = make_stats(8000, 1, 100, 5, 5);
+            update_leaderboard_index(&env, p, &stats);
+            let lb = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
+            assert_eq!(lb.len(), 1);
+        });
     }
 
     /// 30 providers with varied metrics — verify top-10 by each metric.

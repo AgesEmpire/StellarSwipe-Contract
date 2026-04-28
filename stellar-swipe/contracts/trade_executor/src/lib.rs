@@ -7,6 +7,7 @@ mod oracle;
 pub mod risk_gates;
 pub mod sdex;
 pub mod triggers;
+mod wire;
 
 use errors::{ContractError, InsufficientBalanceDetail};
 use risk_gates::{
@@ -17,6 +18,7 @@ use sdex::{execute_sdex_swap, min_received_from_slippage};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Val, Vec};
 
 use triggers::{ORACLE_KEY, PORTFOLIO_KEY};
+use wire::TRADE_TIMEOUT_LEDGERS;
 
 /// Instance storage keys.
 #[contracttype]
@@ -45,12 +47,19 @@ pub enum StorageKey {
     /// Oracle contracts allowed to feed stop-loss / take-profit triggers.
     OracleWhitelisted(Address),
     OracleWhitelistCount,
+    NextLimitOrderId,
+    PendingLimitOrder(u64),
+    PendingLimitOrderIds,
+    SdexPrice(Address),
     /// DCA plan for (user, signal_id). Stores a `DCAPlan`.
     DCAPlan(Address, u64),
+    /// Set when fee fallback was used for a trade: stores the fee amount deducted from received.
+    FeeDeductedFromReceived(Address, u64),
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
 const EXECUTION_LOCK: &str = "ExecLock";
+pub const CIRCUIT_BREAKER_DURATION_LEDGERS: u32 = 720;
 
 /// A single trade input for [`TradeExecutorContract::batch_execute`].
 #[contracttype]
@@ -71,6 +80,25 @@ pub struct BatchTradeResult {
     pub error_code: u32,
 }
 
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderType {
+    Market,
+    Limit,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingLimitOrder {
+    pub order_id: u64,
+    pub user: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub portfolio_pct_bps: Option<u32>,
+    pub limit_price: i128,
+    pub expires_at_ledger: u32,
+}
+
 #[contract]
 pub struct TradeExecutorContract;
 
@@ -83,6 +111,145 @@ fn effective_estimated_fee(env: &Env) -> i128 {
 
 fn require_admin(env: &Env) -> Result<Address, ContractError> {
     oracle::require_admin(env)
+}
+
+fn execute_market_copy_trade(
+    env: &Env,
+    user: Address,
+    token: Address,
+    amount: i128,
+    portfolio_pct_bps: Option<u32>,
+    require_user_auth: bool,
+) -> Result<(), ContractError> {
+    if require_user_auth {
+        user.require_auth();
+    }
+
+    if amount <= 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    // ── Reentrancy guard ──────────────────────────────────────────────────
+    let lock_key = Symbol::new(env, EXECUTION_LOCK);
+    if env
+        .storage()
+        .temporary()
+        .get::<_, bool>(&lock_key)
+        .unwrap_or(false)
+    {
+        return Err(ContractError::ReentrancyDetected);
+    }
+    env.storage().temporary().set(&lock_key, &true);
+
+    // ── Daily volume limit check ───────────────────────────────────────────
+    let limit: i128 = env
+        .storage()
+        .instance()
+        .get(&StorageKey::DailyVolumeLimit)
+        .unwrap_or(0i128);
+    if limit > 0 {
+        let today: u64 = env.ledger().timestamp() / 86_400;
+        let day_key = StorageKey::DailyVolumeDay(user.clone());
+        let vol_key = StorageKey::DailyVolume(user.clone());
+        let stored_day: u64 = env.storage().persistent().get(&day_key).unwrap_or(0u64);
+        let current_vol: i128 = if stored_day == today {
+            env.storage().persistent().get(&vol_key).unwrap_or(0i128)
+        } else {
+            0i128
+        };
+        let new_vol = current_vol.checked_add(amount).unwrap_or(i128::MAX);
+        if new_vol > limit {
+            env.storage().temporary().remove(&lock_key);
+            return Err(ContractError::DailyVolumeLimitExceeded);
+        }
+        env.storage().persistent().set(&vol_key, &new_vol);
+        env.storage().persistent().set(&day_key, &today);
+    }
+
+    // ── Read cached config from instance storage (no cross-contract call) ─
+    let portfolio: Address = match env.storage().instance().get(&StorageKey::UserPortfolio) {
+        Some(portfolio) => portfolio,
+        None => {
+            env.storage().temporary().remove(&lock_key);
+            return Err(ContractError::NotInitialized);
+        }
+    };
+
+    let exempt = {
+        let key = StorageKey::PositionLimitExempt(user.clone());
+        env.storage().instance().get(&key).unwrap_or(false)
+    };
+
+    // ── Resolve effective amount (portfolio % or explicit) ─────────────────
+    let oracle: Option<Address> = env.storage().instance().get(&Symbol::new(env, ORACLE_KEY));
+    let effective_amount =
+        match resolve_trade_amount(env, &user, &token, amount, portfolio_pct_bps, oracle) {
+            Ok(a) => a,
+            Err(e) => {
+                env.storage().temporary().remove(&lock_key);
+                return Err(e);
+            }
+        };
+
+    // ── Cross-contract call #1: SEP-41 balance check ──────────────────────
+    let fee = effective_estimated_fee(env);
+    let bal_key = StorageKey::LastInsufficientBalance(user.clone());
+    match check_user_balance(env, &user, &token, effective_amount, fee) {
+        Ok(()) => {
+            env.storage().instance().remove(&bal_key);
+        }
+        Err(detail) => {
+            env.storage().instance().set(&bal_key, &detail);
+            env.storage().temporary().remove(&lock_key);
+            return Err(ContractError::InsufficientBalance);
+        }
+    }
+
+    // ── Cross-contract call #2: batched position-limit check + record ─────
+    if let Err(e) = validate_and_record_position(env, &portfolio, &user, exempt) {
+        env.storage().temporary().remove(&lock_key);
+        return Err(e);
+    }
+
+    env.storage().temporary().remove(&lock_key);
+    Ok(())
+}
+
+fn next_limit_order_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&StorageKey::NextLimitOrderId)
+        .unwrap_or(1);
+    let next = id.checked_add(1).expect("limit order id overflow");
+    env.storage()
+        .instance()
+        .set(&StorageKey::NextLimitOrderId, &next);
+    id
+}
+
+fn pending_order_ids(env: &Env) -> Vec<u64> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::PendingLimitOrderIds)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn store_pending_order(env: &Env, order: PendingLimitOrder) {
+    let mut ids = pending_order_ids(env);
+    ids.push_back(order.order_id);
+    env.storage()
+        .instance()
+        .set(&StorageKey::PendingLimitOrderIds, &ids);
+    env.storage()
+        .instance()
+        .set(&StorageKey::PendingLimitOrder(order.order_id), &order);
+}
+
+fn set_pending_order_ids(env: &Env, ids: &Vec<u64>) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::PendingLimitOrderIds, ids);
 }
 
 #[contractimpl]
@@ -267,6 +434,43 @@ impl TradeExecutorContract {
         env.storage().instance().get(&key)
     }
 
+    /// Activate the protocol-wide market circuit breaker. The admin or a whitelisted
+    /// oracle may activate it during extreme volatility.
+    pub fn activate_market_circuit_breaker(env: Env, caller: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(ContractError::NotInitialized)?;
+        if caller != admin && !oracle::is_whitelisted(&env, &caller) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let ledger = env.ledger().sequence();
+        env.storage()
+            .instance()
+            .set(&StorageKey::CircuitBreakerActive, &true);
+        env.storage()
+            .instance()
+            .set(&StorageKey::CircuitBreakerLedger, &ledger);
+        emit_circuit_breaker_activated(&env, caller, ledger);
+        Ok(())
+    }
+
+    /// Admin reset hook; normal trade flow also auto-resets after the configured duration.
+    pub fn reset_market_circuit_breaker(env: Env) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        if market_circuit_breaker_active(&env) {
+            reset_circuit_breaker(&env);
+        }
+        Ok(())
+    }
+
+    pub fn is_market_circuit_breaker_active(env: Env) -> bool {
+        market_circuit_breaker_active(&env)
+    }
+
     /// Execute a copy trade.
     ///
     /// ## Cross-contract call budget (Issue #306 optimization)
@@ -283,97 +487,53 @@ impl TradeExecutorContract {
         token: Address,
         amount: i128,
         portfolio_pct_bps: Option<u32>,
+        order_type: OrderType,
+        limit_price: Option<i128>,
     ) -> Result<(), ContractError> {
-        // ── Auth ──────────────────────────────────────────────────────────────
-        user.require_auth();
-
-        if amount <= 0 {
-            return Err(ContractError::InvalidAmount);
-        }
-
-        // ── Reentrancy guard ──────────────────────────────────────────────────
-        let lock_key = Symbol::new(&env, EXECUTION_LOCK);
-        if env
-            .storage()
-            .temporary()
-            .get::<_, bool>(&lock_key)
-            .unwrap_or(false)
-        {
-            return Err(ContractError::ReentrancyDetected);
-        }
-        env.storage().temporary().set(&lock_key, &true);
-
-        // ── Daily volume limit check ───────────────────────────────────────────
-        let limit: i128 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::DailyVolumeLimit)
-            .unwrap_or(0i128);
-        if limit > 0 {
-            let today: u64 = env.ledger().timestamp() / 86_400;
-            let day_key = StorageKey::DailyVolumeDay(user.clone());
-            let vol_key = StorageKey::DailyVolume(user.clone());
-            let stored_day: u64 = env.storage().persistent().get(&day_key).unwrap_or(0u64);
-            let current_vol: i128 = if stored_day == today {
-                env.storage().persistent().get(&vol_key).unwrap_or(0i128)
-            } else {
-                0i128
-            };
-            let new_vol = current_vol.checked_add(amount).unwrap_or(i128::MAX);
-            if new_vol > limit {
-                env.storage().temporary().remove(&lock_key);
-                return Err(ContractError::DailyVolumeLimitExceeded);
+        match order_type {
+            OrderType::Market => {
+                execute_market_copy_trade(&env, user, token, amount, portfolio_pct_bps, true)
             }
-            // Record updated volume and day.
-            env.storage().persistent().set(&vol_key, &new_vol);
-            env.storage().persistent().set(&day_key, &today);
-        }
-
-        // ── Read cached config from instance storage (no cross-contract call) ─
-        let portfolio: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::UserPortfolio)
-            .ok_or(ContractError::NotInitialized)?;
-
-        let exempt = {
-            let key = StorageKey::PositionLimitExempt(user.clone());
-            env.storage().instance().get(&key).unwrap_or(false)
-        };
-
-        // ── Resolve effective amount (portfolio % or explicit) ─────────────────
-        let oracle: Option<Address> = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, triggers::ORACLE_KEY));
-        let effective_amount =
-            match resolve_trade_amount(&env, &user, &token, amount, portfolio_pct_bps, oracle) {
-                Ok(a) => a,
-                Err(e) => {
-                    env.storage().temporary().remove(&lock_key);
-                    return Err(e);
+            OrderType::Limit => {
+                user.require_auth();
+                if amount <= 0 {
+                    return Err(ContractError::InvalidAmount);
                 }
-            };
+                let price = limit_price.ok_or(ContractError::InvalidAmount)?;
+                if price <= 0 {
+                    return Err(ContractError::InvalidAmount);
+                }
 
-        // ── Cross-contract call #1: SEP-41 balance check ──────────────────────
-        let fee = effective_estimated_fee(&env);
-        let bal_key = StorageKey::LastInsufficientBalance(user.clone());
-        match check_user_balance(&env, &user, &token, effective_amount, fee) {
-            Ok(()) => {
-                env.storage().instance().remove(&bal_key);
-            }
-            Err(detail) => {
-                env.storage().instance().set(&bal_key, &detail);
-                env.storage().temporary().remove(&lock_key);
-                return Err(ContractError::InsufficientBalance);
+                let fee = effective_estimated_fee(&env);
+                let bal_key = StorageKey::LastInsufficientBalance(user.clone());
+                match check_user_balance(&env, &user, &token, amount, fee) {
+                    Ok(()) => env.storage().instance().remove(&bal_key),
+                    Err(detail) => {
+                        env.storage().instance().set(&bal_key, &detail);
+                        return Err(ContractError::InsufficientBalance);
+                    }
+                }
+
+                let order_id = next_limit_order_id(&env);
+                let expires_at_ledger = env
+                    .ledger()
+                    .sequence()
+                    .saturating_add(TRADE_TIMEOUT_LEDGERS);
+                store_pending_order(
+                    &env,
+                    PendingLimitOrder {
+                        order_id,
+                        user,
+                        token,
+                        amount,
+                        portfolio_pct_bps,
+                        limit_price: price,
+                        expires_at_ledger,
+                    },
+                );
+                Ok(())
             }
         }
-
-        // ── Cross-contract call #2: batched position-limit check + record ─────
-        validate_and_record_position(&env, &portfolio, &user, exempt)?;
-
-        env.storage().temporary().remove(&lock_key);
-        Ok(())
     }
 
     // ── SDEX router configuration ─────────────────────────────────────────────
@@ -393,6 +553,154 @@ impl TradeExecutorContract {
 
     pub fn get_sdex_router(env: Env) -> Option<Address> {
         env.storage().instance().get(&StorageKey::SdexRouter)
+    }
+
+    /// Admin/keeper-facing price cache used to decide when pending limit orders
+    /// are executable against the configured SDEX route.
+    pub fn set_sdex_price(env: Env, token: Address, price: i128) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if price <= 0 {
+            panic!("price must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::SdexPrice(token), &price);
+    }
+
+    pub fn get_sdex_price(env: Env, token: Address) -> Option<i128> {
+        env.storage().instance().get(&StorageKey::SdexPrice(token))
+    }
+
+    pub fn get_pending_limit_order(env: Env, order_id: u64) -> Option<PendingLimitOrder> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::PendingLimitOrder(order_id))
+    }
+
+    pub fn get_pending_limit_order_ids(env: Env) -> Vec<u64> {
+        pending_order_ids(&env)
+    }
+
+    /// Keeper-facing sweep for pending limit orders on `token`.
+    ///
+    /// Orders expire after `TRADE_TIMEOUT_LEDGERS`. Executable orders run through
+    /// the same market-trade path as immediate copy trades without requiring a
+    /// fresh user signature, because the user authorized the limit order placement.
+    pub fn check_pending_limit_orders(env: Env, token: Address) -> Result<u32, ContractError> {
+        let current_price: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SdexPrice(token.clone()))
+            .ok_or(ContractError::OracleUnavailable)?;
+        let ids = pending_order_ids(&env);
+        let mut next_ids = Vec::new(&env);
+        let mut processed = 0u32;
+
+        for i in 0..ids.len() {
+            let Some(order_id) = ids.get(i) else {
+                continue;
+            };
+            let Some(order) = env
+                .storage()
+                .instance()
+                .get::<StorageKey, PendingLimitOrder>(&StorageKey::PendingLimitOrder(order_id))
+            else {
+                continue;
+            };
+
+        // ── Cross-contract call #1: SEP-41 balance check ──────────────────────
+        let fee = effective_estimated_fee(&env);
+        let bal_key = StorageKey::LastInsufficientBalance(user.clone());
+
+        // Primary: try to deduct fee upfront (user has amount + fee).
+        // Fallback: if primary fails but user has at least `amount`, proceed and
+        // deduct fee from received tokens after the trade.
+        let use_fee_fallback = match check_user_balance(&env, &user, &token, effective_amount, fee) {
+            Ok(()) => {
+                env.storage().instance().remove(&bal_key);
+                false
+            }
+            Err(detail) => {
+                // Primary failed. Check if user has enough for just the amount (no fee).
+                match check_user_balance(&env, &user, &token, effective_amount, 0) {
+                    Ok(()) => {
+                        // User has enough for the trade but not the fee — use fallback.
+                        env.storage().instance().remove(&bal_key);
+                        true
+                    }
+                    Err(_) => {
+                        // User doesn't even have enough for the trade amount.
+                        env.storage().instance().set(&bal_key, &detail);
+                        env.storage().temporary().remove(&lock_key);
+                        return Err(ContractError::InsufficientBalance);
+                    }
+                }
+            }
+        };
+            if order.token != token {
+                next_ids.push_back(order_id);
+                continue;
+            }
+
+            if env.ledger().sequence() >= order.expires_at_ledger {
+                env.storage()
+                    .instance()
+                    .remove(&StorageKey::PendingLimitOrder(order_id));
+                processed = processed.saturating_add(1);
+                continue;
+            }
+
+            if current_price <= order.limit_price {
+                execute_market_copy_trade(
+                    &env,
+                    order.user,
+                    order.token,
+                    order.amount,
+                    order.portfolio_pct_bps,
+                    false,
+                )?;
+                env.storage()
+                    .instance()
+                    .remove(&StorageKey::PendingLimitOrder(order_id));
+                processed = processed.saturating_add(1);
+            } else {
+                next_ids.push_back(order_id);
+            }
+        }
+
+        // If fallback was used, emit the FeeDeductedFromReceived event.
+        // The trade_id is the current position count (used as a proxy identifier).
+        if use_fee_fallback && fee > 0 {
+            // Use a monotonic counter stored per user as a trade_id proxy.
+            let trade_id_key = StorageKey::FeeDeductedFromReceived(user.clone(), 0);
+            let trade_id: u64 = env
+                .storage()
+                .instance()
+                .get(&trade_id_key)
+                .unwrap_or(0u64)
+                .saturating_add(1);
+            env.storage().instance().set(&trade_id_key, &trade_id);
+
+            shared::events::emit_fee_deducted_from_received(
+                &env,
+                shared::events::EvtFeeDeductedFromReceived {
+                    schema_version: shared::events::SCHEMA_VERSION,
+                    user: user.clone(),
+                    fee_amount: fee,
+                    trade_id,
+                },
+            );
+        }
+
+        env.storage().temporary().remove(&lock_key);
+        Ok(())
+        set_pending_order_ids(&env, &next_ids);
+        Ok(processed)
     }
 
     /// Admin: set the global daily trade volume limit (USD-equivalent units).
@@ -417,6 +725,33 @@ impl TradeExecutorContract {
             .instance()
             .get(&StorageKey::DailyVolumeLimit)
             .unwrap_or(0i128)
+    }
+
+    /// Admin: set the per-pair open interest limit. `0` means no limit.
+    pub fn set_max_open_interest_per_pair(env: Env, limit: i128) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if limit < 0 {
+            panic!("limit must be non-negative");
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::MaxOpenInterestPerPair, &limit);
+    }
+
+    pub fn get_max_open_interest_per_pair(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MaxOpenInterestPerPair)
+            .unwrap_or(0i128)
+    }
+
+    pub fn get_open_interest(env: Env, pair: Address) -> i128 {
+        open_interest_for_pair(&env, &pair)
     }
 
     /// # Summary
@@ -540,6 +875,7 @@ impl TradeExecutorContract {
         close_args.push_back(trade_id.into_val(&env));
         close_args.push_back(realized_pnl.into_val(&env));
         env.invoke_contract::<()>(&portfolio, &close_sym, close_args);
+        decrease_open_interest(&env, &from_token, amount);
 
         shared::events::emit_trade_cancelled(
             &env,
@@ -575,8 +911,15 @@ impl TradeExecutorContract {
 
         for i in 0..len {
             let trade = trades.get(i).unwrap();
-            let outcome =
-                Self::execute_copy_trade(env.clone(), trade.user, trade.token, trade.amount, None);
+            let outcome = Self::execute_copy_trade(
+                env.clone(),
+                trade.user,
+                trade.token,
+                trade.amount,
+                None,
+                OrderType::Market,
+                None,
+            );
             let result = match outcome {
                 Ok(()) => BatchTradeResult {
                     ok: true,
