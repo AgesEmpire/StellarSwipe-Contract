@@ -854,3 +854,103 @@ fn volume_resets_on_new_day() {
     // Day 1: limit resets — trade should succeed again.
     exec.execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None);
 }
+
+// ── Issue #390: fee fallback tests ───────────────────────────────────────────
+
+/// Primary fee deduction succeeds when user has amount + fee.
+#[test]
+fn primary_fee_deduction_succeeds_with_sufficient_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = sac_token(&env);
+    let portfolio_id = env.register(MockUserPortfolio, ());
+    let exec_id = env.register(TradeExecutorContract, ());
+
+    // Give user exactly amount + fee.
+    let fee = DEFAULT_ESTIMATED_COPY_TRADE_FEE;
+    let amount = TRADE_AMOUNT;
+    StellarAssetClient::new(&env, &token).mint(&user, &(amount + fee));
+
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    exec.initialize(&admin);
+    exec.set_user_portfolio(&portfolio_id);
+
+    // Should succeed — no fallback needed.
+    let result = exec.try_execute_copy_trade(&user, &token, &amount, &None);
+    assert!(result.is_ok(), "primary fee deduction should succeed");
+
+    // No fee_from_received event should be emitted.
+    let has_fallback_event = env.events().all().iter().any(|e| {
+        use soroban_sdk::TryFromVal;
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        if topics.len() < 2 { return false; }
+        soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
+            .map(|s| s == soroban_sdk::Symbol::new(&env, "fee_from_received"))
+            .unwrap_or(false)
+    });
+    assert!(!has_fallback_event, "fallback event must not be emitted when primary succeeds");
+}
+
+/// Fallback activates when user has exactly the trade amount but not the fee.
+#[test]
+fn fee_fallback_activates_when_only_amount_available() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = sac_token(&env);
+    let portfolio_id = env.register(MockUserPortfolio, ());
+    let exec_id = env.register(TradeExecutorContract, ());
+
+    // Give user exactly the trade amount (no extra for fee).
+    let amount = TRADE_AMOUNT;
+    StellarAssetClient::new(&env, &token).mint(&user, &amount);
+
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    exec.initialize(&admin);
+    exec.set_user_portfolio(&portfolio_id);
+    // Set a non-zero fee so fallback is triggered.
+    exec.set_copy_trade_estimated_fee(&1_000i128);
+
+    // Trade should still succeed via fallback.
+    let result = exec.try_execute_copy_trade(&user, &token, &amount, &None);
+    assert!(result.is_ok(), "trade should succeed via fee fallback");
+
+    // fee_from_received event must be emitted.
+    let has_fallback_event = env.events().all().iter().any(|e| {
+        use soroban_sdk::TryFromVal;
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        if topics.len() < 2 { return false; }
+        soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
+            .map(|s| s == soroban_sdk::Symbol::new(&env, "fee_from_received"))
+            .unwrap_or(false)
+    });
+    assert!(has_fallback_event, "fee_from_received event must be emitted on fallback");
+}
+
+/// Trade fails when user has less than the trade amount (even fallback can't help).
+#[test]
+fn trade_fails_when_balance_below_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = sac_token(&env);
+    let portfolio_id = env.register(MockUserPortfolio, ());
+    let exec_id = env.register(TradeExecutorContract, ());
+
+    // Give user less than the trade amount.
+    StellarAssetClient::new(&env, &token).mint(&user, &(TRADE_AMOUNT - 1));
+
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    exec.initialize(&admin);
+    exec.set_user_portfolio(&portfolio_id);
+
+    let result = exec.try_execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None);
+    assert_eq!(result, Err(Ok(ContractError::InsufficientBalance)));
+}
