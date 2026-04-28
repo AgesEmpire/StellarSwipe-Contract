@@ -27,4 +27,8 @@ pub enum ContractError {
     DailyVolumeLimitExceeded = 12,
     OracleNotWhitelisted = 13,
     CannotRemoveLastOracle = 14,
+    DCAPlanNotFound = 15,
+    DCAPlanAlreadyExists = 16,
+    SignalExpired = 17,
+    IntervalNotDue = 18,
 }

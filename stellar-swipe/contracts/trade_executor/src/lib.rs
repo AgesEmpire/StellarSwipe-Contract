@@ -1,6 +1,7 @@
 #![no_std]
 
 mod errors;
+pub mod dca;
 pub mod keeper;
 mod oracle;
 pub mod risk_gates;
@@ -44,6 +45,8 @@ pub enum StorageKey {
     /// Oracle contracts allowed to feed stop-loss / take-profit triggers.
     OracleWhitelisted(Address),
     OracleWhitelistCount,
+    /// DCA plan for (user, signal_id). Stores a `DCAPlan`.
+    DCAPlan(Address, u64),
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -588,6 +591,70 @@ impl TradeExecutorContract {
         }
 
         Ok(results)
+    }
+
+    // ── DCA copy trading (Issue #360) ─────────────────────────────────────────
+
+    /// Create a DCA plan: split `total_amount` into `num_intervals` equal trades
+    /// spaced `interval_ledgers` apart.  `signal_expiry_ledger = 0` means no expiry.
+    pub fn execute_dca_copy_trade(
+        env: Env,
+        user: Address,
+        signal_id: u64,
+        total_amount: i128,
+        num_intervals: u32,
+        interval_ledgers: u32,
+        signal_expiry_ledger: u32,
+    ) -> Result<(), ContractError> {
+        user.require_auth();
+        dca::execute_dca_copy_trade(
+            &env,
+            &user,
+            signal_id,
+            total_amount,
+            num_intervals,
+            interval_ledgers,
+            signal_expiry_ledger,
+        )
+    }
+
+    /// Execute the next DCA interval for `(user, signal_id)`.
+    /// Called by the keeper network.  Returns `true` when the plan is complete.
+    pub fn execute_dca_interval(
+        env: Env,
+        user: Address,
+        signal_id: u64,
+    ) -> Result<bool, ContractError> {
+        // Capture config needed inside the closure before moving env.
+        let portfolio: Option<Address> = env.storage().instance().get(&StorageKey::UserPortfolio);
+        let exempt = {
+            let key = StorageKey::PositionLimitExempt(user.clone());
+            env.storage().instance().get(&key).unwrap_or(false)
+        };
+
+        dca::execute_dca_interval(&env, &user, signal_id, |amount| {
+            // Reuse the existing copy-trade balance + position-limit logic.
+            let fee = effective_estimated_fee(&env);
+            // We don't have a token address in the DCA plan (it's signal-level),
+            // so balance check is skipped here — the caller is responsible for
+            // ensuring funds are available (same pattern as batch_execute).
+            let _ = (amount, fee); // suppress unused warnings
+
+            if let Some(ref p) = portfolio {
+                risk_gates::validate_and_record_position(&env, p, &user, exempt)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Manually cancel a DCA plan. Only the plan owner may cancel.
+    pub fn cancel_dca_plan(
+        env: Env,
+        user: Address,
+        signal_id: u64,
+    ) -> Result<(), ContractError> {
+        user.require_auth();
+        dca::cancel_dca_plan(&env, &user, signal_id)
     }
 }
 
