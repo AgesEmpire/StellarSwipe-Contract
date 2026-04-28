@@ -32,6 +32,19 @@ pub struct PnlSummary {
 pub enum PositionStatus {
     Open = 0,
     Closed = 1,
+    /// Transitional state: a close operation is in progress.
+    /// Used as a lock to prevent concurrent double-close (race condition between
+    /// user-initiated close and keeper stop-loss trigger).
+    Closing = 2,
+}
+
+/// Error returned when a close is attempted on a position that is already
+/// `Closing` or `Closed`.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PositionError {
+    PositionAlreadyClosed = 1,
 }
 
 #[contracttype]
@@ -241,7 +254,7 @@ impl UserPortfolio {
         asset_pair: u32,
         signal_provider: Address,
         signal_id: u64,
-    ) {
+    ) -> Result<(), PositionError> {
         user.require_auth();
         let key = DataKey::UserPositions(user.clone());
         let list: Vec<u64> = env
@@ -268,9 +281,18 @@ impl UserPortfolio {
             .persistent()
             .get(&pkey)
             .expect("position missing");
+
+        // State machine: only Open positions can be closed.
+        // Closing or Closed → return error (prevents double-close race condition).
         if pos.status != PositionStatus::Open {
-            panic!("position not open");
+            return Err(PositionError::PositionAlreadyClosed);
         }
+
+        // Acquire the CLOSING lock before any further work.
+        pos.status = PositionStatus::Closing;
+        env.storage().persistent().set(&pkey, &pos);
+
+        // Finalize: mark as Closed with realized P&L.
         pos.status = PositionStatus::Closed;
         pos.realized_pnl = realized_pnl;
         env.storage().persistent().set(&pkey, &pos);
@@ -315,6 +337,8 @@ impl UserPortfolio {
                 action_required: false,
             },
         );
+
+        Ok(())
     }
 
     /// Keeper-callable position close: used by TradeExecutor for stop-loss / take-profit
@@ -342,7 +366,7 @@ impl UserPortfolio {
         user: Address,
         position_id: u64,
         asset_pair: u32,
-    ) {
+    ) -> Result<(), PositionError> {
         // Require the caller to authorise this call.
         caller.require_auth();
 
@@ -382,9 +406,15 @@ impl UserPortfolio {
             .persistent()
             .get(&pkey)
             .expect("position missing");
+
+        // State machine: only Open positions can be closed.
         if pos.status != PositionStatus::Open {
-            panic!("position not open");
+            return Err(PositionError::PositionAlreadyClosed);
         }
+
+        // Acquire the CLOSING lock.
+        pos.status = PositionStatus::Closing;
+        env.storage().persistent().set(&pkey, &pos);
 
         // Close position with zero P&L (keeper closes don't calculate P&L).
         pos.status = PositionStatus::Closed;
@@ -401,6 +431,8 @@ impl UserPortfolio {
                 asset_pair,
             },
         );
+
+        Ok(())
     }
 
     /// Portfolio P&L including open positions when oracle price is available.
@@ -1057,6 +1089,62 @@ mod tests {
         let (contract, event) = last_topics(&env);
         assert_eq!(contract, soroban_sdk::Symbol::new(&env, "user_portfolio"));
         assert_eq!(event, soroban_sdk::Symbol::new(&env, "subscription_created"));
+    }
+
+    // ── Issue #389: position state machine tests ──────────────────────────────
+
+    /// First close succeeds; second close returns PositionAlreadyClosed.
+    #[test]
+    fn concurrent_close_second_returns_already_closed() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        let provider = dummy_provider(&env);
+
+        client.open_position(&user, &100, &1_000);
+
+        // First close — must succeed.
+        let first = client.try_close_position(
+            &user, &1, &50, &110i128, &1u32, &provider, &0u64,
+        );
+        assert!(first.is_ok(), "first close should succeed");
+
+        // Second close — must return PositionAlreadyClosed.
+        let second = client.try_close_position(
+            &user, &1, &50, &110i128, &1u32, &provider, &0u64,
+        );
+        assert_eq!(second, Err(Ok(PositionError::PositionAlreadyClosed)));
+    }
+
+    /// Closing state transitions: Open → Closing → Closed.
+    #[test]
+    fn position_transitions_open_to_closed() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        let provider = dummy_provider(&env);
+
+        let id = client.open_position(&user, &100, &1_000);
+
+        // Verify Open state.
+        let pos: Position = env.as_contract(&portfolio_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Position(id))
+                .unwrap()
+        });
+        assert_eq!(pos.status, PositionStatus::Open);
+
+        client.close_position(&user, &id, &100, &110i128, &1u32, &provider, &0u64);
+
+        // Verify Closed state.
+        let pos: Position = env.as_contract(&portfolio_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Position(id))
+                .unwrap()
+        });
+        assert_eq!(pos.status, PositionStatus::Closed);
     }
 }
 

@@ -342,6 +342,29 @@ pub fn emit_kyc_status_updated(env: &Env, evt: EvtKycStatusUpdated) {
     );
 }
 
+// ── Fee fallback event (Issue #390) ──────────────────────────────────────────
+
+/// Emitted when the primary fee deduction fails and the fee is instead
+/// deducted from the received trade amount.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtFeeDeductedFromReceived {
+    pub schema_version: u32,
+    pub user: Address,
+    pub fee_amount: i128,
+    pub trade_id: u64,
+}
+
+pub fn emit_fee_deducted_from_received(env: &Env, evt: EvtFeeDeductedFromReceived) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "fee_from_received"),
+        ),
+        evt,
+    );
+}
+
 // ── DCA event structs (Issue #360) ───────────────────────────────────────────
 
 #[contracttype]

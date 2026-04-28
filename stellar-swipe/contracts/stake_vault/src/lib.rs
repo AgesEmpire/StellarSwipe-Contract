@@ -8,11 +8,19 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Sym
 /// Temporary-storage key for the reentrancy lock on `withdraw_stake`.
 const EXECUTION_LOCK: &str = "WithdrawLock";
 
+/// 24 hours in seconds — grace period for providers to top up stake.
+const GRACE_PERIOD_SECS: u64 = 86_400;
+
 #[contracttype]
 #[derive(Clone)]
 pub enum StorageKey {
     Admin,
     StakeToken,
+    /// Minimum stake required for a provider to submit signals.
+    MinimumStake,
+    /// Timestamp when a provider's stake first dropped below minimum.
+    /// `None` means stake is currently at or above minimum.
+    StakeBelowMinSince(Address),
 }
 
 #[contracttype]
@@ -23,6 +31,8 @@ pub enum StakeVaultError {
     NoStake,
     StakeLocked,
     ReentrancyDetected,
+    /// Provider stake is below minimum and grace period has expired.
+    StakeBelowMinimum,
 }
 
 #[contract]
@@ -39,6 +49,110 @@ impl StakeVaultContract {
         env.storage()
             .instance()
             .set(&StorageKey::StakeToken, &stake_token);
+    }
+
+    /// Admin: set the minimum stake required for signal submission.
+    pub fn set_minimum_stake(env: Env, minimum: i128) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinimumStake, &minimum);
+    }
+
+    pub fn get_minimum_stake(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinimumStake)
+            .unwrap_or(0)
+    }
+
+    /// Called when a provider's stake drops below the minimum (e.g. after slashing).
+    ///
+    /// - Records the timestamp of the drop (grace period start).
+    /// - Emits `ProviderStakeBelowMinimum` event.
+    /// - Existing signals remain valid; only new submissions are blocked.
+    pub fn notify_stake_below_minimum(env: Env, provider: Address) {
+        let minimum: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinimumStake)
+            .unwrap_or(0);
+
+        let current_stake = Self::get_stake(env.clone(), provider.clone());
+
+        // Only record if actually below minimum and not already recorded.
+        if current_stake >= minimum {
+            return;
+        }
+
+        let key = StorageKey::StakeBelowMinSince(provider.clone());
+        if !env.storage().persistent().has(&key) {
+            let now = env.ledger().timestamp();
+            env.storage().persistent().set(&key, &now);
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "stake_vault"),
+                    Symbol::new(&env, "stake_below_min"),
+                ),
+                (provider, current_stake, minimum),
+            );
+        }
+    }
+
+    /// Check whether `provider` is allowed to submit new signals.
+    ///
+    /// Returns `Ok(())` if:
+    /// - stake is at or above minimum, OR
+    /// - stake is below minimum but still within the 24h grace period.
+    ///
+    /// Returns `Err(StakeBelowMinimum)` if grace period has expired.
+    pub fn check_signal_submission_allowed(
+        env: Env,
+        provider: Address,
+    ) -> Result<(), StakeVaultError> {
+        let minimum: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinimumStake)
+            .unwrap_or(0);
+
+        let current_stake = Self::get_stake(env.clone(), provider.clone());
+
+        if current_stake >= minimum {
+            // Stake restored — clear any recorded drop timestamp.
+            let key = StorageKey::StakeBelowMinSince(provider);
+            env.storage().persistent().remove(&key);
+            return Ok(());
+        }
+
+        // Stake is below minimum — check grace period.
+        let key = StorageKey::StakeBelowMinSince(provider.clone());
+        let below_since: u64 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| env.ledger().timestamp());
+
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(below_since) > GRACE_PERIOD_SECS {
+            Err(StakeVaultError::StakeBelowMinimum)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns the timestamp when the provider's stake first dropped below minimum,
+    /// or `None` if the stake is currently at or above minimum.
+    pub fn get_stake_below_min_since(env: Env, provider: Address) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::StakeBelowMinSince(provider))
     }
 
     /// Withdraw all unlocked stake for `staker`.
