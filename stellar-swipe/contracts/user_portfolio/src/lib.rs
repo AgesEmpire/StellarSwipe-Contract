@@ -9,8 +9,11 @@ mod subscriptions;
 #[cfg(test)]
 #[path = "tests/mod.rs"]
 mod portfolio_tests;
+mod queries;
+mod storage;
+mod subscriptions;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 use storage::DataKey;
 
 pub use subscriptions::SubscriptionError;
@@ -49,6 +52,21 @@ pub struct Position {
 pub struct TradeHistoryEntry {
     pub trade_id: u64,
     pub position: Position,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortfolioPosition {
+    pub position_id: u64,
+    pub position: Position,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Portfolio {
+    pub open_positions: Vec<PortfolioPosition>,
+    pub closed_positions: Vec<PortfolioPosition>,
+    pub closed_position_ids: Vec<u64>,
 }
 
 #[contract]
@@ -137,7 +155,12 @@ impl UserPortfolio {
     /// Admin: set or clear the geographic restriction flag for a user.
     /// `reason_hash` is an IPFS CID of the reason document — no reason text stored on-chain.
     /// Emits `UserRestricted { user, reason_hash, restricted }`.
-    pub fn set_user_restriction(env: Env, user: Address, restricted: bool, reason_hash: soroban_sdk::String) {
+    pub fn set_user_restriction(
+        env: Env,
+        user: Address,
+        restricted: bool,
+        reason_hash: soroban_sdk::String,
+    ) {
         Self::require_admin(&env);
         env.storage()
             .persistent()
@@ -226,6 +249,15 @@ impl UserPortfolio {
         list.push_back(id);
         env.storage().persistent().set(&key, &list);
 
+        let open_key = DataKey::UserOpenPositions(user.clone());
+        let mut open_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&open_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        open_ids.push_back(id);
+        env.storage().persistent().set(&open_key, &open_ids);
+
         id
     }
 
@@ -274,6 +306,7 @@ impl UserPortfolio {
         pos.status = PositionStatus::Closed;
         pos.realized_pnl = realized_pnl;
         env.storage().persistent().set(&pkey, &pos);
+        Self::mark_position_closed(&env, &user, position_id);
 
         // Emit TradeShareable only for profitable closes (pnl > 0).
         if realized_pnl > 0 {
@@ -390,6 +423,7 @@ impl UserPortfolio {
         pos.status = PositionStatus::Closed;
         pos.realized_pnl = 0;
         env.storage().persistent().set(&pkey, &pos);
+        Self::mark_position_closed(&env, &user, position_id);
 
         // Emit event for keeper close (no TradeShareable since pnl=0).
         shared::events::emit_position_closed_by_keeper(
@@ -406,6 +440,21 @@ impl UserPortfolio {
     /// Portfolio P&L including open positions when oracle price is available.
     pub fn get_pnl(env: Env, user: Address) -> PnlSummary {
         queries::compute_get_pnl(&env, user)
+    }
+
+    /// Portfolio snapshot. Closed positions are optional because active traders can
+    /// have enough history to make full closed-position loading expensive.
+    pub fn get_portfolio(env: Env, user: Address, include_closed: bool) -> Portfolio {
+        queries::get_portfolio(&env, user, include_closed)
+    }
+
+    pub fn get_trade_history(
+        env: Env,
+        user: Address,
+        cursor: Option<u64>,
+        limit: u32,
+    ) -> Vec<TradeHistoryEntry> {
+        queries::get_trade_history(&env, user, cursor, limit)
     }
 
     /// Provider sets per-day fee token + amount for their premium feed (XLM or USDC, etc.).
@@ -440,6 +489,42 @@ impl UserPortfolio {
             .get(&DataKey::Admin)
             .expect("admin");
         admin.require_auth();
+    }
+
+    fn mark_position_closed(env: &Env, user: &Address, position_id: u64) {
+        let open_key = DataKey::UserOpenPositions(user.clone());
+        let open_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&open_key)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut next_open = Vec::new(env);
+        for i in 0..open_ids.len() {
+            if let Some(id) = open_ids.get(i) {
+                if id != position_id {
+                    next_open.push_back(id);
+                }
+            }
+        }
+        env.storage().persistent().set(&open_key, &next_open);
+
+        let closed_key = DataKey::UserClosedPositions(user.clone());
+        let mut closed_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&closed_key)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut already_closed = false;
+        for i in 0..closed_ids.len() {
+            if closed_ids.get(i) == Some(position_id) {
+                already_closed = true;
+                break;
+            }
+        }
+        if !already_closed {
+            closed_ids.push_back(position_id);
+            env.storage().persistent().set(&closed_key, &closed_ids);
+        }
     }
 }
 
@@ -896,6 +981,87 @@ mod tests {
         assert_eq!(pnl.roi_bps, 333);
     }
 
+    #[test]
+    fn get_portfolio_excludes_closed_positions_when_requested() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        let provider = dummy_provider(&env);
+
+        client.open_position(&user, &100, &1_000);
+        client.open_position(&user, &100, &500);
+        client.close_position(&user, &1, &50, &110i128, &1u32, &provider, &0u64);
+
+        let portfolio = client.get_portfolio(&user, &false);
+        assert_eq!(portfolio.open_positions.len(), 1);
+        assert_eq!(portfolio.open_positions.get(0).unwrap().position_id, 2);
+        assert_eq!(portfolio.closed_positions.len(), 0);
+        assert_eq!(portfolio.closed_position_ids.len(), 0);
+    }
+
+    #[test]
+    fn get_portfolio_includes_small_closed_positions() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        let provider = dummy_provider(&env);
+
+        client.open_position(&user, &100, &1_000);
+        client.open_position(&user, &100, &500);
+        client.close_position(&user, &1, &50, &110i128, &1u32, &provider, &0u64);
+
+        let portfolio = client.get_portfolio(&user, &true);
+        assert_eq!(portfolio.open_positions.len(), 1);
+        assert_eq!(portfolio.closed_position_ids.len(), 1);
+        assert_eq!(portfolio.closed_position_ids.get(0).unwrap(), 1);
+        assert_eq!(portfolio.closed_positions.len(), 1);
+        assert_eq!(portfolio.closed_positions.get(0).unwrap().position_id, 1);
+    }
+
+    #[test]
+    fn get_portfolio_lazy_loads_many_closed_positions_under_half_budget() {
+        const HALF_DEFAULT_CPU_BUDGET: u64 = 50_000_000;
+
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        let provider = dummy_provider(&env);
+
+        for i in 0..50 {
+            let position_id = client.open_position(&user, &100, &1_000);
+            client.close_position(
+                &user,
+                &position_id,
+                &(i as i128),
+                &100i128,
+                &1u32,
+                &provider,
+                &0u64,
+            );
+        }
+        for _ in 0..20 {
+            client.open_position(&user, &100, &1_000);
+        }
+
+        env.cost_estimate().budget().reset_tracker();
+        let open_only = client.get_portfolio(&user, &false);
+        let instructions = env.cost_estimate().budget().cpu_instruction_cost();
+
+        assert_eq!(open_only.open_positions.len(), 20);
+        assert_eq!(open_only.closed_positions.len(), 0);
+        assert_eq!(open_only.closed_position_ids.len(), 0);
+        assert!(
+            instructions < HALF_DEFAULT_CPU_BUDGET,
+            "get_portfolio(include_closed=false) used {instructions} instructions"
+        );
+
+        let with_closed = client.get_portfolio(&user, &true);
+        assert_eq!(with_closed.open_positions.len(), 20);
+        assert_eq!(with_closed.closed_position_ids.len(), 50);
+        assert_eq!(with_closed.closed_positions.len(), 0);
+    }
+
     // ── TradeShareable event tests ─────────────────────────────────────────────
 
     /// Profitable close emits TradeShareable with all required fields.
@@ -932,12 +1098,17 @@ mod tests {
         client.close_position(&user, &1, &-50, &90i128, &42u32, &provider, &7u64);
         let has_trade_shareable = env.events().all().iter().any(|e| {
             let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
-            if topics.len() < 2 { return false; }
+            if topics.len() < 2 {
+                return false;
+            }
             soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
                 .map(|s| s == soroban_sdk::Symbol::new(&env, "trade_shareable"))
                 .unwrap_or(false)
         });
-        assert!(!has_trade_shareable, "TradeShareable must not be emitted for a loss");
+        assert!(
+            !has_trade_shareable,
+            "TradeShareable must not be emitted for a loss"
+        );
     }
 
     /// Breakeven close (pnl == 0) must NOT emit TradeShareable.
@@ -955,12 +1126,17 @@ mod tests {
         client.close_position(&user, &1, &0, &100i128, &42u32, &provider, &7u64);
         let has_trade_shareable = env.events().all().iter().any(|e| {
             let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
-            if topics.len() < 2 { return false; }
+            if topics.len() < 2 {
+                return false;
+            }
             soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
                 .map(|s| s == soroban_sdk::Symbol::new(&env, "trade_shareable"))
                 .unwrap_or(false)
         });
-        assert!(!has_trade_shareable, "TradeShareable must not be emitted for breakeven");
+        assert!(
+            !has_trade_shareable,
+            "TradeShareable must not be emitted for breakeven"
+        );
     }
 
     // ── Overflow / division-by-zero tests ─────────────────────────────────────
@@ -1021,7 +1197,9 @@ mod tests {
         // Find the trade_shareable event specifically (position_closed is emitted after it).
         let shareable_evt = env.events().all().iter().find(|e| {
             let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
-            if topics.len() < 2 { return false; }
+            if topics.len() < 2 {
+                return false;
+            }
             soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
                 .map(|s| s == soroban_sdk::Symbol::new(&env, "trade_shareable"))
                 .unwrap_or(false)
@@ -1056,7 +1234,10 @@ mod tests {
         client.subscribe_to_provider(&subscriber, &provider, &7u32);
         let (contract, event) = last_topics(&env);
         assert_eq!(contract, soroban_sdk::Symbol::new(&env, "user_portfolio"));
-        assert_eq!(event, soroban_sdk::Symbol::new(&env, "subscription_created"));
+        assert_eq!(
+            event,
+            soroban_sdk::Symbol::new(&env, "subscription_created")
+        );
     }
 }
 
@@ -1142,7 +1323,9 @@ mod restriction_tests {
         client.set_user_restriction(&user, &true, &reason(&env));
         let has_event = env.events().all().iter().any(|e| {
             let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
-            if topics.len() < 2 { return false; }
+            if topics.len() < 2 {
+                return false;
+            }
             soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
                 .map(|s| s == soroban_sdk::Symbol::new(&env, "user_restricted"))
                 .unwrap_or(false)
