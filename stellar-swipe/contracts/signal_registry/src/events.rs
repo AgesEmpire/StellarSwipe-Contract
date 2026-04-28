@@ -333,3 +333,8 @@ pub fn emit_reputation_updated(env: &Env, provider: Address, old_score: u32, new
         },
     );
 }
+
+pub fn emit_signal_orphaned(env: &Env, signal_id: u64, reason: String) {
+    let topics = (Symbol::new(env, "signal_orphaned"),);
+    env.events().publish(topics, (signal_id, reason));
+}
