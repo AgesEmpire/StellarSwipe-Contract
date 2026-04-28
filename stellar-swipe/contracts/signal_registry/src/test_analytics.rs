@@ -240,6 +240,27 @@ fn test_best_time_of_day() {
 }
 
 #[test]
+fn test_zero_adoption_signals_treated_as_pending() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 100000);
+
+    let provider = Address::generate(&env);
+    let mut signals = Map::new(&env);
+
+    // Zero-adoption failed signals — should not count toward avg_success_rate
+    for i in 0..5u64 {
+        let mut s = create_test_signal(&env, i, &provider, "XLM/USDC", 99000, 0, 0, SignalStatus::Failed);
+        s.adoption_count = 0;
+        signals.set(i, s);
+    }
+
+    let analytics = calculate_global_analytics(&env, &signals);
+    // No terminal signals with adoption → avg_success_rate must be 0 (no division)
+    assert_eq!(analytics.avg_success_rate, 0);
+    assert_eq!(analytics.total_signals_24h, 5);
+}
+
+#[test]
 fn test_zero_executions_handling() {
     let env = Env::default();
     let provider = Address::generate(&env);

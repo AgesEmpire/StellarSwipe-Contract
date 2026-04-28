@@ -20,6 +20,7 @@ mod reputation;
 mod scheduling;
 mod social;
 mod stake;
+mod storage_monitor;
 mod submission;
 mod templates;
 mod test_reputation;
@@ -161,6 +162,24 @@ impl SignalRegistry {
     /* =========================
        ADMIN FUNCTIONS
     ========================== */
+
+    /// Check storage usage across instance maps. Emits `StorageCapacityWarning`
+    /// if total entry count exceeds 80% of the configured limit.
+    pub fn check_storage_capacity(env: Env) -> storage_monitor::StorageUsage {
+        storage_monitor::check_storage_capacity(&env)
+    }
+
+    /// Admin: archive old expired signals to free instance storage.
+    /// Returns the number of signals removed.
+    pub fn admin_cleanup_storage(
+        env: Env,
+        caller: Address,
+        batch_size: u32,
+    ) -> Result<u32, AdminError> {
+        admin::require_admin(&env, &caller)?;
+        caller.require_auth();
+        Ok(storage_monitor::admin_cleanup_storage(&env, batch_size))
+    }
 
     pub fn set_min_stake(env: Env, caller: Address, new_amount: i128) -> Result<(), AdminError> {
         admin::set_min_stake(&env, &caller, new_amount)
