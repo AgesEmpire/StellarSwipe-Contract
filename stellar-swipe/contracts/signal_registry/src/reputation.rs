@@ -377,6 +377,16 @@ pub fn get_all_trust_scores(env: &Env) -> Vec<(Address, TrustScoreDetails)> {
 }
 
 
+/// Success rate for a signal based on adoption count and successful executions.
+/// Returns None when adoption_count == 0 (undefined, not 0%).
+/// Returns Some(rate_bps) in basis points (0-10000) otherwise.
+pub fn signal_success_rate(adoption_count: u32, successful_executions: u32) -> Option<u32> {
+    if adoption_count == 0 {
+        return None;
+    }
+    Some(((successful_executions as u64 * 10000) / adoption_count as u64) as u32)
+}
+
 /// Points for weighted reputation update (Issue #170): profit 100, neutral 50, loss 0.
 pub fn outcome_points(outcome: &crate::types::SignalOutcome) -> u32 {
     match outcome {
@@ -396,6 +406,24 @@ pub fn next_reputation_score(old_score: u32, outcome: &crate::types::SignalOutco
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger};
+
+    #[test]
+    fn test_signal_success_rate_zero_adoption() {
+        assert_eq!(signal_success_rate(0, 0), None);
+    }
+
+    #[test]
+    fn test_signal_success_rate_one_adoption() {
+        assert_eq!(signal_success_rate(1, 1), Some(10000));
+        assert_eq!(signal_success_rate(1, 0), Some(0));
+    }
+
+    #[test]
+    fn test_signal_success_rate_many_adoptions() {
+        assert_eq!(signal_success_rate(4, 3), Some(7500));
+        assert_eq!(signal_success_rate(10, 10), Some(10000));
+        assert_eq!(signal_success_rate(10, 0), Some(0));
+    }
 
     #[test]
     fn test_trust_score_tiers() {
