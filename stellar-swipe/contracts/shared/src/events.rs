@@ -342,6 +342,68 @@ pub fn emit_kyc_status_updated(env: &Env, evt: EvtKycStatusUpdated) {
     );
 }
 
+// ── DCA event structs (Issue #360) ───────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtDCAIntervalExecuted {
+    pub schema_version: u32,
+    pub user: Address,
+    pub signal_id: u64,
+    pub interval_index: u32,
+    pub amount: i128,
+    pub remaining_intervals: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtDCAPlanCompleted {
+    pub schema_version: u32,
+    pub user: Address,
+    pub signal_id: u64,
+    pub total_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtDCAPlanCancelled {
+    pub schema_version: u32,
+    pub user: Address,
+    pub signal_id: u64,
+    pub intervals_completed: u32,
+    pub reason: u32, // 0 = signal_expired, 1 = manual
+}
+
+pub fn emit_dca_interval_executed(env: &Env, evt: EvtDCAIntervalExecuted) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "dca_interval_executed"),
+        ),
+        evt,
+    );
+}
+
+pub fn emit_dca_plan_completed(env: &Env, evt: EvtDCAPlanCompleted) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "dca_plan_completed"),
+        ),
+        evt,
+    );
+}
+
+pub fn emit_dca_plan_cancelled(env: &Env, evt: EvtDCAPlanCancelled) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "dca_plan_cancelled"),
+        ),
+        evt,
+    );
+}
+
 // ── Analytics event structs (Issue #365) ─────────────────────────────────────
 
 #[contracttype]
