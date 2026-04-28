@@ -44,6 +44,10 @@ pub enum StorageKey {
     /// Oracle contracts allowed to feed stop-loss / take-profit triggers.
     OracleWhitelisted(Address),
     OracleWhitelistCount,
+    /// Global per-pair open interest limit (0 = no limit).
+    MaxOpenInterestPerPair,
+    /// Current open interest tracked by pair token.
+    OpenInterestPerPair(Address),
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -80,6 +84,45 @@ fn effective_estimated_fee(env: &Env) -> i128 {
 
 fn require_admin(env: &Env) -> Result<Address, ContractError> {
     oracle::require_admin(env)
+}
+
+fn open_interest_for_pair(env: &Env, pair: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::OpenInterestPerPair(pair.clone()))
+        .unwrap_or(0)
+}
+
+fn check_open_interest_limit(env: &Env, pair: &Address, amount: i128) -> Result<(), ContractError> {
+    let max_open_interest = env
+        .storage()
+        .instance()
+        .get(&StorageKey::MaxOpenInterestPerPair)
+        .unwrap_or(0);
+    if max_open_interest <= 0 {
+        return Ok(());
+    }
+
+    let current = open_interest_for_pair(env, pair);
+    let next = current.checked_add(amount).unwrap_or(i128::MAX);
+    if next > max_open_interest {
+        return Err(ContractError::OpenInterestLimitReached);
+    }
+    Ok(())
+}
+
+fn increase_open_interest(env: &Env, pair: &Address, amount: i128) {
+    let key = StorageKey::OpenInterestPerPair(pair.clone());
+    let current = open_interest_for_pair(env, pair);
+    let next = current.checked_add(amount).unwrap_or(i128::MAX);
+    env.storage().instance().set(&key, &next);
+}
+
+fn decrease_open_interest(env: &Env, pair: &Address, amount: i128) {
+    let key = StorageKey::OpenInterestPerPair(pair.clone());
+    let current = open_interest_for_pair(env, pair);
+    let next = current.saturating_sub(amount).max(0);
+    env.storage().instance().set(&key, &next);
 }
 
 #[contractimpl]
@@ -288,6 +331,8 @@ impl TradeExecutorContract {
             return Err(ContractError::InvalidAmount);
         }
 
+        check_open_interest_limit(&env, &token, amount)?;
+
         // ── Reentrancy guard ──────────────────────────────────────────────────
         let lock_key = Symbol::new(&env, EXECUTION_LOCK);
         if env
@@ -368,6 +413,7 @@ impl TradeExecutorContract {
 
         // ── Cross-contract call #2: batched position-limit check + record ─────
         validate_and_record_position(&env, &portfolio, &user, exempt)?;
+        increase_open_interest(&env, &token, amount);
 
         env.storage().temporary().remove(&lock_key);
         Ok(())
@@ -414,6 +460,33 @@ impl TradeExecutorContract {
             .instance()
             .get(&StorageKey::DailyVolumeLimit)
             .unwrap_or(0i128)
+    }
+
+    /// Admin: set the per-pair open interest limit. `0` means no limit.
+    pub fn set_max_open_interest_per_pair(env: Env, limit: i128) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if limit < 0 {
+            panic!("limit must be non-negative");
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::MaxOpenInterestPerPair, &limit);
+    }
+
+    pub fn get_max_open_interest_per_pair(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MaxOpenInterestPerPair)
+            .unwrap_or(0i128)
+    }
+
+    pub fn get_open_interest(env: Env, pair: Address) -> i128 {
+        open_interest_for_pair(&env, &pair)
     }
 
     /// # Summary
@@ -537,6 +610,7 @@ impl TradeExecutorContract {
         close_args.push_back(trade_id.into_val(&env));
         close_args.push_back(realized_pnl.into_val(&env));
         env.invoke_contract::<()>(&portfolio, &close_sym, close_args);
+        decrease_open_interest(&env, &from_token, amount);
 
         shared::events::emit_trade_cancelled(
             &env,
