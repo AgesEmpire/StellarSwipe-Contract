@@ -11,6 +11,8 @@ pub enum DataKey {
     Position(u64),
     /// V1: mixed open+closed list (preserved for migration reads).
     UserPositions(Address),
+    UserOpenPositions(Address),
+    UserClosedPositions(Address),
     /// Registered TradeExecutor contract allowed to call `close_position_keeper`.
     TradeExecutor,
     /// Per-user KYC verification flag (bool). No PII stored — boolean only.
