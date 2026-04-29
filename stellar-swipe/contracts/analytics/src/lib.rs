@@ -52,6 +52,18 @@ pub struct WeeklyHealthReport {
     pub success_rate_wow: i32,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolAnalytics {
+    pub total_trades: u64,
+    pub total_volume_usd: u64,
+    pub total_fees_collected: u64,
+    pub active_providers: u32,
+    pub active_users: u32,
+    pub total_signals: u32,
+    pub avg_signal_success_rate: u32,
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -91,6 +103,18 @@ impl AnalyticsContract {
         env.storage()
             .instance()
             .set(&DataKey::CurrentSnapshot, &snapshot);
+    }
+
+    pub fn get_protocol_analytics() -> ProtocolAnalytics {
+        ProtocolAnalytics {
+            total_trades: 0,
+            total_volume_usd: 0,
+            total_fees_collected: 0,
+            active_providers: 0,
+            active_users: 0,
+            total_signals: 0,
+            avg_signal_success_rate: 0,
+        }
     }
 
     /// Emit a `WeeklyHealthReport` event.
@@ -379,4 +403,3 @@ mod tests {
         assert!(result.is_err(), "double initialize must fail");
     }
 }
-
