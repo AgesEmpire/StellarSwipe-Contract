@@ -31,6 +31,9 @@ pub enum SignalStatus {
     Expired,
     Successful,
     Failed,
+    /// Provider's Stellar account was deleted (merged). Signal is orphaned.
+    /// Existing copiers may still close open positions; new copies are blocked.
+    ProviderDeleted,
 }
 
 #[contracttype]

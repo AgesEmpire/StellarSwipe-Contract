@@ -576,6 +576,26 @@ impl SignalRegistry {
         })
     }
 
+    /// Returns `true` if the Stellar account for `provider` still exists on-chain.
+    /// A merged (deleted) account returns `false`.
+    fn check_provider_exists(env: &Env, provider: &Address) -> bool {
+        env.accounts().get(provider).is_some()
+    }
+
+    /// Mark a signal as orphaned (provider account deleted), emit the event, and persist.
+    fn orphan_signal(env: &Env, signals: &mut Map<u64, Signal>, signal_id: u64) {
+        if let Some(mut signal) = signals.get(signal_id) {
+            signal.status = SignalStatus::ProviderDeleted;
+            signals.set(signal_id, signal);
+            Self::save_signals_map(env, signals);
+            events::emit_signal_orphaned(
+                env,
+                signal_id,
+                String::from_str(env, "provider_account_deleted"),
+            );
+        }
+    }
+
     /* =========================
        PUBLIC API
     ========================== */
@@ -639,6 +659,11 @@ impl SignalRegistry {
     ) -> Result<u64, AdminError> {
         // Check if signals are paused
         admin::require_not_paused(env, String::from_str(env, CAT_SIGNALS))?;
+
+        // Verify provider account still exists on Stellar
+        if !Self::check_provider_exists(env, &provider) {
+            return Err(AdminError::Unauthorized);
+        }
 
         // Rate limit: signal submission
         let trust = reputation::get_trust_score(env, &provider)
@@ -729,8 +754,19 @@ impl SignalRegistry {
     }
 
     pub fn get_signal(env: Env, signal_id: u64) -> Option<Signal> {
-        let signals = Self::get_signals_map(&env);
-        signals.get(signal_id)
+        let mut signals = Self::get_signals_map(&env);
+        let signal = signals.get(signal_id)?;
+
+        // If signal is still active, check whether the provider account still exists.
+        // If the provider has merged/deleted their account, orphan the signal in-place.
+        if signal.status == SignalStatus::Active
+            && !Self::check_provider_exists(&env, &signal.provider)
+        {
+            Self::orphan_signal(&env, &mut signals, signal_id);
+            return signals.get(signal_id);
+        }
+
+        Some(signal)
     }
 
     /// Return the signal if `viewer` is allowed to see it. Non-[`SignalCategory::PREMIUM`]
@@ -1284,6 +1320,12 @@ impl SignalRegistry {
         let mut signal = signals.get(signal_id).ok_or(AdminError::InvalidParameter)?;
 
         if signal.status != SignalStatus::Active {
+            return Err(AdminError::InvalidParameter);
+        }
+
+        // Block new copies of orphaned signals (provider account deleted)
+        if !Self::check_provider_exists(&env, &signal.provider) {
+            Self::orphan_signal(&env, &mut signals, signal_id);
             return Err(AdminError::InvalidParameter);
         }
 
