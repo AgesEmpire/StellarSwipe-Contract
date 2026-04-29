@@ -9,7 +9,7 @@ pub mod sdex;
 pub mod triggers;
 mod wire;
 
-use errors::{ContractError, InsufficientBalanceDetail};
+use errors::{ContractError, InsufficientBalanceDetail, NetworkErrorDetail};
 use risk_gates::{
     check_user_balance, resolve_trade_amount, validate_and_record_position,
     DEFAULT_ESTIMATED_COPY_TRADE_FEE, MAX_BATCH_SIZE,

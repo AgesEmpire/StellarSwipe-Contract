@@ -9,6 +9,19 @@ pub struct InsufficientBalanceDetail {
     pub available: i128,
 }
 
+/// Populated when [`ContractError::NetworkCongestion`] is returned.
+/// `retry_after_ledger` is the earliest ledger at which the caller should retry.
+/// A value of `0` means the contract has no estimate — retry at caller's discretion.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkErrorDetail {
+    /// Earliest ledger sequence the caller should retry at.
+    pub retry_after_ledger: u32,
+    /// Whether this error is transient (true) or permanent (false).
+    /// Frontend should only offer a retry option when `is_transient == true`.
+    pub is_transient: bool,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -32,4 +45,8 @@ pub enum ContractError {
     DCAPlanAlreadyExists = 16,
     SignalExpired = 17,
     IntervalNotDue = 18,
+    /// Transient: the network is congested. Caller should read `NetworkErrorDetail`
+    /// via [`crate::TradeExecutorContract::get_network_error_detail`] and retry
+    /// after `retry_after_ledger`.
+    NetworkCongestion = 19,
 }
