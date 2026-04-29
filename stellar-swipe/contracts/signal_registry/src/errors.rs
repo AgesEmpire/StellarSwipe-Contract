@@ -200,3 +200,17 @@ pub enum SignalOutcomeError {
     SignalNotClosed = 1152,
     OutcomeAlreadyRecorded = 1153,
 }
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum SubmissionError {
+    NoStake = 1200,
+    BelowMinimumStake = 1201,
+    InvalidAssetPair = 1202,
+    InvalidPrice = 1203,
+    EmptyRationale = 1204,
+    DuplicateSignal = 1205,
+    MissingRationale = 1206,
+    PriceUnreasonable = 1207,
+}
