@@ -61,9 +61,19 @@ jobs:
       - name: Build optimized Soroban WASM
         run: cd stellar-swipe && chmod +x scripts/build.sh && ./scripts/build.sh
 
+      - name: Generate contract TypeScript bindings
+        run: cd stellar-swipe && chmod +x scripts/generate_abi.sh && ./scripts/generate_abi.sh
+
       - name: Upload optimized WASM artifacts
         uses: actions/upload-artifact@v4
         with:
           name: soroban-wasm-optimized
           path: stellar-swipe/target/wasm-optimized/*.wasm
+          if-no-files-found: error
+
+      - name: Upload contract TypeScript bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: soroban-contract-bindings
+          path: stellar-swipe/bindings/**
           if-no-files-found: error
