@@ -652,35 +652,6 @@ impl TradeExecutorContract {
                 continue;
             };
 
-        // ── Cross-contract call #1: SEP-41 balance check ──────────────────────
-        let fee = effective_estimated_fee(&env);
-        let bal_key = StorageKey::LastInsufficientBalance(user.clone());
-
-        // Primary: try to deduct fee upfront (user has amount + fee).
-        // Fallback: if primary fails but user has at least `amount`, proceed and
-        // deduct fee from received tokens after the trade.
-        let use_fee_fallback = match check_user_balance(&env, &user, &token, effective_amount, fee) {
-            Ok(()) => {
-                env.storage().instance().remove(&bal_key);
-                false
-            }
-            Err(detail) => {
-                // Primary failed. Check if user has enough for just the amount (no fee).
-                match check_user_balance(&env, &user, &token, effective_amount, 0) {
-                    Ok(()) => {
-                        // User has enough for the trade but not the fee — use fallback.
-                        env.storage().instance().remove(&bal_key);
-                        true
-                    }
-                    Err(_) => {
-                        // User doesn't even have enough for the trade amount.
-                        env.storage().instance().set(&bal_key, &detail);
-                        env.storage().temporary().remove(&lock_key);
-                        return Err(ContractError::InsufficientBalance);
-                    }
-                }
-            }
-        };
             if order.token != token {
                 next_ids.push_back(order_id);
                 continue;
@@ -712,32 +683,6 @@ impl TradeExecutorContract {
             }
         }
 
-        // If fallback was used, emit the FeeDeductedFromReceived event.
-        // The trade_id is the current position count (used as a proxy identifier).
-        if use_fee_fallback && fee > 0 {
-            // Use a monotonic counter stored per user as a trade_id proxy.
-            let trade_id_key = StorageKey::FeeDeductedFromReceived(user.clone(), 0);
-            let trade_id: u64 = env
-                .storage()
-                .instance()
-                .get(&trade_id_key)
-                .unwrap_or(0u64)
-                .saturating_add(1);
-            env.storage().instance().set(&trade_id_key, &trade_id);
-
-            shared::events::emit_fee_deducted_from_received(
-                &env,
-                shared::events::EvtFeeDeductedFromReceived {
-                    schema_version: shared::events::SCHEMA_VERSION,
-                    user: user.clone(),
-                    fee_amount: fee,
-                    trade_id,
-                },
-            );
-        }
-
-        env.storage().temporary().remove(&lock_key);
-        Ok(())
         set_pending_order_ids(&env, &next_ids);
         Ok(processed)
     }
