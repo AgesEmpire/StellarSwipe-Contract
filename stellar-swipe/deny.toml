@@ -1,0 +1,113 @@
+# cargo-deny policy for StellarSwipe contract crates
+#
+# Docs: https://embarkstudios.github.io/cargo-deny/
+# Run:  cargo deny --manifest-path stellar-swipe/Cargo.toml check
+#
+# Adding a new dependency
+# -----------------------
+# 1. Ensure the crate is published on crates.io (no git/branch deps allowed).
+# 2. Check its license is in the `allow` list below.  If not, open a PR adding
+#    it with a documented justification under [licenses.exceptions].
+# 3. If the crate itself is on the `deny` list, pick an alternative.
+#
+# Requesting a policy exception
+# ------------------------------
+# Add a [licenses.exceptions] entry or an [[bans.skip]] entry with a comment
+# explaining why the exception is safe, get it reviewed, and land it in the
+# same PR as the dependency.
+
+# ---------------------------------------------------------------------------
+# Graph / advisories
+# ---------------------------------------------------------------------------
+
+[graph]
+# Only check the real (non-dev, non-build) dependencies of contract crates.
+# Dev deps are compiled only for tests and never deployed on-chain.
+all-features = false
+no-default-features = false
+
+[advisories]
+# Fail on any crate with a known security advisory.
+version = 2
+ignore = []
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+
+[licenses]
+version = 2
+
+# Exhaustive list of licenses we accept.  Add to this list (with a PR
+# comment explaining why) rather than widening to a glob.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "0BSD",
+]
+
+# Treat ambiguous (unlicensed / OR) crates as errors unless explicitly listed.
+unlicensed = "deny"
+allow-osi-fsf-free = "neither"
+default = "deny"
+copyleft = "deny"
+exceptions = [
+    # Add per-crate exceptions here when genuinely necessary, with a comment:
+    # { allow = ["GPL-2.0"], name = "some-crate", version = "*" },
+]
+
+# ---------------------------------------------------------------------------
+# Source / supply-chain
+# ---------------------------------------------------------------------------
+
+[sources]
+version = 2
+
+# Only allow crates from crates.io.  Local path dependencies are always OK.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# Disallow git dependencies pinned to a mutable branch reference.
+# Every git source must be pinned to an immutable commit SHA or a tag.
+# (This section is enforced by cargo-deny's source checker.)
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+# If a third-party git dep becomes unavoidable, add it here with its exact
+# commit SHA and a documented justification:
+#   allow-git = ["https://github.com/org/repo?rev=abc1234"]
+
+# ---------------------------------------------------------------------------
+# Banned / duplicate crates
+# ---------------------------------------------------------------------------
+
+[bans]
+version = 2
+
+# Fail if more than one version of a crate is resolved.  Duplicate versions
+# bloat WASM and make auditing harder.  Use [[bans.skip]] to acknowledge a
+# known-transitive duplicate (with a comment explaining when it can be removed).
+multiple-versions = "warn"
+wildcards = "deny"           # wildcard version requirements are banned
+highlight = "deepest-path"
+
+deny = [
+    # openssl pulls in C code and is incompatible with wasm32-unknown-unknown.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    # ring is also incompatible with the Soroban WASM target.
+    { name = "ring" },
+]
+
+skip = [
+    # Add transitive-duplicate exceptions here:
+    # { name = "some-crate", version = "=1.2.3" },
+]
+
+skip-tree = []
