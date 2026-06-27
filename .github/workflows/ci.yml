@@ -65,6 +65,19 @@ jobs:
       - name: Verify #![no_std] compliance
         run: python3 stellar-swipe/scripts/verify_no_std.py
 
+      # Guard against #[contracterror] renumbering and code reuse
+      - name: Check error code stability
+        run: python3 stellar-swipe/scripts/check_error_codes.py
+
+      # Supply-chain: license, banned crates, and source policy
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.16
+
+      - name: cargo-deny check
+        run: cargo deny --manifest-path stellar-swipe/Cargo.toml check
+
       # Release WASM (workspace [profile.release]) + stellar contract optimize
       # Prebuilt release binary — avoids compiling libdbus-sys from source via cargo install
       - name: Install Stellar CLI
