@@ -1,5 +1,6 @@
 #![no_std]
-#![allow(clippy::too_many_arguments)]
+
+soroban_sdk::contractmeta!(key = "source_hash", val = env!("SOURCE_HASH"));
 
 mod committees;
 mod conviction_voting;

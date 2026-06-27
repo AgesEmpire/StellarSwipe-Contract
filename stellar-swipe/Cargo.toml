@@ -47,7 +47,13 @@ unused_unsafe = "allow"
 non_camel_case_types = "allow"
 
 [workspace.lints.clippy]
-all = "allow"
+# Soroban contracts expose many parameters in a single function call (the SDK
+# pattern requires all state to be passed via Env + explicit args).  Suppressed
+# workspace-wide because it is a structural pattern, not a code-quality issue.
+too_many_arguments = "allow"
+# Soroban no_std contracts cannot use the standard type_alias trait idiom, so
+# complex nested type expressions are sometimes unavoidable.
+type_complexity = "allow"
 
 # Smaller WASM for Soroban deploys (lower upload cost + instruction footprint).
 # Build:  cargo build --workspace --target wasm32-unknown-unknown --release
