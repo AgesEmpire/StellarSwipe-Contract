@@ -2,6 +2,8 @@
 
 #![no_std]
 
+soroban_sdk::contractmeta!(key = "source_hash", val = env!("SOURCE_HASH"));
+
 mod achievements;
 mod badges;
 mod migration;

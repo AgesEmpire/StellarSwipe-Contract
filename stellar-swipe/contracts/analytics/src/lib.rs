@@ -1,10 +1,13 @@
-#![no_std]
 //! Analytics contract (Issue #368): keeper-callable weekly protocol health report.
 //!
 //! `emit_weekly_health_report` is callable by anyone and is rate-limited to at most
 //! once per 7 days. It reads the stored `ProtocolSnapshot`, computes week-over-week
 //! deltas against the previous snapshot, emits a `WeeklyHealthReport` event, then
 //! rotates current → previous for next week's comparison.
+
+#![no_std]
+
+soroban_sdk::contractmeta!(key = "source_hash", val = env!("SOURCE_HASH"));
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 use stellar_swipe_common::SECONDS_PER_WEEK;

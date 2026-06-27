@@ -1,5 +1,7 @@
 #![no_std]
 
+soroban_sdk::contractmeta!(key = "source_hash", val = env!("SOURCE_HASH"));
+
 pub mod dca;
 mod errors;
 pub mod feature_flags;

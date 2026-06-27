@@ -1,5 +1,7 @@
 #![no_std]
 
+soroban_sdk::contractmeta!(key = "source_hash", val = env!("SOURCE_HASH"));
+
 mod errors;
 pub use errors::ContractError;
 

@@ -1,5 +1,7 @@
 #![no_std]
 
+soroban_sdk::contractmeta!(key = "source_hash", val = env!("SOURCE_HASH"));
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };

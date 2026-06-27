@@ -1,5 +1,7 @@
 #![no_std]
 
+soroban_sdk::contractmeta!(key = "source_hash", val = env!("SOURCE_HASH"));
+
 #[cfg(target_family = "wasm")]
 #[global_allocator]
 static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;

@@ -34,6 +34,35 @@ if [[ "${1:-}" == "--compare" ]]; then
   compare=true
 fi
 
+# ---------------------------------------------------------------------------
+# Source hash – embedded into each contract's WASM metadata via contractmeta!.
+# The hash identifies the exact source snapshot used to produce this build,
+# enabling third-party verification (see docs/source-verification.md).
+# ---------------------------------------------------------------------------
+compute_source_hash() {
+  # Deterministic hash: SHA-256 of the sorted list of all Rust source files and
+  # their contents, plus Cargo manifests, excluding build artefacts and VCS data.
+  find . \
+    \( -path ./target -o -path ./.git -o -path ./node_modules \) -prune \
+    -o \( -name "*.rs" -o -name "Cargo.toml" -o -name "Cargo.lock" \) -print \
+    | sort \
+    | xargs sha256sum 2>/dev/null \
+    | sha256sum \
+    | cut -d' ' -f1
+}
+
+if [[ -n "${SOURCE_HASH:-}" ]]; then
+  echo "==> Using provided SOURCE_HASH: $SOURCE_HASH"
+else
+  SOURCE_HASH="$(compute_source_hash)"
+  if [[ -z "$SOURCE_HASH" ]]; then
+    echo "error: failed to compute SOURCE_HASH – aborting build" >&2
+    exit 1
+  fi
+  export SOURCE_HASH
+  echo "==> Computed SOURCE_HASH: $SOURCE_HASH"
+fi
+
 need_stellar() {
   if ! command -v stellar >/dev/null 2>&1; then
     echo "error: stellar CLI not found. Install e.g.: cargo install stellar-cli --locked" >&2
