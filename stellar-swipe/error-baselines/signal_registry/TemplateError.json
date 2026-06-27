@@ -1,0 +1,9 @@
+{
+  "TemplateNotFound": 300,
+  "Unauthorized": 301,
+  "PrivateTemplate": 302,
+  "MissingVariable": 303,
+  "InvalidTemplate": 304,
+  "InvalidAction": 305,
+  "InvalidExpiry": 306
+}

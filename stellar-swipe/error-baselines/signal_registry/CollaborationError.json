@@ -1,0 +1,7 @@
+{
+  "NotCoAuthor": 500,
+  "AlreadyApproved": 501,
+  "InvalidContributions": 502,
+  "NotCollaborative": 503,
+  "PendingApproval": 504
+}

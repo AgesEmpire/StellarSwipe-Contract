@@ -1,0 +1,12 @@
+{
+  "SignalNotFound": 200,
+  "InvalidPrice": 201,
+  "DivisionByZero": 202,
+  "InvalidVolume": 203,
+  "SignalExpired": 204,
+  "NoExecutions": 205,
+  "TradingPaused": 206,
+  "OraclePriceStale": 207,
+  "OraclePriceMissing": 208,
+  "OraclePriceOutOfBounds": 209
+}

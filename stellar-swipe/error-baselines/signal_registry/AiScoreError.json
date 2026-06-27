@@ -1,0 +1,6 @@
+{
+  "Unauthorized": 600,
+  "OracleNotConfigured": 601,
+  "InvalidScore": 602,
+  "SignalNotFound": 603
+}

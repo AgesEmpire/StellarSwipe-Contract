@@ -1,0 +1,6 @@
+{
+  "Unauthorized": 1150,
+  "SignalNotFound": 1151,
+  "SignalNotClosed": 1152,
+  "OutcomeAlreadyRecorded": 1153
+}

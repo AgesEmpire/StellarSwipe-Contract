@@ -1,0 +1,18 @@
+{
+  "AlreadyInitialized": 1,
+  "InvalidAmount": 2,
+  "InvalidValidatorSet": 3,
+  "UnauthorizedValidator": 4,
+  "TransferNotFound": 5,
+  "TransferAlreadyExecuted": 6,
+  "ReplayDetected": 7,
+  "SignatureAlreadyUsed": 8,
+  "NotEnoughValidatorApprovals": 9,
+  "DailyLimitExceeded": 10,
+  "MaxTransferExceeded": 11,
+  "InsufficientWrappedBalance": 12,
+  "WithdrawalNotReady": 13,
+  "InvalidOperation": 14,
+  "DynamicLiquidityLimitExceeded": 15,
+  "InvalidThreshold": 16
+}

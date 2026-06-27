@@ -1,0 +1,11 @@
+{
+  "InvalidFormat": 400,
+  "InvalidAssetPair": 401,
+  "InvalidPrice": 402,
+  "InvalidAction": 403,
+  "InvalidRationale": 404,
+  "InvalidExpiry": 405,
+  "BatchSizeExceeded": 406,
+  "EmptyData": 407,
+  "ParseError": 408
+}

@@ -1,0 +1,12 @@
+{
+  "UnauthorizedSigner": 1,
+  "UnauthorizedCaller": 2,
+  "InvalidPayload": 3,
+  "InvalidMessage": 4,
+  "MessageNotFound": 5,
+  "VersionMismatch": 6,
+  "CallDepthExceeded": 7,
+  "ContractHashMismatch": 8,
+  "AlreadyDelivered": 9,
+  "CallerNotRegistered": 10
+}

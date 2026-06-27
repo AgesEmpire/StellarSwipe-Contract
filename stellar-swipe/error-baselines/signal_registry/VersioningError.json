@@ -1,0 +1,10 @@
+{
+  "NotSignalOwner": 900,
+  "CannotUpdateInactive": 901,
+  "MaxUpdatesReached": 902,
+  "UpdateCooldown": 903,
+  "SignalExpired": 904,
+  "InvalidPrice": 905,
+  "InvalidExpiry": 906,
+  "VersionNotFound": 907
+}

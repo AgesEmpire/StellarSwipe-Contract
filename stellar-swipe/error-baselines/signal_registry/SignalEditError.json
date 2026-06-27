@@ -1,0 +1,9 @@
+{
+  "EditWindowClosed": 1100,
+  "FieldNotEditable": 1101,
+  "SignalAlreadyCopied": 1102,
+  "SignalNotFound": 1103,
+  "NotSignalOwner": 1104,
+  "InvalidConfidence": 1105,
+  "TradingPaused": 1106
+}

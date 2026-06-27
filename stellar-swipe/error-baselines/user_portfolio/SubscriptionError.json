@@ -1,0 +1,8 @@
+{
+  "NotInitialized": 1,
+  "NoTermsFromProvider": 2,
+  "InvalidDuration": 3,
+  "Overflow": 4,
+  "InvalidFee": 5,
+  "SelfSubscribe": 6
+}

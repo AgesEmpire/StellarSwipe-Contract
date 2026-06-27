@@ -1,0 +1,7 @@
+{
+  "TradeTooSmall": 100,
+  "FeeRoundedToZero": 101,
+  "ArithmeticOverflow": 102,
+  "InvalidAmount": 103,
+  "InvalidProviderAddress": 104
+}

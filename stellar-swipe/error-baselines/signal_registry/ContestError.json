@@ -1,0 +1,10 @@
+{
+  "ContestNotFound": 800,
+  "InvalidTimeRange": 801,
+  "InvalidPrizePool": 802,
+  "ContestNotEnded": 803,
+  "AlreadyFinalized": 804,
+  "NotQualified": 805,
+  "TradingPaused": 806,
+  "CircuitBreakerTriggered": 807
+}

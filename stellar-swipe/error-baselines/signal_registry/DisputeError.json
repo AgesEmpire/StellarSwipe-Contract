@@ -1,0 +1,8 @@
+{
+  "Unauthorized": 1,
+  "DisputeNotFound": 2,
+  "DisputeNotOpen": 3,
+  "AppealAlreadySubmitted": 4,
+  "AppealNotPending": 5,
+  "AppealWindowNotElapsed": 6
+}

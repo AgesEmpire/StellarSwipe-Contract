@@ -1,0 +1,10 @@
+{
+  "NoStake": 1200,
+  "BelowMinimumStake": 1201,
+  "InvalidAssetPair": 1202,
+  "InvalidPrice": 1203,
+  "EmptyRationale": 1204,
+  "DuplicateSignal": 1205,
+  "MissingRationale": 1206,
+  "PriceUnreasonable": 1207
+}

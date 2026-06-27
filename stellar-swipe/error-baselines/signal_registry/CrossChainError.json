@@ -1,0 +1,9 @@
+{
+  "SignalAlreadyExists": 1000,
+  "SignalNotFound": 1001,
+  "VerificationFailed": 1002,
+  "InvalidProof": 1003,
+  "AddressNotRegistered": 1004,
+  "InvalidSyncStatus": 1005,
+  "NotSignalOwner": 1006
+}

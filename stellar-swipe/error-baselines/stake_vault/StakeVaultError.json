@@ -1,0 +1,14 @@
+{
+  "NotInitialized": 1,
+  "Unauthorized": 2,
+  "NoStake": 3,
+  "StakeLocked": 4,
+  "ReentrancyDetected": 5,
+  "StakeBelowMinimum": 6,
+  "ContractPaused": 7,
+  "TimelockRequired": 8,
+  "TimelockNotElapsed": 9,
+  "FlashLoanDetected": 10,
+  "InvalidSlashTier": 11,
+  "StakeDurationNotElapsed": 12
+}
