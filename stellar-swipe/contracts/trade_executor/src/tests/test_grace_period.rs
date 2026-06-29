@@ -110,11 +110,11 @@ fn cancel_queued_trade_within_grace_period_succeeds() {
     let user = funded_user(&env, &token);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
-    env.ledger().with_mut(|l| l.sequence = 0);
+    env.ledger().with_mut(|l| l.sequence_number = 0);
     let queued_id = exec.queue_copy_trade(&user, &token, &AMOUNT, &None);
     assert!(queued_id > 0);
 
-    env.ledger().with_mut(|l| l.sequence = 5);
+    env.ledger().with_mut(|l| l.sequence_number = 5);
     let result = exec.try_cancel_queued_trade(&user, &queued_id);
     assert!(result.is_ok(), "cancellation within grace period should succeed");
 }
@@ -127,7 +127,7 @@ fn cancel_after_grace_period_elapsed_fails() {
     let user = funded_user(&env, &token);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
-    env.ledger().with_mut(|l| l.sequence = 0);
+    env.ledger().with_mut(|l| l.sequence_number = 0);
     let queued_id = exec.queue_copy_trade(&user, &token, &AMOUNT, &None);
 
 /// Execute queued trades after grace period — only eligible ones execute.
@@ -138,16 +138,16 @@ fn execute_queued_trades_after_grace_period() {
     let user = funded_user(&env, &token);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
-    env.ledger().with_mut(|l| l.sequence = 0);
+    env.ledger().with_mut(|l| l.sequence_number = 0);
     let _queued_id = exec.queue_copy_trade(&user, &token, &AMOUNT, &None);
 
     // Not yet eligible
-    env.ledger().with_mut(|l| l.sequence = 5);
+    env.ledger().with_mut(|l| l.sequence_number = 5);
     let count = exec.execute_queued_trades();
     assert_eq!(count, 0, "no trades before grace period elapses");
 
     // Eligible now
-    env.ledger().with_mut(|l| l.sequence = 15);
+    env.ledger().with_mut(|l| l.sequence_number = 15);
     let count = exec.execute_queued_trades();
     assert_eq!(count, 1, "trade executes after grace period");
 }
@@ -161,18 +161,18 @@ fn multiple_queued_trades_partial_execution() {
     let user2 = funded_user(&env, &token);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
-    env.ledger().with_mut(|l| l.sequence = 0);
+    env.ledger().with_mut(|l| l.sequence_number = 0);
     exec.queue_copy_trade(&user1, &token, &AMOUNT, &None);
 
-    env.ledger().with_mut(|l| l.sequence = 8);
+    env.ledger().with_mut(|l| l.sequence_number = 8);
     exec.queue_copy_trade(&user2, &token, &AMOUNT, &None);
 
     // Only trade 1 eligible (12-0 >= 10)
-    env.ledger().with_mut(|l| l.sequence = 12);
+    env.ledger().with_mut(|l| l.sequence_number = 12);
     assert_eq!(exec.execute_queued_trades(), 1);
 
     // Trade 2 eligible now
-    env.ledger().with_mut(|l| l.sequence = 20);
+    env.ledger().with_mut(|l| l.sequence_number = 20);
     assert_eq!(exec.execute_queued_trades(), 1);
 }
 
@@ -185,7 +185,7 @@ fn zero_grace_period_executes_immediately() {
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
     exec.set_trade_grace_period(&0);
-    env.ledger().with_mut(|l| l.sequence = 5);
+    env.ledger().with_mut(|l| l.sequence_number = 5);
     let _queued_id = exec.queue_copy_trade(&user, &token, &AMOUNT, &None);
     assert_eq!(exec.execute_queued_trades(), 1, "immediate with grace 0");
 }
@@ -198,19 +198,19 @@ fn cancelled_trade_not_executed() {
     let user = funded_user(&env, &token);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
-    env.ledger().with_mut(|l| l.sequence = 0);
+    env.ledger().with_mut(|l| l.sequence_number = 0);
     let queued_id = exec.queue_copy_trade(&user, &token, &AMOUNT, &None);
 
-    env.ledger().with_mut(|l| l.sequence = 5);
+    env.ledger().with_mut(|l| l.sequence_number = 5);
     exec.cancel_queued_trade(&user, &queued_id);
 
-    env.ledger().with_mut(|l| l.sequence = 20);
+    env.ledger().with_mut(|l| l.sequence_number = 20);
     assert_eq!(exec.execute_queued_trades(), 0, "cancelled trade not executed");
 }
 
-    env.ledger().with_mut(|l| l.sequence = 15);
+    env.ledger().with_mut(|l| l.sequence_number = 15);
     let result = exec.try_cancel_queued_trade(&user, &queued_id);
-    assert_eq!(result, Err(ContractError::GracePeriodExpired));
+    assert_eq!(result, Err(Ok(ContractError::GracePeriodExpired)));
 }
 
 /// A non-owner cannot cancel a queued trade.
@@ -221,12 +221,12 @@ fn non_owner_cannot_cancel_queued_trade() {
     let user = funded_user(&env, &token);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
-    env.ledger().with_mut(|l| l.sequence = 0);
+    env.ledger().with_mut(|l| l.sequence_number = 0);
     let queued_id = exec.queue_copy_trade(&user, &token, &AMOUNT, &None);
 
     let impostor = Address::generate(&env);
     let result = exec.try_cancel_queued_trade(&impostor, &queued_id);
-    assert_eq!(result, Err(ContractError::NotTradeOwner));
+    assert_eq!(result, Err(Ok(ContractError::NotTradeOwner)));
 }
 
 /// Cancelling a non-existent queued trade returns QueuedTradeNotFound.
@@ -236,6 +236,6 @@ fn cancel_nonexistent_queued_trade_fails() {
     let user = Address::generate(&env);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
     let result = exec.try_cancel_queued_trade(&user, &999u64);
-    assert_eq!(result, Err(ContractError::QueuedTradeNotFound));
+    assert_eq!(result, Err(Ok(ContractError::QueuedTradeNotFound)));
 }
 

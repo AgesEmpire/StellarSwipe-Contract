@@ -79,6 +79,20 @@ pub enum StorageKey {
     NextQueuedTradeId,
     /// List of all pending queued trade IDs.
     QueuedTradeIds,
+    /// Maximum number of execution attempts before a queued trade is dead-lettered.
+    MaxRetryCount,
+    /// A dead-lettered trade record stored by its original queued trade ID.
+    DeadLetterTrade(u64),
+    /// Per-user index of dead-lettered trade IDs.
+    DeadLetterIds(Address),
+    /// Priority-lane configuration (PriorityConfig).
+    PriorityConfig,
+    /// Consecutive priority-only batch counter for fairness fallback.
+    PriorityBatchCounter,
+    /// SHA-256 receipt hash for a completed trade, keyed by monotonic receipt ID.
+    TradeReceiptHash(u64),
+    /// Next trade receipt ID counter.
+    NextTradeReceiptId,
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -99,10 +113,43 @@ pub struct QueuedTrade {
     pub amount: i128,
     pub queued_at_ledger: u32,
     pub portfolio_pct_bps: Option<u32>,
+    /// Number of failed execution attempts so far (0 = never tried).
+    pub retry_count: u32,
 }
 
 /// Default grace period: 10 ledgers (~50 seconds at 5s/ledger).
 pub const DEFAULT_GRACE_PERIOD_LEDGERS: u32 = 10;
+
+/// Default maximum execution attempts before a trade is dead-lettered (3 attempts total).
+pub const DEFAULT_MAX_RETRY_COUNT: u32 = 3;
+
+/// A trade that has exhausted all retry attempts and been moved to the dead-letter queue.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailedTrade {
+    /// Original queued trade ID.
+    pub trade_id: u64,
+    pub user: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub portfolio_pct_bps: Option<u32>,
+    /// `ContractError` discriminant of the last failure.
+    pub failure_code: u32,
+    /// Total execution attempts made before dead-lettering.
+    pub retry_count: u32,
+    /// Ledger sequence at which the trade was dead-lettered.
+    pub dead_lettered_at_ledger: u32,
+}
+
+/// Event emitted when a trade is moved to the dead-letter queue.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeDeadLettered {
+    pub trade_id: u64,
+    pub user: Address,
+    pub failure_code: u32,
+    pub retry_count: u32,
+}
 
 /// A single trade input for [`TradeExecutorContract::batch_execute`].
 #[contracttype]
@@ -339,6 +386,64 @@ fn decrease_open_interest(env: &Env, pair: &Address, amount: i128) {
     env.storage().instance().set(&key, &next);
 }
 
+/// Compute the SHA-256 trade receipt hash over `(user, asset, amount, price, timestamp)`.
+pub fn compute_trade_hash(
+    env: &Env,
+    user: &Address,
+    asset: &Address,
+    amount: i128,
+    price: i128,
+    timestamp: u64,
+) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&user.to_xdr(env));
+    payload.append(&asset.to_xdr(env));
+    payload.append(&soroban_sdk::Bytes::from_slice(env, &amount.to_be_bytes()));
+    payload.append(&soroban_sdk::Bytes::from_slice(env, &price.to_be_bytes()));
+    payload.append(&soroban_sdk::Bytes::from_slice(env, &timestamp.to_be_bytes()));
+    env.crypto().sha256(&payload).into()
+}
+
+/// Store a SHA-256 receipt hash for a completed trade and emit a `trade_receipt` event.
+fn record_trade_receipt(env: &Env, user: &Address, token: &Address, amount: i128) {
+    use soroban_sdk::xdr::ToXdr;
+    let price: i128 = env
+        .storage()
+        .instance()
+        .get(&StorageKey::SdexPrice(token.clone()))
+        .unwrap_or(0);
+    let timestamp = env.ledger().timestamp();
+
+    let receipt_id: u64 = env
+        .storage()
+        .instance()
+        .get(&StorageKey::NextTradeReceiptId)
+        .unwrap_or(1);
+
+    // Include receipt_id so each receipt hash is unique even within the same ledger.
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&user.to_xdr(env));
+    payload.append(&token.to_xdr(env));
+    payload.append(&soroban_sdk::Bytes::from_slice(env, &amount.to_be_bytes()));
+    payload.append(&soroban_sdk::Bytes::from_slice(env, &price.to_be_bytes()));
+    payload.append(&soroban_sdk::Bytes::from_slice(env, &timestamp.to_be_bytes()));
+    payload.append(&soroban_sdk::Bytes::from_slice(env, &receipt_id.to_be_bytes()));
+    let hash: BytesN<32> = env.crypto().sha256(&payload).into();
+
+    env.storage()
+        .instance()
+        .set(&StorageKey::TradeReceiptHash(receipt_id), &hash);
+    env.storage()
+        .instance()
+        .set(&StorageKey::NextTradeReceiptId, &receipt_id.saturating_add(1));
+
+    env.events().publish(
+        (Symbol::new(env, "trade_executor"), Symbol::new(env, "trade_receipt")),
+        (receipt_id, hash),
+    );
+}
+
 fn execute_market_copy_trade(
     env: &Env,
     user: Address,
@@ -542,6 +647,54 @@ fn effective_grace_period(env: &Env) -> u32 {
         .instance()
         .get(&StorageKey::TradeGracePeriod)
         .unwrap_or(DEFAULT_GRACE_PERIOD_LEDGERS)
+}
+
+/// Return the configured max retry count (defaults to [`DEFAULT_MAX_RETRY_COUNT`]).
+fn effective_max_retry_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::MaxRetryCount)
+        .unwrap_or(DEFAULT_MAX_RETRY_COUNT)
+}
+
+/// Move a failed trade to the dead-letter queue and emit the `trade_dead_lettered` event.
+fn dead_letter_trade_internal(env: &Env, trade: &QueuedTrade, failure_code: u32) {
+    let failed = FailedTrade {
+        trade_id: trade.queued_trade_id,
+        user: trade.user.clone(),
+        token: trade.token.clone(),
+        amount: trade.amount,
+        portfolio_pct_bps: trade.portfolio_pct_bps,
+        failure_code,
+        retry_count: trade.retry_count.saturating_add(1),
+        dead_lettered_at_ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .instance()
+        .set(&StorageKey::DeadLetterTrade(trade.queued_trade_id), &failed);
+
+    let mut ids: Vec<u64> = env
+        .storage()
+        .instance()
+        .get(&StorageKey::DeadLetterIds(trade.user.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    ids.push_back(trade.queued_trade_id);
+    env.storage()
+        .instance()
+        .set(&StorageKey::DeadLetterIds(trade.user.clone()), &ids);
+
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "trade_dead_lettered"),
+        ),
+        TradeDeadLettered {
+            trade_id: trade.queued_trade_id,
+            user: trade.user.clone(),
+            failure_code,
+            retry_count: trade.retry_count.saturating_add(1),
+        },
+    );
 }
 
 /// Generate the next queued trade ID.
@@ -1138,6 +1291,7 @@ impl TradeExecutorContract {
             amount,
             queued_at_ledger: env.ledger().sequence(),
             portfolio_pct_bps,
+            retry_count: 0,
         };
         store_queued_trade(&env, &trade);
         Ok(queued_trade_id)
@@ -1216,23 +1370,47 @@ impl TradeExecutorContract {
             };
 
             if grace_period_elapsed(&env, trade.queued_at_ledger) {
-                // Execute the trade via market copy trade.
                 let result = execute_market_copy_trade(
                     &env,
-                    trade.user,
-                    trade.token,
+                    trade.user.clone(),
+                    trade.token.clone(),
                     trade.amount,
                     trade.portfolio_pct_bps,
                     false,
                     None,
                 );
-                if result.is_ok() {
-                    executed = executed.saturating_add(1);
+                match result {
+                    Ok(()) => {
+                        executed = executed.saturating_add(1);
+                        env.storage()
+                            .instance()
+                            .remove(&StorageKey::QueuedTrade(id));
+                    }
+                    Err(e) => {
+                        let max_retries = effective_max_retry_count(&env);
+                        let new_retry_count = trade.retry_count.saturating_add(1);
+                        if new_retry_count >= max_retries {
+                            dead_letter_trade_internal(&env, &trade, e as u32);
+                            env.storage()
+                                .instance()
+                                .remove(&StorageKey::QueuedTrade(id));
+                        } else {
+                            let updated = QueuedTrade {
+                                retry_count: new_retry_count,
+                                queued_trade_id: trade.queued_trade_id,
+                                user: trade.user,
+                                token: trade.token,
+                                amount: trade.amount,
+                                queued_at_ledger: trade.queued_at_ledger,
+                                portfolio_pct_bps: trade.portfolio_pct_bps,
+                            };
+                            env.storage()
+                                .instance()
+                                .set(&StorageKey::QueuedTrade(id), &updated);
+                            remaining.push_back(id);
+                        }
+                    }
                 }
-                // Remove the queued trade record regardless of execution outcome.
-                env.storage()
-                    .instance()
-                    .remove(&StorageKey::QueuedTrade(id));
             } else {
                 remaining.push_back(id);
             }
@@ -1525,6 +1703,126 @@ impl TradeExecutorContract {
     pub fn cancel_dca_plan(env: Env, user: Address, signal_id: u64) -> Result<(), ContractError> {
         user.require_auth();
         dca::cancel_dca_plan(&env, &user, signal_id)
+    }
+
+    // ── Dead-letter queue (Issue #657) ────────────────────────────────────────
+
+    /// Set the maximum number of execution attempts before a queued trade is moved
+    /// to the dead-letter queue. Default is [`DEFAULT_MAX_RETRY_COUNT`] (3).
+    pub fn set_max_retry_count(env: Env, count: u32) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::MaxRetryCount, &count);
+        Ok(())
+    }
+
+    /// Return the configured maximum retry count.
+    pub fn get_max_retry_count(env: Env) -> u32 {
+        effective_max_retry_count(&env)
+    }
+
+    /// Return all dead-lettered trades for `user`.
+    pub fn get_dead_letter_trades(env: Env, user: Address) -> Vec<FailedTrade> {
+        let ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::DeadLetterIds(user))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut result: Vec<FailedTrade> = Vec::new(&env);
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            if let Some(ft) = env
+                .storage()
+                .instance()
+                .get::<_, FailedTrade>(&StorageKey::DeadLetterTrade(id))
+            {
+                result.push_back(ft);
+            }
+        }
+        result
+    }
+
+    /// Re-queue a dead-lettered trade, resetting its retry count.
+    /// The trade re-enters the grace-period queue as a fresh attempt.
+    pub fn requeue_dead_lettered_trade(
+        env: Env,
+        trade_id: u64,
+    ) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        let failed: FailedTrade = env
+            .storage()
+            .instance()
+            .get(&StorageKey::DeadLetterTrade(trade_id))
+            .ok_or(ContractError::QueuedTradeNotFound)?;
+
+        // Remove from dead-letter storage.
+        env.storage()
+            .instance()
+            .remove(&StorageKey::DeadLetterTrade(trade_id));
+        let mut dl_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::DeadLetterIds(failed.user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut i = 0;
+        while i < dl_ids.len() {
+            if dl_ids.get(i).unwrap() == trade_id {
+                dl_ids.remove(i);
+                break;
+            }
+            i += 1;
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::DeadLetterIds(failed.user.clone()), &dl_ids);
+
+        // Re-queue with a fresh retry_count.
+        let trade = QueuedTrade {
+            queued_trade_id: trade_id,
+            user: failed.user,
+            token: failed.token,
+            amount: failed.amount,
+            portfolio_pct_bps: failed.portfolio_pct_bps,
+            queued_at_ledger: env.ledger().sequence(),
+            retry_count: 0,
+        };
+        store_queued_trade(&env, &trade);
+        Ok(())
+    }
+
+    /// Permanently discard a dead-lettered trade (no requeue).
+    pub fn discard_dead_lettered_trade(
+        env: Env,
+        trade_id: u64,
+    ) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        let failed: FailedTrade = env
+            .storage()
+            .instance()
+            .get(&StorageKey::DeadLetterTrade(trade_id))
+            .ok_or(ContractError::QueuedTradeNotFound)?;
+
+        env.storage()
+            .instance()
+            .remove(&StorageKey::DeadLetterTrade(trade_id));
+        let mut dl_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::DeadLetterIds(failed.user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut i = 0;
+        while i < dl_ids.len() {
+            if dl_ids.get(i).unwrap() == trade_id {
+                dl_ids.remove(i);
+                break;
+            }
+            i += 1;
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::DeadLetterIds(failed.user.clone()), &dl_ids);
+        Ok(())
     }
 
     // ── Feature flag registry ─────────────────────────────────────────────────

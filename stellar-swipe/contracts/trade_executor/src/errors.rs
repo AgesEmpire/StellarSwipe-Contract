@@ -65,6 +65,8 @@ pub enum ContractError {
     QueuedTradeNotFound = 27,
     /// The caller is not the trade owner.
     NotTradeOwner = 28,
+    /// A queued trade exceeded the maximum retry limit and was moved to the dead-letter queue.
+    MaxRetriesExceeded = 29,
 }
 
 /// Populated when [`ContractError::InsufficientLiquidity`] is returned.

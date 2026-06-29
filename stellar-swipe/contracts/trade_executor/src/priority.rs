@@ -5,7 +5,7 @@
 //! during high-congestion periods. A fairness fallback prevents starvation of
 //! lower-priority followers.
 
-use soroban_sdk::{contracterror, contracttype, Address, Env, Vec};
+use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Vec};
 
 use crate::StorageKey;
 
@@ -55,6 +55,11 @@ impl Default for PriorityConfig {
     fn default() -> Self {
         Self {
             high_stake_min: DEFAULT_HIGH_STAKE_MIN,
+            high_tenure_min_secs: DEFAULT_HIGH_TENURE_MIN_SECS,
+            fairness_batch_window: DEFAULT_FAIRNESS_BATCH_WINDOW,
+        }
+    }
+}
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -80,14 +85,11 @@ pub fn set_priority_config(env: &Env, config: &PriorityConfig) {
     env.storage()
         .instance()
         .set(&StorageKey::PriorityConfig, config);
+}
 
 // ── Tier determination ────────────────────────────────────────────────────────
 
 /// Determine the priority tier for a follower based on the current config.
-///
-/// Checks the user's stake against the high_stake_min threshold and their
-/// account age (via the configured portfolio contract) against the tenure threshold.
-/// Returns the highest applicable tier.
 pub fn get_follower_priority_tier(
     env: &Env,
     user: &Address,
@@ -95,7 +97,6 @@ pub fn get_follower_priority_tier(
 ) -> FollowerPriorityTier {
     let config = get_priority_config(env);
 
-    // Check stake via portfolio contract
     let stake = if let Some(portfolio_addr) = portfolio {
         get_follower_stake(env, user, portfolio_addr)
     } else {
@@ -106,7 +107,6 @@ pub fn get_follower_priority_tier(
         return FollowerPriorityTier::HighStake;
     }
 
-    // Check tenure / account age
     if let Some(portfolio_addr) = portfolio {
         let account_age = get_follower_account_age(env, user, portfolio_addr);
         if account_age >= config.high_tenure_min_secs {
@@ -117,47 +117,32 @@ pub fn get_follower_priority_tier(
     FollowerPriorityTier::Standard
 }
 
-/// Attempt to read a follower's stake from the portfolio contract via
-/// `get_stake(user) -> i128`. Returns 0 if the portfolio doesn't expose it.
 fn get_follower_stake(env: &Env, user: &Address, portfolio: &Address) -> i128 {
     let sym = soroban_sdk::Symbol::new(env, "get_stake");
     let mut args = soroban_sdk::Vec::<soroban_sdk::Val>::new(env);
     args.push_back(user.clone().into_val(env));
     env.try_invoke_contract::<i128, soroban_sdk::Error>(portfolio, &sym, args)
         .ok()
-        .flatten()
+        .and_then(|r| r.ok())
         .unwrap_or(0)
 }
 
-/// Attempt to read a follower's account age from the portfolio contract via
-/// `get_account_age(user) -> u64`. Returns 0 if the portfolio doesn't expose it.
 fn get_follower_account_age(env: &Env, user: &Address, portfolio: &Address) -> u64 {
     let sym = soroban_sdk::Symbol::new(env, "get_account_age");
     let mut args = soroban_sdk::Vec::<soroban_sdk::Val>::new(env);
     args.push_back(user.clone().into_val(env));
     env.try_invoke_contract::<u64, soroban_sdk::Error>(portfolio, &sym, args)
         .ok()
-        .flatten()
+        .and_then(|r| r.ok())
         .unwrap_or(0)
 }
 
 // ── Batch sorting ─────────────────────────────────────────────────────────────
 
-/// Represents a trade input paired with its computed priority tier for sorting.
-#[derive(Clone, Debug)]
-struct PrioritizedTrade {
-    tier: FollowerPriorityTier,
-    user: Address,
-    token: Address,
-    amount: i128,
-}
-
-/// Sort a batch of trades by priority tier (highest first), then return them in
-/// that order. Trades with the same tier retain their relative order (stable sort).
+/// Sort a batch of trades by priority tier (highest first) with a fairness fallback
+/// that prevents starvation of lower-priority followers.
 ///
-/// If the fairness fallback is active (consecutive priority-only batches >=
-/// `fairness_batch_window`), standard-follower trades are interleaved so they
-/// are not skipped.
+/// Returns `(sorted_trades, updated_counter)`.
 pub fn sort_trades_by_priority(
     env: &Env,
     trades: Vec<crate::BatchTradeInput>,
@@ -166,67 +151,76 @@ pub fn sort_trades_by_priority(
     let config = get_priority_config(env);
     let mut counter = get_priority_batch_counter(env);
 
-    // Classify each trade
-    let mut scored: Vec<PrioritizedTrade> = Vec::new();
+    // Partition by tier into two buckets: above-standard (priority) and standard.
+    let mut priority_trades: Vec<crate::BatchTradeInput> = Vec::new(env);
+    let mut standard_trades: Vec<crate::BatchTradeInput> = Vec::new(env);
+    let mut all_priority = !trades.is_empty();
+
     for i in 0..trades.len() {
         let t = trades.get(i).unwrap();
         let tier = get_follower_priority_tier(env, &t.user, portfolio);
-        scored.push(PrioritizedTrade {
-            tier,
-            user: t.user,
-            token: t.token,
-            amount: t.amount,
-        });
+        if tier > FollowerPriorityTier::Standard {
+            priority_trades.push_back(t);
+        } else {
+            all_priority = false;
+            standard_trades.push_back(t);
+        }
     }
-
-    // Sort by tier descending (higher priority first), stable
-    scored.sort_by(|a, b| b.tier.cmp(&a.tier));
-
-    // Check if all trades in this batch are priority
-    let all_priority = scored
-        .iter()
-        .all(|t| t.tier > FollowerPriorityTier::Standard);
 
     if all_priority {
-        counter += 1;
+        counter = counter.saturating_add(1);
     } else {
-        counter = 0; // standard trades reset the counter
-    }
-
-    // If fairness fallback is triggered, re-interleave standard trades
-    if counter >= config.fairness_batch_window {
-        let mut priority_count = 0u32;
-        let mut standard_idx = None;
-        for (i, t) in scored.iter().enumerate() {
-            if t.tier > FollowerPriorityTier::Standard {
-                priority_count += 1;
-            } else if standard_idx.is_none() {
-                standard_idx = Some(i);
-            }
-        }
-
-        // If there are standard trades, swap one into an earlier position
-        if let Some(idx) = standard_idx {
-            if idx > 0 && priority_count > 0 {
-                let insert_at = (priority_count.saturating_sub(1)).min(idx as u32) as usize;
-                let standard_trade = scored.remove(idx);
-                scored.insert(insert_at, standard_trade);
-            }
-        }
-
-        // Reset counter after applying the fallback
         counter = 0;
     }
 
-    set_priority_batch_counter(env, counter);
-
-    // Convert back to BatchTradeInput
     let mut result: Vec<crate::BatchTradeInput> = Vec::new(env);
-    for pt in scored {
-        result.push_back(crate::BatchTradeInput {
-            user: pt.user,
-            token: pt.token,
-            amount: pt.amount,
+
+    if counter >= config.fairness_batch_window && !standard_trades.is_empty() {
+        // Fairness fallback: move the first standard trade in front of the last priority
+        // trade so it gets executed this batch.
+        let pc = priority_trades.len();
+        if pc > 0 {
+            for i in 0..pc.saturating_sub(1) {
+                result.push_back(priority_trades.get(i).unwrap());
+            }
+            result.push_back(standard_trades.get(0).unwrap());
+            result.push_back(priority_trades.get(pc - 1).unwrap());
+            for i in 1..standard_trades.len() {
+                result.push_back(standard_trades.get(i).unwrap());
+            }
+        } else {
+            for i in 0..standard_trades.len() {
+                result.push_back(standard_trades.get(i).unwrap());
+            }
+        }
+        counter = 0;
+    } else {
+        for i in 0..priority_trades.len() {
+            result.push_back(priority_trades.get(i).unwrap());
+        }
+        for i in 0..standard_trades.len() {
+            result.push_back(standard_trades.get(i).unwrap());
+        }
+    }
+
+    set_priority_batch_counter(env, counter);
+    (result, counter)
+}
+
+/// Read the consecutive priority-only batch counter.
+pub fn get_priority_batch_counter(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::PriorityBatchCounter)
+        .unwrap_or(0)
+}
+
+/// Set the consecutive priority-only batch counter.
+pub fn set_priority_batch_counter(env: &Env, count: u32) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::PriorityBatchCounter, &count);
+}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -344,6 +338,52 @@ mod tests {
         env.as_contract(&cid, || {
             set_priority_config(&env, &PriorityConfig::default());
             let tier = get_follower_priority_tier(&env, &user, Some(&portfolio_id));
+            assert_eq!(tier, FollowerPriorityTier::HighStake);
+        });
+    }
+
+    #[test]
+    fn high_tenure_tier_above_threshold() {
+        let (env, cid) = setup_env();
+        let user = Address::generate(&env);
+        let portfolio_id = env.register(MockPortfolio, ());
+        let portfolio = MockPortfolioClient::new(&env, &portfolio_id);
+        portfolio.set_account_age(&user, &DEFAULT_HIGH_TENURE_MIN_SECS);
+
+        env.as_contract(&cid, || {
+            set_priority_config(&env, &PriorityConfig::default());
+            let tier = get_follower_priority_tier(&env, &user, Some(&portfolio_id));
+            assert_eq!(tier, FollowerPriorityTier::HighTenure);
+        });
+    }
+
+    #[test]
+    fn high_stake_trumps_high_tenure() {
+        let (env, cid) = setup_env();
+        let user = Address::generate(&env);
+        let portfolio_id = env.register(MockPortfolio, ());
+        let portfolio = MockPortfolioClient::new(&env, &portfolio_id);
+        portfolio.set_stake(&user, &DEFAULT_HIGH_STAKE_MIN);
+        portfolio.set_account_age(&user, &DEFAULT_HIGH_TENURE_MIN_SECS);
+
+        env.as_contract(&cid, || {
+            set_priority_config(&env, &PriorityConfig::default());
+            let tier = get_follower_priority_tier(&env, &user, Some(&portfolio_id));
+            assert_eq!(tier, FollowerPriorityTier::HighStake);
+        });
+    }
+
+    #[test]
+    fn no_portfolio_falls_back_to_standard() {
+        let (env, cid) = setup_env();
+        let user = Address::generate(&env);
+        env.as_contract(&cid, || {
+            set_priority_config(&env, &PriorityConfig::default());
+            let tier = get_follower_priority_tier(&env, &user, None);
+            assert_eq!(tier, FollowerPriorityTier::Standard);
+        });
+    }
+
     // --- Batch sorting ---
 
     #[test]
@@ -425,82 +465,5 @@ mod tests {
             let (_, new_counter) = sort_trades_by_priority(&env, trades, Some(&portfolio_id));
             assert_eq!(new_counter, 1);
         });
-    }
-
-    #[test]
-    fn no_portfolio_falls_back_to_standard() {
-        let (env, cid) = setup_env();
-        let user = Address::generate(&env);
-        env.as_contract(&cid, || {
-            set_priority_config(&env, &PriorityConfig::default());
-            let tier = get_follower_priority_tier(&env, &user, None);
-            assert_eq!(tier, FollowerPriorityTier::Standard);
-        });
-    }
-}
-
-            assert_eq!(tier, FollowerPriorityTier::HighStake);
-        });
-    }
-
-    #[test]
-    fn high_tenure_tier_above_threshold() {
-        let (env, cid) = setup_env();
-        let user = Address::generate(&env);
-        let portfolio_id = env.register(MockPortfolio, ());
-        let portfolio = MockPortfolioClient::new(&env, &portfolio_id);
-        portfolio.set_account_age(&user, &DEFAULT_HIGH_TENURE_MIN_SECS);
-
-        env.as_contract(&cid, || {
-            set_priority_config(&env, &PriorityConfig::default());
-            let tier = get_follower_priority_tier(&env, &user, Some(&portfolio_id));
-            assert_eq!(tier, FollowerPriorityTier::HighTenure);
-        });
-    }
-
-    #[test]
-    fn high_stake_trumps_high_tenure() {
-        let (env, cid) = setup_env();
-        let user = Address::generate(&env);
-        let portfolio_id = env.register(MockPortfolio, ());
-        let portfolio = MockPortfolioClient::new(&env, &portfolio_id);
-        portfolio.set_stake(&user, &DEFAULT_HIGH_STAKE_MIN);
-        portfolio.set_account_age(&user, &DEFAULT_HIGH_TENURE_MIN_SECS);
-
-        env.as_contract(&cid, || {
-            set_priority_config(&env, &PriorityConfig::default());
-            let tier = get_follower_priority_tier(&env, &user, Some(&portfolio_id));
-            assert_eq!(tier, FollowerPriorityTier::HighStake);
-        });
-    }
-}
-
-        });
-    }
-
-    (result, counter)
-}
-
-
-}
-
-/// Read the consecutive priority-only batch counter.
-pub fn get_priority_batch_counter(env: &Env) -> u32 {
-    env.storage()
-        .instance()
-        .get(&StorageKey::PriorityBatchCounter)
-        .unwrap_or(0)
-}
-
-/// Set the consecutive priority-only batch counter.
-pub fn set_priority_batch_counter(env: &Env, count: u32) {
-    env.storage()
-        .instance()
-        .set(&StorageKey::PriorityBatchCounter, &count);
-}
-
-            high_tenure_min_secs: DEFAULT_HIGH_TENURE_MIN_SECS,
-            fairness_batch_window: DEFAULT_FAIRNESS_BATCH_WINDOW,
-        }
     }
 }
