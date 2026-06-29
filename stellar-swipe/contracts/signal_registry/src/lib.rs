@@ -8,6 +8,7 @@ mod admin;
 mod analytics;
 mod categories;
 mod churn_risk;
+mod cohort_retention;
 mod collaboration;
 mod combos;
 mod community_voting;
@@ -100,6 +101,7 @@ use types::{
 // SignalData is a type alias for SignalDataV2; keep the alias re-export for
 // any external clients compiled against the old name (Issue #568).
 pub use types::SignalData;
+pub use cohort_retention::{CohortRetention, get_cohort_retention as cohort_retention_get};
 use versioning::{CopyRecord, SignalVersion};
 
 const MAX_EXPIRY_SECONDS: u64 = SECONDS_PER_30_DAY_MONTH;
@@ -1931,6 +1933,9 @@ impl SignalRegistry {
             },
         );
 
+        // #672: record copy-trade activity for cohort retention
+        cohort_retention::record_activity(&env, &signal.provider, &caller);
+
         // Emit event
         events::emit_signal_adopted(&env, signal_id, caller.clone(), signal.adoption_count);
 
@@ -2050,6 +2055,9 @@ impl SignalRegistry {
         social::follow_provider(&env, user.clone(), provider.clone())
             .map_err(|_| AdminError::CannotFollowSelf)?;
 
+        // #672: record cohort membership on first follow
+        cohort_retention::record_follow(&env, &provider, &user);
+
         Self::sync_provider_social_metrics(&env, &provider);
         Self::update_provider_trust_score(env, provider);
 
@@ -2075,6 +2083,18 @@ impl SignalRegistry {
     /// Get follower count for a provider
     pub fn get_follower_count(env: Env, provider: Address) -> u32 {
         social::get_follower_count(&env, &provider)
+    }
+
+    // ── Issue #672: Cohort retention ──────────────────────────────────────────
+
+    /// Read-only: return cohort retention summary for a provider and week slot.
+    /// `cohort_week_slot` = first_follow_timestamp / (7 * 24 * 3600).
+    pub fn get_cohort_retention(
+        env: Env,
+        provider: Address,
+        cohort_week_slot: u64,
+    ) -> cohort_retention::CohortRetention {
+        cohort_retention::get_cohort_retention(&env, &provider, cohort_week_slot)
     }
 
     fn sync_provider_social_metrics(env: &Env, provider: &Address) {

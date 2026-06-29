@@ -6,6 +6,9 @@
 //! deltas against the previous snapshot, emits a `WeeklyHealthReport` event, then
 //! rotates current → previous for next week's comparison.
 
+// Closes #673 — real-time TVL tracking
+pub mod tvl;
+
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 use stellar_swipe_common::SECONDS_PER_WEEK;
 
@@ -307,6 +310,25 @@ impl AnalyticsContract {
             None => return false,
         };
         compute_snapshot_checksum(&snapshot) == recorded
+    }
+
+    // ── Issue #673: TVL tracking entrypoints ──────────────────────────────────
+
+    /// Read-only: return the current aggregated TVL across all sources.
+    pub fn get_protocol_tvl(env: Env) -> tvl::TvlSnapshot {
+        tvl::get_protocol_tvl(&env)
+    }
+
+    /// Record an incremental deposit into one TVL source.
+    /// `source`: 0 = StakeVault, 1 = LiquidityPool, 2 = Escrow.
+    pub fn record_tvl_deposit(env: Env, source: tvl::TvlSource, amount: i128) {
+        tvl::apply_delta(&env, source, amount);
+    }
+
+    /// Record an incremental withdrawal from one TVL source.
+    /// `source`: 0 = StakeVault, 1 = LiquidityPool, 2 = Escrow.
+    pub fn record_tvl_withdrawal(env: Env, source: tvl::TvlSource, amount: i128) {
+        tvl::apply_delta(&env, source, -amount);
     }
 }
 
