@@ -487,8 +487,8 @@ impl SignalRegistry {
     /// Extend the top-level `StorageKey::Signals` map so active signal data
     /// is never unexpectedly archived.  Open to any caller.
     pub fn bump_signals_ttl(env: Env) {
-        stellar_swipe_common::force_bump_persistent(&env, &StorageKey::Signals);
-        stellar_swipe_common::force_bump_persistent(&env, &StorageKey::ActiveSignalsByCategory);
+        stellar_swipe_common::ttl_manager::force_bump_persistent(&env, &StorageKey::Signals);
+        stellar_swipe_common::ttl_manager::force_bump_persistent(&env, &StorageKey::ActiveSignalsByCategory);
     }
 
     /// Read-only health probe for monitoring and front-ends (no auth).
@@ -2354,6 +2354,46 @@ impl SignalRegistry {
         categories::auto_suggest_tags(&env, &rationale)
     }
 
+    /// Return active, non-expired signals for `category` with pagination.
+    ///
+    /// Uses the pre-built per-category index (`ActiveSignalsByCategory`) so
+    /// callers do not have to scan the entire signals map.  Only signals whose
+    /// `status == Active` and `expiry > now` are included in the result.
+    ///
+    /// `offset` is the number of qualifying signals to skip; `limit` caps how
+    /// many are returned (clamped to 50 to bound response size).
+    pub fn list_signals_by_category(
+        env: Env,
+        category: SignalCategory,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Signal> {
+        let limit = limit.min(50);
+        let cat_map = Self::get_category_index_map(&env);
+        let ids: Vec<u64> = cat_map.get(category).unwrap_or(Vec::new(&env));
+        let signals_map = Self::get_signals_map(&env);
+        let now = env.ledger().timestamp();
+
+        let mut result = Vec::new(&env);
+        let mut seen: u32 = 0;
+        for i in 0..ids.len() {
+            if result.len() >= limit {
+                break;
+            }
+            let id = ids.get(i).unwrap();
+            let Some(signal) = signals_map.get(id) else { continue };
+            if signal.status != SignalStatus::Active || signal.expiry <= now {
+                continue;
+            }
+            if seen < offset {
+                seen += 1;
+                continue;
+            }
+            result.push_back(signal);
+        }
+        result
+    }
+
     /* =======
        SIGNAL IMPORT FUNCTIONS
     ========================== */
@@ -3008,8 +3048,8 @@ impl SignalRegistry {
     // ── Provider specialization tags (Issue #704) ─────────────────────────────
 
     /// Admin: add a specialization tag to the admin-defined set.
-    pub fn add_specialization_tag(env: Env, admin: Address, tag: String) -> Result<(), ()> {
-        providers::add_specialization_tag(&env, &admin, tag)
+    pub fn add_specialization_tag(env: Env, admin: Address, tag: String) {
+        let _ = providers::add_specialization_tag(&env, &admin, tag);
     }
 
     /// Admin: remove a specialization tag from the admin-defined set.
@@ -3104,5 +3144,8 @@ mod test_multisig_approval;
 mod test_scheduling;
 #[cfg(test)]
 mod test_signal_issues;
+/// Signal categorization query tests (Issue #660).
+#[cfg(test)]
+mod test_categorization;
 #[cfg(test)]
 mod tests;

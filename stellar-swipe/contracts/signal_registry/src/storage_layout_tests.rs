@@ -26,6 +26,8 @@
 
 #![cfg(test)]
 
+extern crate std;
+
 use crate::categories::{RiskLevel, SignalCategory};
 use crate::scheduling::ScheduleDataKey;
 use crate::types::{
@@ -34,17 +36,18 @@ use crate::types::{
 };
 use crate::{SignalRegistry, StorageKey};
 use soroban_sdk::testutils::Address as _;
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{Address, Bytes, Env, String, Vec};
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /// Compute the hex-encoded XDR bytes of `val` using the Soroban host.
-/// `env.to_xdr()` is available in testutils and returns `Bytes`.
+/// Uses the `ToXdr` trait from soroban-sdk (available in testutils build).
 fn xdr_hex<T: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, val: T) -> std::string::String {
-    let xdr: Bytes = env.to_xdr(val);
+    let xdr: Bytes = val.to_xdr(env);
     let mut out = std::string::String::with_capacity(xdr.len() as usize * 2);
     for byte in xdr.iter() {
-        out.push_str(&format!("{:02x}", byte));
+        out.push_str(&std::format!("{:02x}", byte));
     }
     out
 }
@@ -64,7 +67,7 @@ fn load_baseline(name: &str) -> Option<std::string::String> {
             if trimmed == "PENDING" {
                 None
             } else {
-                Some(trimmed.to_string())
+                Some(std::string::String::from(trimmed))
             }
         }
         Err(_) => None,
@@ -79,7 +82,7 @@ fn write_baseline(name: &str, hex: &str) {
         name
     );
     std::fs::write(&path, hex).expect("failed to write snapshot baseline");
-    eprintln!("SNAPSHOT_UPDATE: wrote {}.hex", name);
+    std::eprintln!("SNAPSHOT_UPDATE: wrote {}.hex", name);
 }
 
 /// Assert that `actual_hex` matches the committed baseline for `snapshot_name`.
@@ -93,7 +96,7 @@ fn assert_snapshot(snapshot_name: &str, actual_hex: &str) {
         None => {
             // No committed baseline yet — generate it on this first run.
             write_baseline(snapshot_name, actual_hex);
-            eprintln!(
+            std::eprintln!(
                 "INFO: generated initial snapshot for '{snapshot_name}'. \
                  Commit the updated file at storage-snapshots/{snapshot_name}.hex."
             );

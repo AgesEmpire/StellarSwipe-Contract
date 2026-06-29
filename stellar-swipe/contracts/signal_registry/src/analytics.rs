@@ -558,7 +558,7 @@ mod pagination_tests {
     use super::*;
     use crate::categories::RiskLevel;
     use crate::types::SignalAction;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     fn make_signal(env: &Env, id: u64, provider: &Address, ts: u64) -> Signal {
         Signal {

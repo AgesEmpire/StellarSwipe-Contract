@@ -59,6 +59,25 @@ pub fn set_expected_wasm_hash(env: &Env, contract_id: &Address, hash: &BytesN<32
         .set(&AuthStorageKey::ExpectedWasmHash(contract_id.clone()), hash);
 }
 
+/// Extract the WASM hash from a contract's `executable()` return value without
+/// naming the private `soroban_sdk::Executable` type.
+///
+/// The `#[contracttype]` encoding for `Executable::Wasm(hash)` is a soroban
+/// `Vec<Val>` whose first element is `Symbol("Wasm")` and second element is
+/// the `BytesN<32>` hash. Any other variant or encoding returns `None`.
+#[cfg(any(test, feature = "testutils"))]
+fn wasm_hash_from_executable(env: &Env, contract_id: &Address) -> Option<BytesN<32>> {
+    use soroban_sdk::{IntoVal, Symbol, TryFromVal, Val, Vec};
+    let exec = contract_id.executable()?;
+    let exec_val: Val = exec.into_val(env);
+    let exec_vec = Vec::<Val>::try_from_val(env, &exec_val).ok()?;
+    let sym: Symbol = Symbol::try_from_val(env, &exec_vec.get(0)?).ok()?;
+    if sym != Symbol::new(env, "Wasm") {
+        return None;
+    }
+    BytesN::<32>::try_from_val(env, &exec_vec.get(1)?).ok()
+}
+
 /// Verify that `contract_id` is running the expected wasm hash.
 /// Returns `WasmHashError::UnexpectedContractVersion` on mismatch or if no
 /// expected hash has been registered.
@@ -70,10 +89,8 @@ pub fn verify_wasm_hash(env: &Env, contract_id: &Address) -> Result<(), WasmHash
             .instance()
             .get(&AuthStorageKey::ExpectedWasmHash(contract_id.clone()))
             .ok_or(WasmHashError::UnexpectedContractVersion)?;
-        let actual = match contract_id.executable() {
-            Some(soroban_sdk::Executable::Wasm(hash)) => hash,
-            _ => return Err(WasmHashError::UnexpectedContractVersion),
-        };
+        let actual = wasm_hash_from_executable(env, contract_id)
+            .ok_or(WasmHashError::UnexpectedContractVersion)?;
         if actual != expected {
             return Err(WasmHashError::UnexpectedContractVersion);
         }
@@ -203,11 +220,8 @@ mod tests {
     fn wasm_hash_match_succeeds() {
         let (env, contract_id) = setup();
         let other_id = env.register(TestContract, ());
-        // Fetch the real wasm hash of the other contract
-        let real_hash = match other_id.executable() {
-            Some(soroban_sdk::Executable::Wasm(hash)) => hash,
-            _ => panic!("expected wasm contract"),
-        };
+        let real_hash = wasm_hash_from_executable(&env, &other_id)
+            .expect("expected wasm contract");
         env.as_contract(&contract_id, || {
             set_expected_wasm_hash(&env, &other_id, &real_hash);
             assert!(verify_wasm_hash(&env, &other_id).is_ok());
