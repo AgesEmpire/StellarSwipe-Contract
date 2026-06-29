@@ -611,6 +611,7 @@ pub fn emit_provider_banned(
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Bytes;

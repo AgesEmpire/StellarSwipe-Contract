@@ -36,6 +36,8 @@ pub enum AdminError {
     ProposalAlreadyExecuted = 31,
     ProposalCancelled = 32,
     TooManyProposals = 33,
+    /// Provider has submitted too recently; must wait for the cooldown period to elapse.
+    CooldownNotElapsed = 34,
 }
 
 #[contracterror]

@@ -44,6 +44,9 @@ mod versioning;
 /// Storage-layout XDR snapshot regression tests (Issue #580).
 #[cfg(test)]
 mod storage_layout_tests;
+/// Provider submission cooldown tests (Issue #661).
+#[cfg(test)]
+mod test_submission_cooldown;
 
 pub use categories::{RiskLevel, SignalCategory};
 pub use multisig_approvals::CriticalActionPayload;
@@ -163,6 +166,11 @@ pub enum StorageKey {
     /// Minimum number of seconds a signal must remain active before the provider
     /// may cancel it. Set by admin; 0 means no minimum (issue #687).
     MinSignalLifetime,
+    /// Minimum number of seconds a provider must wait between signal submissions.
+    /// 0 (default) disables cooldown enforcement (issue #661).
+    SubmissionCooldown,
+    /// Timestamp of a provider's most recent successful signal submission (issue #661).
+    ProviderLastSignal(Address),
 }
 #[contractimpl]
 impl SignalRegistry {
@@ -260,6 +268,29 @@ impl SignalRegistry {
 
     pub fn set_min_stake(env: Env, caller: Address, new_amount: i128) -> Result<(), AdminError> {
         admin::set_min_stake(&env, &caller, new_amount)
+    }
+
+    /// Admin: configure the minimum seconds between signal submissions per provider.
+    /// A value of 0 disables cooldown enforcement (issue #661).
+    pub fn set_submission_cooldown(
+        env: Env,
+        caller: Address,
+        cooldown_secs: u64,
+    ) -> Result<(), AdminError> {
+        admin::require_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::SubmissionCooldown, &cooldown_secs);
+        Ok(())
+    }
+
+    /// Returns the current submission cooldown in seconds (0 = disabled).
+    pub fn get_submission_cooldown(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::SubmissionCooldown)
+            .unwrap_or(0u64)
     }
 
     /// User stakes tokens. Rate-limited to 5 changes per day.
@@ -489,8 +520,8 @@ impl SignalRegistry {
     /// Extend the top-level `StorageKey::Signals` map so active signal data
     /// is never unexpectedly archived.  Open to any caller.
     pub fn bump_signals_ttl(env: Env) {
-        stellar_swipe_common::force_bump_persistent(&env, &StorageKey::Signals);
-        stellar_swipe_common::force_bump_persistent(&env, &StorageKey::ActiveSignalsByCategory);
+        stellar_swipe_common::ttl_manager::force_bump_persistent(&env, &StorageKey::Signals);
+        stellar_swipe_common::ttl_manager::force_bump_persistent(&env, &StorageKey::ActiveSignalsByCategory);
     }
 
     /// Read-only health probe for monitoring and front-ends (no auth).
@@ -875,6 +906,27 @@ impl SignalRegistry {
             provider_stake_tier,
         )?;
 
+        // Submission cooldown check (issue #661)
+        {
+            let cooldown: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::SubmissionCooldown)
+                .unwrap_or(0u64);
+            if cooldown > 0 {
+                let last_signal_time: u64 = env
+                    .storage()
+                    .persistent()
+                    .get(&StorageKey::ProviderLastSignal(provider.clone()))
+                    .unwrap_or(0u64);
+                if last_signal_time > 0
+                    && env.ledger().timestamp() < last_signal_time + cooldown
+                {
+                    return Err(AdminError::CooldownNotElapsed);
+                }
+            }
+        }
+
         // Rate limit: signal submission
         let trust = reputation::get_trust_score(env, &provider)
             .map(|d| d.score)
@@ -963,6 +1015,11 @@ impl SignalRegistry {
             // Record first signal time for trust score calculation
             reputation::record_first_signal(env, &provider);
         }
+
+        // Record submission timestamp for cooldown tracking (issue #661)
+        env.storage()
+            .persistent()
+            .set(&StorageKey::ProviderLastSignal(provider.clone()), &now);
 
         Ok(id)
     }
@@ -3028,8 +3085,8 @@ impl SignalRegistry {
     // ── Provider specialization tags (Issue #704) ─────────────────────────────
 
     /// Admin: add a specialization tag to the admin-defined set.
-    pub fn add_specialization_tag(env: Env, admin: Address, tag: String) -> Result<(), ()> {
-        providers::add_specialization_tag(&env, &admin, tag)
+    pub fn add_specialization_tag(env: Env, admin: Address, tag: String) {
+        let _ = providers::add_specialization_tag(&env, &admin, tag);
     }
 
     /// Admin: remove a specialization tag from the admin-defined set.
