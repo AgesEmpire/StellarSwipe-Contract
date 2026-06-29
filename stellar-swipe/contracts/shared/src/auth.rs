@@ -220,6 +220,7 @@ mod tests {
     fn wasm_hash_match_succeeds() {
         let (env, contract_id) = setup();
         let other_id = env.register(TestContract, ());
+        // Fetch the real wasm hash via our helper (avoids naming the private Executable type)
         let real_hash = wasm_hash_from_executable(&env, &other_id)
             .expect("expected wasm contract");
         env.as_contract(&contract_id, || {

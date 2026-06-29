@@ -3,6 +3,8 @@
 #[allow(deprecated)]
 mod admin;
 mod conversion;
+// Closes #671 — cross-source price deviation alerting
+mod deviation;
 mod errors;
 #[allow(deprecated)]
 mod events;
@@ -11,6 +13,8 @@ mod history;
 mod multi_hop;
 mod reputation;
 mod sdex;
+// Closes #670 — per-asset update frequency SLA monitoring
+mod sla;
 mod staleness;
 mod storage;
 mod types;
@@ -32,8 +36,10 @@ use types::{
 };
 
 pub use conversion::{convert_to_base, ConversionPath};
+pub use deviation::{check_deviation, get_deviation_threshold, set_deviation_threshold};
 pub use history::{calculate_twap, get_historical_price, get_twap_deviation, store_price};
 pub use multi_hop::{calculate_multi_hop_price, find_optimal_path, LiquidityPath};
+pub use sla::{get_feed_health, record_update as sla_record_update, set_sla, FeedHealth};
 pub use storage::{get_base_currency, get_price, set_base_currency, set_price};
 
 soroban_sdk::contractmeta!(
@@ -485,6 +491,46 @@ impl OracleContract {
             .unwrap_or(Vec::new(env))
     }
 
+    // ── Issue #670: SLA monitoring entrypoints ─────────────────────────────────
+
+    /// Admin: set the expected update interval SLA for an asset pair.
+    pub fn set_feed_sla(
+        env: Env,
+        caller: Address,
+        pair: AssetPair,
+        expected_interval_secs: u64,
+    ) -> Result<(), OracleError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        sla::set_sla(&env, &pair, expected_interval_secs);
+        Ok(())
+    }
+
+    /// Read-only: return the feed health summary (rolling avg, SLA, breach flag).
+    pub fn get_feed_health(env: Env, pair: AssetPair) -> sla::FeedHealth {
+        sla::get_feed_health(&env, &pair)
+    }
+
+    // ── Issue #671: Deviation alert entrypoints ────────────────────────────────
+
+    /// Admin: set the deviation alert threshold for a pair (basis points).
+    pub fn set_deviation_threshold(
+        env: Env,
+        caller: Address,
+        pair: AssetPair,
+        threshold_bps: u32,
+    ) -> Result<(), OracleError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        deviation::set_deviation_threshold(&env, &pair, threshold_bps);
+        Ok(())
+    }
+
+    /// Read-only: return current deviation alert threshold in bps (0 = disabled).
+    pub fn get_deviation_threshold(env: Env, pair: AssetPair) -> u32 {
+        deviation::get_deviation_threshold(&env, &pair)
+    }
+
     /// Get all registered oracles
     pub fn get_oracles(env: Env) -> Vec<Address> {
         Self::read_oracles(&env)
@@ -752,6 +798,14 @@ impl OracleContract {
         env.storage().temporary().set(&key, &prices);
         env.storage().temporary().extend_ttl(&key, 60, 60);
 
+        // #671: compute cross-source deviation and emit alert if threshold exceeded
+        let mut source_prices: Vec<(Address, i128)> = Vec::new(&env);
+        for i in 0..prices.len() {
+            let p = prices.get(i).unwrap();
+            source_prices.push_back((p.source, p.price));
+        }
+        deviation::check_deviation(&env, &pair, &source_prices);
+
         Ok(())
     }
 
@@ -822,6 +876,9 @@ pub fn on_price_update(env: &Env, pair: AssetPair) {
     metadata.update_count_24h += 1;
     metadata.last_heartbeat_status = OracleStatus::Healthy;
     staleness::set_metadata(env, &pair, metadata);
+
+    // #670: update rolling SLA cadence tracking
+    sla::record_update(env, &pair);
 }
 
 fn maybe_emit_heartbeat_missed(env: &Env, pair: &AssetPair, health: &OracleHealth) {
