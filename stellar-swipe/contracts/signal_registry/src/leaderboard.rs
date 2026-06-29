@@ -7,7 +7,7 @@
 //! Qualification: provider must have >= MIN_CLOSED_SIGNALS (10) closed signals.
 
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Vec};
-use stellar_swipe_common::{bump_persistent_if_needed, force_bump_persistent};
+use stellar_swipe_common::ttl_manager::{bump_persistent_if_needed, force_bump_persistent};
 
 use crate::social;
 use crate::stake;

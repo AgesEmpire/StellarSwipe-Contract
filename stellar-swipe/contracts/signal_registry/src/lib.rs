@@ -487,8 +487,8 @@ impl SignalRegistry {
     /// Extend the top-level `StorageKey::Signals` map so active signal data
     /// is never unexpectedly archived.  Open to any caller.
     pub fn bump_signals_ttl(env: Env) {
-        stellar_swipe_common::force_bump_persistent(&env, &StorageKey::Signals);
-        stellar_swipe_common::force_bump_persistent(&env, &StorageKey::ActiveSignalsByCategory);
+        stellar_swipe_common::ttl_manager::force_bump_persistent(&env, &StorageKey::Signals);
+        stellar_swipe_common::ttl_manager::force_bump_persistent(&env, &StorageKey::ActiveSignalsByCategory);
     }
 
     /// Read-only health probe for monitoring and front-ends (no auth).
@@ -3008,8 +3008,8 @@ impl SignalRegistry {
     // ── Provider specialization tags (Issue #704) ─────────────────────────────
 
     /// Admin: add a specialization tag to the admin-defined set.
-    pub fn add_specialization_tag(env: Env, admin: Address, tag: String) -> Result<(), ()> {
-        providers::add_specialization_tag(&env, &admin, tag)
+    pub fn add_specialization_tag(env: Env, admin: Address, tag: String) {
+        let _ = providers::add_specialization_tag(&env, &admin, tag);
     }
 
     /// Admin: remove a specialization tag from the admin-defined set.

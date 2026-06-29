@@ -70,4 +70,10 @@ pub enum DataKey {
     UserFifoLots(Address),
     /// Cumulative realized P&L from FIFO lot consumption.
     UserFifoRealizedPnl(Address),
+    /// Unix timestamp (seconds) at which position `id` was opened, used to populate
+    /// the `open_ts` field of tax events on close (Issue #658).
+    PositionOpenedAt(u64),
+    /// Ordered list of realized tax events for a user (Issue #658).
+    /// Appended on every `close_position` or `close_position_keeper` call.
+    UserTaxEvents(Address),
 }

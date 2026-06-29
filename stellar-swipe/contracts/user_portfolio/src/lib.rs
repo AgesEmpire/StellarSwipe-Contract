@@ -149,6 +149,24 @@ pub struct Position {
     pub realized_pnl: i128,
 }
 
+/// A realized tax event recorded whenever a position is closed (Issue #658).
+/// Suitable for CSV export by downstream tax reporting tools.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaxEvent {
+    pub position_id: u64,
+    /// Unix timestamp (seconds) when the position was opened.
+    pub open_ts: u64,
+    /// Unix timestamp (seconds) when the position was closed.
+    pub close_ts: u64,
+    pub entry_price: i128,
+    /// Exit price at close time; 0 for keeper-triggered closes where the price is unknown.
+    pub exit_price: i128,
+    pub amount: i128,
+    pub realized_pnl: i128,
+    pub asset_pair: u32,
+}
+
 /// A single cost lot used for FIFO P&L tracking.
 /// Lots are enqueued via `add_cost_lot` and consumed front-first by `close_fifo`.
 #[contracttype]
@@ -438,6 +456,11 @@ impl UserPortfolio {
         };
         env.storage().persistent().set(&DataKey::Position(id), &pos);
 
+        // Record open timestamp for tax event log (Issue #658).
+        env.storage()
+            .persistent()
+            .set(&DataKey::PositionOpenedAt(id), &env.ledger().timestamp());
+
         let key = DataKey::UserPositions(user.clone());
         let mut list: Vec<u64> = env
             .storage()
@@ -532,6 +555,33 @@ impl UserPortfolio {
         pos.realized_pnl = realized_pnl;
         env.storage().persistent().set(&pkey, &pos);
         Self::mark_position_closed(&env, &user, position_id);
+
+        // Append tax event for reporting (Issue #658).
+        {
+            let open_ts: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PositionOpenedAt(position_id))
+                .unwrap_or(0);
+            let tax_event = TaxEvent {
+                position_id,
+                open_ts,
+                close_ts: env.ledger().timestamp(),
+                entry_price: pos.entry_price,
+                exit_price,
+                amount: pos.amount,
+                realized_pnl,
+                asset_pair,
+            };
+            let tax_key = DataKey::UserTaxEvents(user.clone());
+            let mut tax_events: Vec<TaxEvent> = env
+                .storage()
+                .persistent()
+                .get(&tax_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            tax_events.push_back(tax_event);
+            env.storage().persistent().set(&tax_key, &tax_events);
+        }
 
         // Emit TradeShareable only for profitable closes (pnl > 0).
         if realized_pnl > 0 {
@@ -707,6 +757,34 @@ impl UserPortfolio {
         pos.realized_pnl = 0;
         env.storage().persistent().set(&pkey, &pos);
         Self::mark_position_closed(&env, &user, position_id);
+
+        // Append tax event for reporting (Issue #658). exit_price is 0 — keeper
+        // closes don't supply a price; downstream tools should treat 0 as unknown.
+        {
+            let open_ts: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PositionOpenedAt(position_id))
+                .unwrap_or(0);
+            let tax_event = TaxEvent {
+                position_id,
+                open_ts,
+                close_ts: env.ledger().timestamp(),
+                entry_price: pos.entry_price,
+                exit_price: 0,
+                amount: pos.amount,
+                realized_pnl: 0,
+                asset_pair,
+            };
+            let tax_key = DataKey::UserTaxEvents(user.clone());
+            let mut tax_events: Vec<TaxEvent> = env
+                .storage()
+                .persistent()
+                .get(&tax_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            tax_events.push_back(tax_event);
+            env.storage().persistent().set(&tax_key, &tax_events);
+        }
 
         // Emit event for keeper close (no TradeShareable since pnl=0).
         shared::events::emit_position_closed_by_keeper(
@@ -1051,6 +1129,50 @@ impl UserPortfolio {
             .set(&pnl_key, &prev.saturating_add(total_pnl));
 
         total_pnl
+    }
+
+    // ── Tax event log (Issue #658) ────────────────────────────────────────────
+
+    /// Returns tax events for `user` whose `close_ts` falls in `[from_ts, to_ts]`
+    /// (inclusive), with pagination via `offset` and `limit`.
+    ///
+    /// Events are returned in chronological close order (the order they were appended).
+    /// Pass `from_ts = 0` and `to_ts = u64::MAX` to retrieve all events.
+    pub fn get_tax_events(
+        env: Env,
+        user: Address,
+        from_ts: u64,
+        to_ts: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<TaxEvent> {
+        let tax_key = DataKey::UserTaxEvents(user);
+        let all: Vec<TaxEvent> = env
+            .storage()
+            .persistent()
+            .get(&tax_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut result = Vec::new(&env);
+        let mut skipped = 0u32;
+        let mut count = 0u32;
+
+        for i in 0..all.len() {
+            let event = all.get(i).unwrap();
+            if event.close_ts < from_ts || event.close_ts > to_ts {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if count >= limit {
+                break;
+            }
+            result.push_back(event);
+            count += 1;
+        }
+        result
     }
 
     fn require_admin(env: &Env) {

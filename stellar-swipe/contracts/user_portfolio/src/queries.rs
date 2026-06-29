@@ -6,8 +6,9 @@ use crate::{
 };
 use soroban_sdk::{Address, Env, Vec};
 use stellar_swipe_common::{
-    oracle_price_to_i128, validate_freshness, Amount, IOracleClient, OnChainOracleClient,
+    oracle_price_to_i128, validate_freshness, IOracleClient, OnChainOracleClient,
 };
+use stellar_swipe_common::checked_amount::Amount;
 
 const MAX_INLINE_CLOSED_POSITIONS: u32 = 20;
 const MAX_TRADE_HISTORY_LIMIT: u32 = 50;

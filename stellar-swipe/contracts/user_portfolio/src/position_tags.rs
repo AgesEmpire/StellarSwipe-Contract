@@ -175,6 +175,7 @@ pub fn get_position_tag(env: &Env, user: Address, position_id: u64) -> Option<St
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use soroban_sdk::{contract, contractimpl, testutils::Address as _, Env};
 
