@@ -2431,6 +2431,46 @@ impl SignalRegistry {
         categories::auto_suggest_tags(&env, &rationale)
     }
 
+    /// Return active, non-expired signals for `category` with pagination.
+    ///
+    /// Uses the pre-built per-category index (`ActiveSignalsByCategory`) so
+    /// callers do not have to scan the entire signals map.  Only signals whose
+    /// `status == Active` and `expiry > now` are included in the result.
+    ///
+    /// `offset` is the number of qualifying signals to skip; `limit` caps how
+    /// many are returned (clamped to 50 to bound response size).
+    pub fn list_signals_by_category(
+        env: Env,
+        category: SignalCategory,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Signal> {
+        let limit = limit.min(50);
+        let cat_map = Self::get_category_index_map(&env);
+        let ids: Vec<u64> = cat_map.get(category).unwrap_or(Vec::new(&env));
+        let signals_map = Self::get_signals_map(&env);
+        let now = env.ledger().timestamp();
+
+        let mut result = Vec::new(&env);
+        let mut seen: u32 = 0;
+        for i in 0..ids.len() {
+            if result.len() >= limit {
+                break;
+            }
+            let id = ids.get(i).unwrap();
+            let Some(signal) = signals_map.get(id) else { continue };
+            if signal.status != SignalStatus::Active || signal.expiry <= now {
+                continue;
+            }
+            if seen < offset {
+                seen += 1;
+                continue;
+            }
+            result.push_back(signal);
+        }
+        result
+    }
+
     /* =======
        SIGNAL IMPORT FUNCTIONS
     ========================== */
@@ -3181,5 +3221,8 @@ mod test_multisig_approval;
 mod test_scheduling;
 #[cfg(test)]
 mod test_signal_issues;
+/// Signal categorization query tests (Issue #660).
+#[cfg(test)]
+mod test_categorization;
 #[cfg(test)]
 mod tests;
