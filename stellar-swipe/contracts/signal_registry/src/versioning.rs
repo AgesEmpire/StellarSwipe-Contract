@@ -230,8 +230,6 @@ pub fn edit_signal_with_audit(
     Ok(new_version)
 }
 
-pub fn get_signal_history
-
 pub fn get_signal_history(env: &Env, signal_id: u64) -> Vec<SignalVersion> {
     let version_key = VersioningStorageKey::LatestVersion(signal_id);
     let latest_version: u32 = env.storage().persistent().get(&version_key).unwrap_or(1);
