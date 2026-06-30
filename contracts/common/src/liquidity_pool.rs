@@ -49,6 +49,159 @@ pub struct LiquidityPosition {
     pub created_at: u64,
 }
 
+/// Per-deposit record used for FIFO lock-up enforcement.
+///
+/// Each call to `add_liquidity` (or `create_pool`) appends one record that
+/// captures the number of LP shares minted and the ledger timestamp at the
+/// time of deposit.  Shares are consumed in FIFO order during withdrawals.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct DepositRecord {
+    /// Number of LP shares minted by this individual deposit.
+    pub shares: i128,
+    /// `env.ledger().timestamp()` at the time of deposit (Unix seconds).
+    pub deposited_at: u64,
+}
+
+// ============================================================================
+// Lockup Administration
+// ============================================================================
+
+/// Admin-only functions for configuring the lock-up period.
+pub struct LockupAdmin;
+
+impl LockupAdmin {
+    /// Set the global minimum lock-up duration (in seconds).
+    ///
+    /// Only an authorised admin address may call this.  A duration of `0`
+    /// effectively disables lock-up enforcement (all deposits are immediately
+    /// withdrawable).
+    ///
+    /// # Parameters
+    /// * `admin`    – Address that must authorise the call.
+    /// * `duration` – New lock-up period in seconds.
+    pub fn set_lockup_duration(env: &Env, admin: Address, duration: u64) {
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::LockupDuration, &duration);
+    }
+
+    /// Read the currently configured lock-up duration in seconds.
+    /// Returns `0` if never set (no lock-up).
+    pub fn get_lockup_duration(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LockupDuration)
+            .unwrap_or(0u64)
+    }
+}
+
+// ============================================================================
+// Deposit-record helpers
+// ============================================================================
+
+/// Append a new `DepositRecord` to the FIFO queue for `(provider, pool_id)`.
+fn push_deposit_record(env: &Env, provider: &Address, pool_id: u64, record: DepositRecord) {
+    let key = DataKey::DepositRecords(provider.clone(), pool_id);
+    let mut records: Vec<DepositRecord> = env
+        .storage()
+        .instance()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    records.push_back(record);
+    env.storage().instance().set(&key, &records);
+}
+
+/// Consume shares from the FIFO queue, enforcing the lock-up period.
+///
+/// Returns `Ok(())` when exactly `shares_to_withdraw` unlocked shares are
+/// consumed and the updated queue has been persisted.
+///
+/// Returns `Err(PoolError::DepositLocked)` if the requested number of shares
+/// cannot be fully covered by deposits that have cleared the lock-up window.
+fn consume_locked_shares(
+    env: &Env,
+    provider: &Address,
+    pool_id: u64,
+    shares_to_withdraw: i128,
+    lockup_duration: u64,
+) -> Result<(), PoolError> {
+    let key = DataKey::DepositRecords(provider.clone(), pool_id);
+    let mut records: Vec<DepositRecord> = env
+        .storage()
+        .instance()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    let now = env.ledger().timestamp();
+    let mut remaining = shares_to_withdraw;
+    let mut consumed_count: u32 = 0;
+    // Track how many shares we partially consumed from the first non-fully-consumed record.
+    let mut partial_remainder: i128 = 0;
+
+    // Walk FIFO (index 0 = oldest deposit).
+    for i in 0..records.len() {
+        if remaining <= 0 {
+            break;
+        }
+
+        let record = records.get(i).unwrap();
+
+        // Check if this deposit has cleared the lock-up window.
+        let age = now.saturating_sub(record.deposited_at);
+        if age < lockup_duration {
+            // This deposit is still locked – and because records are FIFO
+            // (oldest first), all subsequent records are locked too.
+            return Err(PoolError::DepositLocked);
+        }
+
+        if record.shares <= remaining {
+            // Consume the entire record.
+            remaining -= record.shares;
+            consumed_count += 1;
+        } else {
+            // Partially consume this record.
+            partial_remainder = record.shares - remaining;
+            remaining = 0;
+            consumed_count += 1; // will be replaced, not removed
+            break;
+        }
+    }
+
+    if remaining > 0 {
+        // Not enough unlocked shares to cover the withdrawal.
+        return Err(PoolError::InsufficientShares);
+    }
+
+    // Rebuild the records vector, dropping fully consumed entries and
+    // adjusting the partially consumed one.
+    let mut new_records: Vec<DepositRecord> = Vec::new(env);
+    for i in consumed_count..records.len() {
+        if i == consumed_count && partial_remainder > 0 {
+            // Replace the partially consumed record with the leftover amount.
+            let old = records.get(i - 1).unwrap();
+            new_records.push_back(DepositRecord {
+                shares: partial_remainder,
+                deposited_at: old.deposited_at,
+            });
+            partial_remainder = 0; // already inserted
+        }
+        new_records.push_back(records.get(i).unwrap());
+    }
+    // Edge-case: partial_remainder not yet inserted (it was the last element).
+    if partial_remainder > 0 {
+        let old = records.get(consumed_count - 1).unwrap();
+        new_records.push_back(DepositRecord {
+            shares: partial_remainder,
+            deposited_at: old.deposited_at,
+        });
+    }
+
+    env.storage().instance().set(&key, &new_records);
+    Ok(())
+}
+
 /// Pool manager
 pub struct LiquidityPoolManager;
 
@@ -99,7 +252,7 @@ impl LiquidityPoolManager {
         
         // Create initial position for creator
         let position = LiquidityPosition {
-            provider: creator,
+            provider: creator.clone(),
             pool_id,
             shares: total_shares,
             deposited_a: initial_a,
@@ -109,6 +262,17 @@ impl LiquidityPoolManager {
         };
         
         Self::store_position(env, &position);
+        
+        // Record the initial deposit for lock-up tracking (FIFO queue).
+        push_deposit_record(
+            env,
+            &creator,
+            pool_id,
+            DepositRecord {
+                shares: total_shares,
+                deposited_at: env.ledger().timestamp(),
+            },
+        );
         
         Ok(pool)
     }
@@ -148,7 +312,18 @@ impl LiquidityPoolManager {
         );
         
         // Update or create position
-        Self::update_position(env, provider, pool_id, shares, amount_a, amount_b);
+        Self::update_position(env, provider.clone(), pool_id, shares, amount_a, amount_b);
+        
+        // Record this deposit for lock-up tracking (FIFO queue).
+        push_deposit_record(
+            env,
+            &provider,
+            pool_id,
+            DepositRecord {
+                shares,
+                deposited_at: env.ledger().timestamp(),
+            },
+        );
         
         Ok(shares)
     }
@@ -168,9 +343,26 @@ impl LiquidityPoolManager {
             .get(&DataKey::Pool(pool_id))
             .ok_or(PoolError::PoolNotFound)?;
         
+        // ── Lock-up enforcement ─────────────────────────────────────────────
+        // Read the currently configured lock-up duration.  If it is non-zero,
+        // validate that the oldest FIFO deposits covering `shares` have all
+        // cleared their lock-up window before touching any pool state.
+        let lockup_duration = LockupAdmin::get_lockup_duration(env);
+        if lockup_duration > 0 {
+            consume_locked_shares(env, &provider, pool_id, shares, lockup_duration)?;
+        }
+        // ────────────────────────────────────────────────────────────────────
+        
         // Calculate amounts to return
         let amount_a = (shares * pool.reserve_a) / pool.total_shares;
         let amount_b = (shares * pool.reserve_b) / pool.total_shares;
+        
+        // Enforce minimum-liquidity threshold: the pool balance must not drop
+        // below 1 000 units per reserve after a withdrawal.
+        let min_liquidity: i128 = 1_000;
+        if pool.reserve_a - amount_a < min_liquidity || pool.reserve_b - amount_b < min_liquidity {
+            return Err(PoolError::InsufficientLiquidity);
+        }
         
         // Update pool reserves
         pool.reserve_a -= amount_a;
@@ -1290,6 +1482,9 @@ pub enum PoolError {
     InsufficientShares = 6,
     RebalancingFailed = 7,
     OptimizationFailed = 8,
+    /// Withdrawal rejected because the requested shares include deposits that
+    /// are still within their lock-up period.
+    DepositLocked = 9,
 }
 
 /// Storage keys
@@ -1303,6 +1498,10 @@ pub enum DataKey {
     Position(Address, u64),
     IncentiveProgram(u64),
     Alert(u64),
+    /// Global minimum lock-up duration in seconds (set by admin).
+    LockupDuration,
+    /// FIFO queue of deposit records for a specific (provider, pool_id) pair.
+    DepositRecords(Address, u64),
 }
 
 // ============================================================================
@@ -1312,6 +1511,57 @@ pub enum DataKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::Env;
+
+    // ── Dummy contract for as_contract context ─────────────────────────────
+    //
+    // Soroban's env.storage() requires an active contract context.  We
+    // register a no-op contract and wrap every storage-touching call with
+    // env.as_contract(&cid, || { ... }).
+
+    #[contract]
+    struct DummyContract;
+
+    #[contractimpl]
+    impl DummyContract {}
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    /// Build a minimal pool seeded with enough liquidity to survive the
+    /// minimum-liquidity threshold in `remove_liquidity`.
+    ///
+    /// Returns `(env, contract_id, pool_id, provider, total_shares_minted)`.
+    fn setup_pool() -> (Env, Address, u64, Address, i128) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let cid = env.register(DummyContract, ());
+        let creator = Address::generate(&env);
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+
+        let initial_a: i128 = 100_000;
+        let initial_b: i128 = 100_000;
+
+        let pool = env.as_contract(&cid, || {
+            LiquidityPoolManager::create_pool(
+                &env,
+                token_a,
+                token_b,
+                initial_a,
+                initial_b,
+                30,
+                creator.clone(),
+            )
+            .expect("create_pool failed")
+        });
+
+        let total_shares = pool.total_shares;
+        (env, cid, pool.pool_id, creator, total_shares)
+    }
+
+    // ── Existing unit tests ────────────────────────────────────────────────
 
     #[test]
     fn test_sqrt() {
@@ -1327,17 +1577,18 @@ mod tests {
     fn test_initial_shares() {
         let shares = LiquidityPoolManager::calculate_initial_shares(1000, 1000);
         assert_eq!(shares, 1000);
-        
+
         let shares2 = LiquidityPoolManager::calculate_initial_shares(2000, 2000);
         assert_eq!(shares2, 2000);
     }
 
     #[test]
     fn test_liquidity_score() {
+        let env = Env::default();
         let pool = LiquidityPool {
             pool_id: 1,
-            token_a: Address::generate(&Env::default()),
-            token_b: Address::generate(&Env::default()),
+            token_a: Address::generate(&env),
+            token_b: Address::generate(&env),
             reserve_a: 10000000,
             reserve_b: 10000000,
             total_shares: 10000000,
@@ -1345,17 +1596,17 @@ mod tests {
             created_at: 0,
             last_rebalanced: 0,
         };
-        
         let score = PoolMonitor::calculate_liquidity_score(&pool);
         assert_eq!(score, 100);
     }
 
     #[test]
     fn test_balance_score() {
+        let env = Env::default();
         let pool = LiquidityPool {
             pool_id: 1,
-            token_a: Address::generate(&Env::default()),
-            token_b: Address::generate(&Env::default()),
+            token_a: Address::generate(&env),
+            token_b: Address::generate(&env),
             reserve_a: 1000,
             reserve_b: 1000,
             total_shares: 1000,
@@ -1363,8 +1614,177 @@ mod tests {
             created_at: 0,
             last_rebalanced: 0,
         };
-        
         let score = PoolMonitor::calculate_balance_score(&pool);
         assert_eq!(score, 100);
+    }
+
+    // ── Lock-up unit tests ─────────────────────────────────────────────────
+
+    /// Scenario 1: withdrawal before lock-up expiry must be rejected.
+    #[test]
+    fn test_withdrawal_before_lockup_expiry_is_rejected() {
+        let (env, cid, pool_id, provider, total_shares) = setup_pool();
+        let admin = Address::generate(&env);
+
+        let lockup_duration: u64 = 3_600;
+        env.as_contract(&cid, || {
+            LockupAdmin::set_lockup_duration(&env, admin, lockup_duration);
+        });
+
+        // No time has passed since the deposit – the full duration is still pending.
+        let withdraw_shares = total_shares / 2;
+        let result = env.as_contract(&cid, || {
+            LiquidityPoolManager::remove_liquidity(&env, pool_id, withdraw_shares, provider)
+        });
+
+        assert_eq!(
+            result,
+            Err(PoolError::DepositLocked),
+            "Withdrawal within lock-up window must return DepositLocked"
+        );
+    }
+
+    /// Scenario 2: withdrawal exactly at the lock-up expiry boundary must succeed.
+    #[test]
+    fn test_withdrawal_exactly_at_lockup_expiry_is_allowed() {
+        let (env, cid, pool_id, provider, _) = setup_pool();
+        let admin = Address::generate(&env);
+
+        let lockup_duration: u64 = 3_600;
+        env.as_contract(&cid, || {
+            LockupAdmin::set_lockup_duration(&env, admin, lockup_duration);
+        });
+
+        // Advance the ledger by exactly the lock-up duration.
+        let current_ts = env.ledger().timestamp();
+        env.ledger().set_timestamp(current_ts + lockup_duration);
+
+        let result = env.as_contract(&cid, || {
+            LiquidityPoolManager::remove_liquidity(&env, pool_id, 1, provider)
+        });
+
+        assert!(
+            result.is_ok(),
+            "Withdrawal at lock-up expiry must succeed, got {:?}",
+            result
+        );
+    }
+
+    /// Scenario 3: partial withdrawal spanning locked and unlocked deposits.
+    ///
+    /// t=0    first deposit  (~100 000 shares) – unlocked at t=3600
+    /// t=1800 second deposit (extra shares)    – still locked at t=3600
+    ///
+    /// At t=3600:
+    ///   Part A – withdraw (first_shares - 1): must succeed (unlocked batch only)
+    ///   Part B – withdraw 2 more: must fail (spills into locked second deposit)
+    ///
+    /// At t=5400 (second deposit now unlocked too):
+    ///   Part C – withdraw second_shares: must succeed
+    #[test]
+    fn test_partial_withdrawal_spanning_locked_and_unlocked_deposits() {
+        let (env, cid, pool_id, provider, first_shares) = setup_pool();
+        let admin = Address::generate(&env);
+
+        let lockup_duration: u64 = 3_600;
+        env.as_contract(&cid, || {
+            LockupAdmin::set_lockup_duration(&env, admin, lockup_duration);
+        });
+
+        // ── t = 1800: add second deposit ──────────────────────────────────
+        let t0 = env.ledger().timestamp();
+        env.ledger().set_timestamp(t0 + 1_800);
+
+        let second_shares = env.as_contract(&cid, || {
+            LiquidityPoolManager::add_liquidity(&env, pool_id, 50_000, 50_000, provider.clone())
+                .expect("add_liquidity failed")
+        });
+
+        // ── t = 3600: first deposit unlocked; second still locked ─────────
+        let t1 = env.ledger().timestamp();
+        env.ledger().set_timestamp(t1 + 1_800);
+
+        // Part A: consume (first_shares - 1) shares from the first deposit.
+        let result_a = env.as_contract(&cid, || {
+            LiquidityPoolManager::remove_liquidity(
+                &env,
+                pool_id,
+                first_shares - 1,
+                provider.clone(),
+            )
+        });
+        assert!(
+            result_a.is_ok(),
+            "Part A: withdrawing unlocked shares must succeed, got {:?}",
+            result_a
+        );
+
+        // Part B: requesting 2 more shares spills into the locked second deposit.
+        let result_b = env.as_contract(&cid, || {
+            LiquidityPoolManager::remove_liquidity(&env, pool_id, 2, provider.clone())
+        });
+        assert_eq!(
+            result_b,
+            Err(PoolError::DepositLocked),
+            "Part B: crossing into locked deposit must return DepositLocked, got {:?}",
+            result_b
+        );
+
+        // ── t = 5400: both deposits now unlocked ──────────────────────────
+        let t2 = env.ledger().timestamp();
+        env.ledger().set_timestamp(t2 + 1_800);
+
+        // Withdraw most (but not all) of the second deposit to avoid the
+        // min-liquidity guard.  The important thing is that the previously
+        // locked deposit is now accessible.
+        let safe_second_withdraw = second_shares / 2;
+        let result_c = env.as_contract(&cid, || {
+            LiquidityPoolManager::remove_liquidity(&env, pool_id, safe_second_withdraw, provider)
+        });
+        assert!(
+            result_c.is_ok(),
+            "Part C: withdrawing now-unlocked second deposit must succeed, got {:?}",
+            result_c
+        );
+    }
+
+    /// Zero lock-up: withdrawals are immediately allowed.
+    #[test]
+    fn test_no_lockup_when_duration_is_zero() {
+        let (env, cid, pool_id, provider, _) = setup_pool();
+        // Duration defaults to 0 – no set call needed.
+        let result = env.as_contract(&cid, || {
+            LiquidityPoolManager::remove_liquidity(&env, pool_id, 1, provider)
+        });
+        assert!(
+            result.is_ok(),
+            "Zero lock-up must allow immediate withdrawal, got {:?}",
+            result
+        );
+    }
+
+    /// set_lockup_duration / get_lockup_duration round-trip.
+    #[test]
+    fn test_set_and_get_lockup_duration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register(DummyContract, ());
+        let admin = Address::generate(&env);
+
+        // Default is 0.
+        let v0 = env.as_contract(&cid, || LockupAdmin::get_lockup_duration(&env));
+        assert_eq!(v0, 0);
+
+        env.as_contract(&cid, || {
+            LockupAdmin::set_lockup_duration(&env, admin.clone(), 7_200);
+        });
+        let v1 = env.as_contract(&cid, || LockupAdmin::get_lockup_duration(&env));
+        assert_eq!(v1, 7_200);
+
+        env.as_contract(&cid, || {
+            LockupAdmin::set_lockup_duration(&env, admin, 0);
+        });
+        let v2 = env.as_contract(&cid, || LockupAdmin::get_lockup_duration(&env));
+        assert_eq!(v2, 0);
     }
 }
