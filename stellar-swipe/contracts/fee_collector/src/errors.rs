@@ -27,4 +27,5 @@ pub enum ContractError {
     WaterfallNotConfigured = 21,
     PreferredTokenInsufficient = 22,
     PayoutCurrencyUnchanged = 23,
+    InvalidMultiplierBounds = 24,
 }
