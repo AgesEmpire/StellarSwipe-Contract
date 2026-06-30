@@ -7,8 +7,8 @@ use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
 use migration::{MigrationKey, StakeInfoV2};
 use shared::{initializable, pausable};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, IntoVal, Symbol, Val,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, IntoVal, String,
+    Symbol, Val, Vec,
 };
 
 // ── Slash severity tiers ──────────────────────────────────────────────────────
@@ -204,6 +204,55 @@ pub struct UnstakeRequest {
     pub ticket: u64,
     pub user: Address,
     pub queued_at: u64,
+}
+
+// ── Issue #689: Slash appeal types ─────────────────────────────────────────────
+
+/// Status of a slash appeal.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum AppealStatus {
+    /// Appeal submitted; awaiting admin resolution.  Fund disposition is blocked.
+    Pending = 0,
+    /// Admin upheld the slash; slashed funds remain burned.
+    Upheld = 1,
+    /// Admin reversed the slash; slashed funds are restored to the provider.
+    Reversed = 2,
+}
+
+/// Immutable record written at slash time.
+#[contracttype]
+#[derive(Clone)]
+pub struct SlashRecord {
+    /// Unique monotonic identifier for this slash event.
+    pub slash_id: u64,
+    /// The provider whose stake was slashed.
+    pub provider: Address,
+    /// Severity tier applied.
+    pub severity: u32,
+    /// Actual amount of tokens slashed (own + delegated).
+    pub slash_amount: i128,
+    /// Ledger timestamp at the time of the slash.
+    pub slashed_at: u64,
+    /// Textual reason passed in to slash_stake.
+    pub reason: Symbol,
+}
+
+/// Mutable appeal record created when a provider calls `appeal_slash`.
+#[contracttype]
+#[derive(Clone)]
+pub struct SlashAppeal {
+    /// Slash this appeal relates to.
+    pub slash_id: u64,
+    /// Provider who submitted the appeal.
+    pub appellant: Address,
+    /// Off-chain evidence URI (IPFS CID, HTTPS link, etc.).
+    pub evidence_uri: soroban_sdk::String,
+    /// Ledger timestamp when the appeal was submitted.
+    pub submitted_at: u64,
+    /// Current resolution status.
+    pub status: AppealStatus,
 }
 
 soroban_sdk::contractmeta!(
@@ -1072,19 +1121,303 @@ impl StakeVaultContract {
         let slash_amount = own_slash.saturating_add(delegated_slash_total);
         let slash_amount = if slash_amount == 0 { 1 } else { slash_amount };
 
-        // Event records severity tier and resulting slash amount for audit.
+        // ── Assign a unique slash_id and persist the SlashRecord (issue #689) ──
+        let slash_id: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SlashCounter)
+            .unwrap_or(0u64);
+        let next_slash_id = slash_id.saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&StorageKey::SlashCounter, &next_slash_id);
+
+        let record = SlashRecord {
+            slash_id,
+            provider: provider.clone(),
+            severity: severity as u32,
+            slash_amount,
+            slashed_at: env.ledger().timestamp(),
+            reason: reason.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&StorageKey::SlashRecord(slash_id), &record);
+
+        // ── Hold slashed funds pending appeal resolution (issue #689) ──────────
+        // Tokens remain in the vault's custody and are NOT burned until the
+        // appeal window closes or an admin resolves the appeal.  This puts the
+        // slash in a "disputed" state that blocks final fund disposition.
+        let appeal_window_secs: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AppealWindowSecs)
+            .unwrap_or(0);
+
+        if appeal_window_secs > 0 {
+            // Park the slashed amount; resolve_appeal / finalize_slash will burn or return it.
+            env.storage()
+                .persistent()
+                .set(&StorageKey::SlashedFundsHeld(slash_id), &slash_amount);
+        } else {
+            // No appeal window configured — burn immediately (legacy behaviour).
+            token::Client::new(&env, &token).burn(&env.current_contract_address(), &slash_amount);
+        }
+
+        // Event records severity tier, slash amount, and slash_id for audit.
         #[allow(deprecated)]
         env.events().publish(
             (
                 Symbol::new(&env, "stake_vault"),
                 Symbol::new(&env, "stake_slashed"),
             ),
-            (provider.clone(), severity as u32, slash_amount, reason),
+            (provider.clone(), severity as u32, slash_amount, slash_id, reason),
         );
 
-        token::Client::new(&env, &token).burn(&env.current_contract_address(), &slash_amount);
-
         Ok(slash_amount)
+    }
+
+    // ── Issue #689: Slash appeal window ────────────────────────────────────────
+
+    /// Admin: set the window (in seconds) after a slash during which the
+    /// affected provider may submit an evidence appeal.
+    /// Set to 0 to disable appeals entirely.
+    pub fn set_appeal_window(env: Env, window_secs: u64) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        // Sanity cap: max 30 days.
+        if window_secs > 2_592_000 {
+            return Err(StakeVaultError::InvalidAppealWindow);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::AppealWindowSecs, &window_secs);
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "appeal_window_updated"),
+            ),
+            (window_secs,),
+        );
+        Ok(())
+    }
+
+    /// Returns the configured appeal window in seconds (defaults to 0 — disabled).
+    pub fn get_appeal_window(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::AppealWindowSecs)
+            .unwrap_or(0)
+    }
+
+    /// Provider: submit an appeal for a past slash, attaching off-chain evidence.
+    ///
+    /// Requirements:
+    /// - `slash_id` must refer to an existing [`SlashRecord`].
+    /// - The caller must be the slashed provider.
+    /// - The appeal must be submitted within the admin-configured window.
+    /// - Only one appeal per slash is allowed.
+    ///
+    /// While a `Pending` appeal exists the slash is considered "disputed":
+    /// an admin must resolve it before final fund disposition is determined.
+    pub fn appeal_slash(
+        env: Env,
+        appellant: Address,
+        slash_id: u64,
+        evidence_uri: String,
+    ) -> Result<(), StakeVaultError> {
+        appellant.require_auth();
+
+        // Load the slash record.
+        let record: SlashRecord = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::SlashRecord(slash_id))
+            .ok_or(StakeVaultError::SlashNotFound)?;
+
+        // Only the slashed provider may appeal.
+        if record.provider != appellant {
+            return Err(StakeVaultError::Unauthorized);
+        }
+
+        // Enforce appeal window.
+        let window_secs: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AppealWindowSecs)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        if window_secs == 0 || now > record.slashed_at.saturating_add(window_secs) {
+            return Err(StakeVaultError::AppealWindowClosed);
+        }
+
+        // Prevent duplicate appeals.
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::SlashAppeal(slash_id))
+        {
+            return Err(StakeVaultError::AppealAlreadyExists);
+        }
+
+        let appeal = SlashAppeal {
+            slash_id,
+            appellant: appellant.clone(),
+            evidence_uri: evidence_uri.clone(),
+            submitted_at: now,
+            status: AppealStatus::Pending,
+        };
+        env.storage()
+            .persistent()
+            .set(&StorageKey::SlashAppeal(slash_id), &appeal);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "slash_appealed"),
+            ),
+            (appellant, slash_id, evidence_uri),
+        );
+
+        Ok(())
+    }
+
+    /// Admin: resolve a pending slash appeal.
+    ///
+    /// - `uphold`: `true` → slash stands; held funds are burned.
+    /// - `uphold`: `false` → slash is reversed; held funds are returned to the
+    ///   provider's stake balance.
+    ///
+    /// Resolving an appeal that does not exist or has already been resolved
+    /// returns an error.
+    pub fn resolve_appeal(
+        env: Env,
+        slash_id: u64,
+        uphold: bool,
+    ) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+
+        // Load slash record.
+        let record: SlashRecord = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::SlashRecord(slash_id))
+            .ok_or(StakeVaultError::SlashNotFound)?;
+
+        // Load appeal record.
+        let mut appeal: SlashAppeal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::SlashAppeal(slash_id))
+            .ok_or(StakeVaultError::SlashNotFound)?;
+
+        if appeal.status != AppealStatus::Pending {
+            return Err(StakeVaultError::AppealAlreadyResolved);
+        }
+
+        // Retrieve held funds (only present when an appeal window is configured
+        // and the slash_stake did not burn immediately).
+        let held: i128 = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::SlashedFundsHeld(slash_id))
+            .unwrap_or(0);
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+
+        if uphold {
+            appeal.status = AppealStatus::Upheld;
+            // Slash confirmed — burn the held funds now.
+            if held > 0 {
+                env.storage()
+                    .persistent()
+                    .remove(&StorageKey::SlashedFundsHeld(slash_id));
+                token::Client::new(&env, &token)
+                    .burn(&env.current_contract_address(), &held);
+            }
+        } else {
+            // Reversed — tokens are still in the vault; credit provider's stake.
+            appeal.status = AppealStatus::Reversed;
+
+            let amount_to_restore = if held > 0 { held } else { record.slash_amount };
+
+            let mut stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+                .storage()
+                .persistent()
+                .get(&MigrationKey::StakesV2)
+                .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+
+            let current_info = stakes.get(record.provider.clone()).unwrap_or(StakeInfoV2 {
+                balance: 0,
+                locked_until: 0,
+                last_updated: 0,
+            });
+
+            let restored_balance = current_info.balance.saturating_add(amount_to_restore);
+            let now = env.ledger().timestamp();
+
+            stakes.set(
+                record.provider.clone(),
+                StakeInfoV2 {
+                    balance: restored_balance,
+                    locked_until: current_info.locked_until,
+                    last_updated: now,
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&MigrationKey::StakesV2, &stakes);
+
+            if held > 0 {
+                env.storage()
+                    .persistent()
+                    .remove(&StorageKey::SlashedFundsHeld(slash_id));
+            }
+        }
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::SlashAppeal(slash_id), &appeal);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "appeal_resolved"),
+            ),
+            (slash_id, uphold, record.provider),
+        );
+
+        Ok(())
+    }
+
+    /// Returns the [`SlashRecord`] for the given `slash_id`, or `None`.
+    pub fn get_slash_record(env: Env, slash_id: u64) -> Option<SlashRecord> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::SlashRecord(slash_id))
+    }
+
+    /// Returns the [`SlashAppeal`] for the given `slash_id`, or `None`.
+    pub fn get_slash_appeal(env: Env, slash_id: u64) -> Option<SlashAppeal> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::SlashAppeal(slash_id))
     }
 
     // ── Read ───────────────────────────────────────────────────────────────────
