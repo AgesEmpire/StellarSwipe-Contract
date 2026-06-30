@@ -622,6 +622,7 @@ impl GovernanceContract {
         proposer: Address,
     ) -> Result<ProposalStatus, GovernanceError> {
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         proposals::withdraw_proposal(&env, proposal_id, proposer)
     }
 
