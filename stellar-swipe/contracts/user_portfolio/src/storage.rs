@@ -76,4 +76,13 @@ pub enum DataKey {
     /// Ordered list of realized tax events for a user (Issue #658).
     /// Appended on every `close_position` or `close_position_keeper` call.
     UserTaxEvents(Address),
+    // ── Issue #752: Per-asset maximum exposure cap ─────────────────────────────
+    /// User-configured maximum absolute exposure cap for a specific asset pair.
+    /// `None` means no cap (default). Opt-in.
+    UserAssetCap(Address, u32),
+    /// Current tracked open exposure (sum of open position amounts) for a user+asset.
+    /// Updated on open (increment) and close (decrement).
+    UserAssetExposure(Address, u32),
+    /// Per-position record of which asset_id it belongs to (for exposure tracking).
+    PositionAsset(u64),
 }

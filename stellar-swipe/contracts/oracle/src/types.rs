@@ -45,6 +45,10 @@ pub enum StorageKey {
     PendingAdmin,
     PendingAdminExpiry,
     MinSourceCount,
+    /// Max percentage deviation allowed between consecutive price updates for an asset pair (basis points, 10000 = 100%).
+    DeviationThreshold(AssetPair),
+    /// Set to true when the single-update deviation breaker has tripped for an asset pair.
+    DeviationBreakerTripped(AssetPair),
 }
 
 #[contracttype]

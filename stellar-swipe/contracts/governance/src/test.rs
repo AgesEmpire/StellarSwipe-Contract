@@ -2601,7 +2601,7 @@ fn cannot_withdraw_already_withdrawn_proposal() {
     // Second withdrawal — must be rejected (status is Withdrawn, not Pending).
     let result =
         client.try_withdraw_proposal(&proposal_id, &recipients.community_rewards);
-    assert_eq!(result, Err(Ok(GovernanceError::ProposalNotActive)));
+    assert_eq!(result, Err(Ok(GovernanceError::ProposalAlreadyWithdrawn)));
 }
 
 #[test]

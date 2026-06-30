@@ -698,6 +698,9 @@ pub fn withdraw_proposal(
 
     // Must still be in Pending status — once voting opens (Active) or any
     // terminal state is reached, withdrawal is no longer permitted.
+    if proposal.status == ProposalStatus::Withdrawn {
+        return Err(GovernanceError::ProposalAlreadyWithdrawn);
+    }
     if proposal.status != ProposalStatus::Pending {
         return Err(GovernanceError::ProposalNotActive);
     }
@@ -706,11 +709,7 @@ pub fn withdraw_proposal(
     put_proposal(env, &proposal)?;
 
     // Refund the spam-deposit to the proposer (see deposit handling policy above).
-    // Use settle_proposal_deposit with zero votes so it always takes the refund
-    // path (participation threshold will not be met, but that's the forfeit
-    // branch — we need to bypass that and always refund).
-    //
-    // Instead, directly refund via add_balance and clean up the lock record.
+    // Directly refund via add_balance and clean up the lock record.
     let config = crate::proposal_deposit::get_deposit_config(env);
     if config.amount > 0 {
         // Check if a deposit was locked for this proposal.
