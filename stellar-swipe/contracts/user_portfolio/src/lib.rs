@@ -4,6 +4,7 @@
 
 mod achievements;
 mod badges;
+mod exposure_cap;
 mod migration;
 mod position_tags;
 mod onboarding;
@@ -137,6 +138,17 @@ pub enum PositionStatus {
 #[repr(u32)]
 pub enum PositionError {
     PositionAlreadyClosed = 1,
+}
+
+/// Errors for portfolio-level operations (Issue #752 and future extensions).
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PortfolioError {
+    /// The trade would push the user's exposure to a capped asset beyond their limit.
+    ExposureCapExceeded = 1,
+    /// Cap amount must be > 0.
+    InvalidCapAmount = 2,
 }
 
 #[contracttype]
@@ -929,6 +941,143 @@ impl UserPortfolio {
     /// Returns the tag (if any) for a specific position owned by `user`.
     pub fn get_position_tag(env: Env, user: Address, position_id: u64) -> Option<String> {
         position_tags::get_position_tag(&env, user, position_id)
+    }
+
+    // ── Issue #752: Per-asset maximum exposure cap ────────────────────────────
+
+    /// User: set an optional maximum exposure cap for `asset_id`.
+    ///
+    /// - Opt-in; assets without a cap are unrestricted (default behavior).
+    /// - `cap_amount` must be > 0.
+    /// - Caller must be `user`.
+    pub fn set_asset_exposure_cap(
+        env: Env,
+        user: Address,
+        asset_id: u32,
+        cap_amount: i128,
+    ) -> Result<(), PortfolioError> {
+        user.require_auth();
+        if cap_amount <= 0 {
+            return Err(PortfolioError::InvalidCapAmount);
+        }
+        exposure_cap::set_cap(&env, &user, asset_id, cap_amount);
+        Ok(())
+    }
+
+    /// User: remove the exposure cap for `asset_id`.
+    pub fn remove_asset_exposure_cap(
+        env: Env,
+        user: Address,
+        asset_id: u32,
+    ) {
+        user.require_auth();
+        exposure_cap::remove_cap(&env, &user, asset_id);
+    }
+
+    /// Returns the configured exposure cap for `(user, asset_id)`, or `None` if not set.
+    pub fn get_asset_exposure_cap(env: Env, user: Address, asset_id: u32) -> Option<i128> {
+        exposure_cap::get_cap(&env, &user, asset_id)
+    }
+
+    /// Returns the user's current tracked open exposure for `asset_id`.
+    pub fn get_asset_exposure(env: Env, user: Address, asset_id: u32) -> i128 {
+        exposure_cap::get_exposure(&env, &user, asset_id)
+    }
+
+    /// Open a position for copy-trade execution with enforced per-asset exposure cap.
+    ///
+    /// If the user has configured a cap for `asset_id` and adding `amount` to their
+    /// current exposure would exceed it, the call is rejected with `ExposureCapExceeded`.
+    /// The cap check uses current live portfolio state — not a stale snapshot.
+    ///
+    /// When no cap is configured for `asset_id`, this function behaves identically
+    /// to `open_position`.
+    pub fn open_position_with_cap_check(
+        env: Env,
+        user: Address,
+        asset_id: u32,
+        entry_price: i128,
+        amount: i128,
+    ) -> Result<u64, PortfolioError> {
+        user.require_auth();
+        if entry_price <= 0 || amount <= 0 {
+            panic!("invalid entry_price or amount");
+        }
+        // KYC gate
+        let kyc_required: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycRequiredMode)
+            .unwrap_or(false);
+        if kyc_required {
+            let verified: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::KycVerified(user.clone()))
+                .unwrap_or(false);
+            if !verified {
+                panic!("KYC verification required to open a position");
+            }
+        }
+        // Restriction gate
+        let restricted: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Restricted(user.clone()))
+            .unwrap_or(false);
+        if restricted {
+            panic!("user is geographically restricted");
+        }
+
+        // Cap check — uses current live state.
+        exposure_cap::check_cap(&env, &user, asset_id, amount)?;
+
+        // Open the position.
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextPositionId)
+            .expect("next id");
+        let next = id.checked_add(1).expect("position id overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::NextPositionId, &next);
+
+        let pos = Position {
+            entry_price,
+            amount,
+            status: PositionStatus::Open,
+            realized_pnl: 0,
+        };
+        env.storage().persistent().set(&DataKey::Position(id), &pos);
+
+        // Record which asset this position belongs to.
+        env.storage()
+            .persistent()
+            .set(&DataKey::PositionAsset(id), &asset_id);
+
+        let key = DataKey::UserPositions(user.clone());
+        let mut list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        list.push_back(id);
+        env.storage().persistent().set(&key, &list);
+
+        let open_key = DataKey::UserOpenPositions(user.clone());
+        let mut open_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&open_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        open_ids.push_back(id);
+        env.storage().persistent().set(&open_key, &open_ids);
+
+        // Track exposure for cap enforcement.
+        exposure_cap::add_exposure(&env, &user, asset_id, amount);
+
+        Ok(id)
     }
 
     // ── Portfolio snapshots (issue #685) ─────────────────────────────────────────
@@ -2517,5 +2666,93 @@ mod restriction_tests {
                 .unwrap_or(false)
         });
         assert!(has_event, "user_restricted event not emitted");
+    }
+}
+
+// ── Issue #752: Exposure cap unit tests ──────────────────────────────────────
+#[cfg(test)]
+mod exposure_cap_tests {
+    use super::oracle_ok::OracleMock;
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup(env: &Env) -> (Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let oracle = env.register_contract(None, OracleMock);
+        let contract_id = env.register_contract(None, UserPortfolio);
+        let client = UserPortfolioClient::new(env, &contract_id);
+        client.initialize(&admin, &oracle);
+        (admin, contract_id)
+    }
+
+    /// A trade within the cap is allowed and exposure is updated.
+    #[test]
+    fn test_trade_within_cap_allowed() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+
+        // Set cap of 5_000 for asset 1.
+        client.set_asset_exposure_cap(&user, &1u32, &5_000i128).unwrap();
+
+        // Trade 3_000 — within cap.
+        let result = client.try_open_position_with_cap_check(&user, &1u32, &100i128, &3_000i128);
+        assert!(result.is_ok(), "trade within cap should be allowed");
+
+        assert_eq!(client.get_asset_exposure(&user, &1u32), 3_000);
+    }
+
+    /// A trade that would exceed the cap is rejected with ExposureCapExceeded.
+    #[test]
+    fn test_trade_exceeding_cap_rejected() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+
+        client.set_asset_exposure_cap(&user, &1u32, &2_000i128).unwrap();
+
+        // 3_000 > 2_000 cap → must be rejected.
+        let result = client.try_open_position_with_cap_check(&user, &1u32, &100i128, &3_000i128);
+        assert_eq!(result, Err(Ok(PortfolioError::ExposureCapExceeded)));
+    }
+
+    /// An asset with no cap configured is unaffected — any amount is allowed.
+    #[test]
+    fn test_no_cap_asset_unaffected() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+
+        // No cap set for asset 99.
+        let result = client.try_open_position_with_cap_check(&user, &99u32, &100i128, &999_999_999i128);
+        assert!(result.is_ok(), "no cap → any amount should pass");
+    }
+
+    /// Users can update or remove their caps.
+    #[test]
+    fn test_user_can_update_and_remove_cap() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup(&env);
+        let client = UserPortfolioClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+
+        client.set_asset_exposure_cap(&user, &1u32, &1_000i128).unwrap();
+        assert_eq!(client.get_asset_exposure_cap(&user, &1u32), Some(1_000));
+
+        // Raise the cap.
+        client.set_asset_exposure_cap(&user, &1u32, &5_000i128).unwrap();
+        assert_eq!(client.get_asset_exposure_cap(&user, &1u32), Some(5_000));
+
+        // Remove the cap entirely.
+        client.remove_asset_exposure_cap(&user, &1u32);
+        assert_eq!(client.get_asset_exposure_cap(&user, &1u32), None);
+
+        // Trade that previously would have been capped now succeeds.
+        let result = client.try_open_position_with_cap_check(&user, &1u32, &100i128, &999_000i128);
+        assert!(result.is_ok(), "cap removed → trade should be allowed");
     }
 }
