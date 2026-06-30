@@ -1,10 +1,5 @@
 use soroban_sdk::contracterror;
 
-/// AutoTrade contract errors (≤ 50 variants — Soroban XDR limit).
-///
-/// Related sub-errors are collapsed into a single variant; the emitted event
-/// carries the fine-grained reason.  Aliases in the `impl` block keep all
-/// existing call-sites compiling without changes.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AutoTradeError {
@@ -75,8 +70,6 @@ pub enum AutoTradeError {
     // ── Misc ─────────────────────────────────────────────────────────────────
     LastOracleForPair = 49,
     NotPaused = 50,
-    // ── Loss-streak pause (Issue #698) ───────────────────────────────────────
-    LossStreakPaused = 51,
 }
 
 // ── Backward-compatible aliases ───────────────────────────────────────────────
@@ -140,4 +133,11 @@ impl AutoTradeError {
     // ── Dead man's switch ─────────────────────────────────────────────────────
     /// Inactivity window has not elapsed yet; trigger is premature.
     pub const InactivityWindowNotElapsed: AutoTradeError = AutoTradeError::NotPaused;
+
+    // ── Loss-streak pause (Issue #698) ───────────────────────────────────────
+    /// Auto-trade paused due to consecutive losses.
+    pub const LossStreakPaused: AutoTradeError = AutoTradeError::TradingPaused;
+    // ── Daily execution cap ──────────────────────────────────────────────────
+    /// Auto-trade blocked by per-user daily execution cap.
+    pub const DailyExecutionCapExceeded: AutoTradeError = AutoTradeError::DailyTradeLimitExceeded;
 }
