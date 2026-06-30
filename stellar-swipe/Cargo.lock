@@ -804,6 +804,7 @@ name = "integration_tests"
 version = "0.0.0"
 dependencies = [
  "fee_collector",
+ "proptest",
  "signal_registry",
  "soroban-sdk",
  "stake_vault",
@@ -1713,6 +1714,7 @@ dependencies = [
 name = "trade_executor"
 version = "0.0.0"
 dependencies = [
+ "proptest",
  "shared",
  "soroban-sdk",
  "stellar_swipe_common",

@@ -19,6 +19,7 @@ stellar_swipe_common = { path = "../common" }
 trade_executor = { path = "../trade_executor" }
 user_portfolio = { path = "../user_portfolio" }
 fee_collector = { path = "../fee_collector" }
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [[test]]
 name = "test_contract_upgrade"
@@ -43,9 +44,6 @@ path = "tests/integration/test_chaos_ordering.rs"
 [[test]]
 name = "test_arithmetic_invariants"
 path = "tests/integration/test_arithmetic_invariants.rs"
-
-[dev-dependencies]
-proptest = { version = "1", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

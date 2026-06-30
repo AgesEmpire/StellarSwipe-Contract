@@ -5,10 +5,10 @@ pub mod migration;
 
 use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
 use migration::{MigrationKey, StakeInfoV2};
-use shared::{initializable, pausable};
+use shared::{initializable, multisig, pausable};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, IntoVal, String,
-    Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, Env, IntoVal,
+    String, Symbol, Val, Vec,
 };
 
 // ── Slash severity tiers ──────────────────────────────────────────────────────
@@ -145,6 +145,12 @@ pub enum StorageKey {
     EmergencyMultiSigConfig,
     /// Per-staker pending emergency unstake request (approvals accumulate here).
     EmergencyRequest(Address),
+    // ── Issue #689: Slash appeal ─────────────────────────────────────────────────
+    SlashCounter,
+    SlashRecord(u64),
+    SlashAppeal(u64),
+    SlashedFundsHeld(u64),
+    AppealWindowSecs,
 }
 
 #[contracterror]
@@ -195,6 +201,18 @@ pub enum StakeVaultError {
     InvalidEmergencyPenalty = 23,
     /// Multi-sig required count is 0 or exceeds the number of admins.
     InvalidMultiSigConfig = 24,
+    /// The privileged action requires multi-sig approval; use propose/approve/execute.
+    RequiresMultisig = 25,
+    // ── Issue #689: Slash appeal ─────────────────────────────────────────────────
+    InvalidAppealWindow = 26,
+    AppealWindowClosed = 27,
+    SlashNotFound = 28,
+    AppealAlreadyExists = 29,
+    AppealAlreadyResolved = 30,
+    // ── Rate limiting & validation ───────────────────────────────────────────────
+    RateLimitExceeded = 31,
+    InvalidAmount = 32,
+    RemainingStakeBelowMinimum = 33,
 }
 
 /// A pending unstake request held in the FIFO queue (issue #663).
@@ -264,6 +282,44 @@ soroban_sdk::contractmeta!(
     val = env!("STELLAR_GIT_COMMIT")
 );
 
+// ── Multi-sig action discriminators ──────────────────────────────────────────
+
+/// First byte of a multi-sig action payload identifying the privileged action.
+mod action {
+    pub const PAUSE: u8 = 0;
+    pub const UNPAUSE: u8 = 1;
+    pub const SET_MINIMUM_STAKE: u8 = 2;
+    pub const SET_MINIMUM_STAKE_DURATION: u8 = 3;
+    pub const CONFIGURE_SLASH_TIERS: u8 = 4;
+    pub const SET_APPEAL_WINDOW: u8 = 5;
+}
+
+fn encode_action(env: &Env, tag: u8, data: &[u8]) -> Bytes {
+    let mut b = Bytes::new(env);
+    b.push_back(tag);
+    for &byte in data {
+        b.push_back(byte);
+    }
+    b
+}
+
+fn encode_i128_bytes(value: i128) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    let le = value.to_le_bytes();
+    buf.copy_from_slice(&le);
+    buf
+}
+
+fn decode_i128_from_bytes(env: &Env, payload: &Bytes, offset: u32) -> i128 {
+    let mut buf = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        buf[i] = payload.get(offset + i as u32).unwrap_or(0);
+        i += 1;
+    }
+    i128::from_le_bytes(buf)
+}
+
 #[contract]
 pub struct StakeVaultContract;
 
@@ -297,11 +353,15 @@ impl StakeVaultContract {
 
     // ── Emergency pause (shared::pausable) ────────────────────────────────────
 
-    /// Admin: pause all stake/unstake operations.
+    /// Pause all stake/unstake operations.
     ///
-    /// Uses the shared [`pausable`] module so pause behavior and event shape
-    /// are consistent across all contracts that adopt it (Issue #561).
-    pub fn pause(env: Env) {
+    /// When multi-sig is configured this entrypoint returns
+    /// [`StakeVaultError::RequiresMultisig`]; use `propose_action` /
+    /// `approve_action` / `execute_action` instead.
+    pub fn pause(env: Env) -> Result<(), StakeVaultError> {
+        if multisig::get_config(&env).is_some() {
+            return Err(StakeVaultError::RequiresMultisig);
+        }
         let admin: Address = env
             .storage()
             .instance()
@@ -309,10 +369,14 @@ impl StakeVaultContract {
             .expect("not initialized");
         admin.require_auth();
         pausable::set_paused(&env, true);
+        Ok(())
     }
 
-    /// Admin: resume operations.
-    pub fn unpause(env: Env) {
+    /// Resume operations. Behaviour mirrors [`pause`].
+    pub fn unpause(env: Env) -> Result<(), StakeVaultError> {
+        if multisig::get_config(&env).is_some() {
+            return Err(StakeVaultError::RequiresMultisig);
+        }
         let admin: Address = env
             .storage()
             .instance()
@@ -320,6 +384,7 @@ impl StakeVaultContract {
             .expect("not initialized");
         admin.require_auth();
         pausable::set_paused(&env, false);
+        Ok(())
     }
 
     pub fn is_paused(env: Env) -> bool {
@@ -466,9 +531,15 @@ impl StakeVaultContract {
 
     // ── Admin: configure minimum stake duration ────────────────────────────────
 
-    /// Admin: set the minimum duration (in seconds) that newly staked funds
+    /// Set the minimum duration (in seconds) that newly staked funds
     /// must remain locked before counting toward voting power.
+    ///
+    /// When multi-sig is configured use `execute_action` with action
+    /// [`action::SET_MINIMUM_STAKE_DURATION`] instead.
     pub fn set_minimum_stake_duration(env: Env, duration_secs: u64) -> Result<(), StakeVaultError> {
+        if multisig::get_config(&env).is_some() {
+            return Err(StakeVaultError::RequiresMultisig);
+        }
         let admin: Address = env
             .storage()
             .instance()
@@ -506,7 +577,10 @@ impl StakeVaultContract {
 
     // ── Minimum stake ──────────────────────────────────────────────────────────
 
-    pub fn set_minimum_stake(env: Env, minimum: i128) {
+    pub fn set_minimum_stake(env: Env, minimum: i128) -> Result<(), StakeVaultError> {
+        if multisig::get_config(&env).is_some() {
+            return Err(StakeVaultError::RequiresMultisig);
+        }
         let admin: Address = env
             .storage()
             .instance()
@@ -516,6 +590,7 @@ impl StakeVaultContract {
         env.storage()
             .instance()
             .set(&StorageKey::MinimumStake, &minimum);
+        Ok(())
     }
 
     pub fn get_minimum_stake(env: Env) -> i128 {
@@ -523,6 +598,176 @@ impl StakeVaultContract {
             .instance()
             .get(&StorageKey::MinimumStake)
             .unwrap_or(0)
+    }
+
+    // ── Multi-sig approval flow ────────────────────────────────────────────────
+
+    /// Admin: configure the N-of-M multi-sig parameters for privileged actions.
+    ///
+    /// Once configured, single-admin-gated entrypoints such as
+    /// [`set_minimum_stake`] will return [`StakeVaultError::RequiresMultisig`]
+    /// and must instead be invoked via `propose_action` / `approve_action` /
+    /// `execute_action`.
+    ///
+    /// Pass `None` to clear the config and restore single-admin behaviour.
+    pub fn set_multisig_config(
+        env: Env,
+        caller: Address,
+        config: Option<multisig::MultisigConfig>,
+    ) -> Result<(), StakeVaultError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        if caller != admin {
+            return Err(StakeVaultError::Unauthorized);
+        }
+        if let Some(cfg) = config {
+            multisig::set_config(&env, &cfg)
+                .map_err(|_| StakeVaultError::InvalidMultiSigConfig)?;
+        } else {
+            env.storage()
+                .instance()
+                .remove(&multisig::MultisigStorageKey::Config);
+        }
+        Ok(())
+    }
+
+    /// Propose a privileged action. `caller` must be a registered signer.
+    /// Returns the proposal ID.
+    pub fn propose_action(
+        env: Env,
+        caller: Address,
+        payload: Bytes,
+    ) -> Result<u64, StakeVaultError> {
+        caller.require_auth();
+        multisig::propose(&env, &caller, payload)
+            .map_err(|_| StakeVaultError::Unauthorized)
+    }
+
+    /// Approve a pending proposal. `caller` must be a registered signer.
+    /// Returns the current number of approvals.
+    pub fn approve_action(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<u32, StakeVaultError> {
+        caller.require_auth();
+        multisig::approve(&env, &caller, proposal_id)
+            .map_err(|e| -> StakeVaultError {
+                match e {
+                    multisig::MultisigError::ProposalNotFound => {
+                        StakeVaultError::EmergencyRequestNotFound
+                    }
+                    multisig::MultisigError::AlreadyApproved => StakeVaultError::AlreadyApproved,
+                    multisig::MultisigError::ProposalExpired => {
+                        StakeVaultError::EmergencyRequestExpired
+                    }
+                    _ => StakeVaultError::Unauthorized,
+                }
+            })
+    }
+
+    /// Execute an approved proposal. Decodes the action payload and performs
+    /// the privileged action, then marks the proposal as executed.
+    pub fn execute_action(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<(), StakeVaultError> {
+        caller.require_auth();
+        let proposal = multisig::get_proposal(&env, proposal_id)
+            .map_err(|_| StakeVaultError::EmergencyRequestNotFound)?;
+        multisig::require_can_execute(&env, &proposal)
+            .map_err(|e| -> StakeVaultError {
+                match e {
+                    multisig::MultisigError::AlreadyExecuted => {
+                        StakeVaultError::EmergencyRequestNotFound
+                    }
+                    multisig::MultisigError::ThresholdNotMet => {
+                        StakeVaultError::Unauthorized
+                    }
+                    multisig::MultisigError::ProposalExpired => {
+                        StakeVaultError::EmergencyRequestExpired
+                    }
+                    _ => StakeVaultError::Unauthorized,
+                }
+            })?;
+
+        let payload = proposal.payload;
+        let tag = payload.get(0).ok_or(StakeVaultError::Unauthorized)?;
+        match tag {
+            action::PAUSE => Self::do_pause(&env)?,
+            action::UNPAUSE => Self::do_unpause(&env)?,
+            action::SET_MINIMUM_STAKE => {
+                let minimum = decode_i128_from_bytes(&env, &payload, 1);
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::MinimumStake, &minimum);
+            }
+            action::SET_MINIMUM_STAKE_DURATION => {
+                let mut buf = [0u8; 8];
+                let mut i = 0;
+                while i < 8 {
+                    buf[i] = payload.get(1 + i as u32).unwrap_or(0);
+                    i += 1;
+                }
+                let duration = u64::from_le_bytes(buf);
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::MinimumStakeDuration, &duration);
+            }
+            action::CONFIGURE_SLASH_TIERS => {
+                let minor = decode_i128_from_bytes(&env, &payload, 1) as u32;
+                let major = decode_i128_from_bytes(&env, &payload, 17) as u32;
+                let critical = decode_i128_from_bytes(&env, &payload, 33) as u32;
+                if minor > 10_000 || major > 10_000 || critical > 10_000 {
+                    return Err(StakeVaultError::InvalidSlashTier);
+                }
+                let cfg = SlashTierConfig {
+                    minor_bps: minor,
+                    major_bps: major,
+                    critical_bps: critical,
+                };
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::SlashTierConfig, &cfg);
+            }
+            action::SET_APPEAL_WINDOW => {
+                let mut buf = [0u8; 8];
+                let mut i = 0;
+                while i < 8 {
+                    buf[i] = payload.get(1 + i as u32).unwrap_or(0);
+                    i += 1;
+                }
+                let window = u64::from_le_bytes(buf);
+                if window > 2_592_000 {
+                    return Err(StakeVaultError::InvalidAppealWindow);
+                }
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::AppealWindowSecs, &window);
+            }
+            _ => return Err(StakeVaultError::Unauthorized),
+        }
+
+        multisig::mark_executed(&env, proposal_id)
+            .map_err(|_| StakeVaultError::Unauthorized)?;
+        Ok(())
+    }
+
+    // ── Internal execution helpers ────────────────────────────────────────────
+
+    fn do_pause(env: &Env) -> Result<(), StakeVaultError> {
+        pausable::set_paused(env, true);
+        Ok(())
+    }
+
+    fn do_unpause(env: &Env) -> Result<(), StakeVaultError> {
+        pausable::set_paused(env, false);
+        Ok(())
     }
 
     pub fn notify_stake_below_minimum(env: Env, provider: Address) {
@@ -968,14 +1213,20 @@ impl StakeVaultContract {
 
     // ── Slash ──────────────────────────────────────────────────────────────────
 
-    /// Admin: configure the slash percentage for each severity tier (in basis points).
+    /// Configure the slash percentage for each severity tier (in basis points).
     /// `minor_bps`, `major_bps`, `critical_bps` must all be <= 10_000.
+    ///
+    /// When multi-sig is configured use `execute_action` with action
+    /// [`action::CONFIGURE_SLASH_TIERS`] instead.
     pub fn configure_slash_tiers(
         env: Env,
         minor_bps: u32,
         major_bps: u32,
         critical_bps: u32,
     ) -> Result<(), StakeVaultError> {
+        if multisig::get_config(&env).is_some() {
+            return Err(StakeVaultError::RequiresMultisig);
+        }
         let admin: Address = env
             .storage()
             .instance()
@@ -1179,10 +1430,16 @@ impl StakeVaultContract {
 
     // ── Issue #689: Slash appeal window ────────────────────────────────────────
 
-    /// Admin: set the window (in seconds) after a slash during which the
+    /// Set the window (in seconds) after a slash during which the
     /// affected provider may submit an evidence appeal.
     /// Set to 0 to disable appeals entirely.
+    ///
+    /// When multi-sig is configured use `execute_action` with action
+    /// [`action::SET_APPEAL_WINDOW`] instead.
     pub fn set_appeal_window(env: Env, window_secs: u64) -> Result<(), StakeVaultError> {
+        if multisig::get_config(&env).is_some() {
+            return Err(StakeVaultError::RequiresMultisig);
+        }
         let admin: Address = env
             .storage()
             .instance()
