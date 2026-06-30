@@ -93,6 +93,7 @@ pub enum StorageKey {
     TradeReceiptHash(u64),
     /// Next trade receipt ID counter.
     NextTradeReceiptId,
+    ConfirmationDepth,
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -262,6 +263,17 @@ fn effective_estimated_fee(env: &Env) -> i128 {
 
 fn require_admin(env: &Env) -> Result<Address, ContractError> {
     oracle::require_admin(env)
+} 
+fn get_confirmation_depth(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::ConfirmationDepth)
+        .unwrap_or(wire::DEFAULT_CONFIRMATION_DEPTH)
+}
+fn set_confirmation_depth(env: &Env, depth: u32) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::ConfirmationDepth, &depth);
 }
 
 /// Effective per-asset minimum trade size: the admin-configured override for `token`,
@@ -598,6 +610,12 @@ fn execute_market_copy_trade(
 
     record_trade_receipt(env, &user, &token, effective_amount);
 
+    let pending_order = wire::TradeOrder {
+        status: wire::TradeStatus::ExecutedAwaitingConfirmation,
+        execution_ledger: env.ledger().sequence(),
+    };
+    env.storage().instance().set(&StorageKey::UserPortfolio, &pending_order);
+
     env.storage().temporary().remove(&lock_key);
     Ok(())
 }
@@ -741,6 +759,33 @@ impl TradeExecutorContract {
     /// One-time contract initialization. Stores the admin address.
     ///
     /// # Parameters
+    pub fn set_depth(env: Env, depth: u32) -> Result<(), ContractError> {
+        Self::require_admin(&env)?;
+        set_confirmation_depth(&env, depth);
+        Ok(())
+    }
+    pub fn finalize_trade(env: Env) -> Result<(), ContractError> {
+        let mut order: wire::TradeOrder = env.storage()
+            .instance()
+            .get(&StorageKey::UserPortfolio)
+            .ok_or(ContractError::AutoTradeError(AutoTradeError::SignalNotFound))?;
+
+        if order.status != wire::TradeStatus::ExecutedAwaitingConfirmation {
+            return Err(ContractError::AutoTradeError(AutoTradeError::Unauthorized));
+        }
+
+        let depth = get_confirmation_depth(&env);
+        let current_ledger = env.ledger().sequence();
+        
+        if current_ledger.saturating_sub(order.execution_ledger) < depth {
+            return Err(ContractError::AutoTradeError(AutoTradeError::ConfirmationDepthNotReached));
+        }
+
+        order.status = wire::TradeStatus::Filled;
+        env.storage().instance().set(&StorageKey::UserPortfolio, &order);
+
+        Ok(())
+    }
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
         m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));

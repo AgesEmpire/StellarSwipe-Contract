@@ -6,16 +6,17 @@ pub use errors::ContractError;
 mod events;
 mod fee_cache;
 use events::{
-    emit_error_reported, emit_fee_collected, emit_fee_forecast, emit_fee_rate_updated,
-    emit_fees_claimed, emit_fees_claimed_converted, emit_first_trade_fee_waived,
-    emit_network_condition_updated, emit_payout_currency_set, emit_retry_attempted,
-    emit_treasury_withdrawal, emit_volume_discount_config_updated, emit_waterfall_distribution,
-    emit_withdrawal_queued, EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed,
+    emit_effective_multiplier_changed, emit_error_reported, emit_fee_collected, emit_fee_forecast,
+    emit_fee_rate_updated, emit_fees_claimed, emit_fees_claimed_converted,
+    emit_first_trade_fee_waived, emit_network_condition_updated, emit_payout_currency_set,
+    emit_retry_attempted, emit_treasury_withdrawal, emit_volume_discount_config_updated,
+    emit_waterfall_distribution, emit_withdrawal_queued, EvtEffectiveMultiplierChanged,
+    EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed,
     EvtNetworkConditionUpdated, EvtRetryAttempted, EvtTreasuryWithdrawal, EvtWithdrawalQueued,
 };
 pub use events::{
-    FeeRateUpdated, FeesBurned, FeesClaimed, FirstTradeFeeWaived, TreasuryWithdrawal,
-    WithdrawalQueued,
+    EffectiveMultiplierChanged, FeeRateUpdated, FeesBurned, FeesClaimed, FirstTradeFeeWaived,
+    TreasuryWithdrawal, WithdrawalQueued,
 };
 
 mod rebates;
@@ -26,28 +27,30 @@ pub use reports::{EarningsLeaderboardEntry, EarningsReport, ReportPeriod};
 mod storage;
 pub use storage::BalanceMismatch;
 use storage::{
-    add_daily_fee_total, get_admin, get_burn_rate, get_daily_fee_total, get_failed_fee_collection,
-    get_fee_optimization_config, get_fee_rate, get_forecast_config, get_last_error_report,
-    get_last_forecast_day, get_monthly_trade_volume, get_network_condition_score,
-    get_oracle_contract, get_pending_fees, get_provider_payout_currency, get_queued_withdrawal,
-    get_treasury_balance, get_volume_discount_config, get_waterfall_config, has_traded,
-    is_initialized, remove_failed_fee_collection, remove_monthly_trade_volume,
-    remove_provider_payout_currency, remove_queued_withdrawal, set_admin,
-    set_burn_rate as set_burn_rate_storage, set_failed_fee_collection,
-    set_fee_optimization_config, set_fee_rate as set_fee_rate_storage,
-    set_forecast_config_storage, set_has_traded, set_initialized, set_last_error_report,
-    set_last_forecast_day, set_monthly_trade_volume, set_network_condition_score,
+    add_daily_fee_total, get_admin, get_burn_rate, get_congestion_config, get_congestion_signal,
+    get_daily_fee_total, get_failed_fee_collection, get_fee_optimization_config, get_fee_rate,
+    get_forecast_config, get_last_error_report, get_last_forecast_day, get_monthly_trade_volume,
+    get_network_condition_score, get_oracle_contract, get_pending_fees,
+    get_provider_payout_currency, get_queued_withdrawal, get_treasury_balance,
+    get_volume_discount_config, get_waterfall_config, has_traded, is_initialized,
+    remove_failed_fee_collection, remove_monthly_trade_volume, remove_provider_payout_currency,
+    remove_queued_withdrawal, set_admin, set_burn_rate as set_burn_rate_storage,
+    set_congestion_config, set_congestion_signal, set_failed_fee_collection,
+    set_fee_optimization_config, set_fee_rate as set_fee_rate_storage, set_forecast_config_storage,
+    set_has_traded, set_initialized, set_last_error_report, set_last_forecast_day,
+    set_monthly_trade_volume, set_network_condition_score,
     set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
     set_provider_payout_currency, set_queued_withdrawal, set_treasury_balance,
-    set_volume_discount_config_storage,
-    set_waterfall_config as set_waterfall_config_storage, ErrorReport, FailedFeeCollection,
-    FeeOptimizationConfig, ForecastConfigData, MonthlyTradeVolume, QueuedWithdrawal, StorageKey,
-    VolumeDiscountConfig, VolumeTier, WaterfallConfig, WaterfallTier, WaterfallTierResult,
-    MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
+    set_volume_discount_config_storage, set_waterfall_config as set_waterfall_config_storage,
+    CongestionConfig, CongestionSignal, ErrorReport, FailedFeeCollection, FeeOptimizationConfig,
+    ForecastConfigData, MonthlyTradeVolume, QueuedWithdrawal, StorageKey, VolumeDiscountConfig,
+    VolumeTier, WaterfallConfig, WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS,
+    MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
 };
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, IntoVal, String,
-    Symbol, Val, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token, Address, Env, IntoVal, String, Symbol, Val, Vec,
+};
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use stellar_swipe_common::Asset;
@@ -86,14 +89,8 @@ pub struct BatchFeeInput {
     pub trade_asset: Asset,
 }
 
-soroban_sdk::contractmeta!(
-    key = "SourceHash",
-    val = env!("STELLAR_SOURCE_HASH")
-);
-soroban_sdk::contractmeta!(
-    key = "GitCommit",
-    val = env!("STELLAR_GIT_COMMIT")
-);
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct FeeCollector;
@@ -110,8 +107,14 @@ impl FeeCollector {
     /// # Returns
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
-        m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
-        m.set(soroban_sdk::String::from_str(&env, "git_commit"), soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")));
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")),
+        );
         m
     }
 
@@ -449,6 +452,83 @@ impl FeeCollector {
         Ok(())
     }
 
+    /// Admin: update the congestion configuration parameters.
+    pub fn set_congestion_config(env: Env, config: CongestionConfig) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+
+        if config.min_multiplier_bps == 0
+            || config.min_multiplier_bps > config.max_multiplier_bps
+            || config.default_multiplier_bps < config.min_multiplier_bps
+            || config.default_multiplier_bps > config.max_multiplier_bps
+        {
+            return Err(ContractError::InvalidMultiplierBounds);
+        }
+
+        set_congestion_config(&env, &config);
+        Ok(())
+    }
+
+    /// Admin or Keeper: push the current congestion signal.
+    pub fn set_congestion_signal(env: Env, multiplier_bps: u32) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        // Since there is no keeper role yet, we default to admin-only.
+        let admin = get_admin(&env);
+        admin.require_auth();
+
+        let config = get_congestion_config(&env);
+        if multiplier_bps < config.min_multiplier_bps || multiplier_bps > config.max_multiplier_bps
+        {
+            return Err(ContractError::InvalidMultiplierBounds);
+        }
+
+        // Get effective multiplier BEFORE setting the new signal (to check if it actually changed)
+        let old_effective = Self::current_effective_multiplier(&env);
+
+        let new_signal = CongestionSignal {
+            multiplier_bps,
+            updated_at: env.ledger().timestamp(),
+        };
+        set_congestion_signal(&env, &new_signal);
+
+        // Get effective multiplier AFTER setting the new signal
+        let new_effective = Self::current_effective_multiplier(&env);
+
+        if old_effective != new_effective {
+            emit_effective_multiplier_changed(
+                &env,
+                EvtEffectiveMultiplierChanged {
+                    old_multiplier_bps: old_effective,
+                    new_multiplier_bps: new_effective,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn current_effective_multiplier(env: &Env) -> u32 {
+        let config = get_congestion_config(env);
+        if let Some(signal) = get_congestion_signal(env) {
+            let now = env.ledger().timestamp();
+            // Check staleness (if updated_at + threshold < now)
+            if now.saturating_sub(signal.updated_at) > config.staleness_threshold_secs {
+                config.default_multiplier_bps
+            } else {
+                signal
+                    .multiplier_bps
+                    .clamp(config.min_multiplier_bps, config.max_multiplier_bps)
+            }
+        } else {
+            config.default_multiplier_bps
+        }
+    }
+
     /// Admin: update fee optimization settings for dynamic fee adjustments.
     pub fn set_fee_optimization_config(
         env: Env,
@@ -532,7 +612,7 @@ impl FeeCollector {
         let config = get_fee_optimization_config(&env);
         let retry_config = stellar_swipe_common::retry_backoff::RetryConfig {
             max_attempts: config.max_retry_attempts,
-            base_delay_ledgers: 5,   // ~25 seconds at 5s/ledger
+            base_delay_ledgers: 5,        // ~25 seconds at 5s/ledger
             max_delay_ledgers: Some(200), // ~16 minutes max
         };
         let retry_state = stellar_swipe_common::retry_backoff::RetryState {
@@ -711,12 +791,39 @@ impl FeeCollector {
             .publish(&env);
         }
 
+        let mut remaining_distributable = distributable;
+
+        // 1. Referral Share
+        if let Some(referrer) = get_referrer(&env, &trader) {
+            let referral_bps = get_referral_fee_share_bps(&env);
+            let mut referral_amount = fee_amount
+                .checked_mul(referral_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap_or(0);
+            
+            if referral_amount > remaining_distributable {
+                referral_amount = remaining_distributable;
+            }
+
+            if referral_amount > 0 {
+                token_client.transfer(&env.current_contract_address(), &referrer, &referral_amount);
+                emit_referral_fee_paid(&env, &referrer, &trader, &token, referral_amount);
+                remaining_distributable = remaining_distributable.saturating_sub(referral_amount);
+            }
+        }
+
+        // 2. Revenue Share
         let revenue_share_rate = storage::get_revenue_share_rate_bps(&env);
-        let revenue_share_amount = distributable
+        let mut revenue_share_amount = distributable
             .checked_mul(revenue_share_rate as i128)
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or(0);
-        let treasury_credit = distributable.saturating_sub(revenue_share_amount);
+            
+        if revenue_share_amount > remaining_distributable {
+            revenue_share_amount = remaining_distributable;
+        }
+        
+        let treasury_credit = remaining_distributable.saturating_sub(revenue_share_amount);
 
         if revenue_share_amount > 0 {
             storage::add_revenue_share_pool(&env, &token, revenue_share_amount);
@@ -834,8 +941,7 @@ impl FeeCollector {
 
         if amount > 0 {
             // #691 – honour preferred payout currency when set and conversion succeeds.
-            let converted = if let Some(pref_token) =
-                get_provider_payout_currency(&env, &provider)
+            let converted = if let Some(pref_token) = get_provider_payout_currency(&env, &provider)
             {
                 if pref_token != token {
                     Self::try_claim_in_preferred_currency(
@@ -932,11 +1038,7 @@ impl FeeCollector {
         // Execute the conversion: zero out source pending fees and pay preferred.
         set_pending_fees(env, provider, source_token, 0);
 
-        pref_client.transfer(
-            &env.current_contract_address(),
-            provider,
-            &pref_amount,
-        );
+        pref_client.transfer(&env.current_contract_address(), provider, &pref_amount);
 
         emit_fees_claimed_converted(
             env,
@@ -1098,10 +1200,7 @@ impl FeeCollector {
     ///
     /// Tiers are processed in ascending `priority` order; tiers with the same
     /// priority value are processed in the order they appear in the Vec.
-    pub fn set_waterfall_config(
-        env: Env,
-        config: WaterfallConfig,
-    ) -> Result<(), ContractError> {
+    pub fn set_waterfall_config(env: Env, config: WaterfallConfig) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
@@ -1145,8 +1244,7 @@ impl FeeCollector {
             return Err(ContractError::InvalidAmount);
         }
 
-        let config =
-            get_waterfall_config(&env).ok_or(ContractError::WaterfallNotConfigured)?;
+        let config = get_waterfall_config(&env).ok_or(ContractError::WaterfallNotConfigured)?;
 
         let treasury_bal = get_treasury_balance(&env, &token);
         if treasury_bal < total_amount {
@@ -1209,11 +1307,7 @@ impl FeeCollector {
                 continue;
             };
 
-            token_client.transfer(
-                &env.current_contract_address(),
-                &tier.recipient,
-                &allocated,
-            );
+            token_client.transfer(&env.current_contract_address(), &tier.recipient, &allocated);
             remaining = remaining
                 .checked_sub(allocated)
                 .ok_or(ContractError::ArithmeticOverflow)?;
@@ -1390,5 +1484,68 @@ impl FeeCollector {
         emit_fee_forecast(&env, &token, projected, window, current_day);
         set_last_forecast_day(&env, &token, current_day);
         Ok(projected)
+    }
+
+    // ── Referral System ─────────────────────────────────────────────────────────
+
+    /// Register a referral mapping for a trader (referee) to a referrer.
+    pub fn register_referral(env: Env, referrer: Address, referee: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        referee.require_auth();
+
+        if referrer == referee {
+            return Err(ContractError::SelfReferralNotAllowed);
+        }
+
+        if get_referrer(&env, &referee).is_some() {
+            return Err(ContractError::ReferralAlreadyRegistered);
+        }
+
+        set_referrer(&env, &referee, &referrer);
+        emit_referral_registered(&env, &referrer, &referee);
+        Ok(())
+    }
+
+    /// Admin override to forcibly change a referral mapping.
+    pub fn admin_override_referral(env: Env, admin: Address, referrer: Address, referee: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if referrer == referee {
+            return Err(ContractError::SelfReferralNotAllowed);
+        }
+
+        set_referrer(&env, &referee, &referrer);
+        emit_referral_registered(&env, &referrer, &referee);
+        Ok(())
+    }
+
+    /// Admin configuration to set the referral fee share percentage in basis points.
+    pub fn set_referral_fee_share(env: Env, admin: Address, share_bps: u32) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if share_bps > 10_000 {
+            return Err(ContractError::InvalidFeeConfiguration);
+        }
+
+        let old_bps = get_referral_fee_share_bps(&env);
+        set_referral_fee_share_bps(&env, share_bps);
+        emit_referral_fee_share_updated(&env, old_bps, share_bps, &admin);
+        Ok(())
     }
 }

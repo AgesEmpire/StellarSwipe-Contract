@@ -59,6 +59,8 @@ pub enum GovernanceError {
     ActionNotFound = 48,
     InvalidTimelockConfig = 49,
     ConvictionPoolNotFound = 50,
+    /// Proposal has already been withdrawn — cannot be withdrawn again.
+    ProposalAlreadyWithdrawn = 51,
 }
 
 #[allow(non_upper_case_globals)]
