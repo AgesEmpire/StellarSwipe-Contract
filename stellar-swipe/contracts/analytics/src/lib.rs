@@ -9,7 +9,10 @@
 // Closes #673 — real-time TVL tracking
 pub mod risk_score;
 pub mod tvl;
+// Closes #753 — TTL-based result cache for expensive aggregate queries
+pub mod query_cache;
 
+use query_cache::QueryType;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 use stellar_swipe_common::SECONDS_PER_WEEK;
 
@@ -407,6 +410,109 @@ impl AnalyticsContract {
             .get(&DataKey::ProviderRiskScore(provider))
             .unwrap_or(risk_score::ScoreResult::InsufficientData)
     }
+
+    // ── Issue #753: TTL-based result cache ────────────────────────────────────
+
+    /// Admin: configure the cache TTL (seconds) for a specific query type.
+    /// Pass 0 to disable caching for that query type.
+    pub fn set_cache_ttl(env: Env, query_type: QueryType, ttl_secs: u64) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        query_cache::set_ttl(&env, query_type, ttl_secs);
+    }
+
+    /// Returns the configured cache TTL for a query type in seconds.
+    pub fn get_cache_ttl(env: Env, query_type: QueryType) -> u64 {
+        query_cache::get_ttl(&env, query_type)
+    }
+
+    /// Cached aggregate: total volume from the current protocol snapshot.
+    ///
+    /// Returns the cached value if still within the TTL window; otherwise
+    /// recomputes from the current snapshot and stores the fresh result.
+    pub fn get_total_volume_cached(env: Env) -> i128 {
+        if let Some(v) = query_cache::read(&env, QueryType::TotalVolume) {
+            return v;
+        }
+        let snapshot: ProtocolSnapshot = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentSnapshot)
+            .unwrap_or(ProtocolSnapshot {
+                total_signals: 0,
+                active_signals: 0,
+                total_providers: 0,
+                total_executions: 0,
+                total_volume: 0,
+                avg_success_rate_bps: 0,
+                timestamp: 0,
+            });
+        let value = snapshot.total_volume;
+        query_cache::write(&env, QueryType::TotalVolume, value);
+        value
+    }
+
+    /// Cached aggregate: active signal count from the current protocol snapshot.
+    pub fn get_active_signals_cached(env: Env) -> i128 {
+        if let Some(v) = query_cache::read(&env, QueryType::ActiveSignals) {
+            return v;
+        }
+        let snapshot: ProtocolSnapshot = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentSnapshot)
+            .unwrap_or(ProtocolSnapshot {
+                total_signals: 0,
+                active_signals: 0,
+                total_providers: 0,
+                total_executions: 0,
+                total_volume: 0,
+                avg_success_rate_bps: 0,
+                timestamp: 0,
+            });
+        let value = snapshot.active_signals as i128;
+        query_cache::write(&env, QueryType::ActiveSignals, value);
+        value
+    }
+
+    /// Cached aggregate: total execution count from the current protocol snapshot.
+    pub fn get_total_executions_cached(env: Env) -> i128 {
+        if let Some(v) = query_cache::read(&env, QueryType::TotalExecutions) {
+            return v;
+        }
+        let snapshot: ProtocolSnapshot = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentSnapshot)
+            .unwrap_or(ProtocolSnapshot {
+                total_signals: 0,
+                active_signals: 0,
+                total_providers: 0,
+                total_executions: 0,
+                total_volume: 0,
+                avg_success_rate_bps: 0,
+                timestamp: 0,
+            });
+        let value = snapshot.total_executions as i128;
+        query_cache::write(&env, QueryType::TotalExecutions, value);
+        value
+    }
+
+    /// Admin: explicitly invalidate the cached result for a query type,
+    /// forcing the next call to recompute from current state.
+    pub fn invalidate_cache(env: Env, query_type: QueryType) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        query_cache::invalidate(&env, query_type);
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -713,5 +819,119 @@ mod tests {
         // Check view entrypoint matches what keeper updated
         let view_score = client.get_risk_adjusted_score(&provider);
         assert_eq!(final_score, view_score);
+    }
+}
+
+// ── Issue #753: TTL cache unit tests ─────────────────────────────────────────
+
+#[cfg(test)]
+mod tests_cache {
+    use super::*;
+    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+
+    fn make_snapshot(volume: i128, active: u64, executions: u64) -> ProtocolSnapshot {
+        ProtocolSnapshot {
+            total_signals: 0,
+            active_signals: active,
+            total_providers: 0,
+            total_executions: executions,
+            total_volume: volume,
+            avg_success_rate_bps: 0,
+            timestamp: 0,
+        }
+    }
+
+    fn setup(env: &Env) -> (Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let id = env.register(AnalyticsContract, ());
+        let client = AnalyticsContractClient::new(env, &id);
+        client.initialize(&admin);
+        (admin, id)
+    }
+
+    /// Cache miss computes fresh and stores the result.
+    #[test]
+    fn test_cache_miss_computes_and_stores() {
+        let env = Env::default();
+        let (admin, id) = setup(&env);
+        let client = AnalyticsContractClient::new(&env, &id);
+
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        client.update_snapshot(&make_snapshot(5_000_000, 30, 200));
+
+        let value = client.get_total_volume_cached();
+        assert_eq!(value, 5_000_000);
+    }
+
+    /// Cache hit within TTL returns cached value without recomputation.
+    #[test]
+    fn test_cache_hit_within_ttl_returns_cached_value() {
+        let env = Env::default();
+        let (admin, id) = setup(&env);
+        let client = AnalyticsContractClient::new(&env, &id);
+
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        client.update_snapshot(&make_snapshot(5_000_000, 30, 200));
+
+        // First call — computes and caches.
+        let v1 = client.get_total_volume_cached();
+        assert_eq!(v1, 5_000_000);
+
+        // Update the snapshot to a different value.
+        client.update_snapshot(&make_snapshot(9_999_000, 30, 200));
+
+        // Within TTL — should return the OLD cached value.
+        let v2 = client.get_total_volume_cached();
+        assert_eq!(v2, 5_000_000, "should be cached old value");
+    }
+
+    /// Cache expiry after TTL triggers recomputation.
+    #[test]
+    fn test_cache_expiry_recomputes() {
+        let env = Env::default();
+        let (admin, id) = setup(&env);
+        let client = AnalyticsContractClient::new(&env, &id);
+
+        // Set a short TTL of 10 seconds.
+        client.set_cache_ttl(&QueryType::TotalVolume, &10u64);
+
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        client.update_snapshot(&make_snapshot(5_000_000, 30, 200));
+        let v1 = client.get_total_volume_cached();
+        assert_eq!(v1, 5_000_000);
+
+        // Update snapshot.
+        client.update_snapshot(&make_snapshot(7_000_000, 40, 250));
+
+        // Advance past TTL.
+        env.ledger().with_mut(|l| l.timestamp = 1_015);
+
+        // Should recompute and return new value.
+        let v2 = client.get_total_volume_cached();
+        assert_eq!(v2, 7_000_000, "should be fresh value after TTL");
+    }
+
+    /// Admin invalidate hook forces recomputation on next call.
+    #[test]
+    fn test_admin_invalidate_forces_recompute() {
+        let env = Env::default();
+        let (admin, id) = setup(&env);
+        let client = AnalyticsContractClient::new(&env, &id);
+
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        client.update_snapshot(&make_snapshot(3_000_000, 10, 50));
+        let v1 = client.get_total_volume_cached();
+        assert_eq!(v1, 3_000_000);
+
+        // Update snapshot but cache is still valid.
+        client.update_snapshot(&make_snapshot(6_000_000, 20, 100));
+        assert_eq!(client.get_total_volume_cached(), 3_000_000, "still cached");
+
+        // Admin invalidates.
+        client.invalidate_cache(&QueryType::TotalVolume);
+
+        // Next call should return fresh value.
+        assert_eq!(client.get_total_volume_cached(), 6_000_000, "fresh after invalidate");
     }
 }
