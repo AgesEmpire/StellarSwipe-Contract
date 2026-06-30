@@ -2,3 +2,4 @@
 mod test;
 
 pub mod property_tests;
+pub mod referral_tests;

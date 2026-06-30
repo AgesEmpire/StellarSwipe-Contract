@@ -791,12 +791,39 @@ impl FeeCollector {
             .publish(&env);
         }
 
+        let mut remaining_distributable = distributable;
+
+        // 1. Referral Share
+        if let Some(referrer) = get_referrer(&env, &trader) {
+            let referral_bps = get_referral_fee_share_bps(&env);
+            let mut referral_amount = fee_amount
+                .checked_mul(referral_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap_or(0);
+            
+            if referral_amount > remaining_distributable {
+                referral_amount = remaining_distributable;
+            }
+
+            if referral_amount > 0 {
+                token_client.transfer(&env.current_contract_address(), &referrer, &referral_amount);
+                emit_referral_fee_paid(&env, &referrer, &trader, &token, referral_amount);
+                remaining_distributable = remaining_distributable.saturating_sub(referral_amount);
+            }
+        }
+
+        // 2. Revenue Share
         let revenue_share_rate = storage::get_revenue_share_rate_bps(&env);
-        let revenue_share_amount = distributable
+        let mut revenue_share_amount = distributable
             .checked_mul(revenue_share_rate as i128)
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or(0);
-        let treasury_credit = distributable.saturating_sub(revenue_share_amount);
+            
+        if revenue_share_amount > remaining_distributable {
+            revenue_share_amount = remaining_distributable;
+        }
+        
+        let treasury_credit = remaining_distributable.saturating_sub(revenue_share_amount);
 
         if revenue_share_amount > 0 {
             storage::add_revenue_share_pool(&env, &token, revenue_share_amount);
@@ -1457,5 +1484,68 @@ impl FeeCollector {
         emit_fee_forecast(&env, &token, projected, window, current_day);
         set_last_forecast_day(&env, &token, current_day);
         Ok(projected)
+    }
+
+    // ── Referral System ─────────────────────────────────────────────────────────
+
+    /// Register a referral mapping for a trader (referee) to a referrer.
+    pub fn register_referral(env: Env, referrer: Address, referee: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        referee.require_auth();
+
+        if referrer == referee {
+            return Err(ContractError::SelfReferralNotAllowed);
+        }
+
+        if get_referrer(&env, &referee).is_some() {
+            return Err(ContractError::ReferralAlreadyRegistered);
+        }
+
+        set_referrer(&env, &referee, &referrer);
+        emit_referral_registered(&env, &referrer, &referee);
+        Ok(())
+    }
+
+    /// Admin override to forcibly change a referral mapping.
+    pub fn admin_override_referral(env: Env, admin: Address, referrer: Address, referee: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if referrer == referee {
+            return Err(ContractError::SelfReferralNotAllowed);
+        }
+
+        set_referrer(&env, &referee, &referrer);
+        emit_referral_registered(&env, &referrer, &referee);
+        Ok(())
+    }
+
+    /// Admin configuration to set the referral fee share percentage in basis points.
+    pub fn set_referral_fee_share(env: Env, admin: Address, share_bps: u32) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if share_bps > 10_000 {
+            return Err(ContractError::InvalidFeeConfiguration);
+        }
+
+        let old_bps = get_referral_fee_share_bps(&env);
+        set_referral_fee_share_bps(&env, share_bps);
+        emit_referral_fee_share_updated(&env, old_bps, share_bps, &admin);
+        Ok(())
     }
 }

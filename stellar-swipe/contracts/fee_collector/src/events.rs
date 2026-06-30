@@ -67,6 +67,27 @@ pub struct FirstTradeFeeWaived {
     pub user: Address,
 }
 
+#[contractevent]
+pub struct ReferralRegistered {
+    pub referrer: Address,
+    pub referee: Address,
+}
+
+#[contractevent]
+pub struct ReferralFeeShareUpdated {
+    pub old_bps: u32,
+    pub new_bps: u32,
+    pub updated_by: Address,
+}
+
+#[contractevent]
+pub struct ReferralFeePaid {
+    pub referrer: Address,
+    pub referee: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
 // ── Emit helpers ──────────────────────────────────────────────────────────────
 
 pub struct EvtWithdrawalQueued {
