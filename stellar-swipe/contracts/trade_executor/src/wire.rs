@@ -15,17 +15,20 @@ pub enum OrderType {
 pub enum TradeStatus {
     Pending,
     PartiallyFilled,
-    Filled,
+    ExecutedAwaitingConfirmation, 
+    Filled,                      
     Failed,
 }
 
 /// Default timeout: 120 ledgers ≈ 10 minutes (5-second ledger close time).
 pub const TRADE_TIMEOUT_LEDGERS: u32 = 120;
+pub const DEFAULT_CONFIRMATION_DEPTH: u32 = 10;
 
 /// A pending limit order stored on-chain, subject to expiry.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TradeOrder {
+    pub execution_ledger: u32,
     pub trade_id: u64,
     pub user: Address,
     pub amount: i128,
@@ -43,6 +46,7 @@ pub struct Trade {
     pub executed_price: i128,
     pub timestamp: u64,
     pub status: TradeStatus,
+    pub execution_ledger: u32
 }
 
 #[contracttype]
