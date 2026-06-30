@@ -40,5 +40,12 @@ path = "tests/integration/test_signal_to_reward_lifecycle.rs"
 name = "test_chaos_ordering"
 path = "tests/integration/test_chaos_ordering.rs"
 
+[[test]]
+name = "test_arithmetic_invariants"
+path = "tests/integration/test_arithmetic_invariants.rs"
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
 [lints]
 workspace = true
