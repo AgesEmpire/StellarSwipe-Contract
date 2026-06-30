@@ -2402,3 +2402,274 @@ fn test_reputation_leaderboard_limit() {
     assert_eq!(res, Err(Ok(GovernanceError::IterationLimitExceeded)));
 }
 
+// ── Proposal self-withdrawal tests ──────────────────────────────────────────
+
+#[test]
+fn proposer_can_withdraw_proposal_before_voting_opens() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::ParameterChange(
+            String::from_str(&env, "liquidity_reward_bps"),
+            100,
+            120,
+        ),
+        &String::from_str(&env, "Adjust reward"),
+        &String::from_str(&env, "Increase by 20%"),
+        &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
+    );
+
+    // Still at t=0, well before voting_starts (t=60). Proposal is Pending.
+    let status = client.withdraw_proposal(&proposal_id, &recipients.community_rewards);
+    assert_eq!(status, ProposalStatus::Withdrawn);
+
+    let proposal = client.proposal(&proposal_id);
+    assert_eq!(proposal.status, ProposalStatus::Withdrawn);
+}
+
+#[test]
+fn non_proposer_cannot_withdraw_others_proposal() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "Test signal")),
+        &String::from_str(&env, "Signal vote"),
+        &String::from_str(&env, "Community signal"),
+        &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
+    );
+
+    // public_sale is NOT the proposer — must be rejected.
+    let result =
+        client.try_withdraw_proposal(&proposal_id, &recipients.public_sale);
+    assert_eq!(result, Err(Ok(GovernanceError::Unauthorized)));
+
+    // Original proposal must remain unchanged.
+    let proposal = client.proposal(&proposal_id);
+    assert_eq!(proposal.status, ProposalStatus::Pending);
+}
+
+#[test]
+fn cannot_withdraw_after_voting_has_started() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+    client.stake(&recipients.public_sale, &40_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::ParameterChange(
+            String::from_str(&env, "liquidity_reward_bps"),
+            100,
+            120,
+        ),
+        &String::from_str(&env, "Adjust reward"),
+        &String::from_str(&env, "Increase by 20%"),
+        &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
+    );
+
+    // Advance past voting_starts (t=60) and cast a vote → status becomes Active.
+    env.ledger().set_timestamp(70);
+    client.cast_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+
+    // Now try to withdraw — must be rejected because status is Active.
+    let result =
+        client.try_withdraw_proposal(&proposal_id, &recipients.community_rewards);
+    assert_eq!(result, Err(Ok(GovernanceError::ProposalNotActive)));
+}
+
+#[test]
+fn withdrawn_proposal_refunds_deposit() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+
+    let proposer = &recipients.community_rewards;
+    let balance_before = client.balance(proposer);
+
+    let proposal_id = client.create_proposal(
+        proposer,
+        &ProposalType::SignalProposal(String::from_str(&env, "Test")),
+        &String::from_str(&env, "Deposit test"),
+        &String::from_str(&env, "Verify deposit refund"),
+        &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
+    );
+
+    // Deposit was locked — balance should be reduced.
+    let balance_after_create = client.balance(proposer);
+    assert!(
+        balance_after_create < balance_before,
+        "balance must decrease after proposal creation due to deposit lock"
+    );
+
+    // Withdraw the proposal.
+    client.withdraw_proposal(&proposal_id, proposer);
+
+    // Deposit must be refunded — balance should return to original.
+    let balance_after_withdraw = client.balance(proposer);
+    assert_eq!(
+        balance_after_withdraw, balance_before,
+        "deposit must be fully refunded on self-withdrawal"
+    );
+}
+
+#[test]
+fn withdraw_proposal_emits_event() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "Event test")),
+        &String::from_str(&env, "Event check"),
+        &String::from_str(&env, "Verify event emission"),
+        &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
+    );
+
+    client.withdraw_proposal(&proposal_id, &recipients.community_rewards);
+
+    // Verify that a (gov, propwdr) event was emitted.
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        let t0 = topics
+            .get(0)
+            .and_then(|v| Symbol::try_from_val(&env, &v).ok());
+        let t1 = topics
+            .get(1)
+            .and_then(|v| Symbol::try_from_val(&env, &v).ok());
+        t0 == Some(Symbol::new(&env, "gov")) && t1 == Some(Symbol::new(&env, "propwdr"))
+    });
+    assert!(
+        found,
+        "withdraw_proposal must emit (gov, propwdr) event"
+    );
+}
+
+#[test]
+fn cannot_withdraw_already_withdrawn_proposal() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "Double withdraw")),
+        &String::from_str(&env, "Double withdraw test"),
+        &String::from_str(&env, "Cannot withdraw twice"),
+        &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
+    );
+
+    // First withdrawal — succeeds.
+    let status = client.withdraw_proposal(&proposal_id, &recipients.community_rewards);
+    assert_eq!(status, ProposalStatus::Withdrawn);
+
+    // Second withdrawal — must be rejected (status is Withdrawn, not Pending).
+    let result =
+        client.try_withdraw_proposal(&proposal_id, &recipients.community_rewards);
+    assert_eq!(result, Err(Ok(GovernanceError::ProposalNotActive)));
+}
+
+#[test]
+fn withdrawn_proposals_excluded_from_voting_eligible_listings() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+
+    // Create two proposals.
+    let pid1 = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "Keep this")),
+        &String::from_str(&env, "Active proposal"),
+        &String::from_str(&env, "Should remain"),
+        &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
+    );
+    let pid2 = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "Withdraw this")),
+        &String::from_str(&env, "Withdrawn proposal"),
+        &String::from_str(&env, "Should be withdrawn"),
+        &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
+    );
+
+    // Withdraw the second proposal.
+    client.withdraw_proposal(&pid2, &recipients.community_rewards);
+
+    // get_all_proposals should still return both, but the withdrawn one
+    // has Withdrawn status (not Pending/Active) so it's excluded from
+    // voting-eligible listings by status check.
+    let all = client.proposals();
+    assert_eq!(all.len(), 2);
+    let p1 = all.get(0).unwrap();
+    let p2 = all.get(1).unwrap();
+    assert_eq!(p1.status, ProposalStatus::Pending);
+    assert_eq!(p2.status, ProposalStatus::Withdrawn);
+}
+
+#[test]
+fn cancelled_proposal_cannot_be_withdrawn() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "Cancel test")),
+        &String::from_str(&env, "Cancel first"),
+        &String::from_str(&env, "Then try withdraw"),
+        &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
+    );
+
+    // Cancel the proposal first.
+    client.cancel_proposal(&proposal_id, &recipients.community_rewards);
+
+    // Now try to withdraw — must be rejected (status is Cancelled, not Pending).
+    let result =
+        client.try_withdraw_proposal(&proposal_id, &recipients.community_rewards);
+    assert_eq!(result, Err(Ok(GovernanceError::ProposalNotActive)));
+}
+

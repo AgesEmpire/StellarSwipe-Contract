@@ -1,6 +1,6 @@
+use crate::storage::WaterfallTierResult;
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use soroban_sdk::{contractevent, Address, Env, String, Symbol, Vec};
-use crate::storage::WaterfallTierResult;
 
 #[contractevent]
 pub struct WithdrawalQueued {
@@ -341,34 +341,25 @@ pub fn emit_fees_claimed_converted(
     );
 }
 
-// ── Referral Events ─────────────────────────────────────────────────────────
+// ── Congestion-Based Dynamic Fees event ──────────────────────────────────────
 
-pub fn emit_referral_registered(env: &Env, referrer: &Address, referee: &Address) {
-    env.events().publish(
-        (
-            Symbol::new(env, "fee_collector"),
-            Symbol::new(env, "referral_registered"),
-        ),
-        (referrer.clone(), referee.clone()),
-    );
+#[contractevent]
+pub struct EffectiveMultiplierChanged {
+    pub old_multiplier_bps: u32,
+    pub new_multiplier_bps: u32,
 }
 
-pub fn emit_referral_fee_share_updated(env: &Env, old_bps: u32, new_bps: u32, updated_by: &Address) {
-    env.events().publish(
-        (
-            Symbol::new(env, "fee_collector"),
-            Symbol::new(env, "referral_fee_share_updated"),
-        ),
-        (old_bps, new_bps, updated_by.clone()),
-    );
+pub struct EvtEffectiveMultiplierChanged {
+    pub old_multiplier_bps: u32,
+    pub new_multiplier_bps: u32,
 }
 
-pub fn emit_referral_fee_paid(env: &Env, referrer: &Address, referee: &Address, token: &Address, amount: i128) {
+pub fn emit_effective_multiplier_changed(env: &Env, evt: EvtEffectiveMultiplierChanged) {
     env.events().publish(
         (
             Symbol::new(env, "fee_collector"),
-            Symbol::new(env, "referral_fee_paid"),
+            Symbol::new(env, "multiplier_changed"),
         ),
-        (referrer.clone(), referee.clone(), token.clone(), amount),
+        (evt.old_multiplier_bps, evt.new_multiplier_bps),
     );
 }

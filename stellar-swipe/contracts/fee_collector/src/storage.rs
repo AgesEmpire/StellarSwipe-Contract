@@ -1,7 +1,9 @@
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use shared::initializable;
 use soroban_sdk::{contracttype, Address, Env, String, Vec};
-use stellar_swipe_common::storage_crud::{crud_get, crud_get_or, crud_has, crud_remove, crud_set, StorageTier};
+use stellar_swipe_common::storage_crud::{
+    crud_get, crud_get_or, crud_has, crud_remove, crud_set, StorageTier,
+};
 use stellar_swipe_common::Asset;
 
 // ── #690: Fee Distribution Waterfall ────────────────────────────────────────
@@ -116,10 +118,9 @@ pub enum StorageKey {
     DailyFeeTotal(Address, u64),
     /// #665: Last day a forecast was emitted per token.
     LastForecastDay(Address),
-    /// Referral mapping: Referee (Address) -> Referrer (Address)
-    Referral(Address),
-    /// Configurable referral fee-share percentage in basis points.
-    ReferralFeeShareBps,
+    /// Congestion signal parameters
+    CongestionConfig,
+    CongestionSignal,
 }
 
 #[contracttype]
@@ -210,17 +211,32 @@ pub fn get_oracle_contract(env: &Env) -> Option<Address> {
 }
 
 pub fn set_oracle_contract(env: &Env, contract: &Address) {
-    crud_set(env, StorageTier::Instance, &StorageKey::OracleContract, contract);
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::OracleContract,
+        contract,
+    );
 }
 
 // --- Treasury Balance ---
 
 pub fn get_treasury_balance(env: &Env, token: &Address) -> i128 {
-    crud_get_or(env, StorageTier::Persistent, &StorageKey::TreasuryBalance(token.clone()), 0i128)
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::TreasuryBalance(token.clone()),
+        0i128,
+    )
 }
 
 pub fn set_treasury_balance(env: &Env, token: &Address, balance: i128) {
-    crud_set(env, StorageTier::Persistent, &StorageKey::TreasuryBalance(token.clone()), &balance);
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::TreasuryBalance(token.clone()),
+        &balance,
+    );
 }
 
 // --- Queued Withdrawal ---
@@ -230,7 +246,12 @@ pub fn get_queued_withdrawal(env: &Env) -> Option<QueuedWithdrawal> {
 }
 
 pub fn set_queued_withdrawal(env: &Env, withdrawal: &QueuedWithdrawal) {
-    crud_set(env, StorageTier::Instance, &StorageKey::QueuedWithdrawal, withdrawal);
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::QueuedWithdrawal,
+        withdrawal,
+    );
 }
 
 pub fn remove_queued_withdrawal(env: &Env) {
@@ -240,7 +261,12 @@ pub fn remove_queued_withdrawal(env: &Env) {
 // --- Fee Rate ---
 
 pub fn get_fee_rate(env: &Env) -> u32 {
-    crud_get_or(env, StorageTier::Instance, &StorageKey::FeeRate, DEFAULT_FEE_RATE_BPS)
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &StorageKey::FeeRate,
+        DEFAULT_FEE_RATE_BPS,
+    )
 }
 
 pub fn set_fee_rate(env: &Env, rate: u32) {
@@ -250,25 +276,44 @@ pub fn set_fee_rate(env: &Env, rate: u32) {
 // --- Fee Optimization ---
 
 pub fn get_network_condition_score(env: &Env) -> u32 {
-    crud_get_or(env, StorageTier::Instance, &StorageKey::NetworkConditionScore, DEFAULT_NETWORK_SCORE_BPS)
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &StorageKey::NetworkConditionScore,
+        DEFAULT_NETWORK_SCORE_BPS,
+    )
 }
 
 pub fn set_network_condition_score(env: &Env, score: u32) {
-    crud_set(env, StorageTier::Instance, &StorageKey::NetworkConditionScore, &score);
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::NetworkConditionScore,
+        &score,
+    );
 }
 
 pub fn get_fee_optimization_config(env: &Env) -> FeeOptimizationConfig {
-    crud_get(env, StorageTier::Instance, &StorageKey::FeeOptimizationConfig)
-        .unwrap_or(FeeOptimizationConfig {
-            max_dynamic_rate_bps: DEFAULT_FEE_OPTIMIZATION_MAX_RATE_BPS,
-            congestion_sensitivity_bps: DEFAULT_CONGESTION_SENSITIVITY_BPS,
-            min_effective_rate_bps: MIN_FEE_RATE_BPS,
-            max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
-        })
+    crud_get(
+        env,
+        StorageTier::Instance,
+        &StorageKey::FeeOptimizationConfig,
+    )
+    .unwrap_or(FeeOptimizationConfig {
+        max_dynamic_rate_bps: DEFAULT_FEE_OPTIMIZATION_MAX_RATE_BPS,
+        congestion_sensitivity_bps: DEFAULT_CONGESTION_SENSITIVITY_BPS,
+        min_effective_rate_bps: MIN_FEE_RATE_BPS,
+        max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
+    })
 }
 
 pub fn set_fee_optimization_config(env: &Env, config: &FeeOptimizationConfig) {
-    crud_set(env, StorageTier::Instance, &StorageKey::FeeOptimizationConfig, config);
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::FeeOptimizationConfig,
+        config,
+    );
 }
 
 pub fn get_last_error_report(env: &Env) -> Option<ErrorReport> {
@@ -276,25 +321,48 @@ pub fn get_last_error_report(env: &Env) -> Option<ErrorReport> {
 }
 
 pub fn set_last_error_report(env: &Env, report: &ErrorReport) {
-    crud_set(env, StorageTier::Instance, &StorageKey::LastErrorReport, report);
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::LastErrorReport,
+        report,
+    );
 }
 
 pub fn get_failed_fee_collection(env: &Env, id: &String) -> Option<FailedFeeCollection> {
-    crud_get(env, StorageTier::Persistent, &StorageKey::FailedFeeCollection(id.clone()))
+    crud_get(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::FailedFeeCollection(id.clone()),
+    )
 }
 
 pub fn set_failed_fee_collection(env: &Env, failed: &FailedFeeCollection) {
-    crud_set(env, StorageTier::Persistent, &StorageKey::FailedFeeCollection(failed.id.clone()), failed);
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::FailedFeeCollection(failed.id.clone()),
+        failed,
+    );
 }
 
 pub fn remove_failed_fee_collection(env: &Env, id: &String) {
-    crud_remove(env, StorageTier::Persistent, &StorageKey::FailedFeeCollection(id.clone()));
+    crud_remove(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::FailedFeeCollection(id.clone()),
+    );
 }
 
 // --- Burn Rate ---
 
 pub fn get_burn_rate(env: &Env) -> u32 {
-    crud_get_or(env, StorageTier::Instance, &StorageKey::BurnRate, DEFAULT_BURN_RATE_BPS)
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &StorageKey::BurnRate,
+        DEFAULT_BURN_RATE_BPS,
+    )
 }
 
 pub fn set_burn_rate(env: &Env, rate: u32) {
@@ -324,15 +392,28 @@ pub fn set_pending_fees(env: &Env, provider: &Address, token: &Address, amount: 
 // --- Monthly Trade Volume ---
 
 pub fn get_monthly_trade_volume(env: &Env, user: &Address) -> Option<MonthlyTradeVolume> {
-    crud_get(env, StorageTier::Persistent, &StorageKey::MonthlyTradeVolume(user.clone()))
+    crud_get(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::MonthlyTradeVolume(user.clone()),
+    )
 }
 
 pub fn set_monthly_trade_volume(env: &Env, user: &Address, volume: &MonthlyTradeVolume) {
-    crud_set(env, StorageTier::Persistent, &StorageKey::MonthlyTradeVolume(user.clone()), volume);
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::MonthlyTradeVolume(user.clone()),
+        volume,
+    );
 }
 
 pub fn remove_monthly_trade_volume(env: &Env, user: &Address) {
-    crud_remove(env, StorageTier::Persistent, &StorageKey::MonthlyTradeVolume(user.clone()));
+    crud_remove(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::MonthlyTradeVolume(user.clone()),
+    );
 }
 
 // --- Provider Daily Fee Shares (Issue #366) ---
@@ -356,8 +437,12 @@ pub fn get_provider_total_earnings(env: &Env, provider: &Address) -> i128 {
 }
 
 pub fn get_provider_earnings_index(env: &Env) -> Vec<Address> {
-    crud_get(env, StorageTier::Persistent, &StorageKey::ProviderEarningsIndex)
-        .unwrap_or_else(|| Vec::new(env))
+    crud_get(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::ProviderEarningsIndex,
+    )
+    .unwrap_or_else(|| Vec::new(env))
 }
 
 pub fn add_provider_to_earnings_index(env: &Env, provider: &Address) {
@@ -368,20 +453,35 @@ pub fn add_provider_to_earnings_index(env: &Env, provider: &Address) {
         }
     }
     index.push_back(provider.clone());
-    crud_set(env, StorageTier::Persistent, &StorageKey::ProviderEarningsIndex, &index);
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::ProviderEarningsIndex,
+        &index,
+    );
 }
 
 pub fn add_provider_total_earnings(env: &Env, provider: &Address, amount: i128) {
     let key = StorageKey::ProviderTotalEarnings(provider.clone());
     let current: i128 = crud_get_or(env, StorageTier::Persistent, &key, 0i128);
-    crud_set(env, StorageTier::Persistent, &key, &current.saturating_add(amount));
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &key,
+        &current.saturating_add(amount),
+    );
     add_provider_to_earnings_index(env, provider);
 }
 
 pub fn add_provider_daily_fee_shares(env: &Env, provider: &Address, day: u64, amount: i128) {
     let key = StorageKey::ProviderDailyFeeShares(provider.clone(), day);
     let current: i128 = crud_get_or(env, StorageTier::Persistent, &key, 0i128);
-    crud_set(env, StorageTier::Persistent, &key, &current.saturating_add(amount));
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &key,
+        &current.saturating_add(amount),
+    );
 
     let first_key = StorageKey::ProviderEarningsFirstDay(provider.clone());
     if !crud_has(env, StorageTier::Persistent, &first_key) {
@@ -391,17 +491,31 @@ pub fn add_provider_daily_fee_shares(env: &Env, provider: &Address, day: u64, am
 }
 
 pub fn get_provider_earnings_first_day(env: &Env, provider: &Address) -> Option<u64> {
-    crud_get(env, StorageTier::Persistent, &StorageKey::ProviderEarningsFirstDay(provider.clone()))
+    crud_get(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::ProviderEarningsFirstDay(provider.clone()),
+    )
 }
 
 // --- First-trade tracking (Issue #428) ---
 
 pub fn has_traded(env: &Env, user: &Address) -> bool {
-    crud_get_or(env, StorageTier::Persistent, &StorageKey::HasTraded(user.clone()), false)
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::HasTraded(user.clone()),
+        false,
+    )
 }
 
 pub fn set_has_traded(env: &Env, user: &Address) {
-    crud_set(env, StorageTier::Persistent, &StorageKey::HasTraded(user.clone()), &true);
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::HasTraded(user.clone()),
+        &true,
+    );
 }
 
 // ── Issue #438: Protocol Token ──────────────────────────────────────
@@ -411,7 +525,12 @@ pub fn get_protocol_token(env: &Env) -> Option<Address> {
 }
 
 pub fn set_protocol_token(env: &Env, token: &Address) {
-    crud_set(env, StorageTier::Instance, &StorageKey::ProtocolToken, token);
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::ProtocolToken,
+        token,
+    );
 }
 
 // ── Issue #442: Revenue Share ────────────────────────────────────────
@@ -420,23 +539,47 @@ pub const DEFAULT_REVENUE_SHARE_RATE_BPS: u32 = 2000; // 20%
 pub const SECONDS_PER_WEEK: u64 = 604_800;
 
 pub fn get_revenue_share_rate_bps(env: &Env) -> u32 {
-    crud_get_or(env, StorageTier::Instance, &StorageKey::RevenueShareRateBps, DEFAULT_REVENUE_SHARE_RATE_BPS)
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RevenueShareRateBps,
+        DEFAULT_REVENUE_SHARE_RATE_BPS,
+    )
 }
 
 pub fn set_revenue_share_rate_bps(env: &Env, rate_bps: u32) {
-    crud_set(env, StorageTier::Instance, &StorageKey::RevenueShareRateBps, &rate_bps);
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RevenueShareRateBps,
+        &rate_bps,
+    );
 }
 
 pub fn get_last_revenue_share_snapshot(env: &Env) -> Option<u64> {
-    crud_get(env, StorageTier::Instance, &StorageKey::LastRevenueShareSnapshot)
+    crud_get(
+        env,
+        StorageTier::Instance,
+        &StorageKey::LastRevenueShareSnapshot,
+    )
 }
 
 pub fn set_last_revenue_share_snapshot(env: &Env, ledger: u64) {
-    crud_set(env, StorageTier::Instance, &StorageKey::LastRevenueShareSnapshot, &ledger);
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::LastRevenueShareSnapshot,
+        &ledger,
+    );
 }
 
 pub fn get_revenue_share_pool(env: &Env, token: &Address) -> i128 {
-    crud_get_or(env, StorageTier::Persistent, &StorageKey::RevenueSharePool(token.clone()), 0i128)
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::RevenueSharePool(token.clone()),
+        0i128,
+    )
 }
 
 pub fn add_revenue_share_pool(env: &Env, token: &Address, amount: i128) {
@@ -450,7 +593,11 @@ pub fn add_revenue_share_pool(env: &Env, token: &Address, amount: i128) {
 }
 
 pub fn clear_revenue_share_pool(env: &Env, token: &Address) {
-    crud_remove(env, StorageTier::Persistent, &StorageKey::RevenueSharePool(token.clone()));
+    crud_remove(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::RevenueSharePool(token.clone()),
+    );
 }
 
 // ── #690: Waterfall Config ───────────────────────────────────────────────────
@@ -460,7 +607,12 @@ pub fn get_waterfall_config(env: &Env) -> Option<WaterfallConfig> {
 }
 
 pub fn set_waterfall_config(env: &Env, config: &WaterfallConfig) {
-    crud_set(env, StorageTier::Instance, &StorageKey::WaterfallConfig, config);
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::WaterfallConfig,
+        config,
+    );
 }
 
 // ── #691: Provider Payout Currency ──────────────────────────────────────────
@@ -585,22 +737,48 @@ pub fn set_last_forecast_day(env: &Env, token: &Address, day: u64) {
         .set(&StorageKey::LastForecastDay(token.clone()), &day);
 }
 
-// ── Referral System ─────────────────────────────────────────────────────────
+// ── Congestion-Based Dynamic Fees ─────────────────────────────────────────────
 
-pub fn get_referrer(env: &Env, referee: &Address) -> Option<Address> {
-    crud_get(env, StorageTier::Persistent, &StorageKey::Referral(referee.clone()))
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CongestionConfig {
+    pub min_multiplier_bps: u32,
+    pub max_multiplier_bps: u32,
+    pub staleness_threshold_secs: u64,
+    pub default_multiplier_bps: u32,
 }
 
-pub fn set_referrer(env: &Env, referee: &Address, referrer: &Address) {
-    crud_set(env, StorageTier::Persistent, &StorageKey::Referral(referee.clone()), referrer);
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CongestionSignal {
+    pub multiplier_bps: u32,
+    pub updated_at: u64,
 }
 
-pub const DEFAULT_REFERRAL_FEE_SHARE_BPS: u32 = 1000; // 10%
-
-pub fn get_referral_fee_share_bps(env: &Env) -> u32 {
-    crud_get_or(env, StorageTier::Instance, &StorageKey::ReferralFeeShareBps, DEFAULT_REFERRAL_FEE_SHARE_BPS)
+pub fn get_congestion_config(env: &Env) -> CongestionConfig {
+    env.storage()
+        .instance()
+        .get(&StorageKey::CongestionConfig)
+        .unwrap_or(CongestionConfig {
+            min_multiplier_bps: 10_000,
+            max_multiplier_bps: 50_000,
+            staleness_threshold_secs: 300,
+            default_multiplier_bps: 10_000,
+        })
 }
 
-pub fn set_referral_fee_share_bps(env: &Env, bps: u32) {
-    crud_set(env, StorageTier::Instance, &StorageKey::ReferralFeeShareBps, &bps);
+pub fn set_congestion_config(env: &Env, config: &CongestionConfig) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::CongestionConfig, config);
+}
+
+pub fn get_congestion_signal(env: &Env) -> Option<CongestionSignal> {
+    env.storage().instance().get(&StorageKey::CongestionSignal)
+}
+
+pub fn set_congestion_signal(env: &Env, signal: &CongestionSignal) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::CongestionSignal, signal);
 }

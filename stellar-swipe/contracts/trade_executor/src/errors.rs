@@ -45,6 +45,7 @@ pub enum ContractError {
     DCAPlanAlreadyExists = 17,
     SignalExpired = 18,
     IntervalNotDue = 19,
+    ConfirmationDepthNotReached = 26,
     /// Transient: the network is congested. Caller should read `NetworkErrorDetail`
     /// via [`crate::TradeExecutorContract::get_network_error_detail`] and retry
     /// after `retry_after_ledger`.

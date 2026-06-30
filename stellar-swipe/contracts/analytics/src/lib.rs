@@ -7,6 +7,7 @@
 //! rotates current → previous for next week's comparison.
 
 // Closes #673 — real-time TVL tracking
+pub mod risk_score;
 pub mod tvl;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
@@ -81,6 +82,11 @@ enum DataKey {
     ExportChecksum(u64),
     /// Monotonic counter for export IDs.
     ExportCounter,
+    // ── Risk Score Storage ──
+    TrailingWindowSize,
+    MinSampleSize,
+    ProviderReturns(Address),
+    ProviderRiskScore(Address),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -113,14 +119,8 @@ fn compute_snapshot_checksum(s: &ProtocolSnapshot) -> u64 {
     h
 }
 
-soroban_sdk::contractmeta!(
-    key = "SourceHash",
-    val = env!("STELLAR_SOURCE_HASH")
-);
-soroban_sdk::contractmeta!(
-    key = "GitCommit",
-    val = env!("STELLAR_GIT_COMMIT")
-);
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct AnalyticsContract;
@@ -129,8 +129,14 @@ pub struct AnalyticsContract;
 impl AnalyticsContract {
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
-        m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
-        m.set(soroban_sdk::String::from_str(&env, "git_commit"), soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")));
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")),
+        );
         m
     }
 
@@ -286,12 +292,19 @@ impl AnalyticsContract {
             .get(&DataKey::ExportCounter)
             .unwrap_or(0)
             + 1;
-        env.storage().instance().set(&DataKey::ExportCounter, &export_id);
-        env.storage().instance().set(&DataKey::ExportChecksum(export_id), &checksum);
+        env.storage()
+            .instance()
+            .set(&DataKey::ExportCounter, &export_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::ExportChecksum(export_id), &checksum);
 
         #[allow(deprecated)]
         env.events().publish(
-            (Symbol::new(&env, "analytics"), Symbol::new(&env, "compliance_export")),
+            (
+                Symbol::new(&env, "analytics"),
+                Symbol::new(&env, "compliance_export"),
+            ),
             (export_id, checksum, snapshot.clone()),
         );
 
@@ -329,6 +342,70 @@ impl AnalyticsContract {
     /// `source`: 0 = StakeVault, 1 = LiquidityPool, 2 = Escrow.
     pub fn record_tvl_withdrawal(env: Env, source: tvl::TvlSource, amount: i128) {
         tvl::apply_delta(&env, source, -amount);
+    }
+
+    // ── Risk-Adjusted Return Score (Sharpe-style) ─────────────────────────────
+
+    /// Admin: Set the length of the trailing window (last N signals).
+    pub fn set_trailing_window_size(env: Env, size: u32) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        risk_score::set_trailing_window_size(&env, size);
+    }
+
+    /// Read-only: Get the length of the trailing window.
+    pub fn get_trailing_window_size(env: Env) -> u32 {
+        risk_score::get_trailing_window_size(&env)
+    }
+
+    /// Admin: Set the minimum sample size required to compute a score.
+    pub fn set_min_sample_size(env: Env, size: u32) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        risk_score::set_min_sample_size(&env, size);
+    }
+
+    /// Read-only: Get the minimum sample size.
+    pub fn get_min_sample_size(env: Env) -> u32 {
+        risk_score::get_min_sample_size(&env)
+    }
+
+    /// Record a historical signal outcome for a provider.
+    pub fn record_provider_outcome(env: Env, provider: Address, return_bps: i128) {
+        let timestamp = env.ledger().timestamp();
+        risk_score::record_provider_return(
+            &env,
+            &provider,
+            risk_score::HistoricReturn {
+                return_bps,
+                timestamp,
+            },
+        );
+    }
+
+    /// Keeper-triggered update entrypoint to recompute and persist score for a provider.
+    pub fn update_risk_adjusted_score(env: Env, provider: Address) -> risk_score::ScoreResult {
+        let score = risk_score::compute_risk_adjusted_score(&env, &provider);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProviderRiskScore(provider.clone()), &score);
+        score
+    }
+
+    /// View entrypoint exposing the currently stored risk-adjusted score.
+    pub fn get_risk_adjusted_score(env: Env, provider: Address) -> risk_score::ScoreResult {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProviderRiskScore(provider))
+            .unwrap_or(risk_score::ScoreResult::InsufficientData)
     }
 }
 
@@ -591,5 +668,50 @@ mod tests {
 
         client.initialize(&admin);
         assert!(!client.verify_export_checksum(&999, &week1_snapshot(0)));
+    }
+
+    // ── Risk-Adjusted Score Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_risk_adjusted_score_entrypoints() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let id = env.register(AnalyticsContract, ());
+        let client = AnalyticsContractClient::new(&env, &id);
+
+        client.initialize(&admin);
+        client.set_min_sample_size(&3);
+        assert_eq!(client.get_min_sample_size(), 3);
+
+        let provider = Address::generate(&env);
+
+        // Initial state
+        assert_eq!(
+            client.get_risk_adjusted_score(&provider),
+            risk_score::ScoreResult::InsufficientData
+        );
+
+        // Record 3 returns
+        env.ledger().with_mut(|l| l.timestamp = 100);
+        client.record_provider_outcome(&provider, &1000); // 10%
+        client.record_provider_outcome(&provider, &1000);
+
+        // Not enough data yet (min 3), updating shouldn't crash but return InsufficientData
+        let score_intermediate = client.update_risk_adjusted_score(&provider);
+        assert_eq!(
+            score_intermediate,
+            risk_score::ScoreResult::InsufficientData
+        );
+
+        client.record_provider_outcome(&provider, &1000);
+
+        // Recompute
+        let final_score = client.update_risk_adjusted_score(&provider);
+        assert!(matches!(final_score, risk_score::ScoreResult::Score(_)));
+
+        // Check view entrypoint matches what keeper updated
+        let view_score = client.get_risk_adjusted_score(&provider);
+        assert_eq!(final_score, view_score);
     }
 }

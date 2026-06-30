@@ -1402,4 +1402,124 @@ fn test_claim_fees_arg_scoped_auth_passes_for_correct_args() {
     assert!(result.is_ok(), "correctly scoped auth must succeed");
 }
 
+// ---------------------------------------------------------------------------
+// Congestion-Based Dynamic Fees
+// ---------------------------------------------------------------------------
 
+#[test]
+fn test_congestion_normal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+
+    // Base fee is 30 bps.
+    client.set_fee_rate(&30u32);
+    disable_revenue_share(&client);
+
+    let trade_amount: i128 = 10_000_000;
+    StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
+    mark_trader_has_traded(&env, &contract_id, &trader);
+
+    // Normal congestion: 1.0x (10_000 bps default)
+    // Fee = 10_000_000 * 30 / 10_000 = 30_000
+    let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
+    assert_eq!(fee, 30_000);
+}
+
+#[test]
+fn test_congestion_high() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+    client.set_fee_rate(&30u32);
+    disable_revenue_share(&client);
+
+    // Set high congestion signal: 2.0x (20_000 bps)
+    client.set_congestion_signal(&20_000u32);
+
+    let trade_amount: i128 = 10_000_000;
+    StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
+    mark_trader_has_traded(&env, &contract_id, &trader);
+
+    // High congestion fee = 10_000_000 * (30 * 2.0 = 60) / 10_000 = 60_000
+    let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
+    assert_eq!(fee, 60_000);
+}
+
+#[test]
+fn test_congestion_stale_fallback() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+    client.set_fee_rate(&30u32);
+    disable_revenue_share(&client);
+
+    // Set high congestion signal: 2.0x
+    env.ledger().set_timestamp(100);
+    client.set_congestion_signal(&20_000u32);
+
+    // Advance time past staleness threshold (300 secs)
+    env.ledger().set_timestamp(100 + 301);
+
+    let trade_amount: i128 = 10_000_000;
+    StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
+    mark_trader_has_traded(&env, &contract_id, &trader);
+
+    // Stale signal falls back to default 1.0x (30 bps)
+    let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
+    assert_eq!(fee, 30_000);
+}
+
+#[test]
+fn test_congestion_bounded() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Max multiplier is 5.0x by default. Try 6.0x -> Should fail bounds check.
+    let result = client.try_set_congestion_signal(&60_000u32);
+    assert_eq!(result, Err(Ok(ContractError::InvalidMultiplierBounds)));
+}
