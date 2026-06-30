@@ -1,6 +1,6 @@
+use crate::storage::WaterfallTierResult;
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use soroban_sdk::{contractevent, Address, Env, String, Symbol, Vec};
-use crate::storage::WaterfallTierResult;
 
 #[contractevent]
 pub struct WithdrawalQueued {
@@ -317,5 +317,28 @@ pub fn emit_fees_claimed_converted(
             source_amount,
             preferred_amount,
         ),
+    );
+}
+
+// ── Congestion-Based Dynamic Fees event ──────────────────────────────────────
+
+#[contractevent]
+pub struct EffectiveMultiplierChanged {
+    pub old_multiplier_bps: u32,
+    pub new_multiplier_bps: u32,
+}
+
+pub struct EvtEffectiveMultiplierChanged {
+    pub old_multiplier_bps: u32,
+    pub new_multiplier_bps: u32,
+}
+
+pub fn emit_effective_multiplier_changed(env: &Env, evt: EvtEffectiveMultiplierChanged) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "multiplier_changed"),
+        ),
+        (evt.old_multiplier_bps, evt.new_multiplier_bps),
     );
 }
