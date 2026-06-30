@@ -1,7 +1,9 @@
 #![no_std]
 
+pub mod emergency_unstake;
 pub mod migration;
 
+use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
 use migration::{MigrationKey, StakeInfoV2};
 use shared::{initializable, pausable};
 use soroban_sdk::{
@@ -138,6 +140,11 @@ pub enum StorageKey {
     UnstakeQueueEntry(u64),
     /// Ticket number assigned to a queued user (for position lookup).
     UserUnstakeTicket(Address),
+    // ── Issue #754: Multi-sig emergency early-unstake ──────────────────────────
+    /// N-of-M multi-sig configuration for emergency early unstakes.
+    EmergencyMultiSigConfig,
+    /// Per-staker pending emergency unstake request (approvals accumulate here).
+    EmergencyRequest(Address),
 }
 
 #[contracterror]
@@ -171,6 +178,23 @@ pub enum StakeVaultError {
     NoUnstakeQueued = 15,
     /// Unstake queue is empty.
     QueueEmpty = 16,
+    // ── Issue #754 ─────────────────────────────────────────────────────────────
+    /// Emergency unstake is not configured (no multi-sig config set).
+    EmergencyNotConfigured = 17,
+    /// A pending emergency request already exists for this staker.
+    EmergencyRequestAlreadyExists = 18,
+    /// No emergency request found for this staker.
+    EmergencyRequestNotFound = 19,
+    /// The emergency request has expired without sufficient approvals.
+    EmergencyRequestExpired = 20,
+    /// The request has not yet expired and cannot be discarded.
+    EmergencyRequestNotExpired = 21,
+    /// The signer has already approved this request.
+    AlreadyApproved = 22,
+    /// Penalty basis points exceed 100%.
+    InvalidEmergencyPenalty = 23,
+    /// Multi-sig required count is 0 or exceeds the number of admins.
+    InvalidMultiSigConfig = 24,
 }
 
 /// A pending unstake request held in the FIFO queue (issue #663).
@@ -1074,6 +1098,74 @@ impl StakeVaultContract {
         stakes.get(staker).map(|s| s.balance).unwrap_or(0)
     }
 
+    // ── Issue #754: Multi-sig emergency early-unstake ─────────────────────────
+
+    /// Admin: configure the multi-sig parameters for emergency early unstakes.
+    ///
+    /// - `admins`: list of addresses that may approve emergency requests.
+    /// - `required`: how many approvals are needed (N-of-M).
+    /// - `penalty_bps`: basis points deducted from the withdrawn stake (0–10_000).
+    /// - `timeout_secs`: seconds before an unapproved request expires (0 = no timeout).
+    pub fn configure_emergency_multisig(
+        env: Env,
+        caller: Address,
+        admins: Vec<Address>,
+        required: u32,
+        penalty_bps: u32,
+        timeout_secs: u64,
+    ) -> Result<(), StakeVaultError> {
+        caller.require_auth();
+        emergency_unstake::configure(&env, &caller, admins, required, penalty_bps, timeout_secs)
+    }
+
+    /// Returns the current emergency multi-sig configuration, if set.
+    pub fn get_emergency_multisig_config(env: Env) -> Option<EmergencyMultiSigConfig> {
+        emergency_unstake::get_config_pub(&env)
+    }
+
+    /// Staker: submit an emergency early-unstake request.
+    ///
+    /// The request will only execute once `required` multi-sig admins have called
+    /// `approve_emergency_unstake`. Until then, no funds move.
+    pub fn request_emergency_unstake(
+        env: Env,
+        staker: Address,
+    ) -> Result<(), StakeVaultError> {
+        staker.require_auth();
+        emergency_unstake::request(&env, &staker)
+    }
+
+    /// Admin signer: approve a pending emergency unstake request.
+    ///
+    /// When the N-of-M threshold is reached the unstake executes immediately,
+    /// applying the configured penalty to the withdrawn amount.
+    pub fn approve_emergency_unstake(
+        env: Env,
+        signer: Address,
+        staker: Address,
+    ) -> Result<(), StakeVaultError> {
+        signer.require_auth();
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        emergency_unstake::approve(&env, &signer, &staker, &token)
+    }
+
+    /// Anyone may call this to clean up an expired emergency request.
+    pub fn expire_emergency_request(
+        env: Env,
+        staker: Address,
+    ) -> Result<(), StakeVaultError> {
+        emergency_unstake::expire_request(&env, &staker)
+    }
+
+    /// Returns the pending emergency request for `staker`, if any.
+    pub fn get_emergency_request(env: Env, staker: Address) -> Option<EmergencyRequest> {
+        emergency_unstake::get_emergency_request(&env, &staker)
+    }
+
     // ── Stake delegation (issue #688) ──────────────────────────────────────────
 
     /// Stake `amount` tokens on behalf of `provider`. The delegator's funds are
@@ -1341,3 +1433,6 @@ impl StakeVaultContract {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_emergency;
