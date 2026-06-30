@@ -6,6 +6,8 @@ mod conversion;
 // Closes #671 — cross-source price deviation alerting
 mod deviation;
 mod errors;
+// Closes #755 — single-update price-deviation circuit breaker
+mod price_cb;
 #[allow(deprecated)]
 mod events;
 mod external_adapter;
@@ -123,10 +125,51 @@ impl OracleContract {
         if price <= 0 {
             return Err(OracleError::InvalidAsset);
         }
+        // #755: single-update deviation circuit breaker check.
+        price_cb::check_and_trip(&env, &pair, price)?;
         storage::set_price(&env, &pair, price);
         storage::add_available_pair(&env, pair.clone());
         history::store_price(&env, &pair, price);
         on_price_update(&env, pair);
+        Ok(())
+    }
+
+    // ── Issue #755: single-update price-deviation circuit breaker ─────────────
+
+    /// Admin: set the maximum allowed single-update price deviation for a pair.
+    /// `max_deviation_bps`: basis points (500 = 5 %). 0 disables the check.
+    pub fn set_update_deviation_threshold(
+        env: Env,
+        admin: Address,
+        pair: AssetPair,
+        max_deviation_bps: u32,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        price_cb::set_threshold(&env, &pair, max_deviation_bps);
+        Ok(())
+    }
+
+    /// Returns the configured single-update deviation threshold in basis points (0 = disabled).
+    pub fn get_update_deviation_threshold(env: Env, pair: AssetPair) -> u32 {
+        price_cb::get_threshold(&env, &pair)
+    }
+
+    /// Returns true if the single-update deviation breaker has tripped for this pair.
+    pub fn is_update_deviation_breaker_tripped(env: Env, pair: AssetPair) -> bool {
+        price_cb::is_breaker_tripped(&env, &pair)
+    }
+
+    /// Admin: reset the deviation circuit breaker for a pair after manual review.
+    /// Only an authorized admin/multi-sig may call this.
+    pub fn reset_update_deviation_breaker(
+        env: Env,
+        admin: Address,
+        pair: AssetPair,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        price_cb::reset(&env, &pair, admin);
         Ok(())
     }
 
@@ -650,6 +693,8 @@ impl OracleContract {
         env: Env,
         pair: AssetPair,
     ) -> Result<(i128, u32), OracleError> {
+        // #755: reject price reads while the single-update deviation breaker is tripped.
+        price_cb::guard_tripped(&env, &pair)?;
         let key = StorageKey::PriceMap(pair.clone());
         let prices: Vec<PriceData> = env
             .storage()
@@ -907,3 +952,6 @@ mod test_health;
 
 #[cfg(test)]
 mod test_admin_transfer;
+
+#[cfg(test)]
+mod test_price_cb;
