@@ -15,7 +15,19 @@
       "TimelockNotElapsed": 9,
       "FlashLoanDetected": 10,
       "InvalidSlashTier": 11,
-      "StakeDurationNotElapsed": 12
+      "StakeDurationNotElapsed": 12,
+      "NoDelegatedStake": 13,
+      "UnstakeAlreadyQueued": 14,
+      "NoUnstakeQueued": 15,
+      "QueueEmpty": 16,
+      "SlashNotFound": 17,
+      "AppealWindowClosed": 18,
+      "AppealAlreadyExists": 19,
+      "AppealAlreadyResolved": 20,
+      "InvalidAppealWindow": 21,
+      "RateLimitExceeded": 22,
+      "InvalidAmount": 23,
+      "RemainingStakeBelowMinimum": 24
     }
   }
 }

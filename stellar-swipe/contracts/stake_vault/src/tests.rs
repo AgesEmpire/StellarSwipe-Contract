@@ -1418,3 +1418,511 @@ mod slash_severity_tests {
         assert_eq!(withdrawn, amount, "correctly scoped auth must succeed");
     }
 }
+
+// ── Issue #689: Slash appeal window tests ─────────────────────────────────────
+
+#[cfg(test)]
+mod slash_appeal_tests {
+    use crate::{
+        migration::{MigrationKey, StakeInfoV2},
+        AppealStatus, SlashSeverity, StakeVaultContract, StakeVaultContractClient, StakeVaultError,
+    };
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token::StellarAssetClient,
+        Address, Env, Map, String, Symbol,
+    };
+
+    fn sac_token(env: &Env, admin: &Address) -> Address {
+        env.register_stellar_asset_contract_v2(admin.clone())
+            .address()
+    }
+
+    fn seed(env: &Env, contract_id: &Address, staker: &Address, balance: i128) {
+        env.as_contract(contract_id, || {
+            let mut stakes: Map<Address, StakeInfoV2> = env
+                .storage()
+                .persistent()
+                .get(&MigrationKey::StakesV2)
+                .unwrap_or_else(|| Map::new(env));
+            stakes.set(
+                staker.clone(),
+                StakeInfoV2 {
+                    balance,
+                    locked_until: 0,
+                    last_updated: env.ledger().timestamp(),
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&MigrationKey::StakesV2, &stakes);
+        });
+    }
+
+    /// Convenience setup: returns (env, vault_id, token, admin, signal_registry).
+    fn setup() -> (Env, Address, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let signal_registry = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        StakeVaultContractClient::new(&env, &vault_id)
+            .initialize(&admin, &token, &signal_registry);
+        (env, vault_id, token, admin, signal_registry)
+    }
+
+    // ── set_appeal_window tests ───────────────────────────────────────────────
+
+    #[test]
+    fn set_appeal_window_persists_and_readable() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.get_appeal_window(), 0, "default window should be 0");
+        client.set_appeal_window(&86_400u64);
+        assert_eq!(client.get_appeal_window(), 86_400);
+    }
+
+    #[test]
+    fn set_appeal_window_rejects_value_over_30_days() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let result = client.try_set_appeal_window(&2_592_001u64);
+        assert_eq!(result, Err(Ok(StakeVaultError::InvalidAppealWindow)));
+    }
+
+    // ── appeal_slash within window ────────────────────────────────────────────
+
+    #[test]
+    fn appeal_slash_within_window_succeeds() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        // Configure a 24 h appeal window.
+        client.set_appeal_window(&86_400u64);
+
+        // Slash the provider — slash_id 0 is assigned.
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+
+        // Appeal within the window — should succeed.
+        let evidence = String::from_str(&env, "ipfs://Qm_evidence_hash_here");
+        client.appeal_slash(&provider, &0u64, &evidence);
+
+        // The appeal record should exist and be Pending.
+        let appeal = client.get_slash_appeal(&0u64).unwrap();
+        assert_eq!(appeal.status, AppealStatus::Pending);
+        assert_eq!(appeal.appellant, provider);
+        assert_eq!(appeal.slash_id, 0);
+    }
+
+    #[test]
+    fn appeal_slash_emits_slash_appealed_event() {
+        use soroban_sdk::testutils::Events;
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 500_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_appeal_window(&86_400u64);
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+
+        let events_before = env.events().all().len();
+        client.appeal_slash(
+            &provider,
+            &0u64,
+            &String::from_str(&env, "ipfs://evidence"),
+        );
+        assert!(
+            env.events().all().len() > events_before,
+            "slash_appealed event not emitted"
+        );
+    }
+
+    // ── appeal_slash after window ─────────────────────────────────────────────
+
+    #[test]
+    fn appeal_slash_after_window_returns_appeal_window_closed() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_appeal_window(&3_600u64); // 1 hour window
+
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+
+        // Advance past the appeal window.
+        env.ledger().with_mut(|l| l.timestamp += 3_601);
+
+        let result = client.try_appeal_slash(
+            &provider,
+            &0u64,
+            &String::from_str(&env, "ipfs://late_evidence"),
+        );
+        assert_eq!(result, Err(Ok(StakeVaultError::AppealWindowClosed)));
+    }
+
+    #[test]
+    fn appeal_slash_when_no_window_configured_returns_appeal_window_closed() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 500_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        // No appeal window set (defaults to 0).
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "misconduct"),
+        );
+
+        let result = client.try_appeal_slash(
+            &provider,
+            &0u64,
+            &String::from_str(&env, "ipfs://evidence"),
+        );
+        assert_eq!(result, Err(Ok(StakeVaultError::AppealWindowClosed)));
+    }
+
+    // ── duplicate appeal ──────────────────────────────────────────────────────
+
+    #[test]
+    fn duplicate_appeal_returns_appeal_already_exists() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_appeal_window(&86_400u64);
+
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+
+        let evidence = String::from_str(&env, "ipfs://evidence");
+        client.appeal_slash(&provider, &0u64, &evidence);
+
+        // Second appeal for the same slash_id should fail.
+        let result = client.try_appeal_slash(&provider, &0u64, &evidence);
+        assert_eq!(result, Err(Ok(StakeVaultError::AppealAlreadyExists)));
+    }
+
+    // ── appeal_slash on non-existent slash_id ─────────────────────────────────
+
+    #[test]
+    fn appeal_slash_nonexistent_slash_id_returns_slash_not_found() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let provider = Address::generate(&env);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_appeal_window(&86_400u64);
+
+        let result = client.try_appeal_slash(
+            &provider,
+            &999u64,
+            &String::from_str(&env, "ipfs://evidence"),
+        );
+        assert_eq!(result, Err(Ok(StakeVaultError::SlashNotFound)));
+    }
+
+    // ── appeal by wrong address ───────────────────────────────────────────────
+
+    #[test]
+    fn appeal_slash_by_non_provider_returns_unauthorized() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let amount: i128 = 500_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_appeal_window(&86_400u64);
+
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+
+        let result = client.try_appeal_slash(
+            &attacker,
+            &0u64,
+            &String::from_str(&env, "ipfs://evidence"),
+        );
+        assert_eq!(result, Err(Ok(StakeVaultError::Unauthorized)));
+    }
+
+    // ── resolve_appeal: uphold ────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_appeal_uphold_burns_held_funds_and_marks_upheld() {
+        use soroban_sdk::token;
+        let (env, vault_id, token_addr, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let initial: i128 = 1_000_000;
+        // Minor = 5 % → slash = 50_000
+        let expected_slash: i128 = 50_000;
+
+        StellarAssetClient::new(&env, &token_addr).mint(&vault_id, &initial);
+        seed(&env, &vault_id, &provider, initial);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_appeal_window(&86_400u64);
+
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+
+        // Vault still holds the tokens (not yet burned).
+        let token_client = token::Client::new(&env, &token_addr);
+        let balance_after_slash = token_client.balance(&vault_id);
+        // Provider's stake balance is reduced by the slash.
+        assert_eq!(client.get_stake(&provider), initial - expected_slash);
+
+        // Submit appeal.
+        client.appeal_slash(
+            &provider,
+            &0u64,
+            &String::from_str(&env, "ipfs://Qm_evidence"),
+        );
+
+        // Admin upholds the appeal → tokens burned now.
+        client.resolve_appeal(&0u64, &true);
+
+        assert!(
+            token_client.balance(&vault_id) < balance_after_slash,
+            "held funds must be burned on uphold"
+        );
+
+        let appeal = client.get_slash_appeal(&0u64).unwrap();
+        assert_eq!(appeal.status, AppealStatus::Upheld);
+    }
+
+    // ── resolve_appeal: reverse ───────────────────────────────────────────────
+
+    #[test]
+    fn resolve_appeal_reverse_restores_provider_stake() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let initial: i128 = 1_000_000;
+        // Minor = 5 % → slash = 50_000
+        let expected_slash: i128 = 50_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &initial);
+        seed(&env, &vault_id, &provider, initial);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_appeal_window(&86_400u64);
+
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+
+        // Stake was reduced.
+        assert_eq!(client.get_stake(&provider), initial - expected_slash);
+
+        // Submit appeal.
+        client.appeal_slash(
+            &provider,
+            &0u64,
+            &String::from_str(&env, "ipfs://Qm_exculpatory_evidence"),
+        );
+
+        // Admin reverses the appeal → stake restored.
+        client.resolve_appeal(&0u64, &false);
+
+        assert_eq!(
+            client.get_stake(&provider),
+            initial,
+            "stake must be fully restored after reversal"
+        );
+
+        let appeal = client.get_slash_appeal(&0u64).unwrap();
+        assert_eq!(appeal.status, AppealStatus::Reversed);
+    }
+
+    #[test]
+    fn resolve_appeal_reverse_emits_appeal_resolved_event() {
+        use soroban_sdk::testutils::Events;
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 500_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_appeal_window(&86_400u64);
+
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+        client.appeal_slash(
+            &provider,
+            &0u64,
+            &String::from_str(&env, "ipfs://evidence"),
+        );
+
+        let events_before = env.events().all().len();
+        client.resolve_appeal(&0u64, &false);
+        assert!(
+            env.events().all().len() > events_before,
+            "appeal_resolved event not emitted"
+        );
+    }
+
+    // ── resolve already-resolved appeal ──────────────────────────────────────
+
+    #[test]
+    fn resolve_appeal_already_resolved_returns_error() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 500_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_appeal_window(&86_400u64);
+
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+        client.appeal_slash(
+            &provider,
+            &0u64,
+            &String::from_str(&env, "ipfs://evidence"),
+        );
+        client.resolve_appeal(&0u64, &true);
+
+        // Second resolution should fail.
+        let result = client.try_resolve_appeal(&0u64, &false);
+        assert_eq!(result, Err(Ok(StakeVaultError::AppealAlreadyResolved)));
+    }
+
+    // ── resolve_appeal with no appeal filed ───────────────────────────────────
+
+    #[test]
+    fn resolve_appeal_no_appeal_filed_returns_slash_not_found() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 500_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_appeal_window(&86_400u64);
+
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+
+        // No appeal filed — resolve should fail.
+        let result = client.try_resolve_appeal(&0u64, &true);
+        assert_eq!(result, Err(Ok(StakeVaultError::SlashNotFound)));
+    }
+
+    // ── get_slash_record ──────────────────────────────────────────────────────
+
+    #[test]
+    fn get_slash_record_returns_correct_data() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Major,
+            &Symbol::new(&env, "fraud"),
+        );
+
+        let record = client.get_slash_record(&0u64).unwrap();
+        assert_eq!(record.slash_id, 0);
+        assert_eq!(record.provider, provider);
+        assert_eq!(record.severity, SlashSeverity::Major as u32);
+
+        // Non-existent slash_id returns None.
+        assert!(client.get_slash_record(&999u64).is_none());
+    }
+
+    // ── slash counter increments monotonically ────────────────────────────────
+
+    #[test]
+    fn slash_ids_increment_across_multiple_slashes() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        let amount: i128 = 500_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &(amount * 2));
+        seed(&env, &vault_id, &p1, amount);
+        seed(&env, &vault_id, &p2, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.slash_stake(&signal_registry, &p1, &SlashSeverity::Minor, &Symbol::new(&env, "r1"));
+        client.slash_stake(&signal_registry, &p2, &SlashSeverity::Minor, &Symbol::new(&env, "r2"));
+
+        assert_eq!(client.get_slash_record(&0u64).unwrap().provider, p1);
+        assert_eq!(client.get_slash_record(&1u64).unwrap().provider, p2);
+    }
+}
