@@ -30,4 +30,6 @@ pub enum OracleError {
     PendingAdminNotFound = 23,
     PendingAdminExpired = 24,
     InsufficientSources = 25,
+    /// A single-update price deviation exceeded the configured maximum percentage.
+    PriceDeviationBreakerTripped = 26,
 }

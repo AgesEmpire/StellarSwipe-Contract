@@ -74,3 +74,25 @@ pub fn emit_guardian_revoked(env: &Env, guardian: Address) {
     env.events()
         .publish((Symbol::new(env, "guardian_revoked"),), guardian);
 }
+
+pub fn emit_deviation_breaker_tripped(
+    env: &Env,
+    pair_code: String,
+    previous_price: i128,
+    new_price: i128,
+    deviation_bps: i128,
+) {
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("oracle"), symbol_short!("dev_trip")),
+        (pair_code, previous_price, new_price, deviation_bps),
+    );
+}
+
+pub fn emit_deviation_breaker_reset(env: &Env, pair_code: String, admin: Address) {
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("oracle"), symbol_short!("dev_reset")),
+        (pair_code, admin),
+    );
+}
