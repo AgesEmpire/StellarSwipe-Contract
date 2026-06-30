@@ -27,4 +27,6 @@ pub enum ContractError {
     WaterfallNotConfigured = 21,
     PreferredTokenInsufficient = 22,
     PayoutCurrencyUnchanged = 23,
+    SelfReferralNotAllowed = 24,
+    ReferralAlreadyRegistered = 25,
 }

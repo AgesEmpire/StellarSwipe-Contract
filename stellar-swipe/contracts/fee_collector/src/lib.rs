@@ -10,12 +10,13 @@ use events::{
     emit_fees_claimed, emit_fees_claimed_converted, emit_first_trade_fee_waived,
     emit_network_condition_updated, emit_payout_currency_set, emit_retry_attempted,
     emit_treasury_withdrawal, emit_volume_discount_config_updated, emit_waterfall_distribution,
-    emit_withdrawal_queued, EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed,
+    emit_withdrawal_queued, emit_referral_registered, emit_referral_fee_share_updated,
+    emit_referral_fee_paid, EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed,
     EvtNetworkConditionUpdated, EvtRetryAttempted, EvtTreasuryWithdrawal, EvtWithdrawalQueued,
 };
 pub use events::{
     FeeRateUpdated, FeesBurned, FeesClaimed, FirstTradeFeeWaived, TreasuryWithdrawal,
-    WithdrawalQueued,
+    WithdrawalQueued, ReferralRegistered, ReferralFeeShareUpdated, ReferralFeePaid,
 };
 
 mod rebates;
@@ -40,7 +41,9 @@ use storage::{
     set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
     set_provider_payout_currency, set_queued_withdrawal, set_treasury_balance,
     set_volume_discount_config_storage,
-    set_waterfall_config as set_waterfall_config_storage, ErrorReport, FailedFeeCollection,
+    set_waterfall_config as set_waterfall_config_storage,
+    get_referrer, set_referrer, get_referral_fee_share_bps, set_referral_fee_share_bps,
+    ErrorReport, FailedFeeCollection,
     FeeOptimizationConfig, ForecastConfigData, MonthlyTradeVolume, QueuedWithdrawal, StorageKey,
     VolumeDiscountConfig, VolumeTier, WaterfallConfig, WaterfallTier, WaterfallTierResult,
     MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
@@ -711,12 +714,39 @@ impl FeeCollector {
             .publish(&env);
         }
 
+        let mut remaining_distributable = distributable;
+
+        // 1. Referral Share
+        if let Some(referrer) = get_referrer(&env, &trader) {
+            let referral_bps = get_referral_fee_share_bps(&env);
+            let mut referral_amount = fee_amount
+                .checked_mul(referral_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap_or(0);
+            
+            if referral_amount > remaining_distributable {
+                referral_amount = remaining_distributable;
+            }
+
+            if referral_amount > 0 {
+                token_client.transfer(&env.current_contract_address(), &referrer, &referral_amount);
+                emit_referral_fee_paid(&env, &referrer, &trader, &token, referral_amount);
+                remaining_distributable = remaining_distributable.saturating_sub(referral_amount);
+            }
+        }
+
+        // 2. Revenue Share
         let revenue_share_rate = storage::get_revenue_share_rate_bps(&env);
-        let revenue_share_amount = distributable
+        let mut revenue_share_amount = distributable
             .checked_mul(revenue_share_rate as i128)
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or(0);
-        let treasury_credit = distributable.saturating_sub(revenue_share_amount);
+            
+        if revenue_share_amount > remaining_distributable {
+            revenue_share_amount = remaining_distributable;
+        }
+        
+        let treasury_credit = remaining_distributable.saturating_sub(revenue_share_amount);
 
         if revenue_share_amount > 0 {
             storage::add_revenue_share_pool(&env, &token, revenue_share_amount);
@@ -1390,5 +1420,68 @@ impl FeeCollector {
         emit_fee_forecast(&env, &token, projected, window, current_day);
         set_last_forecast_day(&env, &token, current_day);
         Ok(projected)
+    }
+
+    // ── Referral System ─────────────────────────────────────────────────────────
+
+    /// Register a referral mapping for a trader (referee) to a referrer.
+    pub fn register_referral(env: Env, referrer: Address, referee: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        referee.require_auth();
+
+        if referrer == referee {
+            return Err(ContractError::SelfReferralNotAllowed);
+        }
+
+        if get_referrer(&env, &referee).is_some() {
+            return Err(ContractError::ReferralAlreadyRegistered);
+        }
+
+        set_referrer(&env, &referee, &referrer);
+        emit_referral_registered(&env, &referrer, &referee);
+        Ok(())
+    }
+
+    /// Admin override to forcibly change a referral mapping.
+    pub fn admin_override_referral(env: Env, admin: Address, referrer: Address, referee: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if referrer == referee {
+            return Err(ContractError::SelfReferralNotAllowed);
+        }
+
+        set_referrer(&env, &referee, &referrer);
+        emit_referral_registered(&env, &referrer, &referee);
+        Ok(())
+    }
+
+    /// Admin configuration to set the referral fee share percentage in basis points.
+    pub fn set_referral_fee_share(env: Env, admin: Address, share_bps: u32) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if share_bps > 10_000 {
+            return Err(ContractError::InvalidFeeConfiguration);
+        }
+
+        let old_bps = get_referral_fee_share_bps(&env);
+        set_referral_fee_share_bps(&env, share_bps);
+        emit_referral_fee_share_updated(&env, old_bps, share_bps, &admin);
+        Ok(())
     }
 }

@@ -116,6 +116,10 @@ pub enum StorageKey {
     DailyFeeTotal(Address, u64),
     /// #665: Last day a forecast was emitted per token.
     LastForecastDay(Address),
+    /// Referral mapping: Referee (Address) -> Referrer (Address)
+    Referral(Address),
+    /// Configurable referral fee-share percentage in basis points.
+    ReferralFeeShareBps,
 }
 
 #[contracttype]
@@ -579,4 +583,24 @@ pub fn set_last_forecast_day(env: &Env, token: &Address, day: u64) {
     env.storage()
         .persistent()
         .set(&StorageKey::LastForecastDay(token.clone()), &day);
+}
+
+// ── Referral System ─────────────────────────────────────────────────────────
+
+pub fn get_referrer(env: &Env, referee: &Address) -> Option<Address> {
+    crud_get(env, StorageTier::Persistent, &StorageKey::Referral(referee.clone()))
+}
+
+pub fn set_referrer(env: &Env, referee: &Address, referrer: &Address) {
+    crud_set(env, StorageTier::Persistent, &StorageKey::Referral(referee.clone()), referrer);
+}
+
+pub const DEFAULT_REFERRAL_FEE_SHARE_BPS: u32 = 1000; // 10%
+
+pub fn get_referral_fee_share_bps(env: &Env) -> u32 {
+    crud_get_or(env, StorageTier::Instance, &StorageKey::ReferralFeeShareBps, DEFAULT_REFERRAL_FEE_SHARE_BPS)
+}
+
+pub fn set_referral_fee_share_bps(env: &Env, bps: u32) {
+    crud_set(env, StorageTier::Instance, &StorageKey::ReferralFeeShareBps, &bps);
 }

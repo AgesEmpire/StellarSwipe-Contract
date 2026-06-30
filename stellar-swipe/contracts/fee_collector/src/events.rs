@@ -67,6 +67,27 @@ pub struct FirstTradeFeeWaived {
     pub user: Address,
 }
 
+#[contractevent]
+pub struct ReferralRegistered {
+    pub referrer: Address,
+    pub referee: Address,
+}
+
+#[contractevent]
+pub struct ReferralFeeShareUpdated {
+    pub old_bps: u32,
+    pub new_bps: u32,
+    pub updated_by: Address,
+}
+
+#[contractevent]
+pub struct ReferralFeePaid {
+    pub referrer: Address,
+    pub referee: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
 // ── Emit helpers ──────────────────────────────────────────────────────────────
 
 pub struct EvtWithdrawalQueued {
@@ -317,5 +338,37 @@ pub fn emit_fees_claimed_converted(
             source_amount,
             preferred_amount,
         ),
+    );
+}
+
+// ── Referral Events ─────────────────────────────────────────────────────────
+
+pub fn emit_referral_registered(env: &Env, referrer: &Address, referee: &Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "referral_registered"),
+        ),
+        (referrer.clone(), referee.clone()),
+    );
+}
+
+pub fn emit_referral_fee_share_updated(env: &Env, old_bps: u32, new_bps: u32, updated_by: &Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "referral_fee_share_updated"),
+        ),
+        (old_bps, new_bps, updated_by.clone()),
+    );
+}
+
+pub fn emit_referral_fee_paid(env: &Env, referrer: &Address, referee: &Address, token: &Address, amount: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "referral_fee_paid"),
+        ),
+        (referrer.clone(), referee.clone(), token.clone(), amount),
     );
 }

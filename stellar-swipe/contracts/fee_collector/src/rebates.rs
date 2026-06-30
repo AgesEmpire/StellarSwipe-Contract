@@ -1,5 +1,5 @@
 use soroban_sdk::{Address, Env, IntoVal, Symbol};
-use stellar_swipe_common::{Amount, Asset};
+use stellar_swipe_common::{checked_amount::Amount, Asset};
 
 use crate::storage::{
     get_fee_rate, get_monthly_trade_volume, get_oracle_contract, get_volume_discount_config,
