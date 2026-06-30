@@ -61,8 +61,8 @@ use proposals::{
     calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
     default_governance_config, execute_proposal, finalize_proposal, get_all_proposals,
     get_category_threshold, get_governance_config, get_proposal, set_category_thresholds,
-    Proposal, ProposalStatistics, ProposalStatus, ProposalType, Vote, VoteDelegation,
-    VoteType as GovernanceVoteType,
+    withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalType, Vote,
+    VoteDelegation, VoteType as GovernanceVoteType,
 };
 use quadratic_voting::{
     allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
@@ -588,6 +588,42 @@ impl GovernanceContract {
     ) -> Result<ProposalStatus, GovernanceError> {
         require_initialized(&env)?;
         proposals::cancel_proposal(&env, proposal_id, canceller)
+    }
+
+    /// # Summary
+    /// Voluntarily withdraw a proposal before voting opens.  Only callable by
+    /// the original proposer while the proposal is still in `Pending` status.
+    ///
+    /// # Behaviour
+    /// - Authorization: only the original `proposer` may call this.
+    /// - State guard: proposal must be `Pending` (pre-vote).  Rejected if
+    ///   voting has already started (`Active`) or any terminal state is reached.
+    /// - Deposit: the spam-deposit is **refunded** to the proposer (unlike
+    ///   failed proposals which forfeit the deposit).  See inline docs in
+    ///   `proposals::withdraw_proposal` for the rationale.
+    /// - Event: a `propwdr` event is emitted on success.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `proposal_id`: ID of the proposal to withdraw.
+    /// - `proposer`: Address of the original proposer (must authorize).
+    ///
+    /// # Returns
+    /// `Ok(ProposalStatus::Withdrawn)` on success.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::NotInitialized`] — contract not initialized.
+    /// - [`GovernanceError::Unauthorized`] — caller is not the original proposer.
+    /// - [`GovernanceError::ProposalNotFound`] — proposal_id does not exist.
+    /// - [`GovernanceError::ProposalNotActive`] — proposal is not in Pending status.
+    pub fn withdraw_proposal(
+        env: Env,
+        proposal_id: u64,
+        proposer: Address,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        require_not_paused(&env)?;
+        proposals::withdraw_proposal(&env, proposal_id, proposer)
     }
 
     // ── Issue #666: Proposal execution payload simulation (dry-run) ───────────

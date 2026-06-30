@@ -72,4 +72,6 @@ impl GovernanceError {
     pub const IterationLimitExceeded: GovernanceError = GovernanceError::InvalidCommitteeAction;
     /// Vote rejected because the mandatory discussion window has not yet elapsed (Issue #667).
     pub const DiscussionPeriodActive: GovernanceError = GovernanceError::VotingNotStarted;
+    /// Proposal has already been withdrawn — cannot be withdrawn again.
+    pub const ProposalAlreadyWithdrawn: GovernanceError = GovernanceError::ProposalNotActive;
 }

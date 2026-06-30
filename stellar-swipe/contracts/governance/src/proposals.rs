@@ -72,6 +72,10 @@ pub enum ProposalStatus {
     Executed,
     Cancelled,
     Expired,
+    /// Proposal was voluntarily withdrawn by the original proposer before
+    /// voting opened.  This status is immutable once set — the proposal is
+    /// permanently excluded from future voting-eligible listings.
+    Withdrawn,
 }
 
 #[contracttype]
@@ -645,6 +649,107 @@ pub fn cancel_proposal(
     proposal.status = ProposalStatus::Cancelled;
     put_proposal(env, &proposal)?;
     Ok(ProposalStatus::Cancelled)
+}
+
+/// Voluntarily withdraw a proposal by its original proposer.
+///
+/// # Behaviour
+/// - Only the original proposer may call this entrypoint (authorization check).
+/// - Only allowed while the proposal is in `Pending` status (pre-vote state).
+///   Once voting has opened (status transitions to `Active`) or the proposal
+///   has reached any other terminal state, withdrawal is rejected.
+/// - On success:
+///   1. Status is set to `Withdrawn` (immutable — cannot be further modified).
+///   2. The spam-deposit is **refunded** to the proposer (区别 from failed
+///      proposals which forfeit the deposit). The rationale is that a
+///      responsible self-withdrawal (e.g. correcting a mistake) should not
+///      penalise the proposer, unlike a proposal that fails due to lack of
+///      community support.
+///   3. A `propwdr` event is emitted with the proposer, proposal ID, and
+///      timestamp.
+///
+/// # Deposit Handling Policy
+/// Self-withdrawal **always refunds** the deposit, regardless of participation
+/// thresholds. This distinguishes it from `finalize_proposal` where a failed
+/// proposal forfeits its deposit to the treasury. The reasoning:
+/// - A proposer who self-withdraws is acting responsibly (e.g. fixing errors).
+/// - Penalising responsible behaviour would discourage honest participation.
+/// - The spam-deposit's purpose (deterring frivolous proposals) is served by
+///   the forfeit path for proposals that actually fail, not by penalising
+///   voluntary corrections.
+///
+/// # Errors
+/// - [`GovernanceError::Unauthorized`] — caller is not the original proposer.
+/// - [`GovernanceError::ProposalNotFound`] — proposal_id does not exist.
+/// - [`GovernanceError::ProposalNotActive`] — proposal is not in Pending status
+///   (voting has already started or the proposal reached a terminal state).
+pub fn withdraw_proposal(
+    env: &Env,
+    proposal_id: u64,
+    proposer: Address,
+) -> Result<ProposalStatus, GovernanceError> {
+    proposer.require_auth();
+    let mut proposal = get_proposal(env, proposal_id)?;
+
+    // Only the original proposer may withdraw their own proposal.
+    if proposer != proposal.proposer {
+        return Err(GovernanceError::Unauthorized);
+    }
+
+    // Must still be in Pending status — once voting opens (Active) or any
+    // terminal state is reached, withdrawal is no longer permitted.
+    if proposal.status == ProposalStatus::Withdrawn {
+        return Err(GovernanceError::ProposalAlreadyWithdrawn);
+    }
+    if proposal.status != ProposalStatus::Pending {
+        return Err(GovernanceError::ProposalNotActive);
+    }
+
+    proposal.status = ProposalStatus::Withdrawn;
+    put_proposal(env, &proposal)?;
+
+    // Refund the spam-deposit to the proposer (see deposit handling policy above).
+    // Directly refund via add_balance and clean up the lock record.
+    let config = crate::proposal_deposit::get_deposit_config(env);
+    if config.amount > 0 {
+        // Check if a deposit was locked for this proposal.
+        let locked: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&crate::proposal_deposit::DepositKey::LockedDeposit(proposal_id));
+        if let Some(deposit_proposer) = locked {
+            if deposit_proposer == proposer {
+                // Refund the full deposit amount to the proposer.
+                let _ = crate::add_balance(env, &proposer, config.amount);
+                env.storage()
+                    .persistent()
+                    .remove(&crate::proposal_deposit::DepositKey::LockedDeposit(
+                        proposal_id,
+                    ));
+                #[allow(deprecated)]
+                env.events().publish(
+                    (
+                        symbol_short!("deposit"),
+                        symbol_short!("refund"),
+                    ),
+                    (proposal_id, proposer.clone(), config.amount),
+                );
+            }
+        }
+    }
+
+    // Emit self-withdrawal event.
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("propwdr")),
+        (
+            proposal_id,
+            proposer,
+            env.ledger().timestamp(),
+        ),
+    );
+
+    Ok(ProposalStatus::Withdrawn)
 }
 
 pub fn calculate_proposal_statistics(env: &Env) -> Result<ProposalStatistics, GovernanceError> {
