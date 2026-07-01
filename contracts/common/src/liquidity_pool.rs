@@ -1,7 +1,7 @@
 // Liquidity Pool Management and Optimization
 // Mechanisms for managing and optimizing liquidity pools
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec, Symbol};
 
 // ============================================================================
 // Liquidity Pool Interface
@@ -302,6 +302,82 @@ impl LiquidityPoolManager {
             return Err(PoolError::InsufficientLiquidity);
         }
         
+        // Fetch position for IL calculation before reserves/shares are mutated
+        let position = Self::get_position(env, &provider, pool_id)
+            .unwrap_or(LiquidityPosition {
+                provider: provider.clone(),
+                pool_id,
+                shares: 0,
+                deposited_a: 0,
+                deposited_b: 0,
+                earned_fees: 0,
+                created_at: 0,
+            });
+        
+        // Compute and emit realized impermanent loss for this withdrawal
+        if position.shares > 0 && position.shares >= shares {
+            let hold_basis_a = shares
+                .checked_mul(position.deposited_a)
+                .and_then(|v| v.checked_div(position.shares))
+                .unwrap_or(0);
+            let hold_basis_b = shares
+                .checked_mul(position.deposited_b)
+                .and_then(|v| v.checked_div(position.shares))
+                .unwrap_or(0);
+            let price_a_per_b = if pool.reserve_b > 0 {
+                pool.reserve_a.checked_div(pool.reserve_b).unwrap_or(0)
+            } else {
+                0
+            };
+            let hold_value_in_a = hold_basis_a
+                .checked_add(
+                    hold_basis_b.checked_mul(price_a_per_b).unwrap_or(0)
+                )
+                .unwrap_or(0);
+            let withdrawn_value_in_a = amount_a
+                .checked_add(
+                    amount_b.checked_mul(price_a_per_b).unwrap_or(0)
+                )
+                .unwrap_or(0);
+            let il_a = if hold_value_in_a >= withdrawn_value_in_a {
+                hold_value_in_a
+                    .checked_sub(withdrawn_value_in_a)
+                    .unwrap_or(0)
+            } else {
+                let gain = withdrawn_value_in_a
+                    .checked_sub(hold_value_in_a)
+                    .unwrap_or(0);
+                gain.checked_neg().unwrap_or(0)
+            };
+            let il_bps = if hold_value_in_a > 0 {
+                let abs_il = if il_a >= 0 { il_a } else { il_a.checked_neg().unwrap_or(0) };
+                let raw = abs_il
+                    .checked_mul(10000)
+                    .and_then(|v| v.checked_div(hold_value_in_a))
+                    .unwrap_or(0);
+                if il_a >= 0 { raw } else { raw.checked_neg().unwrap_or(0) }
+            } else {
+                0
+            };
+            
+            let record = WithdrawalILRecord {
+                provider: provider.clone(),
+                pool_id,
+                shares_withdrawn: shares,
+                withdrawn_a: amount_a,
+                withdrawn_b: amount_b,
+                hold_basis_a,
+                hold_basis_b,
+                impermanent_loss_a: il_a,
+                impermanent_loss_bps: il_bps,
+            };
+            
+            env.events().publish(
+                (Symbol::new(env, "liquidity_pool"), Symbol::new(env, "withdraw_il")),
+                record,
+            );
+        }
+        
         // Update pool reserves
         pool.reserve_a -= amount_a;
         pool.reserve_b -= amount_b;
@@ -421,13 +497,26 @@ impl LiquidityPoolManager {
         Self::store_position(env, &position);
     }
     
-    /// Reduce position
+    /// Reduce position and proportionally reduce deposited amounts
+    /// so that deposited_a/b reflect the hold basis for remaining shares.
     fn reduce_position(env: &Env, provider: &Address, pool_id: u64, shares: i128) {
         if let Some(mut position) = env
             .storage()
             .instance()
             .get::<DataKey, LiquidityPosition>(&DataKey::Position(provider.clone(), pool_id))
         {
+            if position.shares > 0 && shares > 0 {
+                let reduction_a = shares
+                    .checked_mul(position.deposited_a)
+                    .and_then(|v| v.checked_div(position.shares))
+                    .unwrap_or(0);
+                let reduction_b = shares
+                    .checked_mul(position.deposited_b)
+                    .and_then(|v| v.checked_div(position.shares))
+                    .unwrap_or(0);
+                position.deposited_a = position.deposited_a.saturating_sub(reduction_a);
+                position.deposited_b = position.deposited_b.saturating_sub(reduction_b);
+            }
             position.shares -= shares;
             
             if position.shares > 0 {
@@ -474,6 +563,147 @@ impl LiquidityPoolManager {
         env.storage()
             .instance()
             .get(&DataKey::Position(provider.clone(), pool_id))
+    }
+
+    /// Compute impermanent loss/gain for a position given current pool state.
+    ///
+    /// Compares the current withdrawable value of the position's shares against
+    /// the value of simply holding the originally deposited assets, both valued
+    /// at the current pool price (token A as numeraire).
+    ///
+    /// **Two-asset only** – this pool design supports exactly two assets per pool.
+    ///
+    /// Uses checked arithmetic throughout and returns zero for all edge cases
+    /// (zero total_shares, zero shares, zero deposited, zero reserve_b) instead of
+    /// panicking.
+    ///
+    /// Gas cost: O(1) – a handful of i128 multiplications and divisions.
+    pub fn compute_impermanent_loss(
+        pool: &LiquidityPool,
+        provider: Address,
+        pool_id: u64,
+        shares: i128,
+        deposited_a: i128,
+        deposited_b: i128,
+    ) -> ImpermanentLossResult {
+        if pool.total_shares == 0 || shares == 0 {
+            return ImpermanentLossResult {
+                pool_id,
+                provider,
+                share_of_pool_bps: 0,
+                current_value_a: 0,
+                current_value_b: 0,
+                hold_value_a: deposited_a,
+                hold_value_b: deposited_b,
+                impermanent_loss_a: 0,
+                impermanent_loss_bps: 0,
+            };
+        }
+
+        let share_of_pool_bps = shares
+            .checked_mul(10000)
+            .and_then(|v| v.checked_div(pool.total_shares))
+            .unwrap_or(0);
+
+        // Current withdrawable amounts
+        let current_value_a = shares
+            .checked_mul(pool.reserve_a)
+            .and_then(|v| v.checked_div(pool.total_shares))
+            .unwrap_or(0);
+        let current_value_b = shares
+            .checked_mul(pool.reserve_b)
+            .and_then(|v| v.checked_div(pool.total_shares))
+            .unwrap_or(0);
+
+        // Current price of token B in terms of token A: reserve_a / reserve_b
+        let price_a_per_b = if pool.reserve_b > 0 {
+            pool.reserve_a
+                .checked_div(pool.reserve_b)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Value of LP position in terms of token A
+        let pool_value_in_a = current_value_a
+            .checked_add(
+                current_value_b
+                    .checked_mul(price_a_per_b)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(0);
+
+        // Value of simply holding deposited assets in terms of token A
+        let hold_value_in_a = deposited_a
+            .checked_add(
+                deposited_b
+                    .checked_mul(price_a_per_b)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(0);
+
+        // Impermanent loss (positive = loss, negative = gain)
+        let il_a = if hold_value_in_a >= pool_value_in_a {
+            hold_value_in_a
+                .checked_sub(pool_value_in_a)
+                .unwrap_or(0)
+        } else {
+            // Impermanent gain: pool value exceeds hold value
+            let gain = pool_value_in_a
+                .checked_sub(hold_value_in_a)
+                .unwrap_or(0);
+            gain.checked_neg().unwrap_or(0)
+        };
+
+        let il_bps = if hold_value_in_a > 0 {
+            let abs_il = if il_a >= 0 { il_a } else { il_a.checked_neg().unwrap_or(0) };
+            let raw = abs_il
+                .checked_mul(10000)
+                .and_then(|v| v.checked_div(hold_value_in_a))
+                .unwrap_or(0);
+            if il_a >= 0 { raw } else { raw.checked_neg().unwrap_or(0) }
+        } else {
+            0
+        };
+
+        ImpermanentLossResult {
+            pool_id,
+            provider,
+            share_of_pool_bps,
+            current_value_a,
+            current_value_b,
+            hold_value_a: deposited_a,
+            hold_value_b: deposited_b,
+            impermanent_loss_a: il_a,
+            impermanent_loss_bps: il_bps,
+        }
+    }
+
+    /// View entrypoint: compute current impermanent loss/gain for a provider's position.
+    ///
+    /// Returns an `ImpermanentLossResult` comparing the current withdrawable
+    /// value against the hold-only baseline.
+    ///
+    /// Gas cost: O(1) – reads two storage entries (pool + position) and performs
+    /// a handful of i128 arithmetic operations.
+    pub fn get_impermanent_loss(
+        env: &Env,
+        provider: Address,
+        pool_id: u64,
+    ) -> Result<ImpermanentLossResult, PoolError> {
+        let position = Self::get_position(env, &provider, pool_id)
+            .ok_or(PoolError::PositionNotFound)?;
+        let pool = Self::get_pool(env, pool_id)
+            .ok_or(PoolError::PoolNotFound)?;
+
+        Ok(Self::compute_impermanent_loss(
+            &pool,
+            provider,
+            pool_id,
+            position.shares,
+            position.deposited_a,
+            position.deposited_b,
+        ))
     }
 }
 
