@@ -126,6 +126,17 @@ impl LiquidityPoolManager {
         // Record the initial deposit for lock-up tracking (FIFO list)
         Self::push_deposit_record(env, &creator, pool_id, total_shares, env.ledger().timestamp());
         
+        // Record the initial deposit for lock-up tracking (FIFO queue).
+        push_deposit_record(
+            env,
+            &creator,
+            pool_id,
+            DepositRecord {
+                shares: total_shares,
+                deposited_at: env.ledger().timestamp(),
+            },
+        );
+        
         Ok(pool)
     }
 
@@ -194,6 +205,16 @@ impl LiquidityPoolManager {
             .instance()
             .get(&DataKey::Pool(pool_id))
             .ok_or(PoolError::PoolNotFound)?;
+        
+        // ── Lock-up enforcement ─────────────────────────────────────────────
+        // Read the currently configured lock-up duration.  If it is non-zero,
+        // validate that the oldest FIFO deposits covering `shares` have all
+        // cleared their lock-up window before touching any pool state.
+        let lockup_duration = LockupAdmin::get_lockup_duration(env);
+        if lockup_duration > 0 {
+            consume_locked_shares(env, &provider, pool_id, shares, lockup_duration)?;
+        }
+        // ────────────────────────────────────────────────────────────────────
         
         // Calculate amounts to return
         let amount_a = (shares * pool.reserve_a) / pool.total_shares;
@@ -272,6 +293,13 @@ impl LiquidityPoolManager {
             } else {
                 env.storage().instance().set(&key, &updated_records);
             }
+        }
+        
+        // Enforce minimum-liquidity threshold: the pool balance must not drop
+        // below 1 000 units per reserve after a withdrawal.
+        let min_liquidity: i128 = 1_000;
+        if pool.reserve_a - amount_a < min_liquidity || pool.reserve_b - amount_b < min_liquidity {
+            return Err(PoolError::InsufficientLiquidity);
         }
         
         // Update pool reserves
@@ -1543,7 +1571,7 @@ mod tests {
     fn test_initial_shares() {
         let shares = LiquidityPoolManager::calculate_initial_shares(1000, 1000);
         assert_eq!(shares, 1000);
-        
+
         let shares2 = LiquidityPoolManager::calculate_initial_shares(2000, 2000);
         assert_eq!(shares2, 2000);
     }
@@ -1562,7 +1590,6 @@ mod tests {
             created_at: 0,
             last_rebalanced: 0,
         };
-        
         let score = PoolMonitor::calculate_liquidity_score(&pool);
         assert_eq!(score, 100);
     }
@@ -1581,7 +1608,6 @@ mod tests {
             created_at: 0,
             last_rebalanced: 0,
         };
-        
         let score = PoolMonitor::calculate_balance_score(&pool);
         assert_eq!(score, 100);
     }
