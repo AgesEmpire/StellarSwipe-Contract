@@ -120,7 +120,7 @@ impl Default for LossStreakConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LossStreakKey {
     Counter(Address),
-    Config,
+    ConfigState,
     /// Whether auto-trading is paused due to loss-streak for a user.
     Paused(Address),
 }
@@ -137,12 +137,12 @@ pub fn set_loss_streak_counter(env: &Env, user: &Address, counter: &LossStreakCo
 
 /// Get the loss-streak threshold config.
 pub fn get_loss_streak_config(env: &Env) -> LossStreakConfig {
-    crud_get_or(env, StorageTier::Instance, &LossStreakKey::Config, LossStreakConfig::default())
+    crud_get_or(env, StorageTier::Instance, &LossStreakKey::ConfigState, LossStreakConfig::default())
 }
 
 /// Set the loss-streak threshold config (admin only).
 pub fn set_loss_streak_config(env: &Env, config: &LossStreakConfig) {
-    crud_set(env, StorageTier::Instance, &LossStreakKey::Config, config);
+    crud_set(env, StorageTier::Instance, &LossStreakKey::ConfigState, config);
 }
 
 /// Whether the user is currently paused due to a loss-streak.
@@ -158,4 +158,78 @@ pub fn set_loss_streak_paused(env: &Env, user: &Address) {
 /// Clear the loss-streak pause for a user.
 pub fn clear_loss_streak_paused(env: &Env, user: &Address) {
     crud_remove(env, StorageTier::Persistent, &LossStreakKey::Paused(user.clone()));
+}
+
+// ── Daily Execution Cap ───────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DailyExecutionCounter {
+    pub count: u32,
+    pub window_start: u64,
+}
+
+impl Default for DailyExecutionCounter {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            window_start: 0,
+        }
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DailyCapConfig {
+    /// Maximum auto-trade executions allowed per rolling 24-hour window.
+    pub max_executions: u32,
+}
+
+impl Default for DailyCapConfig {
+    fn default() -> Self {
+        Self { max_executions: 10 }
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DailyExecutionCapKey {
+    Counter(Address),
+    Config(Address),
+}
+
+pub fn get_daily_execution_counter(env: &Env, user: &Address) -> DailyExecutionCounter {
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &DailyExecutionCapKey::Counter(user.clone()),
+        DailyExecutionCounter::default(),
+    )
+}
+
+pub fn set_daily_execution_counter(env: &Env, user: &Address, counter: &DailyExecutionCounter) {
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &DailyExecutionCapKey::Counter(user.clone()),
+        counter,
+    );
+}
+
+pub fn get_daily_cap_config(env: &Env, user: &Address) -> DailyCapConfig {
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &DailyExecutionCapKey::Config(user.clone()),
+        DailyCapConfig::default(),
+    )
+}
+
+pub fn set_daily_cap_config(env: &Env, user: &Address, config: &DailyCapConfig) {
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &DailyExecutionCapKey::Config(user.clone()),
+        config,
+    );
 }

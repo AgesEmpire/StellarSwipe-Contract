@@ -2,11 +2,13 @@
 
 use crate::{
     migration::{MigrationKey, StakeInfoV2},
-    SlashSeverity, StakeVaultContract, StakeVaultContractClient, StakeVaultError,
+    action, encode_action, encode_i128_bytes, SlashSeverity, StakeVaultContract,
+    StakeVaultContractClient, StakeVaultError,
 };
+use shared::multisig::MultisigConfig;
 use soroban_sdk::{
-    contract, contractimpl, testutils::Address as _, token::StellarAssetClient, Address, Env, Map,
-    MuxedAddress, Symbol,
+    contract, contractimpl, testutils::Address as _, token::StellarAssetClient, Address, Bytes, Env,
+    Map, MuxedAddress, Symbol, Vec,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1425,12 +1427,14 @@ mod slash_severity_tests {
 mod slash_appeal_tests {
     use crate::{
         migration::{MigrationKey, StakeInfoV2},
-        AppealStatus, SlashSeverity, StakeVaultContract, StakeVaultContractClient, StakeVaultError,
+        action, encode_action, encode_i128_bytes, AppealStatus, SlashSeverity,
+        StakeVaultContract, StakeVaultContractClient, StakeVaultError,
     };
+    use shared::multisig::MultisigConfig;
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token::StellarAssetClient,
-        Address, Env, Map, String, Symbol,
+        Address, Bytes, Env, Map, String, Symbol, Vec,
     };
 
     fn sac_token(env: &Env, admin: &Address) -> Address {
@@ -1924,5 +1928,177 @@ mod slash_appeal_tests {
 
         assert_eq!(client.get_slash_record(&0u64).unwrap().provider, p1);
         assert_eq!(client.get_slash_record(&1u64).unwrap().provider, p2);
+    }
+
+    // ── Multi-sig approval flow tests ─────────────────────────────────────────
+
+    fn multisig_env() -> (Env, Address, Address, Vec<Address>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let sig_reg = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.initialize(&admin, &token, &sig_reg);
+
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let signer_c = Address::generate(&env);
+        let signers = soroban_sdk::vec![&env, signer_a.clone(), signer_b.clone(), signer_c.clone()];
+        let cfg = MultisigConfig {
+            signers: signers.clone(),
+            threshold: 2,
+            proposal_timeout_secs: 86_400,
+        };
+        client.set_multisig_config(&admin, &Some(cfg));
+        (env, vault_id, admin, signers)
+    }
+
+    #[test]
+    fn set_minimum_stake_returns_requires_multisig_when_configured() {
+        let (env, vault_id, _admin, _signers) = multisig_env();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let result = client.try_set_minimum_stake(&1_000_000i128);
+        assert_eq!(result, Err(Ok(StakeVaultError::RequiresMultisig)));
+    }
+
+    #[test]
+    fn pause_returns_requires_multisig_when_configured() {
+        let (env, vault_id, _admin, _signers) = multisig_env();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let result = client.try_pause();
+        assert_eq!(result, Err(Ok(StakeVaultError::RequiresMultisig)));
+    }
+
+    #[test]
+    fn propose_approve_execute_set_minimum_stake() {
+        let (env, vault_id, _admin, signers) = multisig_env();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        // Proposer encodes the action
+        let payload = {
+            let e = &env;
+            encode_action(e, action::SET_MINIMUM_STAKE, &encode_i128_bytes(500_000i128))
+        };
+
+        // Propose by signer A
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+
+        // Approve by signer B (threshold = 2, so this reaches threshold)
+        let count = client.approve_action(&signers.get(1).unwrap(), &id);
+        assert_eq!(count, 2);
+
+        // Execute (auto-unwraps in mock auth mode)
+        client.execute_action(&signers.get(0).unwrap(), &id);
+
+        // Verify the state change
+        assert_eq!(client.get_minimum_stake(), 500_000);
+    }
+
+    #[test]
+    fn propose_approve_execute_pause() {
+        let (env, vault_id, _admin, signers) = multisig_env();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        let payload = {
+            let e = &env;
+            encode_action(e, action::PAUSE, &[])
+        };
+
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+        let _ = client.approve_action(&signers.get(1).unwrap(), &id);
+        client.execute_action(&signers.get(0).unwrap(), &id);
+        assert!(client.is_paused());
+    }
+
+    #[test]
+    fn execute_before_threshold_rejected() {
+        let (env, vault_id, _admin, signers) = multisig_env();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        let payload = {
+            let e = &env;
+            encode_action(e, action::PAUSE, &[])
+        };
+
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+        // Only 1 approval, threshold is 2
+        let result = client.try_execute_action(&signers.get(0).unwrap(), &id);
+        assert_eq!(result, Err(Ok(StakeVaultError::Unauthorized)));
+    }
+
+    #[test]
+    fn duplicate_approval_rejected() {
+        let (env, vault_id, _admin, signers) = multisig_env();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        let payload = {
+            let e = &env;
+            encode_action(e, action::SET_MINIMUM_STAKE, &encode_i128_bytes(100_000i128))
+        };
+
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+        // Second signer approves
+        let _ = client.approve_action(&signers.get(1).unwrap(), &id);
+        // First signer tries to approve again — fails
+        let result = client.try_approve_action(&signers.get(0).unwrap(), &id);
+        assert_eq!(result, Err(Ok(StakeVaultError::AlreadyApproved)));
+    }
+
+    #[test]
+    fn unauthorized_signer_approval_rejected() {
+        let (env, vault_id, _admin, signers) = multisig_env();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let impostor = Address::generate(&env);
+
+        let payload = {
+            let e = &env;
+            encode_action(e, action::PAUSE, &[])
+        };
+
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+        let result = client.try_approve_action(&impostor, &id);
+        assert_eq!(result, Err(Ok(StakeVaultError::Unauthorized)));
+    }
+
+    #[test]
+    fn proposal_expiry_blocks_execution() {
+        use soroban_sdk::testutils::Ledger;
+        let (env, vault_id, _admin, signers) = multisig_env();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        let payload = {
+            let e = &env;
+            encode_action(e, action::PAUSE, &[])
+        };
+
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+        let _ = client.approve_action(&signers.get(1).unwrap(), &id);
+
+        // Jump past the 1-day expiry
+        env.ledger().with_mut(|l| l.timestamp = 86_401);
+
+        let result = client.try_execute_action(&signers.get(0).unwrap(), &id);
+        assert_eq!(result, Err(Ok(StakeVaultError::EmergencyRequestExpired)));
+    }
+
+    #[test]
+    fn clear_multisig_restores_direct_admin() {
+        let (env, vault_id, admin, signers) = multisig_env();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        // With multisig configured, direct call fails
+        assert_eq!(
+            client.try_set_minimum_stake(&1_000_000i128),
+            Err(Ok(StakeVaultError::RequiresMultisig))
+        );
+
+        // Admin clears the multisig config
+        client.set_multisig_config(&admin, &None);
+
+        // Now direct admin call succeeds again (auto-unwraps in mock auth)
+        client.set_minimum_stake(&1_000_000i128);
+        assert_eq!(client.get_minimum_stake(), 1_000_000);
     }
 }

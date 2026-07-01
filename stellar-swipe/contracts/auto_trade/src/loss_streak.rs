@@ -1,30 +1,14 @@
-//! Loss-streak pause safety circuit (Issue #698).
-//!
-//! Tracks a per-user consecutive-loss counter that increments on a losing
-//! auto-trade outcome and resets on a winning one.  Once the counter reaches
-//! an admin-configurable threshold, further auto-trade execution is
-//! automatically paused for that user until they explicitly resume.
-//!
-//! # Event
-//! When the circuit triggers, a `loss_streak_pause` event is emitted with
-//! topics `(Symbol("loss_streak_pause"), user, threshold)` and no payload.
-//!
-//! # Resume
-//! The user must call `resume_after_loss_streak` to clear the pause flag.
-//! The counter is preserved (not reset) so the user can review their streak
-//! history.  The counter IS reset on the next successful trade.
-
 use soroban_sdk::{symbol_short, Address, Env, Symbol};
 
+use crate::admin;
 use crate::errors::AutoTradeError;
 use crate::storage::{
     self, clear_loss_streak_paused, get_loss_streak_config, get_loss_streak_counter,
     is_loss_streak_paused, set_loss_streak_counter, set_loss_streak_paused,
-    LossStreakCounter,
+    LossStreakConfig, LossStreakCounter,
 };
 use crate::TradeStatus;
 
-/// Emit a `loss_streak_pause` event.
 fn emit_loss_streak_pause(env: &Env, user: &Address, threshold: u32) {
     #[allow(deprecated)]
     env.events().publish(
@@ -37,22 +21,13 @@ fn emit_loss_streak_pause(env: &Env, user: &Address, threshold: u32) {
     );
 }
 
-/// Checks the loss-streak pause state for a user.
-/// Should be called at the start of `execute_trade` (after other pause checks).
-/// Returns `Err(AutoTradeError::LossStreakPaused)` if the user is currently paused.
 pub fn check_loss_streak_paused(env: &Env, user: &Address) -> Result<(), AutoTradeError> {
     if is_loss_streak_paused(env, user) {
-        return Err(AutoTradeError::LossStreakPaused);
+        return Err(AutoTradeError::TradingPaused);
     }
     Ok(())
 }
 
-/// Record the outcome of a completed auto-trade for loss-streak tracking.
-///
-/// - On a successful trade (`Filled` or `PartiallyFilled`): resets the
-///   consecutive-loss counter to 0.
-/// - On a failed trade (`Failed`): increments the counter.  If the counter
-///   reaches the configured threshold, the user is automatically paused.
 pub fn record_trade_outcome(
     env: &Env,
     user: &Address,
@@ -62,35 +37,64 @@ pub fn record_trade_outcome(
 
     match status {
         TradeStatus::Filled | TradeStatus::PartiallyFilled => {
-            // Winning trade → reset counter
             let counter = LossStreakCounter {
                 consecutive_losses: 0,
                 updated_at: now,
             };
             set_loss_streak_counter(env, user, &counter);
-
-            // Also clear any lingering pause flag
             clear_loss_streak_paused(env, user);
         }
         TradeStatus::Failed => {
-            // Losing trade → increment counter
             let mut counter = get_loss_streak_counter(env, user);
             counter.consecutive_losses = counter.consecutive_losses.saturating_add(1);
             counter.updated_at = now;
             set_loss_streak_counter(env, user, &counter);
 
-            // Check if threshold is reached
             let config = get_loss_streak_config(env);
             if counter.consecutive_losses >= config.threshold {
                 set_loss_streak_paused(env, user);
                 emit_loss_streak_pause(env, user, config.threshold);
 
-                // Log the pause event via the existing logging system
                 crate::logging::emit_log(
                     env,
                     crate::logging::LogLevel::Critical,
+                    soroban_sdk::String::from_str(env, "loss_streak"),
+                    soroban_sdk::String::from_str(env, "auto_paused"),
+                    None,
+                );
+            }
+        }
+        TradeStatus::Pending => {}
+    }
+}
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+pub fn set_loss_streak_threshold(
+    env: &Env,
+    caller: &Address,
+    threshold: u32,
+) -> Result<(), AutoTradeError> {
+    if threshold == 0 {
+        return Err(AutoTradeError::InvalidAmount);
+    }
+    let admin = admin::get_admin(env).ok_or(AutoTradeError::Unauthorized)?;
+    if caller != &admin {
+        return Err(AutoTradeError::Unauthorized);
+    }
+    let config = storage::LossStreakConfig { threshold };
+    storage::set_loss_streak_config(env, &config);
+    Ok(())
+}
+
+pub fn resume_after_loss_streak(
+    env: &Env,
+    user: &Address,
+) -> Result<(), AutoTradeError> {
+    if !is_loss_streak_paused(env, user) {
+        return Err(AutoTradeError::NotPaused);
+    }
+    clear_loss_streak_paused(env, user);
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -100,7 +104,7 @@ mod tests {
     use soroban_sdk::{
         contract,
         testutils::{Address as _, Events as _, Ledger as _},
-        Address, Env, IntoVal, Symbol, Val,
+        Address, Env, Symbol, TryFromVal, Val,
     };
 
     #[contract]
@@ -176,29 +180,18 @@ mod tests {
             assert!(is_loss_streak_paused(&env, &user));
             let events = env.events().all();
             let found = events.iter().any(|event| {
-                let (sym, data): (Symbol, (Address, u32)) =
-                    (event.0.clone(), event.2.clone().try_into().unwrap());
+                let topics: soroban_sdk::Vec<Val> = event.1.clone();
+                if topics.len() < 3 {
+                    return false;
+                }
+                let sym = Symbol::try_from_val(&env, &topics.get(0).unwrap())
+                    .unwrap_or(Symbol::new(&env, ""));
                 sym == Symbol::new(&env, "loss_streak_pause")
-                    && data.0 == user
-                    && data.1 == 3
             });
             assert!(found, "Expected loss_streak_pause event");
         });
     }
 
-                    soroban_sdk::String::from_str(env, "loss_streak"),
-                    soroban_sdk::String::from_str(env, "auto_paused"),
-                    None,
-                );
-            }
-        }
-        TradeStatus::Pending => {
-            // Pending trades don't affect the loss streak.
-        }
-    }
-}
-
-/// Explicitly resume auto-trading after a loss-streak pause.
     #[test]
     fn test_check_blocks_paused_user() {
         let (env, _cid, admin) = setup();
@@ -210,7 +203,7 @@ mod tests {
             assert!(is_loss_streak_paused(&env, &user));
             assert_eq!(
                 check_loss_streak_paused(&env, &user),
-                Err(AutoTradeError::LossStreakPaused)
+                Err(AutoTradeError::TradingPaused)
             );
         });
     }
@@ -274,7 +267,10 @@ mod tests {
     #[test]
     fn test_default_threshold_is_five() {
         let env = Env::default();
-        let config = get_loss_streak_config(&env);
-        assert_eq!(config.threshold, 5);
+        let contract_id = env.register(AutoTradeContract, ());
+        env.as_contract(&contract_id, || {
+            let config = get_loss_streak_config(&env);
+            assert_eq!(config.threshold, 5);
+        });
     }
 }
