@@ -16,7 +16,9 @@ mod auth;
 pub mod auth;
 mod conditional;
 mod correlation;
+mod daily_cap;
 mod errors;
+mod escrow;
 mod exit_strategy;
 mod history;
 mod iceberg;
@@ -601,6 +603,9 @@ impl AutoTradeContract {
         // Check loss-streak pause (Issue #698)
         loss_streak::check_loss_streak_paused(&env, &user)?;
 
+        // Check per-user daily execution cap (independent of profit/loss)
+        daily_cap::check_daily_execution_cap(&env, &user)?;
+
         let signal = storage::get_signal(&env, signal_id).ok_or(AutoTradeError::SignalNotFound)?;
 
         if env.ledger().timestamp() > signal.expiry {
@@ -666,6 +671,9 @@ impl AutoTradeContract {
         };
 
         logging::record_trade_outcome(&env, &status);
+
+        // Record daily execution (increments rolling counter)
+        daily_cap::record_execution(&env, &user);
 
         // Record loss-streak outcome (Issue #698)
         loss_streak::record_trade_outcome(&env, &user, &status);
@@ -1551,6 +1559,33 @@ impl AutoTradeContract {
         user: Address,
     ) -> Option<portfolio_insurance::PortfolioInsurance> {
         portfolio_insurance::get_insurance(&env, &user)
+    }
+
+    // ── Daily execution cap ───────────────────────────────────────────────────
+
+    /// Get the daily execution cap config for a user.
+    pub fn get_daily_cap_config(env: Env, user: Address) -> storage::DailyCapConfig {
+        storage::get_daily_cap_config(&env, &user)
+    }
+
+    /// Set the daily execution cap config for a user.
+    pub fn set_daily_cap_config(
+        env: Env,
+        user: Address,
+        config: storage::DailyCapConfig,
+    ) {
+        user.require_auth();
+        storage::set_daily_cap_config(&env, &user, &config);
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "daily_cap_config_updated"), user.clone()),
+            config,
+        );
+    }
+
+    /// Get the current daily execution counter for a user.
+    pub fn get_daily_execution_counter(env: Env, user: Address) -> storage::DailyExecutionCounter {
+        storage::get_daily_execution_counter(&env, &user)
     }
 
     // ── Drawdown trigger (Issue #674) ─────────────────────────────────────────

@@ -53,7 +53,8 @@
       "SystemError": 47,
       "SlippageExceeded": 48,
       "LastOracleForPair": 49,
-      "NotPaused": 50
+      "NotPaused": 50,
+      "DailyExecutionCapExceeded": 52
     }
   }
 }
