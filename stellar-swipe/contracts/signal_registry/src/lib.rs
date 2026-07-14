@@ -125,6 +125,7 @@ pub struct SignalRegistry;
 #[contracttype]
 #[derive(Clone)]
 pub enum StorageKey {
+    PendingRewards(Address),
     SignalCounter,
     Signals,
     /// Legacy v1 signal map (pre-upgrade). Cleared as rows migrate to [`StorageKey::Signals`].
@@ -171,6 +172,13 @@ pub enum StorageKey {
     SubmissionCooldown,
     /// Timestamp of a provider's most recent successful signal submission (issue #661).
     ProviderLastSignal(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingRewards {
+    pub fee: i128,
+    pub roi: i128,
 }
 #[contractimpl]
 impl SignalRegistry {
@@ -666,6 +674,25 @@ impl SignalRegistry {
         multisig_approvals::set_timelock_config(&env, &caller, config)
     }
 
+    pub fn claim_pending_rewards(env: Env, caller: Address) -> (i128, i128) {
+    caller.require_auth();
+    let pending = get_pending_rewards(&env, &caller);
+    if pending.fee == 0 && pending.roi == 0 {
+        return (0, 0);
+    }
+    // Clear storage before transfer (reentrancy-safe)
+    store_pending_rewards(&env, &caller, &PendingRewards { fee: 0, roi: 0 });
+
+    // TODO: Transfer tokens from the fee collector to the caller.
+    // Use the token contract address stored in your contract (e.g., fee_collector).
+    // Example:
+    // let token_client = TokenClient::new(&env, &fee_collector_address);
+    // token_client.transfer(&fee_collector_address, &caller, &pending.fee);
+    // Similarly for ROI token.
+
+    (pending.fee, pending.roi)
+    }
+
     /* =========================
        INTERNAL HELPERS
     ========================== */
@@ -803,6 +830,26 @@ impl SignalRegistry {
                 String::from_str(env, "provider_account_deleted"),
             );
         }
+    }
+
+    fn get_pending_rewards(env: &Env, address: &Address) -> PendingRewards {
+    env.storage()
+        .instance()
+        .get(&StorageKey::PendingRewards(address.clone()))
+         .unwrap_or(PendingRewards { fee: 0, roi: 0 })
+    }
+
+    fn store_pending_rewards(env: &Env, address: &Address, rewards: &PendingRewards) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::PendingRewards(address.clone()), rewards);
+     }
+
+    fn add_pending_rewards(env: &Env, address: &Address, fee_add: i128, roi_add: i128) {
+    let mut current = get_pending_rewards(env, address);
+    current.fee += fee_add;
+    current.roi += roi_add;
+    store_pending_rewards(env, address, &current);
     }
 
     /* =========================
@@ -1283,6 +1330,8 @@ impl SignalRegistry {
         caller: Address,
         signal_id: u64,
         outcome: SignalOutcome,
+        total_fee: i128,
+        total_roi: i128,
     ) -> Result<(), SignalOutcomeError> {
         caller.require_auth();
         let executor: Address = env
@@ -1309,7 +1358,39 @@ impl SignalRegistry {
             .ok_or(SignalOutcomeError::SignalNotFound)?;
         if signal.status == SignalStatus::Active {
             return Err(SignalOutcomeError::SignalNotClosed);
+           
         }
+         if collaboration::is_collaborative_signal(&env, signal_id) {
+    let authors = collaboration::get_collaborative_signal(&env, signal_id)
+        .ok_or(SignalOutcomeError::SignalNotFound)?;
+
+    let distributions = collaboration::distribute_collaborative_rewards(
+        &env,
+        &authors,
+        total_fee,
+        total_roi,
+    );
+
+    // Emit event
+    let mut event_data = Vec::new(&env);
+    for (addr, fee, roi) in distributions.iter() {
+        event_data.push_back((addr.clone(), fee, roi));
+    }
+    env.events().publish(
+        ("CollaborativeRewardDistributed", signal_id),
+        event_data,
+    );
+
+    // Credit pending rewards for each author
+    for (addr, fee_share, roi_share) in distributions.iter() {
+        if *fee_share > 0 || *roi_share > 0 {
+            add_pending_rewards(&env, addr, *fee_share, *roi_share);
+        }
+    }
+} else {
+    // Single-author: credit all to the signal provider
+    add_pending_rewards(&env, &signal.provider, total_fee, total_roi);
+}
 
         let provider = signal.provider.clone();
         let rep_key = StorageKey::ProviderReputationScore(provider.clone());
