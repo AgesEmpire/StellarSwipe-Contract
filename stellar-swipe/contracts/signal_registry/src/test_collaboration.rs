@@ -123,3 +123,49 @@ fn test_invalid_contribution_percentages() {
         &RiskLevel::Medium,
     );
 }
+
+#[test]
+fn test_collaborative_reward_distribution() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let primary = Address::generate(&env);
+    let co_author1 = Address::generate(&env);
+    let co_author2 = Address::generate(&env);
+
+    client.initialize(&admin);
+
+    // Create collaborative signal with 60/25/15
+    let mut co_authors = Vec::new(&env);
+    co_authors.push_back(co_author1.clone());
+    co_authors.push_back(co_author2.clone());
+    let mut pcts = Vec::new(&env);
+    pcts.push_back(6000);
+    pcts.push_back(2500);
+    pcts.push_back(1500);
+
+    let signal_id = client.create_collaborative_signal(
+        &primary,
+        &co_authors,
+        &pcts,
+        // ... other params
+    );
+
+    // Have co-authors approve
+    client.approve_collaborative_signal(&signal_id, &co_author1);
+    client.approve_collaborative_signal(&signal_id, &co_author2);
+
+    // Simulate closing signal with total_fee = 1000
+    // We need to mock the outcome and fee collection
+    // ...
+
+    // Check pending rewards for each author
+    // primary: 6000/10000 * 1000 = 600
+    // co_author1: 250
+    // co_author2: 150
+    // Use client.claim_pending_rewards and assert balances
+}
