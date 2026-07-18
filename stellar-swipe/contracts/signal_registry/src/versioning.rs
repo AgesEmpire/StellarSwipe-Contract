@@ -220,9 +220,7 @@ pub fn edit_signal_with_audit(
     }
 
     // Update version metadata
-    env.storage()
-        .persistent()
-        .set(&version_key, &new_version);
+    env.storage().persistent().set(&version_key, &new_version);
 
     // Emit event
     events::emit_signal_updated(env, signal_id, new_version, updater.clone());

@@ -99,7 +99,12 @@ pub fn publish_scheduled_signals(env: Env) -> Vec<u64> {
                 if scheduled.recurrence.is_recurring && scheduled.recurrence.repeat_count > 0 {
                     // Upgrade V1 → V2 on first publish of a recurring schedule.
                     let resolved = scheduled.signal_data.clone().resolve();
-                    schedule_next_occurrence(&env, &scheduled, scheduled.recurrence.clone(), resolved);
+                    schedule_next_occurrence(
+                        &env,
+                        &scheduled,
+                        scheduled.recurrence.clone(),
+                        resolved,
+                    );
                 }
 
                 env.storage()

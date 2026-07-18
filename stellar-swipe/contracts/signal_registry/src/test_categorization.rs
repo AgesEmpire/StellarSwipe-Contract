@@ -15,7 +15,12 @@ fn setup(env: &Env) -> (Address, SignalRegistryClient) {
     (admin, client)
 }
 
-fn add_signal(env: &Env, client: &SignalRegistryClient, provider: &Address, category: SignalCategory) -> u64 {
+fn add_signal(
+    env: &Env,
+    client: &SignalRegistryClient,
+    provider: &Address,
+    category: SignalCategory,
+) -> u64 {
     client.create_signal(
         provider,
         &String::from_str(env, "XLM/USDC"),
@@ -87,8 +92,12 @@ fn pagination_offset_skips_signals() {
     // All three IDs present across pages (no duplicates)
     let ids: soroban_sdk::Vec<u64> = {
         let mut v = soroban_sdk::Vec::new(&env);
-        for i in 0..page1.len() { v.push_back(page1.get(i).unwrap().id); }
-        for i in 0..page2.len() { v.push_back(page2.get(i).unwrap().id); }
+        for i in 0..page1.len() {
+            v.push_back(page1.get(i).unwrap().id);
+        }
+        for i in 0..page2.len() {
+            v.push_back(page2.get(i).unwrap().id);
+        }
         v
     };
     assert!(ids.contains(id1));

@@ -389,11 +389,7 @@ pub fn check_verification_eligibility(
 /// Set the specialization tags for a provider (self-selected).
 /// Replaces any existing tags for this provider.
 /// Validates that all tags are in the admin-defined set and within count limits.
-pub fn set_provider_specializations(
-    env: &Env,
-    provider: &Address,
-    tags: soroban_sdk::Vec<String>,
-) {
+pub fn set_provider_specializations(env: &Env, provider: &Address, tags: soroban_sdk::Vec<String>) {
     provider.require_auth();
 
     if tags.len() > MAX_SPECIALIZATION_TAGS_PER_PROVIDER {
@@ -486,13 +482,12 @@ pub fn set_provider_specializations(
 }
 
 /// Returns the specialization tags for a given provider.
-pub fn get_provider_specializations(
-    env: &Env,
-    provider: &Address,
-) -> soroban_sdk::Vec<String> {
+pub fn get_provider_specializations(env: &Env, provider: &Address) -> soroban_sdk::Vec<String> {
     env.storage()
         .persistent()
-        .get(&SpecializationStorageKey::ProviderSpecializations(provider.clone()))
+        .get(&SpecializationStorageKey::ProviderSpecializations(
+            provider.clone(),
+        ))
         .unwrap_or_else(|| soroban_sdk::Vec::new(env))
 }
 
@@ -890,7 +885,8 @@ mod tests {
             set_provider_specializations(env, &provider2, p2_tags);
 
             // List by tag
-            let defi_providers = list_providers_by_specialization(env, String::from_str(env, "DeFi"));
+            let defi_providers =
+                list_providers_by_specialization(env, String::from_str(env, "DeFi"));
             assert_eq!(defi_providers.len(), 1);
             assert_eq!(defi_providers.get(0).unwrap(), provider1);
         });
@@ -966,7 +962,8 @@ mod tests {
             assert_eq!(stored2.get(0).unwrap(), String::from_str(env, "Forex"));
 
             // Old tag should no longer list the provider
-            let defi_providers = list_providers_by_specialization(env, String::from_str(env, "DeFi"));
+            let defi_providers =
+                list_providers_by_specialization(env, String::from_str(env, "DeFi"));
             assert_eq!(defi_providers.len(), 0);
         });
     }

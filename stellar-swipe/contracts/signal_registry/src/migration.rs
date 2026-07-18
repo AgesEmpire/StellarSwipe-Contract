@@ -184,7 +184,11 @@ fn snapshot_v2(v2: &Map<u64, Signal>, max_id: u64) -> MigrationSnapshot {
 /// of the same scope and reports whether they reconcile.
 fn reconcile(pre: MigrationSnapshot, post: MigrationSnapshot) -> MigrationVerification {
     let verified = pre == post;
-    MigrationVerification { verified, pre, post }
+    MigrationVerification {
+        verified,
+        pre,
+        post,
+    }
 }
 
 fn get_migration_pre_snapshot(env: &Env) -> Option<MigrationSnapshot> {
@@ -429,10 +433,16 @@ mod migration_invariant_tests {
             }
 
             let verification = get_migration_verification(env).expect("verification recorded");
-            assert!(verification.verified, "expected clean migration to reconcile: {verification:?}");
+            assert!(
+                verification.verified,
+                "expected clean migration to reconcile: {verification:?}"
+            );
             assert_eq!(verification.pre.record_count, 37);
             assert_eq!(verification.post.record_count, 37);
-            assert_eq!(verification.pre.total_volume_sum, verification.post.total_volume_sum);
+            assert_eq!(
+                verification.pre.total_volume_sum,
+                verification.post.total_volume_sum
+            );
             // Sum of (i * 100) for i in 1..=37
             let expected_sum: i128 = (1..=37i128).map(|i| i * 100).sum();
             assert_eq!(verification.pre.total_volume_sum, expected_sum);
@@ -473,11 +483,16 @@ mod migration_invariant_tests {
             }
 
             let verification = get_migration_verification(env).expect("verification recorded");
-            assert!(!verification.verified, "expected corrupted migration to be flagged as mismatched");
-            assert_eq!(verification.pre.record_count, verification.post.record_count);
+            assert!(
+                !verification.verified,
+                "expected corrupted migration to be flagged as mismatched"
+            );
+            assert_eq!(
+                verification.pre.record_count,
+                verification.post.record_count
+            );
             assert_ne!(
-                verification.pre.total_volume_sum,
-                verification.post.total_volume_sum,
+                verification.pre.total_volume_sum, verification.post.total_volume_sum,
                 "corruption should have shifted the total_volume sum"
             );
             assert_eq!(

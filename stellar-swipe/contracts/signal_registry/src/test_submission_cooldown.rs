@@ -5,7 +5,9 @@ extern crate std;
 use super::*;
 use crate::categories::{RiskLevel, SignalCategory};
 use crate::errors::AdminError;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger, vec, Address, Env, InvokeError, String};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Ledger, vec, Address, Env, InvokeError, String,
+};
 
 fn setup(env: &Env) -> (Address, SignalRegistryClient) {
     env.mock_all_auths();

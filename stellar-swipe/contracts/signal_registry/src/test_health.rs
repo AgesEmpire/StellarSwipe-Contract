@@ -12,6 +12,7 @@ fn health_uninitialized_contract() {
     let h = client.health_check();
     assert!(!h.is_initialized);
     assert!(!h.is_paused);
+    assert_eq!(h.expired_signal_count, 0);
 }
 
 #[test]

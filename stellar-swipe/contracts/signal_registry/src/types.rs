@@ -1,6 +1,21 @@
 use crate::categories::{RiskLevel, SignalCategory};
 use soroban_sdk::{contracttype, Address, String, Symbol, Vec};
 
+/// Health probe response for the signal registry. Extends the shared
+/// `HealthStatus` shape with `expired_signal_count` so monitoring dashboards
+/// can surface storage-bloat pressure from expired signals (issue #779).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryHealthStatus {
+    pub is_initialized: bool,
+    pub is_paused: bool,
+    pub version: String,
+    pub admin: Address,
+    /// Signals past their expiry timestamp still occupying instance storage —
+    /// what `prune_expired_signals` would remove given a large enough budget.
+    pub expired_signal_count: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SortOption {

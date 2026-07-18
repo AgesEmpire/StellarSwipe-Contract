@@ -516,8 +516,7 @@ pub fn calculate_global_analytics_paginated(
             if let Some(signal) = signals_map.get(key) {
                 if signal.timestamp >= cutoff {
                     acc.total_signals_24h = acc.total_signals_24h.saturating_add(1);
-                    acc.total_volume_24h =
-                        acc.total_volume_24h.saturating_add(signal.total_volume);
+                    acc.total_volume_24h = acc.total_volume_24h.saturating_add(signal.total_volume);
                 }
                 if matches!(
                     signal.status,
@@ -623,14 +622,24 @@ mod pagination_tests {
             env.ledger().with_mut(|l| l.timestamp = 1_000_000);
             let map = make_map(env, 5, 999_000);
 
-            let paged =
-                calculate_global_analytics_paginated(env, &map, None, GlobalAnalyticsAccumulator::new());
+            let paged = calculate_global_analytics_paginated(
+                env,
+                &map,
+                None,
+                GlobalAnalyticsAccumulator::new(),
+            );
             assert_eq!(paged.cursor, None);
 
             let direct = calculate_global_analytics(env, &map);
-            assert_eq!(paged.accumulator.total_signals_24h, direct.total_signals_24h);
+            assert_eq!(
+                paged.accumulator.total_signals_24h,
+                direct.total_signals_24h
+            );
             assert_eq!(paged.accumulator.total_volume_24h, direct.total_volume_24h);
-            assert_eq!(paged.accumulator.avg_success_rate(), direct.avg_success_rate);
+            assert_eq!(
+                paged.accumulator.avg_success_rate(),
+                direct.avg_success_rate
+            );
         });
     }
 
@@ -661,7 +670,10 @@ mod pagination_tests {
                 }
                 assert!(pages < 10_000, "pagination did not terminate");
             }
-            assert!(pages > 1, "expected pagination to span multiple pages, got {pages}");
+            assert!(
+                pages > 1,
+                "expected pagination to span multiple pages, got {pages}"
+            );
 
             let direct = calculate_global_analytics(env, &map);
             assert_eq!(acc.total_signals_24h, direct.total_signals_24h);

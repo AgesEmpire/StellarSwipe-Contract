@@ -136,8 +136,7 @@ fn test_v1_signal_data_upgrades_on_read() {
             .set(&ScheduleDataKey::NextScheduleId, &1u64);
 
         // Read back and resolve — should yield V2 with default confidence/risk.
-        let (record, resolved) = get_scheduled_signal_data(&env, 0)
-            .expect("record must exist");
+        let (record, resolved) = get_scheduled_signal_data(&env, 0).expect("record must exist");
 
         // Verify the raw stored variant is still V1.
         assert!(
@@ -201,8 +200,7 @@ fn test_v2_signal_data_roundtrips() {
             .instance()
             .set(&ScheduleDataKey::NextScheduleId, &2u64);
 
-        let (_record, resolved) = get_scheduled_signal_data(&env, 1)
-            .expect("record must exist");
+        let (_record, resolved) = get_scheduled_signal_data(&env, 1).expect("record must exist");
 
         // V2 resolve is a no-op — all fields preserved exactly.
         assert_eq!(resolved.asset_pair, v2_data.asset_pair);

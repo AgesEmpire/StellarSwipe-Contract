@@ -265,8 +265,7 @@ fn derive_tiebreak_nonce(env: &Env, random_seed: u64, ledger_sequence: u32) -> u
     let hash = env.crypto().sha256(&preimage);
     let bytes = hash.to_array();
     u64::from_be_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ])
 }
 
@@ -326,7 +325,11 @@ pub fn finalize_contest(env: &Env, contest_id: u64) -> Result<Vec<Address>, Cont
 
     env.events().publish(
         (Symbol::new(env, "contest_randomness"), contest_id),
-        (contest.random_seed, contest.finalize_after_ledger, current_ledger),
+        (
+            contest.random_seed,
+            contest.finalize_after_ledger,
+            current_ledger,
+        ),
     );
 
     let mut qualified_entries: Vec<ContestEntry> = Vec::new(env);

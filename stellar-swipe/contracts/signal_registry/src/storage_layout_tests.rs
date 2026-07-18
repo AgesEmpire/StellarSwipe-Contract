@@ -43,7 +43,10 @@ use soroban_sdk::{Address, Bytes, Env, String, Vec};
 
 /// Compute the hex-encoded XDR bytes of `val` using the Soroban host.
 /// Uses the `ToXdr` trait from soroban-sdk (available in testutils build).
-fn xdr_hex<T: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, val: T) -> std::string::String {
+fn xdr_hex<T: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    val: T,
+) -> std::string::String {
     let xdr: Bytes = val.to_xdr(env);
     let mut out = std::string::String::with_capacity(xdr.len() as usize * 2);
     for byte in xdr.iter() {
@@ -144,8 +147,13 @@ fn snapshot_signal_data_v1_layout() {
         };
 
         // Store → read-back to confirm the host accepts this layout.
-        env.storage().persistent().set(&StorageKey::MigrationCursor, &val);
-        let _: SignalDataV1 = env.storage().persistent().get(&StorageKey::MigrationCursor)
+        env.storage()
+            .persistent()
+            .set(&StorageKey::MigrationCursor, &val);
+        let _: SignalDataV1 = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::MigrationCursor)
             .expect("round-trip must succeed");
 
         let hex = xdr_hex(env, val);
@@ -166,8 +174,13 @@ fn snapshot_signal_data_v2_layout() {
             risk_level: RiskLevel::Medium,
         };
 
-        env.storage().persistent().set(&StorageKey::MigrationCursor, &val);
-        let _: SignalDataV2 = env.storage().persistent().get(&StorageKey::MigrationCursor)
+        env.storage()
+            .persistent()
+            .set(&StorageKey::MigrationCursor, &val);
+        let _: SignalDataV2 = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::MigrationCursor)
             .expect("round-trip must succeed");
 
         let hex = xdr_hex(env, val);
@@ -205,7 +218,8 @@ fn snapshot_scheduled_signal_layout() {
         env.storage()
             .persistent()
             .set(&ScheduleDataKey::Schedule(1u64), &val);
-        let _: ScheduledSignal = env.storage()
+        let _: ScheduledSignal = env
+            .storage()
             .persistent()
             .get(&ScheduleDataKey::Schedule(1u64))
             .expect("round-trip must succeed");
@@ -231,7 +245,9 @@ fn snapshot_mechanism_detects_field_order_sensitivity() {
             price: 3_000i128,
             rationale: String::from_str(env, "canary"),
         };
-        env.storage().persistent().set(&StorageKey::MigrationCursor, &original);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::MigrationCursor, &original);
         let decoded: SignalDataV1 = env
             .storage()
             .persistent()
@@ -239,7 +255,13 @@ fn snapshot_mechanism_detects_field_order_sensitivity() {
             .expect("must decode");
 
         // Confirm each field round-trips correctly in position order.
-        assert_eq!(decoded.price, 3_000i128, "price field must be in expected position");
-        assert_eq!(decoded.rationale, original.rationale, "rationale field must be in expected position");
+        assert_eq!(
+            decoded.price, 3_000i128,
+            "price field must be in expected position"
+        );
+        assert_eq!(
+            decoded.rationale, original.rationale,
+            "rationale field must be in expected position"
+        );
     });
 }

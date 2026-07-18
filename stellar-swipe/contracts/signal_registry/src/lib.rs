@@ -33,20 +33,20 @@ mod scheduling;
 mod scoring;
 mod social;
 mod stake;
+/// Storage-layout XDR snapshot regression tests (Issue #580).
+#[cfg(test)]
+mod storage_layout_tests;
 mod storage_monitor;
 mod submission;
 mod template_presets;
 mod templates;
 mod test_reputation;
-mod types;
-mod validation;
-mod versioning;
-/// Storage-layout XDR snapshot regression tests (Issue #580).
-#[cfg(test)]
-mod storage_layout_tests;
 /// Provider submission cooldown tests (Issue #661).
 #[cfg(test)]
 mod test_submission_cooldown;
+mod types;
+mod validation;
+mod versioning;
 
 pub use categories::{RiskLevel, SignalCategory};
 pub use multisig_approvals::CriticalActionPayload;
@@ -90,7 +90,7 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, Address, Bytes, Env, IntoVal, Map, String, Symbol, Val,
     Vec,
 };
-use stellar_swipe_common::{health_uninitialized, placeholder_admin, HealthStatus};
+use stellar_swipe_common::placeholder_admin;
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
 use stellar_swipe_common::{ApprovalProposal, MultisigTimelockConfig, ProposalStatus};
 pub use template_presets::{SignalTemplateOverrides, SignalTemplatePreset, StoredSignalTemplate};
@@ -98,26 +98,20 @@ pub use templates::SignalTemplate;
 use templates::DEFAULT_TEMPLATE_EXPIRY_HOURS;
 use types::{
     AddressMapping, Asset, CrossChainSignal, ImportResultView, ProviderMonthlyReport,
-    RecurrencePattern, Signal, SignalDataV2, SignalEditInput, SignalPerformanceView, SignalSummary,
-    SortOption, SyncStatus, TradeExecution,
+    RecurrencePattern, RegistryHealthStatus, Signal, SignalDataV2, SignalEditInput,
+    SignalPerformanceView, SignalSummary, SortOption, SyncStatus, TradeExecution,
 };
 // SignalData is a type alias for SignalDataV2; keep the alias re-export for
 // any external clients compiled against the old name (Issue #568).
+pub use cohort_retention::{get_cohort_retention as cohort_retention_get, CohortRetention};
 pub use types::SignalData;
-pub use cohort_retention::{CohortRetention, get_cohort_retention as cohort_retention_get};
 use versioning::{CopyRecord, SignalVersion};
 
 const MAX_EXPIRY_SECONDS: u64 = SECONDS_PER_30_DAY_MONTH;
 const WARNING_WINDOW_LEDGERS: u64 = 720;
 
-soroban_sdk::contractmeta!(
-    key = "SourceHash",
-    val = env!("STELLAR_SOURCE_HASH")
-);
-soroban_sdk::contractmeta!(
-    key = "GitCommit",
-    val = env!("STELLAR_GIT_COMMIT")
-);
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct SignalRegistry;
@@ -171,6 +165,9 @@ pub enum StorageKey {
     SubmissionCooldown,
     /// Timestamp of a provider's most recent successful signal submission (issue #661).
     ProviderLastSignal(Address),
+    /// Keeper addresses allowlisted (by the admin) to call
+    /// `prune_expired_signals` alongside the admin (issue #779).
+    PruneKeepers,
 }
 #[contractimpl]
 impl SignalRegistry {
@@ -521,25 +518,138 @@ impl SignalRegistry {
     /// is never unexpectedly archived.  Open to any caller.
     pub fn bump_signals_ttl(env: Env) {
         stellar_swipe_common::ttl_manager::force_bump_persistent(&env, &StorageKey::Signals);
-        stellar_swipe_common::ttl_manager::force_bump_persistent(&env, &StorageKey::ActiveSignalsByCategory);
+        stellar_swipe_common::ttl_manager::force_bump_persistent(
+            &env,
+            &StorageKey::ActiveSignalsByCategory,
+        );
     }
 
     /// Read-only health probe for monitoring and front-ends (no auth).
-    pub fn health_check(env: Env) -> HealthStatus {
+    ///
+    /// `expired_signal_count` reports how many stored signals are past their
+    /// expiry timestamp and thus reclaimable via `prune_expired_signals`
+    /// (issue #779).
+    pub fn health_check(env: Env) -> RegistryHealthStatus {
         let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        let signals = Self::get_signals_map(&env);
+        let expired_signal_count = expiry::count_prunable_signals(&env, &signals);
         if !admin::has_admin(&env) {
-            return health_uninitialized(&env, version);
+            return RegistryHealthStatus {
+                is_initialized: false,
+                is_paused: false,
+                version,
+                admin: placeholder_admin(&env),
+                expired_signal_count,
+            };
         }
         let admin_addr = match get_admin(&env) {
             Ok(a) => a,
             Err(_) => placeholder_admin(&env),
         };
-        HealthStatus {
+        RegistryHealthStatus {
             is_initialized: true,
             is_paused: is_trading_paused(&env),
             version,
             admin: admin_addr,
+            expired_signal_count,
         }
+    }
+
+    /// Permanently remove up to `max_entries` expired signals from instance
+    /// storage to bound rent costs and keep `get_active_signals` scans cheap
+    /// (issue #779). Only the admin or an allowlisted keeper may call this.
+    ///
+    /// Pruned signal ids are also dropped from the per-category index.
+    /// Returns the number of signals removed; `max_entries == 0` is a no-op
+    /// that returns 0.
+    ///
+    /// # Errors
+    /// - [`AdminError::Unauthorized`] if `caller` is neither admin nor an
+    ///   allowlisted keeper.
+    pub fn prune_expired_signals(
+        env: Env,
+        caller: Address,
+        max_entries: u32,
+    ) -> Result<u32, AdminError> {
+        caller.require_auth();
+        if admin::require_admin(&env, &caller).is_err() && !Self::is_prune_keeper(&env, &caller) {
+            return Err(AdminError::Unauthorized);
+        }
+        if max_entries == 0 {
+            return Ok(0);
+        }
+
+        let signals = Self::get_signals_map(&env);
+        let pruned = expiry::prune_expired_signals(&env, &signals, max_entries);
+
+        if !pruned.is_empty() {
+            let mut cat_map = Self::get_category_index_map(&env);
+            for signal in pruned.iter() {
+                let old_list = cat_map
+                    .get(signal.category.clone())
+                    .unwrap_or(Vec::new(&env));
+                let mut new_list = Vec::new(&env);
+                for j in 0..old_list.len() {
+                    let sid = old_list.get(j).unwrap();
+                    if sid != signal.id {
+                        new_list.push_back(sid);
+                    }
+                }
+                cat_map.set(signal.category.clone(), new_list);
+            }
+            Self::save_category_index_map(&env, &cat_map);
+        }
+
+        Ok(pruned.len())
+    }
+
+    /// Allowlist a keeper address permitted to call `prune_expired_signals`
+    /// (admin only). Adding an already-listed keeper is a no-op.
+    pub fn add_prune_keeper(env: Env, caller: Address, keeper: Address) -> Result<(), AdminError> {
+        admin::require_admin(&env, &caller)?;
+        caller.require_auth();
+        let mut keepers = Self::get_prune_keepers(env.clone());
+        if !keepers.contains(&keeper) {
+            keepers.push_back(keeper);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PruneKeepers, &keepers);
+        }
+        Ok(())
+    }
+
+    /// Remove a keeper address from the prune allowlist (admin only).
+    pub fn remove_prune_keeper(
+        env: Env,
+        caller: Address,
+        keeper: Address,
+    ) -> Result<(), AdminError> {
+        admin::require_admin(&env, &caller)?;
+        caller.require_auth();
+        let keepers = Self::get_prune_keepers(env.clone());
+        let mut remaining = Vec::new(&env);
+        for i in 0..keepers.len() {
+            let addr = keepers.get(i).unwrap();
+            if addr != keeper {
+                remaining.push_back(addr);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::PruneKeepers, &remaining);
+        Ok(())
+    }
+
+    /// Current prune-keeper allowlist (read-only).
+    pub fn get_prune_keepers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::PruneKeepers)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    fn is_prune_keeper(env: &Env, caller: &Address) -> bool {
+        Self::get_prune_keepers(env.clone()).contains(caller)
     }
 
     pub fn set_circuit_breaker_config(
@@ -919,9 +1029,7 @@ impl SignalRegistry {
                     .persistent()
                     .get(&StorageKey::ProviderLastSignal(provider.clone()))
                     .unwrap_or(0u64);
-                if last_signal_time > 0
-                    && env.ledger().timestamp() < last_signal_time + cooldown
-                {
+                if last_signal_time > 0 && env.ledger().timestamp() < last_signal_time + cooldown {
                     return Err(AdminError::CooldownNotElapsed);
                 }
             }
@@ -1270,10 +1378,7 @@ impl SignalRegistry {
 
     /// Retrieve the full version history for a signal (audit trail, Issue #686).
     /// Returns all stored versions in chronological order.
-    pub fn get_signal_version_history(
-        env: Env,
-        signal_id: u64,
-    ) -> Vec<versioning::SignalVersion> {
+    pub fn get_signal_version_history(env: Env, signal_id: u64) -> Vec<versioning::SignalVersion> {
         versioning::get_signal_history(&env, signal_id)
     }
 
@@ -1370,9 +1475,7 @@ impl SignalRegistry {
         provider.require_auth();
 
         let mut signals = Self::get_signals_map(&env);
-        let mut signal = signals
-            .get(signal_id)
-            .ok_or(SignalCancelError::NotFound)?;
+        let mut signal = signals.get(signal_id).ok_or(SignalCancelError::NotFound)?;
 
         if signal.provider != provider {
             return Err(SignalCancelError::NotOwner);
@@ -2248,10 +2351,7 @@ impl SignalRegistry {
     /// rate (30 %), and performance trend (30 %) into a composite 0–100 score.
     /// Emits `churn_risk_elevated` when the composite score meets or exceeds the
     /// admin-configured threshold.
-    pub fn get_provider_churn_risk(
-        env: Env,
-        provider: Address,
-    ) -> churn_risk::ChurnRiskScore {
+    pub fn get_provider_churn_risk(env: Env, provider: Address) -> churn_risk::ChurnRiskScore {
         let signals = Self::get_signals_map(&env);
         let stats_map = Self::get_provider_stats_map(&env);
         let stats = stats_map.get(provider.clone());
@@ -2458,7 +2558,9 @@ impl SignalRegistry {
                 break;
             }
             let id = ids.get(i).unwrap();
-            let Some(signal) = signals_map.get(id) else { continue };
+            let Some(signal) = signals_map.get(id) else {
+                continue;
+            };
             if signal.status != SignalStatus::Active || signal.expiry <= now {
                 continue;
             }
@@ -3211,18 +3313,21 @@ mod test;
 mod test_admin_transfer;
 #[cfg(test)]
 mod test_adoption;
+/// Signal categorization query tests (Issue #660).
+#[cfg(test)]
+mod test_categorization;
 #[cfg(test)]
 mod test_emergency;
 #[cfg(test)]
 mod test_health;
 #[cfg(test)]
 mod test_multisig_approval;
+/// Paginated signal expiry pruning tests (Issue #779).
+#[cfg(test)]
+mod test_prune_expiry;
 #[cfg(test)]
 mod test_scheduling;
 #[cfg(test)]
 mod test_signal_issues;
-/// Signal categorization query tests (Issue #660).
-#[cfg(test)]
-mod test_categorization;
 #[cfg(test)]
 mod tests;
