@@ -3,10 +3,7 @@
 
 extern crate std;
 
-use soroban_sdk::{
-    testutils::Address as _,
-    Address, Env, String,
-};
+use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
 use crate::{
     errors::ContractError,
@@ -114,10 +111,7 @@ fn execute_copy_trade_blocked_when_flag_disabled() {
         &soroban_sdk::Bytes::from_array(&env, &[0u8; 32]),
         &(env.ledger().timestamp() + 86_400),
     );
-    assert_eq!(
-        result,
-        Err(Ok(ContractError::FeatureDisabled))
-    );
+    assert_eq!(result, Err(Ok(ContractError::FeatureDisabled)));
 }
 
 // ── execute_dca_interval blocked when flag disabled ───────────────────────────
@@ -133,8 +127,5 @@ fn execute_dca_interval_blocked_when_flag_disabled() {
     let user = Address::generate(&env);
 
     let result = client.try_execute_dca_interval(&user, &1u64);
-    assert_eq!(
-        result,
-        Err(Ok(ContractError::FeatureDisabled))
-    );
+    assert_eq!(result, Err(Ok(ContractError::FeatureDisabled)));
 }

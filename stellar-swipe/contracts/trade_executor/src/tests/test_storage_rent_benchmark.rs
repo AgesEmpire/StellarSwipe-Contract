@@ -142,7 +142,7 @@ fn dca_interval_storage_rent_baseline_smoke() {
     // Create a DCA plan first.
     client.execute_dca_copy_trade(
         &user,
-        &1u64,   // signal_id
+        &1u64, // signal_id
         &10_000_000i128,
         &3u32,   // num_intervals
         &10u32,  // interval_ledgers
@@ -155,7 +155,10 @@ fn dca_interval_storage_rent_baseline_smoke() {
 
     let done = client.execute_dca_interval(&user, &1u64);
     // Returns false while the plan has remaining intervals.
-    assert!(!done, "DCA plan should not be complete after the first interval");
+    assert!(
+        !done,
+        "DCA plan should not be complete after the first interval"
+    );
 }
 
 /// Delta-check: compare the current write count to the baseline and fail if the

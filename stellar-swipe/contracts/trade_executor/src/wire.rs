@@ -15,8 +15,8 @@ pub enum OrderType {
 pub enum TradeStatus {
     Pending,
     PartiallyFilled,
-    ExecutedAwaitingConfirmation, 
-    Filled,                      
+    ExecutedAwaitingConfirmation,
+    Filled,
     Failed,
 }
 
@@ -46,7 +46,7 @@ pub struct Trade {
     pub executed_price: i128,
     pub timestamp: u64,
     pub status: TradeStatus,
-    pub execution_ledger: u32
+    pub execution_ledger: u32,
 }
 
 #[contracttype]
