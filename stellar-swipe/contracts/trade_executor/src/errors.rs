@@ -45,7 +45,6 @@ pub enum ContractError {
     DCAPlanAlreadyExists = 17,
     SignalExpired = 18,
     IntervalNotDue = 19,
-    ConfirmationDepthNotReached = 26,
     /// Transient: the network is congested. Caller should read `NetworkErrorDetail`
     /// via [`crate::TradeExecutorContract::get_network_error_detail`] and retry
     /// after `retry_after_ledger`.
@@ -68,6 +67,10 @@ pub enum ContractError {
     NotTradeOwner = 28,
     /// A queued trade exceeded the maximum retry limit and was moved to the dead-letter queue.
     MaxRetriesExceeded = 29,
+    /// Trade executed but the confirmation depth has not yet been reached.
+    ConfirmationDepthNotReached = 30,
+    /// The user already holds the maximum number of concurrent open positions.
+    TooManyOpenPositions = 31,
 }
 
 /// Populated when [`ContractError::InsufficientLiquidity`] is returned.

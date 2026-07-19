@@ -223,6 +223,7 @@ fn close_position_keeper(
     args.push_back(trade_id.into_val(env));
     args.push_back(asset_pair.into_val(env));
     env.invoke_contract::<()>(portfolio, &sym, args);
+    crate::decrement_user_position_count(env, user);
 }
 
 /// If `current_price <= stop_loss_price`, closes the position and emits `StopLossTriggered`.

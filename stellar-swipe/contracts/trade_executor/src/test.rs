@@ -76,7 +76,6 @@ impl MockUserPortfolio {
 
 const TRADE_AMOUNT: i128 = 1_000_000;
 
-
 fn test_tx_hash(env: &Env, seed: u8) -> soroban_sdk::Bytes {
     let mut arr = [0u8; 32];
     arr[0] = seed;
@@ -208,8 +207,7 @@ fn check_user_balance_more_than_sufficient() {
 
 #[test]
 fn execute_copy_trade_below_default_minimum_is_rejected() {
-    let (env, exec_id, portfolio_id, user, _admin, token) =
-        setup_with_balance(1_000_000_000);
+    let (env, exec_id, portfolio_id, user, _admin, token) = setup_with_balance(1_000_000_000);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
     let below_default_min = crate::risk_gates::DEFAULT_MIN_TRADE_SIZE - 1;
@@ -235,8 +233,7 @@ fn execute_copy_trade_below_default_minimum_is_rejected() {
 
 #[test]
 fn execute_copy_trade_below_per_asset_minimum_is_rejected() {
-    let (env, exec_id, _portfolio_id, user, _admin, token) =
-        setup_with_balance(1_000_000_000);
+    let (env, exec_id, _portfolio_id, user, _admin, token) = setup_with_balance(1_000_000_000);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
     exec.set_min_trade_size(&token, &10_000_000);
 
@@ -256,8 +253,7 @@ fn execute_copy_trade_below_per_asset_minimum_is_rejected() {
 
 #[test]
 fn execute_copy_trade_exactly_at_minimum_is_accepted() {
-    let (env, exec_id, portfolio_id, user, _admin, token) =
-        setup_with_balance(1_000_000_000);
+    let (env, exec_id, portfolio_id, user, _admin, token) = setup_with_balance(1_000_000_000);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
     exec.set_min_trade_size(&token, &10_000_000);
 
@@ -281,8 +277,7 @@ fn execute_copy_trade_exactly_at_minimum_is_accepted() {
 
 #[test]
 fn execute_copy_trade_above_minimum_is_accepted() {
-    let (env, exec_id, portfolio_id, user, _admin, token) =
-        setup_with_balance(1_000_000_000);
+    let (env, exec_id, portfolio_id, user, _admin, token) = setup_with_balance(1_000_000_000);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
     exec.set_min_trade_size(&token, &10_000_000);
 
@@ -306,8 +301,7 @@ fn execute_copy_trade_above_minimum_is_accepted() {
 
 #[test]
 fn admin_can_update_min_trade_size_for_asset() {
-    let (env, exec_id, _portfolio_id, _user, _admin, token) =
-        setup_with_balance(1_000_000_000);
+    let (env, exec_id, _portfolio_id, _user, _admin, token) = setup_with_balance(1_000_000_000);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
     assert_eq!(
@@ -321,8 +315,7 @@ fn admin_can_update_min_trade_size_for_asset() {
 
 #[test]
 fn limit_order_below_minimum_trade_size_is_rejected() {
-    let (env, exec_id, _portfolio_id, user, _admin, token) =
-        setup_with_balance(1_000_000_000);
+    let (env, exec_id, _portfolio_id, user, _admin, token) = setup_with_balance(1_000_000_000);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
     exec.set_min_trade_size(&token, &10_000_000);
 
@@ -387,7 +380,9 @@ fn execute_copy_trade_sufficient_balance_invokes_portfolio() {
         &None::<u32>,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 0),
+        &far_future(&env),
     );
     assert!(exec.get_insufficient_balance_detail(&user).is_none());
     assert_eq!(
@@ -423,7 +418,8 @@ fn twenty_first_copy_trade_fails_until_one_closed() {
         setup_with_balance(per * 30 + 1_000_000);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
-    for _ in 0..MAX_POSITIONS_PER_USER {
+    for n in 0..MAX_POSITIONS_PER_USER {
+        let nonce = (n + 1) as u64;
         exec.execute_copy_trade(
             &user,
             &token,
@@ -431,10 +427,14 @@ fn twenty_first_copy_trade_fails_until_one_closed() {
             &None::<u32>,
             &OrderType::Market,
             &None,
-            &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+            &nonce,
+            &test_tx_hash(&env, nonce as u8),
+            &far_future(&env),
         );
     }
 
+    // A failed call rolls back its nonce commit, so the retry reuses the nonce.
+    let next_nonce = (MAX_POSITIONS_PER_USER + 1) as u64;
     let err = exec.try_execute_copy_trade(
         &user,
         &token,
@@ -442,7 +442,9 @@ fn twenty_first_copy_trade_fails_until_one_closed() {
         &None::<u32>,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &next_nonce,
+        &test_tx_hash(&env, next_nonce as u8),
+        &far_future(&env),
     );
     assert_eq!(err, Err(Ok(ContractError::PositionLimitReached)));
 
@@ -454,7 +456,9 @@ fn twenty_first_copy_trade_fails_until_one_closed() {
         &None::<u32>,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &next_nonce,
+        &test_tx_hash(&env, next_nonce as u8),
+        &far_future(&env),
     );
 
     assert_eq!(
@@ -470,7 +474,8 @@ fn whitelisted_user_bypasses_position_limit() {
         setup_with_balance(per * 35 + 1_000_000);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
-    for _ in 0..MAX_POSITIONS_PER_USER {
+    for n in 0..MAX_POSITIONS_PER_USER {
+        let nonce = (n + 1) as u64;
         exec.execute_copy_trade(
             &user,
             &token,
@@ -478,10 +483,14 @@ fn whitelisted_user_bypasses_position_limit() {
             &None::<u32>,
             &OrderType::Market,
             &None,
-            &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+            &nonce,
+            &test_tx_hash(&env, nonce as u8),
+            &far_future(&env),
         );
     }
 
+    // A failed call rolls back its nonce commit, so the retry reuses the nonce.
+    let next_nonce = (MAX_POSITIONS_PER_USER + 1) as u64;
     let err = exec.try_execute_copy_trade(
         &user,
         &token,
@@ -489,7 +498,9 @@ fn whitelisted_user_bypasses_position_limit() {
         &None::<u32>,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &next_nonce,
+        &test_tx_hash(&env, next_nonce as u8),
+        &far_future(&env),
     );
     assert_eq!(err, Err(Ok(ContractError::PositionLimitReached)));
 
@@ -503,7 +514,9 @@ fn whitelisted_user_bypasses_position_limit() {
         &None::<u32>,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &next_nonce,
+        &test_tx_hash(&env, next_nonce as u8),
+        &far_future(&env),
     );
     assert_eq!(
         MockUserPortfolioClient::new(&env, &portfolio_id).get_open_position_count(&user),
@@ -513,6 +526,7 @@ fn whitelisted_user_bypasses_position_limit() {
     exec.set_position_limit_exempt(&user, &false);
     assert!(!exec.is_position_limit_exempt(&user));
 
+    let after_nonce = next_nonce + 1;
     let err2 = exec.try_execute_copy_trade(
         &user,
         &token,
@@ -520,7 +534,9 @@ fn whitelisted_user_bypasses_position_limit() {
         &None::<u32>,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &after_nonce,
+        &test_tx_hash(&env, after_nonce as u8),
+        &far_future(&env),
     );
     assert_eq!(err2, Err(Ok(ContractError::PositionLimitReached)));
 }
@@ -606,7 +622,9 @@ fn reentrant_call_returns_reentrancy_detected() {
         &None::<u32>,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 0),
+        &far_future(&env),
     );
     assert!(
         ReentrantPortfolioClient::new(&env, &portfolio_id).was_blocked(),
@@ -640,7 +658,9 @@ fn lock_cleared_after_successful_execution() {
         &None::<u32>,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 1),
+        &far_future(&env),
     );
     exec.execute_copy_trade(
         &user,
@@ -649,7 +669,9 @@ fn lock_cleared_after_successful_execution() {
         &None::<u32>,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &2u64,
+        &test_tx_hash(&env, 2),
+        &far_future(&env),
     );
 
     assert_eq!(
@@ -918,9 +940,7 @@ impl MockPortfolioWithPositions {
         env.storage()
             .instance()
             .set(&PortfolioKey::LastClosed, &trade_id);
-        env.storage()
-            .instance()
-            .set(&PortfolioKey::LastPnl, &pnl);
+        env.storage().instance().set(&PortfolioKey::LastPnl, &pnl);
     }
     pub fn last_closed(env: Env) -> Option<u64> {
         env.storage().instance().get(&PortfolioKey::LastClosed)
@@ -966,11 +986,24 @@ fn cancel_copy_trade_success() {
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
     MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position_with_entry_price(
-        &user, &1u64, &10_000_000i128,
+        &user,
+        &1u64,
+        &10_000_000i128,
     );
     exec.cancel_copy_trade(
-        &user, &user, &1u64, &token_a, &token_b, &1_000_000, &900_000, &10_000_000,
-        &ReplayParams { nonce: 1, tx_hash: test_tx_hash(&env, 0), expiry_ts: far_future(&env) },
+        &user,
+        &user,
+        &1u64,
+        &token_a,
+        &token_b,
+        &1_000_000,
+        &900_000,
+        &10_000_000,
+        &ReplayParams {
+            nonce: 1,
+            tx_hash: test_tx_hash(&env, 0),
+            expiry_ts: far_future(&env),
+        },
     );
 
     assert_eq!(
@@ -986,7 +1019,9 @@ fn cancel_copy_trade_unauthorized() {
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
     MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position_with_entry_price(
-        &user, &1u64, &10_000_000i128,
+        &user,
+        &1u64,
+        &10_000_000i128,
     );
 
     let err = env.as_contract(&exec_id, || {
@@ -1050,8 +1085,19 @@ fn cancel_copy_trade_pnl_calculation() {
     let portfolio = MockPortfolioWithPositionsClient::new(&env, &portfolio_id);
     portfolio.add_position_with_entry_price(&user, &2u64, &9_500_000i128);
     exec.cancel_copy_trade(
-        &user, &user, &2u64, &token_a, &token_b, &1_000_000, &900_000, &9_500_000,
-        &ReplayParams { nonce: 1, tx_hash: test_tx_hash(&env, 0), expiry_ts: far_future(&env) },
+        &user,
+        &user,
+        &2u64,
+        &token_a,
+        &token_b,
+        &1_000_000,
+        &900_000,
+        &9_500_000,
+        &ReplayParams {
+            nonce: 1,
+            tx_hash: test_tx_hash(&env, 0),
+            expiry_ts: far_future(&env),
+        },
     );
 
     // Verify the close_position was called with the correct realized_pnl.
@@ -1070,7 +1116,9 @@ fn cancel_copy_trade_third_party_rejected() {
     let third_party = Address::generate(&env);
 
     MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position_with_entry_price(
-        &user, &5u64, &10_000_000i128,
+        &user,
+        &5u64,
+        &10_000_000i128,
     );
 
     let err = env.as_contract(&exec_id, || {
@@ -1094,18 +1142,30 @@ fn cancel_copy_trade_third_party_rejected() {
     assert_eq!(err, Err(ContractError::Unauthorized));
 }
 
-
 #[test]
 fn cancel_copy_trade_replay_nonce_rejected() {
     let (env, exec_id, portfolio_id, user, token_a, token_b, _) = setup_cancel(1_000_000);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
 
     MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position_with_entry_price(
-        &user, &1u64, &10_000_000i128,
+        &user,
+        &1u64,
+        &10_000_000i128,
     );
     exec.cancel_copy_trade(
-        &user, &user, &1u64, &token_a, &token_b, &1_000_000, &900_000, &10_000_000,
-        &ReplayParams { nonce: 1, tx_hash: test_tx_hash(&env, 1), expiry_ts: far_future(&env) },
+        &user,
+        &user,
+        &1u64,
+        &token_a,
+        &token_b,
+        &1_000_000,
+        &900_000,
+        &10_000_000,
+        &ReplayParams {
+            nonce: 1,
+            tx_hash: test_tx_hash(&env, 1),
+            expiry_ts: far_future(&env),
+        },
     );
 
     let err = env.as_contract(&exec_id, || {
@@ -1147,11 +1207,24 @@ fn trade_cancelled_event_has_two_topic_format() {
     let (env, exec_id, portfolio_id, user, token_a, token_b, _) = setup_cancel(1_100_000);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
     MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position_with_entry_price(
-        &user, &1u64, &10_000_000i128,
+        &user,
+        &1u64,
+        &10_000_000i128,
     );
     exec.cancel_copy_trade(
-        &user, &user, &1u64, &token_a, &token_b, &1_000_000, &900_000, &10_000_000,
-        &ReplayParams { nonce: 1, tx_hash: test_tx_hash(&env, 0), expiry_ts: far_future(&env) },
+        &user,
+        &user,
+        &1u64,
+        &token_a,
+        &token_b,
+        &1_000_000,
+        &900_000,
+        &10_000_000,
+        &ReplayParams {
+            nonce: 1,
+            tx_hash: test_tx_hash(&env, 0),
+            expiry_ts: far_future(&env),
+        },
     );
     let (contract, event) = last_event_topics(&env);
     assert_eq!(contract, soroban_sdk::Symbol::new(&env, "trade_executor"));
@@ -1180,7 +1253,9 @@ fn volume_limit_zero_means_no_restriction() {
         &None,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 0),
+        &far_future(&env),
     );
 }
 
@@ -1196,7 +1271,9 @@ fn volume_under_limit_succeeds() {
         &None,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 0),
+        &far_future(&env),
     );
 }
 
@@ -1212,7 +1289,9 @@ fn volume_at_limit_succeeds() {
         &None,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 0),
+        &far_future(&env),
     );
 }
 
@@ -1228,7 +1307,9 @@ fn volume_over_limit_returns_error() {
         &None,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 0),
+        &far_future(&env),
     );
     assert_eq!(result, Err(Ok(ContractError::DailyVolumeLimitExceeded)));
 }
@@ -1248,7 +1329,9 @@ fn volume_resets_on_new_day() {
         &None,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 1),
+        &far_future(&env),
     );
 
     // Advance to day 1.
@@ -1262,7 +1345,9 @@ fn volume_resets_on_new_day() {
         &None,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &2u64,
+        &test_tx_hash(&env, 2),
+        &far_future(&env),
     );
 }
 
@@ -1290,8 +1375,17 @@ fn primary_fee_deduction_succeeds_with_sufficient_balance() {
     exec.set_user_portfolio(&portfolio_id);
 
     // Should succeed — no fallback needed.
-    let result =
-        exec.try_execute_copy_trade(&user, &token, &amount, &None, &OrderType::Market, &None, &1u64, &test_tx_hash(&env, 0), &far_future(&env));
+    let result = exec.try_execute_copy_trade(
+        &user,
+        &token,
+        &amount,
+        &None,
+        &OrderType::Market,
+        &None,
+        &1u64,
+        &test_tx_hash(&env, 0),
+        &far_future(&env),
+    );
     assert!(result.is_ok(), "primary fee deduction should succeed");
 
     // No fee_from_received event should be emitted.
@@ -1334,8 +1428,17 @@ fn fee_fallback_activates_when_only_amount_available() {
     exec.set_copy_trade_estimated_fee(&1_000i128);
 
     // Trade should still succeed via fallback.
-    let result =
-        exec.try_execute_copy_trade(&user, &token, &amount, &None, &OrderType::Market, &None, &1u64, &test_tx_hash(&env, 0), &far_future(&env));
+    let result = exec.try_execute_copy_trade(
+        &user,
+        &token,
+        &amount,
+        &None,
+        &OrderType::Market,
+        &None,
+        &1u64,
+        &test_tx_hash(&env, 0),
+        &far_future(&env),
+    );
     assert!(result.is_ok(), "trade should succeed via fee fallback");
 
     // fee_from_received event must be emitted.
@@ -1381,7 +1484,9 @@ fn trade_fails_when_balance_below_amount() {
         &None,
         &OrderType::Market,
         &None,
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 0),
+        &far_future(&env),
     );
     assert_eq!(result, Err(Ok(ContractError::InsufficientBalance)));
 }
@@ -1404,7 +1509,9 @@ fn test_limit_order_execution() {
         &None,
         &OrderType::Limit,
         &Some(10_000i128),
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 0),
+        &far_future(&env),
     );
 
     // Verify order is stored
@@ -1452,7 +1559,9 @@ fn test_limit_order_expiration() {
         &None,
         &OrderType::Limit,
         &Some(10_000i128),
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 0),
+        &far_future(&env),
     );
 
     let order_ids = exec.get_pending_limit_order_ids();
@@ -1497,7 +1606,9 @@ fn test_limit_order_persistence() {
         &None,
         &OrderType::Limit,
         &Some(10_000i128),
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &1u64,
+        &test_tx_hash(&env, 1),
+        &far_future(&env),
     );
     exec.execute_copy_trade(
         &user,
@@ -1506,7 +1617,9 @@ fn test_limit_order_persistence() {
         &None,
         &OrderType::Limit,
         &Some(9_000i128),
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &2u64,
+        &test_tx_hash(&env, 2),
+        &far_future(&env),
     );
     exec.execute_copy_trade(
         &user,
@@ -1515,7 +1628,9 @@ fn test_limit_order_persistence() {
         &None,
         &OrderType::Limit,
         &Some(8_000i128),
-        &1u64, &test_tx_hash(&env, 0), &far_future(&env),
+        &3u64,
+        &test_tx_hash(&env, 3),
+        &far_future(&env),
     );
 
     let initial_ids = exec.get_pending_limit_order_ids();
@@ -1562,7 +1677,10 @@ fn trade_receipt_hash_is_stored_after_execute_copy_trade() {
     );
 
     let receipt = exec.get_trade_receipt(&1u64);
-    assert!(receipt.is_some(), "receipt hash must be stored after a trade");
+    assert!(
+        receipt.is_some(),
+        "receipt hash must be stored after a trade"
+    );
     let hash = receipt.unwrap();
     assert_ne!(hash, soroban_sdk::BytesN::from_array(&env, &[0u8; 32]));
 }
@@ -1666,4 +1784,196 @@ fn get_trade_receipt_returns_none_for_unknown_id() {
     let (env, exec_id, _, _, _, _) = setup_with_balance(1_000_000);
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
     assert!(exec.get_trade_receipt(&999u64).is_none());
+}
+
+// ── Per-user open-position cap tests (Issue #791) ─────────────────────────────
+
+fn execute_trade(
+    env: &Env,
+    exec: &TradeExecutorContractClient,
+    user: &Address,
+    token: &Address,
+    nonce: u64,
+) {
+    exec.execute_copy_trade(
+        user,
+        token,
+        &TRADE_AMOUNT,
+        &None,
+        &OrderType::Market,
+        &None,
+        &nonce,
+        &test_tx_hash(env, nonce as u8),
+        &far_future(env),
+    );
+}
+
+#[test]
+fn max_open_positions_defaults_to_50() {
+    let (env, exec_id, _, _, _, _) = setup_with_balance(1_000_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    assert_eq!(
+        exec.get_max_open_positions(),
+        crate::DEFAULT_MAX_OPEN_POSITIONS
+    );
+    assert_eq!(crate::DEFAULT_MAX_OPEN_POSITIONS, 50);
+}
+
+#[test]
+#[should_panic(expected = "max must be positive")]
+fn set_max_open_positions_rejects_zero() {
+    let (env, exec_id, _, _, _, _) = setup_with_balance(1_000_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    exec.set_max_open_positions(&0);
+}
+
+#[test]
+fn open_below_cap_succeeds_and_increments_count() {
+    let (env, exec_id, _, user, _, token) = setup_with_balance(1_000_000_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    exec.set_max_open_positions(&3);
+
+    execute_trade(&env, &exec, &user, &token, 1);
+    assert_eq!(exec.get_user_position_count(&user), 1);
+
+    execute_trade(&env, &exec, &user, &token, 2);
+    assert_eq!(exec.get_user_position_count(&user), 2);
+}
+
+#[test]
+fn open_at_exactly_cap_is_rejected() {
+    let (env, exec_id, _, user, _, token) = setup_with_balance(1_000_000_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    exec.set_max_open_positions(&2);
+
+    execute_trade(&env, &exec, &user, &token, 1);
+    execute_trade(&env, &exec, &user, &token, 2);
+    assert_eq!(exec.get_user_position_count(&user), 2);
+
+    let err = exec.try_execute_copy_trade(
+        &user,
+        &token,
+        &TRADE_AMOUNT,
+        &None,
+        &OrderType::Market,
+        &None,
+        &3u64,
+        &test_tx_hash(&env, 3),
+        &far_future(&env),
+    );
+    assert_eq!(err, Err(Ok(ContractError::TooManyOpenPositions)));
+    assert_eq!(exec.get_user_position_count(&user), 2);
+}
+
+#[test]
+fn queue_copy_trade_rejected_at_cap() {
+    let (env, exec_id, _, user, _, token) = setup_with_balance(1_000_000_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    exec.set_max_open_positions(&1);
+
+    execute_trade(&env, &exec, &user, &token, 1);
+
+    let err = exec.try_queue_copy_trade(&user, &token, &TRADE_AMOUNT, &None);
+    assert_eq!(err, Err(Ok(ContractError::TooManyOpenPositions)));
+}
+
+#[test]
+fn exempt_user_ignores_cap() {
+    let (env, exec_id, _, user, _, token) = setup_with_balance(1_000_000_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    exec.set_max_open_positions(&1);
+    exec.set_position_limit_exempt(&user, &true);
+
+    for nonce in 1u64..=3 {
+        execute_trade(&env, &exec, &user, &token, nonce);
+    }
+    // Exempt users are still counted, just not capped.
+    assert_eq!(exec.get_user_position_count(&user), 3);
+
+    // Queueing is also uncapped for exempt users.
+    exec.queue_copy_trade(&user, &token, &TRADE_AMOUNT, &None);
+}
+
+#[test]
+fn close_frees_a_slot() {
+    let (env, exec_id, portfolio_id, user, token_a, token_b, _) = setup_cancel(1_100_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    StellarAssetClient::new(&env, &token_a).mint(&user, &1_000_000_000);
+    exec.set_max_open_positions(&1);
+
+    execute_trade(&env, &exec, &user, &token_a, 1);
+    assert_eq!(exec.get_user_position_count(&user), 1);
+
+    // Cap of 1 reached — next open is rejected.
+    let err = exec.try_execute_copy_trade(
+        &user,
+        &token_a,
+        &TRADE_AMOUNT,
+        &None,
+        &OrderType::Market,
+        &None,
+        &2u64,
+        &test_tx_hash(&env, 2),
+        &far_future(&env),
+    );
+    assert_eq!(err, Err(Ok(ContractError::TooManyOpenPositions)));
+
+    // Close the position; the slot is freed. (The rejected call above rolled
+    // back its nonce commit, so the next sequential nonce is 2.)
+    MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position_with_entry_price(
+        &user,
+        &1u64,
+        &10_000_000i128,
+    );
+    exec.cancel_copy_trade(
+        &user,
+        &user,
+        &1u64,
+        &token_a,
+        &token_b,
+        &1_000_000,
+        &900_000,
+        &10_000_000,
+        &ReplayParams {
+            nonce: 2,
+            tx_hash: test_tx_hash(&env, 20),
+            expiry_ts: far_future(&env),
+        },
+    );
+    assert_eq!(exec.get_user_position_count(&user), 0);
+
+    // A new position can be opened again.
+    execute_trade(&env, &exec, &user, &token_a, 3);
+    assert_eq!(exec.get_user_position_count(&user), 1);
+}
+
+#[test]
+fn count_never_goes_negative_on_close() {
+    let (env, exec_id, portfolio_id, user, token_a, token_b, _) = setup_cancel(1_100_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+
+    // Close a position that was never counted (pre-existing position):
+    // the saturating decrement must leave the count at zero, not underflow.
+    MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position_with_entry_price(
+        &user,
+        &7u64,
+        &10_000_000i128,
+    );
+    assert_eq!(exec.get_user_position_count(&user), 0);
+    exec.cancel_copy_trade(
+        &user,
+        &user,
+        &7u64,
+        &token_a,
+        &token_b,
+        &1_000_000,
+        &900_000,
+        &10_000_000,
+        &ReplayParams {
+            nonce: 1,
+            tx_hash: test_tx_hash(&env, 1),
+            expiry_ts: far_future(&env),
+        },
+    );
+    assert_eq!(exec.get_user_position_count(&user), 0);
 }

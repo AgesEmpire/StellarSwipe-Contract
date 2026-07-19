@@ -12,8 +12,7 @@
 //! - Successful trade is not dead-lettered
 
 use crate::{
-    errors::ContractError,
-    FailedTrade, TradeExecutorContract, TradeExecutorContractClient,
+    errors::ContractError, FailedTrade, TradeExecutorContract, TradeExecutorContractClient,
     DEFAULT_MAX_RETRY_COUNT,
 };
 use soroban_sdk::{
@@ -116,16 +115,28 @@ fn failed_trade_dead_lettered_after_max_retries() {
     // First two calls: trade is retried (not yet dead-lettered).
     exec.execute_queued_trades();
     let dl_after_1 = exec.get_dead_letter_trades(&user);
-    assert_eq!(dl_after_1.len(), 0, "should not be dead-lettered after attempt 1");
+    assert_eq!(
+        dl_after_1.len(),
+        0,
+        "should not be dead-lettered after attempt 1"
+    );
 
     exec.execute_queued_trades();
     let dl_after_2 = exec.get_dead_letter_trades(&user);
-    assert_eq!(dl_after_2.len(), 0, "should not be dead-lettered after attempt 2");
+    assert_eq!(
+        dl_after_2.len(),
+        0,
+        "should not be dead-lettered after attempt 2"
+    );
 
     // Third call: max retries reached → dead-lettered.
     exec.execute_queued_trades();
     let dl_after_3 = exec.get_dead_letter_trades(&user);
-    assert_eq!(dl_after_3.len(), 1, "should be dead-lettered after attempt 3");
+    assert_eq!(
+        dl_after_3.len(),
+        1,
+        "should be dead-lettered after attempt 3"
+    );
 }
 
 /// `get_dead_letter_trades` returns the correct FailedTrade fields.
@@ -151,7 +162,10 @@ fn dead_letter_trade_has_correct_fields() {
     assert_eq!(ft.token, token);
     assert_eq!(ft.amount, AMOUNT);
     assert_eq!(ft.retry_count, DEFAULT_MAX_RETRY_COUNT);
-    assert!(ft.failure_code > 0, "failure_code should be a non-zero error discriminant");
+    assert!(
+        ft.failure_code > 0,
+        "failure_code should be a non-zero error discriminant"
+    );
 }
 
 /// A successful trade is never dead-lettered.
@@ -173,7 +187,11 @@ fn successful_trade_not_dead_lettered() {
     assert_eq!(count, 1, "trade should succeed");
 
     let dl = exec.get_dead_letter_trades(&user);
-    assert_eq!(dl.len(), 0, "successful trade must not appear in dead-letter queue");
+    assert_eq!(
+        dl.len(),
+        0,
+        "successful trade must not appear in dead-letter queue"
+    );
 }
 
 /// `get_dead_letter_trades` returns empty vec for a user with no failures.
@@ -206,7 +224,11 @@ fn admin_can_requeue_dead_lettered_trade() {
     exec.requeue_dead_lettered_trade(&queued_id);
 
     // Dead-letter queue should now be empty for this user.
-    assert_eq!(exec.get_dead_letter_trades(&user).len(), 0, "after requeue, dead-letter should be cleared");
+    assert_eq!(
+        exec.get_dead_letter_trades(&user).len(),
+        0,
+        "after requeue, dead-letter should be cleared"
+    );
 }
 
 /// Admin can permanently discard a dead-lettered trade.
@@ -226,7 +248,11 @@ fn admin_can_discard_dead_lettered_trade() {
     assert_eq!(exec.get_dead_letter_trades(&user).len(), 1);
 
     exec.discard_dead_lettered_trade(&queued_id);
-    assert_eq!(exec.get_dead_letter_trades(&user).len(), 0, "after discard, dead-letter should be cleared");
+    assert_eq!(
+        exec.get_dead_letter_trades(&user).len(),
+        0,
+        "after discard, dead-letter should be cleared"
+    );
 }
 
 /// Multiple users' dead-letter queues are isolated — one user's failures don't

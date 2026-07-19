@@ -1,6 +1,6 @@
 pub mod test_batch_execute;
-pub mod test_dead_letter;
 pub mod test_dca;
+pub mod test_dead_letter;
 pub mod test_feature_flags;
 pub mod test_grace_period;
 pub mod test_market_simulation;

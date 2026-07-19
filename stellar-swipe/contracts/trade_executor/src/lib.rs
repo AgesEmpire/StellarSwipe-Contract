@@ -5,20 +5,20 @@ mod errors;
 pub mod feature_flags;
 pub mod keeper;
 mod oracle;
-pub mod risk_gates;
 pub mod priority;
+pub mod risk_gates;
 pub mod sdex;
 pub mod triggers;
 mod wire;
 
 use errors::{ContractError, InsufficientBalanceDetail, NetworkErrorDetail};
-use shared::math::normalize_amount;
 use risk_gates::{
     check_user_balance, resolve_trade_amount, validate_and_record_position,
     validate_min_trade_size, DEFAULT_ESTIMATED_COPY_TRADE_FEE, DEFAULT_MIN_TRADE_SIZE,
     MAX_BATCH_SIZE,
 };
 use sdex::{execute_sdex_swap, min_received_from_slippage};
+use shared::math::normalize_amount;
 use soroban_sdk::{
     contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal, String, Symbol,
     Val, Vec,
@@ -87,6 +87,12 @@ pub enum StorageKey {
     DeadLetterIds(Address),
     /// Priority-lane configuration (PriorityConfig).
     PriorityConfig,
+    /// The most recent trade order awaiting confirmation-depth finalization.
+    PendingTradeConfirmation,
+    /// Maximum concurrent open positions per user (absent = [`DEFAULT_MAX_OPEN_POSITIONS`]).
+    MaxOpenPositions,
+    /// Number of currently open copy-trade positions for `user` (persistent storage).
+    UserPositionCount(Address),
     /// Consecutive priority-only batch counter for fairness fallback.
     PriorityBatchCounter,
     /// SHA-256 receipt hash for a completed trade, keyed by monotonic receipt ID.
@@ -242,14 +248,8 @@ pub struct PendingLimitOrder {
     pub expires_at_ledger: u32,
 }
 
-soroban_sdk::contractmeta!(
-    key = "SourceHash",
-    val = env!("STELLAR_SOURCE_HASH")
-);
-soroban_sdk::contractmeta!(
-    key = "GitCommit",
-    val = env!("STELLAR_GIT_COMMIT")
-);
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct TradeExecutorContract;
@@ -263,7 +263,7 @@ fn effective_estimated_fee(env: &Env) -> i128 {
 
 fn require_admin(env: &Env) -> Result<Address, ContractError> {
     oracle::require_admin(env)
-} 
+}
 fn get_confirmation_depth(env: &Env) -> u32 {
     env.storage()
         .instance()
@@ -398,6 +398,51 @@ fn decrease_open_interest(env: &Env, pair: &Address, amount: i128) {
     env.storage().instance().set(&key, &next);
 }
 
+// ── Per-user open-position cap (Issue #791) ──────────────────────────────────
+
+/// Default maximum concurrent open positions per user.
+pub const DEFAULT_MAX_OPEN_POSITIONS: u32 = 50;
+
+/// Effective per-user position cap (admin override, or [`DEFAULT_MAX_OPEN_POSITIONS`]).
+fn effective_max_open_positions(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::MaxOpenPositions)
+        .unwrap_or(DEFAULT_MAX_OPEN_POSITIONS)
+}
+
+fn user_position_count(env: &Env, user: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::UserPositionCount(user.clone()))
+        .unwrap_or(0)
+}
+
+fn increment_user_position_count(env: &Env, user: &Address) {
+    let key = StorageKey::UserPositionCount(user.clone());
+    let next = user_position_count(env, user).saturating_add(1);
+    env.storage().persistent().set(&key, &next);
+}
+
+/// Saturating decrement so the count can never go negative, even if a close
+/// path runs for a position opened before this counter existed.
+pub(crate) fn decrement_user_position_count(env: &Env, user: &Address) {
+    let key = StorageKey::UserPositionCount(user.clone());
+    let next = user_position_count(env, user).saturating_sub(1);
+    env.storage().persistent().set(&key, &next);
+}
+
+/// Reject a new position when a non-exempt user is already at the cap.
+fn check_position_cap(env: &Env, user: &Address, exempt: bool) -> Result<(), ContractError> {
+    if exempt {
+        return Ok(());
+    }
+    if user_position_count(env, user) >= effective_max_open_positions(env) {
+        return Err(ContractError::TooManyOpenPositions);
+    }
+    Ok(())
+}
+
 /// Compute the SHA-256 trade receipt hash over `(user, asset, amount, price, timestamp)`.
 pub fn compute_trade_hash(
     env: &Env,
@@ -413,12 +458,16 @@ pub fn compute_trade_hash(
     payload.append(&asset.to_xdr(env));
     payload.append(&soroban_sdk::Bytes::from_slice(env, &amount.to_be_bytes()));
     payload.append(&soroban_sdk::Bytes::from_slice(env, &price.to_be_bytes()));
-    payload.append(&soroban_sdk::Bytes::from_slice(env, &timestamp.to_be_bytes()));
+    payload.append(&soroban_sdk::Bytes::from_slice(
+        env,
+        &timestamp.to_be_bytes(),
+    ));
     env.crypto().sha256(&payload).into()
 }
 
 /// Store a SHA-256 receipt hash for a completed trade and emit a `trade_receipt` event.
-fn record_trade_receipt(env: &Env, user: &Address, token: &Address, amount: i128) {
+/// Returns the monotonic receipt ID assigned to this trade.
+fn record_trade_receipt(env: &Env, user: &Address, token: &Address, amount: i128) -> u64 {
     use soroban_sdk::xdr::ToXdr;
     let price: i128 = env
         .storage()
@@ -439,21 +488,33 @@ fn record_trade_receipt(env: &Env, user: &Address, token: &Address, amount: i128
     payload.append(&token.to_xdr(env));
     payload.append(&soroban_sdk::Bytes::from_slice(env, &amount.to_be_bytes()));
     payload.append(&soroban_sdk::Bytes::from_slice(env, &price.to_be_bytes()));
-    payload.append(&soroban_sdk::Bytes::from_slice(env, &timestamp.to_be_bytes()));
-    payload.append(&soroban_sdk::Bytes::from_slice(env, &receipt_id.to_be_bytes()));
+    payload.append(&soroban_sdk::Bytes::from_slice(
+        env,
+        &timestamp.to_be_bytes(),
+    ));
+    payload.append(&soroban_sdk::Bytes::from_slice(
+        env,
+        &receipt_id.to_be_bytes(),
+    ));
     let hash: BytesN<32> = env.crypto().sha256(&payload).into();
 
     env.storage()
         .instance()
         .set(&StorageKey::TradeReceiptHash(receipt_id), &hash);
-    env.storage()
-        .instance()
-        .set(&StorageKey::NextTradeReceiptId, &receipt_id.saturating_add(1));
+    env.storage().instance().set(
+        &StorageKey::NextTradeReceiptId,
+        &receipt_id.saturating_add(1),
+    );
 
     env.events().publish(
-        (Symbol::new(env, "trade_executor"), Symbol::new(env, "trade_receipt")),
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "trade_receipt"),
+        ),
         (receipt_id, hash),
     );
+
+    receipt_id
 }
 
 fn execute_market_copy_trade(
@@ -537,6 +598,12 @@ fn execute_market_copy_trade(
         env.storage().instance().get(&key).unwrap_or(false)
     };
 
+    // ── Per-user open-position cap (Issue #791) ────────────────────────────
+    if let Err(e) = check_position_cap(env, &user, exempt) {
+        env.storage().temporary().remove(&lock_key);
+        return Err(e);
+    }
+
     // ── Resolve effective amount (portfolio % or explicit) ─────────────────
     let oracle: Option<Address> = env.storage().instance().get(&Symbol::new(env, ORACLE_KEY));
     let effective_amount =
@@ -583,6 +650,7 @@ fn execute_market_copy_trade(
     }
 
     increase_open_interest(env, &token, amount);
+    increment_user_position_count(env, &user);
 
     // If fallback was used, emit the FeeDeductedFromReceived event.
     // The trade_id is the current position count (used as a proxy identifier).
@@ -608,13 +676,22 @@ fn execute_market_copy_trade(
         );
     }
 
-    record_trade_receipt(env, &user, &token, effective_amount);
+    let receipt_id = record_trade_receipt(env, &user, &token, effective_amount);
 
     let pending_order = wire::TradeOrder {
-        status: wire::TradeStatus::ExecutedAwaitingConfirmation,
         execution_ledger: env.ledger().sequence(),
+        trade_id: receipt_id,
+        user: user.clone(),
+        amount: effective_amount,
+        expires_at_ledger: env
+            .ledger()
+            .sequence()
+            .saturating_add(TRADE_TIMEOUT_LEDGERS),
+        status: wire::TradeStatus::ExecutedAwaitingConfirmation,
     };
-    env.storage().instance().set(&StorageKey::UserPortfolio, &pending_order);
+    env.storage()
+        .instance()
+        .set(&StorageKey::PendingTradeConfirmation, &pending_order);
 
     env.storage().temporary().remove(&lock_key);
     Ok(())
@@ -760,36 +837,52 @@ impl TradeExecutorContract {
     ///
     /// # Parameters
     pub fn set_depth(env: Env, depth: u32) -> Result<(), ContractError> {
-        Self::require_admin(&env)?;
+        require_admin(&env)?;
         set_confirmation_depth(&env, depth);
         Ok(())
     }
+
+    /// Mark the pending trade order as `Filled` once the configured
+    /// confirmation depth has elapsed since its execution ledger.
+    ///
+    /// Note: finalization confirms the fill — the position remains open (and
+    /// counted against the per-user cap) until it is closed via
+    /// [`Self::cancel_copy_trade`] or a stop-loss/take-profit trigger.
     pub fn finalize_trade(env: Env) -> Result<(), ContractError> {
-        let mut order: wire::TradeOrder = env.storage()
+        let mut order: wire::TradeOrder = env
+            .storage()
             .instance()
-            .get(&StorageKey::UserPortfolio)
-            .ok_or(ContractError::AutoTradeError(AutoTradeError::SignalNotFound))?;
+            .get(&StorageKey::PendingTradeConfirmation)
+            .ok_or(ContractError::TradeNotFound)?;
 
         if order.status != wire::TradeStatus::ExecutedAwaitingConfirmation {
-            return Err(ContractError::AutoTradeError(AutoTradeError::Unauthorized));
+            return Err(ContractError::Unauthorized);
         }
 
         let depth = get_confirmation_depth(&env);
         let current_ledger = env.ledger().sequence();
-        
+
         if current_ledger.saturating_sub(order.execution_ledger) < depth {
-            return Err(ContractError::AutoTradeError(AutoTradeError::ConfirmationDepthNotReached));
+            return Err(ContractError::ConfirmationDepthNotReached);
         }
 
         order.status = wire::TradeStatus::Filled;
-        env.storage().instance().set(&StorageKey::UserPortfolio, &order);
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingTradeConfirmation, &order);
 
         Ok(())
     }
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
-        m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
-        m.set(soroban_sdk::String::from_str(&env, "git_commit"), soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")));
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")),
+        );
         m
     }
 
@@ -892,6 +985,33 @@ impl TradeExecutorContract {
     pub fn is_position_limit_exempt(env: Env, user: Address) -> bool {
         let key = StorageKey::PositionLimitExempt(user);
         env.storage().instance().get(&key).unwrap_or(false)
+    }
+
+    /// Admin: set the maximum concurrent open positions per user (Issue #791).
+    /// Exempt users (see [`Self::set_position_limit_exempt`]) bypass this cap.
+    pub fn set_max_open_positions(env: Env, max: u32) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if max == 0 {
+            panic!("max must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::MaxOpenPositions, &max);
+    }
+
+    /// Effective per-user position cap ([`DEFAULT_MAX_OPEN_POSITIONS`] unless overridden).
+    pub fn get_max_open_positions(env: Env) -> u32 {
+        effective_max_open_positions(&env)
+    }
+
+    /// Number of open copy-trade positions currently counted for `user`.
+    pub fn get_user_position_count(env: Env, user: Address) -> u32 {
+        user_position_count(&env, &user)
     }
 
     // ── Stop-loss / take-profit configuration ─────────────────────────────────
@@ -1328,6 +1448,17 @@ impl TradeExecutorContract {
         portfolio_pct_bps: Option<u32>,
     ) -> Result<u64, ContractError> {
         user.require_auth();
+
+        // Fail fast if the user is already at the position cap (Issue #791).
+        // The cap is re-checked at execution time, when queued positions may
+        // have been freed by intervening closes.
+        let exempt = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PositionLimitExempt(user.clone()))
+            .unwrap_or(false);
+        check_position_cap(&env, &user, exempt)?;
+
         let queued_trade_id = next_queued_trade_id(&env);
         let trade = QueuedTrade {
             queued_trade_id,
@@ -1405,14 +1536,11 @@ impl TradeExecutorContract {
 
         for i in 0..ids.len() {
             let id = ids.get(i).unwrap();
-            let trade: QueuedTrade = match env
-                .storage()
-                .instance()
-                .get(&StorageKey::QueuedTrade(id))
-            {
-                Some(t) => t,
-                None => continue,
-            };
+            let trade: QueuedTrade =
+                match env.storage().instance().get(&StorageKey::QueuedTrade(id)) {
+                    Some(t) => t,
+                    None => continue,
+                };
 
             if grace_period_elapsed(&env, trade.queued_at_ledger) {
                 let result = execute_market_copy_trade(
@@ -1611,6 +1739,7 @@ impl TradeExecutorContract {
         close_args.push_back(realized_pnl.into_val(&env));
         env.invoke_contract::<()>(&portfolio, &close_sym, close_args);
         decrease_open_interest(&env, &from_token, amount);
+        decrement_user_position_count(&env, &user);
 
         shared::events::emit_trade_cancelled(
             &env,
@@ -1790,10 +1919,7 @@ impl TradeExecutorContract {
 
     /// Re-queue a dead-lettered trade, resetting its retry count.
     /// The trade re-enters the grace-period queue as a fresh attempt.
-    pub fn requeue_dead_lettered_trade(
-        env: Env,
-        trade_id: u64,
-    ) -> Result<(), ContractError> {
+    pub fn requeue_dead_lettered_trade(env: Env, trade_id: u64) -> Result<(), ContractError> {
         require_admin(&env)?;
         let failed: FailedTrade = env
             .storage()
@@ -1837,10 +1963,7 @@ impl TradeExecutorContract {
     }
 
     /// Permanently discard a dead-lettered trade (no requeue).
-    pub fn discard_dead_lettered_trade(
-        env: Env,
-        trade_id: u64,
-    ) -> Result<(), ContractError> {
+    pub fn discard_dead_lettered_trade(env: Env, trade_id: u64) -> Result<(), ContractError> {
         require_admin(&env)?;
         let failed: FailedTrade = env
             .storage()
@@ -1877,11 +2000,7 @@ impl TradeExecutorContract {
     /// Emits a `feat_flag / changed` event for transparency.
     /// Toggling a flag only affects entrypoints that explicitly check it;
     /// all other entrypoints remain unaffected.
-    pub fn set_feature_flag(
-        env: Env,
-        name: String,
-        enabled: bool,
-    ) -> Result<(), ContractError> {
+    pub fn set_feature_flag(env: Env, name: String, enabled: bool) -> Result<(), ContractError> {
         require_admin(&env)?;
         feature_flags::set_flag(&env, name, enabled);
         Ok(())

@@ -229,9 +229,7 @@ mod tests {
     use super::*;
     use crate::BatchTradeInput;
     use soroban_sdk::{
-        contract, contractimpl, contracttype,
-        testutils::Address as _,
-        Address, Env,
+        contract, contractimpl, contracttype, testutils::Address as _, Address, Env,
     };
 
     #[contract]
@@ -261,9 +259,7 @@ mod tests {
         }
 
         pub fn set_stake(env: Env, user: Address, amount: i128) {
-            env.storage()
-                .instance()
-                .set(&MockKey::Stake(user), &amount);
+            env.storage().instance().set(&MockKey::Stake(user), &amount);
         }
 
         pub fn set_account_age(env: Env, user: Address, age: u64) {
@@ -284,7 +280,11 @@ mod tests {
 
     fn make_trade_input(env: &Env, user: Address, amount: i128) -> BatchTradeInput {
         let token = Address::generate(env);
-        BatchTradeInput { user, token, amount }
+        BatchTradeInput {
+            user,
+            token,
+            amount,
+        }
     }
 
     // --- Priority config ---
