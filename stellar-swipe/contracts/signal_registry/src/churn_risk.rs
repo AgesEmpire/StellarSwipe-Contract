@@ -74,10 +74,7 @@ pub fn set_churn_threshold(env: &Env, threshold: u32) {
 
 // ─── Snapshot management ──────────────────────────────────────────────────────
 
-pub fn get_provider_churn_snapshot(
-    env: &Env,
-    provider: &Address,
-) -> Option<ProviderChurnSnapshot> {
+pub fn get_provider_churn_snapshot(env: &Env, provider: &Address) -> Option<ProviderChurnSnapshot> {
     env.storage()
         .persistent()
         .get(&ChurnStorageKey::ProviderSnapshot(provider.clone()))
@@ -112,9 +109,10 @@ pub fn update_provider_churn_snapshot(
         snapshot_at: now,
     };
 
-    env.storage()
-        .persistent()
-        .set(&ChurnStorageKey::ProviderSnapshot(provider.clone()), &snapshot);
+    env.storage().persistent().set(
+        &ChurnStorageKey::ProviderSnapshot(provider.clone()),
+        &snapshot,
+    );
 }
 
 // ─── Core scoring ─────────────────────────────────────────────────────────────
@@ -253,11 +251,9 @@ fn emit_churn_risk_elevated(
     composite_score: u32,
     level: ChurnRiskLevel,
 ) {
-    let topics = (
-        Symbol::new(env, "churn_risk_elevated"),
-        provider.clone(),
-    );
-    env.events().publish(topics, (composite_score, level as u32));
+    let topics = (Symbol::new(env, "churn_risk_elevated"), provider.clone());
+    env.events()
+        .publish(topics, (composite_score, level as u32));
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -265,8 +261,8 @@ fn emit_churn_risk_elevated(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Signal, SignalAction, SignalStatus};
     use crate::categories::{RiskLevel, SignalCategory};
+    use crate::types::{Signal, SignalAction, SignalStatus};
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::{vec, Env, Map, String, Vec};
 
@@ -353,7 +349,11 @@ mod tests {
             let score = get_provider_churn_risk(&env, &provider, &signals, Some(&stats));
 
             assert_eq!(score.level, ChurnRiskLevel::Low);
-            assert!(score.composite_score < 34, "score={}", score.composite_score);
+            assert!(
+                score.composite_score < 34,
+                "score={}",
+                score.composite_score
+            );
         });
     }
 
@@ -430,7 +430,11 @@ mod tests {
             let score = get_provider_churn_risk(&env, &provider, &signals, Some(&stats));
 
             assert_eq!(score.level, ChurnRiskLevel::High);
-            assert!(score.composite_score >= 67, "score={}", score.composite_score);
+            assert!(
+                score.composite_score >= 67,
+                "score={}",
+                score.composite_score
+            );
         });
     }
 

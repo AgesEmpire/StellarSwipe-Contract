@@ -122,7 +122,11 @@ pub fn record_activity(env: &Env, provider: &Address, user: &Address) {
 }
 
 /// Read-only: return cohort retention summary for `(provider, week_slot)`.
-pub fn get_cohort_retention(env: &Env, provider: &Address, cohort_week_slot: u64) -> CohortRetention {
+pub fn get_cohort_retention(
+    env: &Env,
+    provider: &Address,
+    cohort_week_slot: u64,
+) -> CohortRetention {
     let data = load_cohort(env, provider, cohort_week_slot);
     let total = data.total_followers;
 
@@ -148,7 +152,10 @@ pub fn get_cohort_retention(env: &Env, provider: &Address, cohort_week_slot: u64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Env,
+    };
 
     fn setup() -> (Env, Address, Address, Address) {
         let env = Env::default();
@@ -162,7 +169,8 @@ mod tests {
     #[test]
     fn test_new_follower_joins_cohort() {
         let (env, provider, user1, _) = setup();
-        env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 5);
+        env.ledger()
+            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 5);
 
         record_follow(&env, &provider, &user1);
 
@@ -174,11 +182,13 @@ mod tests {
     #[test]
     fn test_activity_at_week_1_recorded() {
         let (env, provider, user1, _) = setup();
-        env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 10);
+        env.ledger()
+            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 10);
         record_follow(&env, &provider, &user1);
 
         // Advance 1 week
-        env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 11);
+        env.ledger()
+            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 11);
         record_activity(&env, &provider, &user1);
 
         let retention = get_cohort_retention(&env, &provider, 10);
@@ -191,11 +201,13 @@ mod tests {
     #[test]
     fn test_activity_at_week_12_fills_all_buckets() {
         let (env, provider, user1, _) = setup();
-        env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 0);
+        env.ledger()
+            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 0);
         record_follow(&env, &provider, &user1);
 
         // Advance 12 weeks
-        env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 12);
+        env.ledger()
+            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 12);
         record_activity(&env, &provider, &user1);
 
         let retention = get_cohort_retention(&env, &provider, 0);
@@ -217,7 +229,8 @@ mod tests {
         record_follow(&env, &provider, &user2);
 
         // user1 is active at week 1 (relative to their cohort)
-        env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK + 1);
+        env.ledger()
+            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK + 1);
         record_activity(&env, &provider, &user1);
 
         // cohort 0: user1 joined, 100% at week 1

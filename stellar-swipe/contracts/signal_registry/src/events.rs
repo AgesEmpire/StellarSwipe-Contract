@@ -105,6 +105,14 @@ pub fn emit_signal_expired(env: &Env, signal_id: u64, provider: Address, expired
         .publish(topics, (signal_id, provider, expired_at_ledger));
 }
 
+/// Emitted when expired signals are permanently removed from storage
+/// (issue #779). `ledger` is the ledger sequence at prune time so off-chain
+/// indexers can track storage health over time.
+pub fn emit_signals_pruned(env: &Env, count: u32, ledger: u32) {
+    let topics = (Symbol::new(env, "signals_pruned"),);
+    env.events().publish(topics, (count, ledger));
+}
+
 pub fn emit_trade_executed(env: &Env, signal_id: u64, executor: Address, roi: i128, volume: i128) {
     let topics = (Symbol::new(env, "trade_executed"),);
     env.events()

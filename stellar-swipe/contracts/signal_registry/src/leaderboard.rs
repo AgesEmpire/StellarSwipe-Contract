@@ -526,7 +526,12 @@ mod tests {
     // ── Tie-breaking tests (#611) ─────────────────────────────────────────────
 
     /// Helper: build an IndexEntry directly so `registered_at` can be controlled.
-    fn make_entry(env: &Env, provider: Address, success_rate: u32, registered_at: u64) -> IndexEntry {
+    fn make_entry(
+        env: &Env,
+        provider: Address,
+        success_rate: u32,
+        registered_at: u64,
+    ) -> IndexEntry {
         IndexEntry {
             provider,
             closed_signals: 10,
@@ -552,8 +557,18 @@ mod tests {
             let score = 7500u32;
             let mut idx = Vec::new(&env);
             // Insert later-registered first, then earlier-registered
-            upsert_sorted(&env, &mut idx, make_entry(&env, p_late.clone(), score, 2000), |e| e.success_rate as i128);
-            upsert_sorted(&env, &mut idx, make_entry(&env, p_early.clone(), score, 1000), |e| e.success_rate as i128);
+            upsert_sorted(
+                &env,
+                &mut idx,
+                make_entry(&env, p_late.clone(), score, 2000),
+                |e| e.success_rate as i128,
+            );
+            upsert_sorted(
+                &env,
+                &mut idx,
+                make_entry(&env, p_early.clone(), score, 1000),
+                |e| e.success_rate as i128,
+            );
 
             // Earlier registration (t=1000) should rank first
             assert_eq!(idx.get(0).unwrap().provider, p_early);
@@ -602,8 +617,18 @@ mod tests {
             let mut idx = Vec::new(&env);
             // p_high has score 9000, p_low has score 6000
             // p_high registered later — tie-break would put p_low first if primary score didn't dominate
-            upsert_sorted(&env, &mut idx, make_entry(&env, p_high.clone(), 9000, 5000), |e| e.success_rate as i128);
-            upsert_sorted(&env, &mut idx, make_entry(&env, p_low.clone(), 6000, 1000), |e| e.success_rate as i128);
+            upsert_sorted(
+                &env,
+                &mut idx,
+                make_entry(&env, p_high.clone(), 9000, 5000),
+                |e| e.success_rate as i128,
+            );
+            upsert_sorted(
+                &env,
+                &mut idx,
+                make_entry(&env, p_low.clone(), 6000, 1000),
+                |e| e.success_rate as i128,
+            );
 
             // Higher primary score must still win regardless of registration time
             assert_eq!(idx.get(0).unwrap().provider, p_high);

@@ -363,8 +363,7 @@ fn cancel_before_min_lifetime_rejected() {
     let id = create_signal(&env, &client, &provider, 86_400);
 
     // Advance only 1 800 seconds — half the required lifetime.
-    env.ledger()
-        .set_timestamp(env.ledger().timestamp() + 1_800);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1_800);
 
     let result = client.try_cancel_signal(&provider, &id);
     assert_eq!(result, Err(Ok(SignalCancelError::LifetimeNotElapsed)));
@@ -384,8 +383,7 @@ fn cancel_at_min_lifetime_boundary_succeeds() {
     client.set_min_signal_lifetime(&admin, &3_600u64);
     let id = create_signal(&env, &client, &provider, 86_400);
 
-    env.ledger()
-        .set_timestamp(env.ledger().timestamp() + 3_600);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3_600);
 
     client.cancel_signal(&provider, &id);
     assert_eq!(
@@ -403,8 +401,7 @@ fn cancel_after_min_lifetime_succeeds() {
     client.set_min_signal_lifetime(&admin, &3_600u64);
     let id = create_signal(&env, &client, &provider, 86_400);
 
-    env.ledger()
-        .set_timestamp(env.ledger().timestamp() + 7_200);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 7_200);
 
     client.cancel_signal(&provider, &id);
     assert_eq!(
