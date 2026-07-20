@@ -1,9 +1,5 @@
 use crate::errors::AdminError;
 use crate::types::{Signal, SignalAction};
-use crate::collaboration::{
-    self, Author, CollaborationStatus, get_collaborative_signal,
-    is_collaborative_signal, distribute_collaborative_rewards,
-};
 use soroban_sdk::{contracttype, Address, Env, Map, Vec};
 
 #[contracttype]
@@ -130,11 +126,13 @@ pub fn distribute_collaborative_rewards(
     }
 
     // Adjust the last entry to absorb any rounding remainder
-    if let Some(last) = distributions.last_mut() {
+    // (soroban_sdk::Vec has no `last_mut`; read, mutate, and write back by index).
+    if distributions.len() > 0 {
+        let last_idx = distributions.len() - 1;
+        let (address, fee_share, roi_share) = distributions.get(last_idx).unwrap();
         let fee_rem = total_fees - fee_sum;
         let roi_rem = total_roi - roi_sum;
-        last.1 += fee_rem;
-        last.2 += roi_rem;
+        distributions.set(last_idx, (address, fee_share + fee_rem, roi_share + roi_rem));
     }
 
     distributions

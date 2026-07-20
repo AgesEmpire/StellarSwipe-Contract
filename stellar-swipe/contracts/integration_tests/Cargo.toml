@@ -45,5 +45,9 @@ path = "tests/integration/test_chaos_ordering.rs"
 name = "test_arithmetic_invariants"
 path = "tests/integration/test_arithmetic_invariants.rs"
 
+[[test]]
+name = "test_signal_registry_reentrancy"
+path = "tests/integration/test_signal_registry_reentrancy.rs"
+
 [lints]
 workspace = true
