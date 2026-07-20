@@ -518,24 +518,31 @@ pub fn get_ban_reason(env: &Env, provider: &Address) -> Option<String> {
         .get(&BanStorageKey::ProviderBanReason(provider.clone()))
 }
 
-/// Ban a provider: cancel all active signals, slash full stake, block future submissions.
+/// Ban a provider: persist the ban and cancel all active signals.
+///
+/// This is the "effects" half of the ban flow — it performs **no external
+/// calls** and is safe to call and persist in full before the caller talks
+/// to `StakeVault` (see [`slash_stake`]). Splitting the pure-storage work
+/// from the cross-contract interaction lets the caller follow
+/// checks-effects-interactions: persist the ban reason and cancelled
+/// signals first, *then* invoke the external contract, so a reentrant call
+/// arriving during that external call can never observe a signal that is
+/// "active" but already mid-ban (Issue #781).
 ///
 /// # Arguments
 /// * `env` - Soroban environment
 /// * `signals_map` - Mutable reference to the signals map (signals will be cancelled in-place)
 /// * `provider` - Address of the provider to ban
 /// * `reason_hash` - On-chain evidence hash (e.g. IPFS CID of dispute documentation)
-/// * `stake_vault` - Address of the StakeVault contract for slashing
 ///
 /// # Returns
-/// `(signals_cancelled, stake_slashed)` tuple
-pub fn ban_provider(
+/// Number of signals cancelled.
+pub fn apply_ban(
     env: &Env,
     signals_map: &mut Map<u64, Signal>,
     provider: &Address,
     reason_hash: &String,
-    stake_vault: &Address,
-) -> (u32, i128) {
+) -> u32 {
     // Mark provider as banned by storing the reason hash
     env.storage().persistent().set(
         &BanStorageKey::ProviderBanReason(provider.clone()),
@@ -556,34 +563,58 @@ pub fn ban_provider(
         }
     }
 
-    // Slash full stake via cross-contract call to StakeVault
-    let stake_slashed = slash_stake(env, provider, stake_vault);
-
-    (signals_cancelled, stake_slashed)
+    signals_cancelled
 }
 
-/// Slash the full stake of a provider via StakeVault cross-contract call
-fn slash_stake(env: &Env, provider: &Address, stake_vault: &Address) -> i128 {
+/// Slash the full stake of a provider via a `StakeVault` cross-contract call.
+///
+/// # Reentrancy risk assessment (Issue #781)
+/// This is the only cross-contract *write* call site in `signal_registry`.
+/// `stake_vault` is admin-supplied and, in the general case, untrusted code:
+/// nothing stops a misconfigured or malicious address from calling back into
+/// `signal_registry` while its `slash_stake` entrypoint is executing. The
+/// caller (`SignalRegistry::ban_provider` in `lib.rs`) addresses this with
+/// two independent layers:
+/// 1. **Checks-effects-interactions** — all storage effects of the ban
+///    ([`apply_ban`]) are persisted *before* this function is called, so a
+///    reentrant read sees the post-ban state, not an intermediate one.
+/// 2. **Reentrancy guard** — the caller wraps the whole entrypoint in
+///    [`crate::reentrancy::guarded`], so any reentrant *state-changing*
+///    call back into a guarded `signal_registry` entrypoint (including a
+///    second `ban_provider`) is rejected with `AdminError::ReentrancyDetected`
+///    before it can touch storage.
+pub fn slash_stake(env: &Env, provider: &Address, stake_vault: &Address) -> i128 {
     let sym = soroban_sdk::Symbol::new(env, "get_stake");
     let mut args = soroban_sdk::Vec::<soroban_sdk::Val>::new(env);
     args.push_back(provider.clone().into_val(env));
     let stake: i128 = env.invoke_contract(stake_vault, &sym, args);
 
-    if stake > 0 {
-        // Call slash_stake on StakeVault — pass this contract as caller (authorizes the slash),
-        // the provider, the full stake amount, and a reason tag for the audit event.
-        let slash_sym = soroban_sdk::Symbol::new(env, "slash_stake");
-        let mut slash_args = soroban_sdk::Vec::<soroban_sdk::Val>::new(env);
-        let caller = env.current_contract_address();
-        slash_args.push_back(caller.into_val(env));
-        slash_args.push_back(provider.clone().into_val(env));
-        slash_args.push_back(stake.into_val(env));
-        let reason = soroban_sdk::Symbol::new(env, "ban");
-        slash_args.push_back(reason.into_val(env));
-        let _ = env.invoke_contract::<()>(stake_vault, &slash_sym, slash_args);
+    if stake <= 0 {
+        return 0;
     }
 
-    stake
+    // Call slash_stake on StakeVault — pass this contract as caller (authorizes
+    // the slash), the provider, the slash severity tier, and a reason tag for
+    // the audit event. A ban always applies the harshest tier: StakeVault's
+    // `SlashSeverity` is a `#[repr(u32)]` fieldless enum (Minor=0, Major=1,
+    // Critical=2), so it crosses the contract boundary as a plain u32 — there
+    // is no shared Rust type between the two independently deployed contracts.
+    const SLASH_SEVERITY_CRITICAL: u32 = 2;
+
+    let slash_sym = soroban_sdk::Symbol::new(env, "slash_stake");
+    let mut slash_args = soroban_sdk::Vec::<soroban_sdk::Val>::new(env);
+    let caller = env.current_contract_address();
+    slash_args.push_back(caller.into_val(env));
+    slash_args.push_back(provider.clone().into_val(env));
+    slash_args.push_back(SLASH_SEVERITY_CRITICAL.into_val(env));
+    let reason = soroban_sdk::Symbol::new(env, "ban");
+    slash_args.push_back(reason.into_val(env));
+
+    // StakeVault::slash_stake returns the amount actually slashed, which is
+    // the tier percentage of `stake` (default Critical = 100%) — read it back
+    // instead of assuming `stake` in full, so the emitted event always
+    // reflects what was really burned.
+    env.invoke_contract::<i128>(stake_vault, &slash_sym, slash_args)
 }
 
 /// Emit the ProviderBanned event

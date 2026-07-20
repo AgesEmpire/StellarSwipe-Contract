@@ -27,6 +27,8 @@ mod multisig_approvals;
 mod performance;
 mod providers;
 mod query;
+/// Contract-wide cross-contract reentrancy guard (Issue #781).
+mod reentrancy;
 mod reports;
 pub mod reputation;
 mod scheduling;
@@ -49,6 +51,10 @@ mod validation;
 mod versioning;
 
 pub use categories::{RiskLevel, SignalCategory};
+/// Re-exported so downstream / integration-test callers (e.g.
+/// `contracts/integration_tests`) can pattern-match on contract errors —
+/// including `AdminError::ReentrancyDetected` — without duplicating the enum.
+pub use errors::AdminError;
 pub use multisig_approvals::CriticalActionPayload;
 pub use types::SignalAction;
 pub use types::{FeeBreakdown, ProviderPerformance, SignalOutcome, SignalStatus};
@@ -73,8 +79,8 @@ use community_voting::{
 };
 use contests::{Contest, ContestEntry, ContestMetric, ContestStatus};
 use errors::{
-    AdminError, AiScoreError, ComboError, ContestError, CrossChainError, SignalCancelError,
-    SignalEditError, SignalOutcomeError, TemplateError, VersioningError,
+    AiScoreError, ComboError, ContestError, CrossChainError, SignalCancelError, SignalEditError,
+    SignalOutcomeError, TemplateError, VersioningError,
 };
 pub use leaderboard::{
     get_leaderboard as get_leaderboard_internal, update_leaderboard_index, LeaderboardMetric,
@@ -291,6 +297,15 @@ impl SignalRegistry {
     }
 
     /// User stakes tokens. Rate-limited to 5 changes per day.
+    ///
+    /// # Reentrancy risk assessment (Issue #781)
+    /// `amount` is bookkeeping against the in-contract `ProviderStakes` map
+    /// only ([`stake::stake`]) — this entrypoint makes **no cross-contract
+    /// call** (no token transfer, no `StakeVault` invocation), so there is no
+    /// external callee that could reenter during this call. No guard needed.
+    /// If a real token transfer is added here in the future, it must go
+    /// through [`reentrancy::guarded`] the same way [`Self::ban_provider`] and
+    /// [`Self::unstake_tokens`] do.
     pub fn stake_tokens(env: Env, provider: Address, amount: i128) -> Result<(), AdminError> {
         provider.require_auth();
         let trust = reputation::get_trust_score(&env, &provider)
@@ -313,25 +328,23 @@ impl SignalRegistry {
     }
 
     /// User unstakes tokens. Rate-limited to 5 changes per day.
+    ///
+    /// # Reentrancy risk assessment (Issue #781)
+    /// Like [`Self::stake_tokens`], this entrypoint makes no cross-contract
+    /// call today — `amount` is bookkeeping against the in-contract
+    /// `ProviderStakes` map only ([`stake::unstake`]). It is nonetheless
+    /// guarded (originally Issue #264, now on the shared
+    /// [`reentrancy::guarded`] primitive) as defense in depth for a
+    /// fund-affecting flow, and so that a future token transfer added here
+    /// is automatically covered by the same contract-wide lock used by
+    /// [`Self::ban_provider`].
     pub fn unstake_tokens(env: Env, provider: Address) -> Result<(), AdminError> {
         provider.require_auth();
 
-        // ── Reentrancy guard ──────────────────────────────────────────────────
-        let lock_key = soroban_sdk::Symbol::new(&env, "UnstakeLock");
-        if env
-            .storage()
-            .temporary()
-            .get::<_, bool>(&lock_key)
-            .unwrap_or(false)
-        {
-            return Err(AdminError::ReentrancyDetected);
-        }
-        env.storage().temporary().set(&lock_key, &true);
-
-        let trust = reputation::get_trust_score(&env, &provider)
-            .map(|d| d.score)
-            .unwrap_or(0);
-        let result = (|| -> Result<(), AdminError> {
+        reentrancy::guarded(&env, || {
+            let trust = reputation::get_trust_score(&env, &provider)
+                .map(|d| d.score)
+                .unwrap_or(0);
             rl::check_rate_limit(&env, &provider, RLAction::StakeChange, trust)
                 .map_err(|_| AdminError::RateLimitExceeded)?;
 
@@ -346,10 +359,7 @@ impl SignalRegistry {
             Self::save_provider_stakes_map(&env, &stakes);
             rl::record_action(&env, &provider, RLAction::StakeChange);
             Ok(())
-        })();
-
-        env.storage().temporary().remove(&lock_key);
-        result
+        })
     }
 
     pub fn set_trade_fee(env: Env, caller: Address, new_fee_bps: u32) -> Result<(), AdminError> {
@@ -923,6 +933,12 @@ impl SignalRegistry {
     /// Create a new trading signal. The provider must authorize the call.
     /// Signals are rate-limited and subject to pause state checks.
     ///
+    /// # Reentrancy risk assessment (Issue #781)
+    /// The provider's stake tier is read from local storage
+    /// (`ProviderStakes` / the provider's `stake_tier` profile field) — this
+    /// function makes **no cross-contract call**, so there is no external
+    /// callee that could reenter during signal creation. No guard needed.
+    ///
     /// # Parameters
     /// - `env`: Soroban environment.
     /// - `provider`: Address of the signal provider (must authorize).
@@ -1239,6 +1255,17 @@ impl SignalRegistry {
     /// signals are visible to any viewer. PREMIUM signals require an active on-chain
     /// subscription (via UserPortfolio [`check_subscription`]) unless the viewer is the
     /// signal provider.
+    ///
+    /// # Reentrancy risk assessment (Issue #781)
+    /// Calls out to `UserPortfolio::check_subscription`
+    /// ([`Self::invoke_check_subscription`]) for PREMIUM signals. This is a
+    /// **read-only query path**: it never authorizes a fund movement or
+    /// mutates business-logic state, so it cannot be used to double-spend or
+    /// corrupt state via reentrancy regardless of what the callee does. The
+    /// one write on this path — `emit_session_started_once`'s per-session
+    /// dedup flag — is explicitly documented as "No business-logic state is
+    /// changed" (see `shared::events`) and only suppresses a duplicate
+    /// analytics event; it carries no reentrancy risk. No guard needed.
     pub fn get_signal_for_viewer(env: Env, signal_id: u64, viewer: Address) -> Option<Signal> {
         let signals = Self::get_signals_map(&env);
         let signal = signals.get(signal_id)?;
@@ -1890,6 +1917,20 @@ impl SignalRegistry {
     /// Ban a provider, cancelling all active signals and slashing full stake.
     /// Admin only. Emits `ProviderBanned` event.
     ///
+    /// # Reentrancy risk assessment (Issue #781)
+    /// This entrypoint makes a cross-contract call into the admin-supplied
+    /// `stake_vault` (see [`providers::slash_stake`]), which — unlike a
+    /// hardcoded protocol contract — cannot be assumed non-malicious. It is
+    /// therefore hardened two ways:
+    /// - **Checks-effects-interactions**: the ban reason and every cancelled
+    ///   signal ([`providers::apply_ban`]) are persisted *before* the
+    ///   `stake_vault` call, so a reentrant call during that call sees the
+    ///   fully-banned state, never an intermediate one.
+    /// - **Reentrancy guard**: the whole body runs under
+    ///   [`reentrancy::guarded`], so any reentrant call back into another
+    ///   guarded `signal_registry` entrypoint (including `ban_provider`
+    ///   itself) is rejected with [`AdminError::ReentrancyDetected`].
+    ///
     /// # Arguments
     /// * `caller` - Must be the current admin.
     /// * `provider` - Provider address to ban.
@@ -1905,10 +1946,17 @@ impl SignalRegistry {
         admin::require_admin(&env, &caller)?;
         caller.require_auth();
 
-        let mut signals = Self::get_signals_map(&env);
-        let (signals_cancelled, stake_slashed) =
-            providers::ban_provider(&env, &mut signals, &provider, &reason_hash, &stake_vault);
-        Self::save_signals_map(&env, &signals);
+        let (signals_cancelled, stake_slashed) = reentrancy::guarded(&env, || {
+            // Effects: persist the ban and cancel signals before the external call.
+            let mut signals = Self::get_signals_map(&env);
+            let signals_cancelled = providers::apply_ban(&env, &mut signals, &provider, &reason_hash);
+            Self::save_signals_map(&env, &signals);
+
+            // Interaction: cross-contract call to StakeVault to slash the stake.
+            let stake_slashed = providers::slash_stake(&env, &provider, &stake_vault);
+
+            Ok((signals_cancelled, stake_slashed))
+        })?;
 
         providers::emit_provider_banned(
             &env,
@@ -2017,6 +2065,13 @@ impl SignalRegistry {
        SIGNAL ADOPTION (Issue #169)
     ========================== */
 
+    /// # Reentrancy risk assessment (Issue #781)
+    /// This is an *inbound* trust boundary, not an outbound call site: the
+    /// caller must equal the registered `TradeExecutor` address, checked via
+    /// `caller.require_auth()` (a signature check, not a cross-contract
+    /// invocation). `increment_adoption` itself makes **no cross-contract
+    /// call** — nothing here can be reentered mid-execution by an external
+    /// contract. No guard needed.
     pub fn increment_adoption(
         env: Env,
         caller: Address,
