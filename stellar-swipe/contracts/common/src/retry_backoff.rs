@@ -78,17 +78,11 @@ impl Default for RetryConfig {
 
 /// Mutable retry state that should be persisted between invocations.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RetryState {
     /// How many times the operation has been **attempted** so far.
     /// Starts at 0 (not yet attempted) and is incremented on each try.
     pub attempt: u32,
-}
-
-impl Default for RetryState {
-    fn default() -> Self {
-        Self { attempt: 0 }
-    }
 }
 
 /// Whether the caller should retry the operation.
