@@ -55,7 +55,7 @@ fi
 
 echo "==> Computing source hash and embedding into contract metadata..."
 # shellcheck source=scripts/embed_source_hash.sh
-source "$SCRIPT_DIR/scripts/embed_source_hash.sh"
+source "$SCRIPT_DIR/embed_source_hash.sh"
 if [[ -z "${STELLAR_SOURCE_HASH:-}" ]]; then
   echo "error: STELLAR_SOURCE_HASH is empty — aborting release build." >&2
   exit 1

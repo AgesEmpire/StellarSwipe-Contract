@@ -142,7 +142,8 @@ fn batch_mixed_success_failure() {
         results.get(0).unwrap(),
         BatchTradeResult {
             ok: true,
-            error_code: 0
+            error_code: 0,
+            atomic_rollback: false,
         }
     );
     // Trade 2 fails: InvalidAmount.
@@ -150,7 +151,8 @@ fn batch_mixed_success_failure() {
         results.get(1).unwrap(),
         BatchTradeResult {
             ok: false,
-            error_code: ContractError::InvalidAmount as u32
+            error_code: ContractError::InvalidAmount as u32,
+            atomic_rollback: false,
         }
     );
     // Trade 3 succeeds.
@@ -158,7 +160,8 @@ fn batch_mixed_success_failure() {
         results.get(2).unwrap(),
         BatchTradeResult {
             ok: true,
-            error_code: 0
+            error_code: 0,
+            atomic_rollback: false,
         }
     );
     // Trade 4 fails: InsufficientBalance.
@@ -166,7 +169,8 @@ fn batch_mixed_success_failure() {
         results.get(3).unwrap(),
         BatchTradeResult {
             ok: false,
-            error_code: ContractError::InsufficientBalance as u32
+            error_code: ContractError::InsufficientBalance as u32,
+            atomic_rollback: false,
         }
     );
     // Trade 5 succeeds.
@@ -174,7 +178,8 @@ fn batch_mixed_success_failure() {
         results.get(4).unwrap(),
         BatchTradeResult {
             ok: true,
-            error_code: 0
+            error_code: 0,
+            atomic_rollback: false,
         }
     );
 

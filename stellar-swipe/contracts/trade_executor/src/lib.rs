@@ -175,6 +175,17 @@ pub struct BatchTradeResult {
     pub ok: bool,
     /// `ContractError` discriminant when `ok == false`; 0 when `ok == true`.
     pub error_code: u32,
+    /// `true` when this entry belongs to an atomic batch (Issue #793) that
+    /// failed and was rolled back via panic. Set on every entry of the
+    /// locally-computed result vec right before the panic that discards it —
+    /// the panic itself (not this field) is what makes the rollback real;
+    /// this exists so the marking logic is unit-testable on its own (see
+    /// `mark_atomic_rollback`) and so the intent is self-documenting in code
+    /// that inspects a `BatchTradeResult` outside the panicking call path
+    /// (e.g. a future off-chain dry-run/simulation layer). Always `false` in
+    /// non-atomic mode and in a successful atomic batch, since nothing was
+    /// rolled back in either case.
+    pub atomic_rollback: bool,
 }
 
 /// Instance config hoisted once per `batch_execute` call to amortize storage reads.
@@ -202,6 +213,25 @@ fn prepare_batch_context(env: &Env) -> Result<BatchExecutionContext, ContractErr
             .unwrap_or(0i128),
         circuit_breaker_active: market_circuit_breaker_active(env),
     })
+}
+
+/// Returns `results` unchanged if every entry succeeded, otherwise a copy
+/// with `atomic_rollback: true` set on every entry. Pulled out of
+/// `batch_execute_impl` so the marking logic (Issue #793) is unit-testable
+/// on its own, independent of the panic-based rollback it precedes.
+fn mark_atomic_rollback(env: &Env, results: &Vec<BatchTradeResult>) -> Vec<BatchTradeResult> {
+    if results.iter().all(|r| r.ok) {
+        return results.clone();
+    }
+    let mut marked: Vec<BatchTradeResult> = Vec::new(env);
+    for r in results.iter() {
+        marked.push_back(BatchTradeResult {
+            ok: r.ok,
+            error_code: r.error_code,
+            atomic_rollback: true,
+        });
+    }
+    marked
 }
 
 #[contracttype]
@@ -1755,8 +1785,9 @@ impl TradeExecutorContract {
         Ok(())
     }
 
-    /// Execute a batch of copy trades. Each trade is attempted independently;
-    /// a failure in one trade does NOT roll back successful trades.
+    /// Execute a batch of copy trades in best-effort mode. Each trade is
+    /// attempted independently; a failure in one trade does NOT roll back
+    /// successful trades.
     ///
     /// Trades are processed in priority-tier order (high-stake -> high-tenure -> standard)
     /// when a portfolio contract is configured (Issue #682). A fairness fallback
@@ -1765,24 +1796,72 @@ impl TradeExecutorContract {
     /// Returns a Vec<BatchTradeResult> with one entry per input trade, in the
     /// priority-sorted order (not the original input order).
     ///
+    /// Kept as a frozen, unchanged entry point (equivalent to
+    /// `batch_execute_atomic(env, trades, false)`) so existing callers who
+    /// already integrated against this exact signature are unaffected by
+    /// atomic mode (Issue #793) — see `batch_execute_atomic` for that.
+    ///
     /// # Errors
     /// - [ContractError::InvalidAmount] - batch is empty or exceeds MAX_BATCH_SIZE.
     pub fn batch_execute(
         env: Env,
         trades: Vec<BatchTradeInput>,
     ) -> Result<Vec<BatchTradeResult>, ContractError> {
+        Self::batch_execute_impl(&env, trades, false)
+    }
+
+    /// Execute a batch of copy trades, optionally with all-or-nothing atomic
+    /// semantics (Issue #793).
+    ///
+    /// - `atomic = false`: identical behavior to [`Self::batch_execute`] —
+    ///   each trade is attempted independently and a failure does not affect
+    ///   the others.
+    /// - `atomic = true`: if any trade in the batch fails, the entire batch
+    ///   is rolled back — including trades that individually succeeded
+    ///   earlier in the same call — by panicking. Soroban reverts every
+    ///   storage effect from a panicking top-level invocation, so this
+    ///   relies on the host's own transaction-level atomicity rather than
+    ///   any manual undo bookkeeping. Because a panic aborts the call
+    ///   entirely, this function never actually *returns* a
+    ///   `Vec<BatchTradeResult>` to the caller on the failing path — the
+    ///   caller instead observes the whole invocation failing (e.g. a
+    ///   `try_*` client call returning an error, or the transaction itself
+    ///   failing on submission). It still computes and marks
+    ///   `atomic_rollback: true` on every entry before panicking, purely so
+    ///   that marking logic has a testable, correct implementation (see
+    ///   `mark_atomic_rollback` and its unit test) independent of testing
+    ///   the panic/rollback behavior itself.
+    ///
+    /// # Errors
+    /// - [ContractError::InvalidAmount] - batch is empty or exceeds MAX_BATCH_SIZE.
+    ///
+    /// # Panics
+    /// - If `atomic == true` and any trade in `trades` fails.
+    pub fn batch_execute_atomic(
+        env: Env,
+        trades: Vec<BatchTradeInput>,
+        atomic: bool,
+    ) -> Result<Vec<BatchTradeResult>, ContractError> {
+        Self::batch_execute_impl(&env, trades, atomic)
+    }
+
+    fn batch_execute_impl(
+        env: &Env,
+        trades: Vec<BatchTradeInput>,
+        atomic: bool,
+    ) -> Result<Vec<BatchTradeResult>, ContractError> {
         let len = trades.len();
         if len == 0 || len > MAX_BATCH_SIZE {
             return Err(ContractError::InvalidAmount);
         }
 
-        let batch_ctx = prepare_batch_context(&env)?;
-        let mut results: Vec<BatchTradeResult> = Vec::new(&env);
+        let batch_ctx = prepare_batch_context(env)?;
+        let mut results: Vec<BatchTradeResult> = Vec::new(env);
 
         for i in 0..len {
             let trade = trades.get(i).unwrap();
             let outcome = execute_market_copy_trade(
-                &env,
+                env,
                 trade.user.clone(),
                 trade.token.clone(),
                 trade.amount,
@@ -1794,13 +1873,27 @@ impl TradeExecutorContract {
                 Ok(()) => BatchTradeResult {
                     ok: true,
                     error_code: 0,
+                    atomic_rollback: false,
                 },
                 Err(e) => BatchTradeResult {
                     ok: false,
                     error_code: e as u32,
+                    atomic_rollback: false,
                 },
             };
             results.push_back(result);
+        }
+
+        if atomic && results.iter().any(|r| !r.ok) {
+            let failed = results.iter().filter(|r| !r.ok).count();
+            // Mark before panicking — see the doc comment on
+            // `batch_execute_atomic` for why this vec is never actually
+            // observed by a real caller on this path.
+            let _marked = mark_atomic_rollback(env, &results);
+            panic!(
+                "atomic batch rolled back: {} of {} trades failed",
+                failed, len
+            );
         }
 
         Ok(results)

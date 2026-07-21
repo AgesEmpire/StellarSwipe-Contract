@@ -269,7 +269,7 @@ pub fn approve(env: &Env, caller: &Address, proposal_id: u64) -> Result<u32, Mul
         .persistent()
         .set(&MultisigStorageKey::Proposal(proposal_id), &proposal);
 
-    Ok(count as u32)
+    Ok(count)
 }
 
 /// Return `true` if `signer` has already approved `proposal`.
@@ -312,7 +312,7 @@ pub fn require_can_execute(env: &Env, proposal: &Proposal) -> Result<(), Multisi
     if proposal.status == ProposalStatus::Executed {
         return Err(MultisigError::AlreadyExecuted);
     }
-    if (proposal.approvals.len() as u32) < config.threshold {
+    if proposal.approvals.len() < config.threshold {
         return Err(MultisigError::ThresholdNotMet);
     }
     if env.ledger().timestamp() > proposal.expires_at {
