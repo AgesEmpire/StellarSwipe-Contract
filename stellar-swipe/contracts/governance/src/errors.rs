@@ -59,8 +59,6 @@ pub enum GovernanceError {
     ActionNotFound = 48,
     InvalidTimelockConfig = 49,
     ConvictionPoolNotFound = 50,
-    /// Proposal has already been withdrawn — cannot be withdrawn again.
-    ProposalAlreadyWithdrawn = 51,
 }
 
 #[allow(non_upper_case_globals)]
@@ -76,4 +74,6 @@ impl GovernanceError {
     pub const DiscussionPeriodActive: GovernanceError = GovernanceError::VotingNotStarted;
     /// Proposal has already been withdrawn — cannot be withdrawn again.
     pub const ProposalAlreadyWithdrawn: GovernanceError = GovernanceError::ProposalNotActive;
+    /// Decay rate is outside the valid range (MIN_DECAY_RATE..=MAX_DECAY_RATE).
+    pub const InvalidDecayRate: GovernanceError = GovernanceError::InvalidGovernanceConfig;
 }

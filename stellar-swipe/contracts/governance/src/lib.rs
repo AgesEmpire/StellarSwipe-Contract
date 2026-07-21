@@ -46,8 +46,9 @@ use conviction_voting::{
     analyze_conviction_proposal, change_conviction_vote, create_conviction_pool,
     create_conviction_proposal, execute_conviction_funding, get_conviction_calibration,
     get_conviction_growth_curve, put_conviction_calibration, refill_conviction_pool,
-    update_proposal_conviction, vote_conviction, withdraw_conviction_vote, ConvictionAnalytics,
-    ConvictionCalibration, ConvictionStatus, ConvictionVotingPool,
+    set_conviction_decay_rate, update_proposal_conviction, vote_conviction, withdraw_conviction_vote,
+    ConvictionAnalytics, ConvictionCalibration, ConvictionStatus, ConvictionVotingPool,
+    MIN_DECAY_RATE, MAX_DECAY_RATE,
 };
 use distribution::{
     circulating_supply as calculate_circulating_supply, create_vesting_schedule as create_schedule,
@@ -1032,8 +1033,22 @@ impl GovernanceContract {
         if config.penalty_multiplier == 0 || config.reward_bonus_pct > 100 {
             return Err(GovernanceError::InvalidCalibrationConfig);
         }
-        conviction_voting::put_conviction_calibration(&env, &config);
+        conviction_voting::put_conviction_calibration(&env, &config)?;
         Ok(config)
+    }
+
+    /// # Summary
+    /// Admin-only: set the conviction decay rate (in basis points, 1-999).
+    /// A decay rate of 0 would disable decay (unbounded accumulation).
+    /// A decay rate of 1000 would cause instant full decay (votes always zero).
+    /// Returns Error::InvalidDecayRate if rate is outside MIN_DECAY_RATE..=MAX_DECAY_RATE.
+    pub fn set_conviction_decay_rate(
+        env: Env,
+        admin: Address,
+        rate: u64,
+    ) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        conviction_voting::set_conviction_decay_rate(&env, rate)
     }
 
     pub fn distribution(env: Env) -> Result<DistributionState, GovernanceError> {
