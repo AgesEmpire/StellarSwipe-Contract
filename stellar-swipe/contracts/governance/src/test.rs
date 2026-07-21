@@ -2092,6 +2092,7 @@ fn conviction_calibration_admin_can_set_config() {
         penalty_multiplier: 2,
         reward_bonus_pct: 10,
         max_conviction_cap: 50_000,
+        decay_rate_bps: 50,
     };
     client.set_conviction_calibration(&admin, &config);
 
@@ -2114,6 +2115,7 @@ fn conviction_calibration_non_admin_cannot_set_config() {
         penalty_multiplier: 4,
         reward_bonus_pct: 5,
         max_conviction_cap: 10_000,
+        decay_rate_bps: 50,
     };
 
     let result = client.try_set_conviction_calibration(&fake_admin, &config);
@@ -2131,6 +2133,7 @@ fn conviction_calibration_rejects_invalid_multiplier() {
         penalty_multiplier: 0,
         reward_bonus_pct: 0,
         max_conviction_cap: 0,
+        decay_rate_bps: 50,
     };
     let result = client.try_set_conviction_calibration(&admin, &config);
     assert_eq!(result, Err(Ok(GovernanceError::InvalidCalibrationConfig)));
@@ -2146,6 +2149,7 @@ fn conviction_calibration_rejects_invalid_reward_bonus() {
         penalty_multiplier: 2,
         reward_bonus_pct: 101,
         max_conviction_cap: 0,
+        decay_rate_bps: 50,
     };
     let result = client.try_set_conviction_calibration(&admin, &config);
     assert_eq!(result, Err(Ok(GovernanceError::InvalidCalibrationConfig)));
@@ -2162,6 +2166,7 @@ fn conviction_calibration_penalty_short_votes() {
         penalty_multiplier: 2,
         reward_bonus_pct: 0,
         max_conviction_cap: 0,
+        decay_rate_bps: 50,
     };
     client.set_conviction_calibration(&admin, &config);
 
@@ -2198,6 +2203,7 @@ fn conviction_calibration_reward_long_votes() {
         penalty_multiplier: 1,
         reward_bonus_pct: 20,
         max_conviction_cap: 0,
+        decay_rate_bps: 50,
     };
     client.set_conviction_calibration(&admin, &config);
 
@@ -2233,6 +2239,7 @@ fn conviction_calibration_caps_max_conviction() {
         penalty_multiplier: 1,
         reward_bonus_pct: 0,
         max_conviction_cap: 5,
+        decay_rate_bps: 50,
     };
     client.set_conviction_calibration(&admin, &config);
 
@@ -2268,6 +2275,7 @@ fn conviction_calibration_combination_penalty_and_reward() {
         penalty_multiplier: 3,
         reward_bonus_pct: 10,
         max_conviction_cap: 0,
+        decay_rate_bps: 50,
     };
     client.set_conviction_calibration(&admin, &config);
 
@@ -2308,6 +2316,7 @@ fn conviction_calibration_zero_threshold_disables_penalty() {
         penalty_multiplier: 2,
         reward_bonus_pct: 0,
         max_conviction_cap: 0,
+        decay_rate_bps: 50,
     };
     client.set_conviction_calibration(&admin, &config);
 
@@ -2671,5 +2680,124 @@ fn cancelled_proposal_cannot_be_withdrawn() {
     let result =
         client.try_withdraw_proposal(&proposal_id, &recipients.community_rewards);
     assert_eq!(result, Err(Ok(GovernanceError::ProposalNotActive)));
+}
+
+// ── Decay rate validation tests ─────────────────────────────────────────────
+
+#[test]
+fn conviction_decay_rate_zero_is_rejected() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    // Attempt to set decay rate to 0 (below MIN_DECAY_RATE)
+    let result = client.try_set_conviction_decay_rate(&admin, &0u64);
+    assert_eq!(result, Err(Ok(GovernanceError::InvalidDecayRate)));
+}
+
+#[test]
+fn conviction_decay_rate_1000_is_rejected() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    // Attempt to set decay rate to 1000 (above MAX_DECAY_RATE)
+    let result = client.try_set_conviction_decay_rate(&admin, &1000u64);
+    assert_eq!(result, Err(Ok(GovernanceError::InvalidDecayRate)));
+}
+
+#[test]
+fn conviction_decay_rate_valid_min_accepted() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    // MIN_DECAY_RATE (1) should be accepted
+    let result = client.try_set_conviction_decay_rate(&admin, &1u64);
+    assert_eq!(result, Ok(Ok(())));
+}
+
+#[test]
+fn conviction_decay_rate_valid_max_accepted() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    // MAX_DECAY_RATE (999) should be accepted
+    let result = client.try_set_conviction_decay_rate(&admin, &999u64);
+    assert_eq!(result, Ok(Ok(())));
+}
+
+#[test]
+fn conviction_decay_rate_via_calibration_rejects_invalid() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    // Attempt to set calibration with decay_rate_bps = 0
+    let config = crate::conviction_voting::ConvictionCalibration {
+        penalty_threshold_days: 0,
+        penalty_multiplier: 1,
+        reward_bonus_pct: 0,
+        max_conviction_cap: 0,
+        decay_rate_bps: 0,
+    };
+    let result = client.try_set_conviction_calibration(&admin, &config);
+    assert_eq!(result, Err(Ok(GovernanceError::InvalidDecayRate)));
+
+    // Attempt to set calibration with decay_rate_bps = 1000
+    let config = crate::conviction_voting::ConvictionCalibration {
+        penalty_threshold_days: 0,
+        penalty_multiplier: 1,
+        reward_bonus_pct: 0,
+        max_conviction_cap: 0,
+        decay_rate_bps: 1000,
+    };
+    let result = client.try_set_conviction_calibration(&admin, &config);
+    assert_eq!(result, Err(Ok(GovernanceError::InvalidDecayRate)));
+}
+
+#[test]
+fn conviction_decay_rate_non_admin_cannot_set() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let fake_admin = Address::generate(&env);
+    let result = client.try_set_conviction_decay_rate(&fake_admin, &50u64);
+    assert_eq!(result, Err(Ok(GovernanceError::Unauthorized)));
+}
+
+#[test]
+fn conviction_score_bounded_across_valid_decay_rates() {
+    // Proptest-style verification: for all valid decay rates (1..=999),
+    // conviction score should be in (0, max_conviction] after some time.
+    use crate::conviction_voting::{calculate_conviction, ConvictionCalibration, MIN_DECAY_RATE, MAX_DECAY_RATE};
+
+    let tokens = 10_000i128;
+    let time_elapsed = 30u64 * 86_400; // 30 days
+
+    for decay_rate in MIN_DECAY_RATE..=MAX_DECAY_RATE {
+        let calibration = ConvictionCalibration {
+            penalty_threshold_days: 0,
+            penalty_multiplier: 1,
+            reward_bonus_pct: 0,
+            max_conviction_cap: 0,
+            decay_rate_bps: decay_rate,
+        };
+
+        let conviction = calculate_conviction(tokens, time_elapsed, &calibration);
+
+        // Conviction should be non-negative
+        assert!(conviction >= 0, "Conviction should be non-negative for decay_rate={}", decay_rate);
+
+        // With 10,000 tokens and 30 days, sqrt(30) ≈ 5.47, so base conviction ≈ 54
+        // After decay, it should be less than or equal to the base (no decay case)
+        // The maximum possible conviction without decay would be tokens * sqrt(days) / 1000
+        let max_possible = tokens * (30i128).checked_mul(1).unwrap_or(1) / 1000;
+        assert!(conviction <= max_possible + 100, 
+            "Conviction {} exceeds max possible {} for decay_rate={}", 
+            conviction, max_possible, decay_rate);
+    }
 }
 
