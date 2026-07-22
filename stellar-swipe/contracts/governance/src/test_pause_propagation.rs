@@ -89,6 +89,8 @@ fn make_proposal(c: &GovernanceContractClient<'_>, env: &Env, proposer: &Address
         &String::from_str(env, "Title"),
         &String::from_str(env, "Description"),
         &Bytes::new(env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
     )
 }
 
@@ -113,6 +115,8 @@ fn paused_blocks_create_proposal() {
         &String::from_str(&env, "T"),
         &String::from_str(&env, "D"),
         &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
     );
     assert_eq!(result, Err(Ok(GovernanceError::ContractPaused)));
 }

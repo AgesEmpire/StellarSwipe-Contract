@@ -1309,6 +1309,7 @@ impl GovernanceContract {
         approved_cap: i128,
     ) -> Result<BudgetApproval, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_executed_proposal(&env, proposal_id)?;
         let mut treasury = get_treasury(&env);
         let approval = treasury::approve_budget(
             &env,
@@ -1646,13 +1647,20 @@ impl GovernanceContract {
         committees::report_activity(&env, &get_committees_state(&env), committee_id)
     }
 
+    /// Requires `proposal_id` to reference a proposal that has already
+    /// cleared governance voting and the timelock delay (issue #795) —
+    /// admin authority alone is not sufficient to override a committee's
+    /// decision, since that is exactly the kind of critical state change
+    /// the timelock exists to gate.
     pub fn override_committee_decision(
         env: Env,
         admin: Address,
         committee_id: u64,
         decision_id: u64,
+        proposal_id: u64,
     ) -> Result<CommitteeDecision, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_executed_proposal(&env, proposal_id)?;
         let mut committees_state = get_committees_state(&env);
         let decision =
             committees::override_decision(&mut committees_state, committee_id, decision_id)?;
@@ -1661,12 +1669,19 @@ impl GovernanceContract {
         Ok(decision)
     }
 
+    /// Requires `proposal_id` to reference a proposal that has already
+    /// cleared governance voting and the timelock delay (issue #795) —
+    /// dissolving a committee is a committee-membership change that must go
+    /// through the same DAO approval + delay as any other critical action,
+    /// not be available to the admin unilaterally.
     pub fn dissolve_committee(
         env: Env,
         admin: Address,
         committee_id: u64,
+        proposal_id: u64,
     ) -> Result<Committee, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_executed_proposal(&env, proposal_id)?;
         let mut committees_state = get_committees_state(&env);
         let committee = committees::dissolve_committee(&env, &mut committees_state, committee_id)?;
         put_committees_state(&env, &committees_state);
@@ -1812,6 +1827,22 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
 /// Crate-visible alias used by sub-modules (e.g. proposal_deposit).
 pub(crate) fn require_admin_pub(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
     require_admin(env, caller)
+}
+
+/// Verify that `proposal_id` refers to a proposal that has actually cleared
+/// governance voting *and* the timelock delay (i.e. `ProposalStatus::Executed`).
+///
+/// Several admin entry points accept a `proposal_id` to document which DAO
+/// vote authorized them, but previously never checked it — an admin could
+/// pass any integer and the delay-gated approval was purely cosmetic
+/// (issue #795). Callers that mutate critical state on the strength of a
+/// "the DAO approved this" claim must route through this check.
+fn require_executed_proposal(env: &Env, proposal_id: u64) -> Result<(), GovernanceError> {
+    let proposal = get_proposal(env, proposal_id)?;
+    if proposal.status != ProposalStatus::Executed {
+        return Err(GovernanceError::ProposalNotExecuted);
+    }
+    Ok(())
 }
 
 fn balances(env: &Env) -> Map<Address, i128> {

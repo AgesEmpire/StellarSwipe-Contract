@@ -176,6 +176,8 @@ fn proposal_contract_upgrade_invalid_payload_rejected() {
         &String::from_str(&env, "Upgrade"),
         &String::from_str(&env, "Upgrade the contract"),
         &bad_payload,
+        &crate::proposals::ProposalCategory::ContractUpgrade,
+        &false,
     );
     assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
 }
@@ -197,6 +199,8 @@ fn proposal_contract_upgrade_valid_payload_accepted() {
         &String::from_str(&env, "Upgrade"),
         &String::from_str(&env, "Upgrade the contract"),
         &hash,
+        &crate::proposals::ProposalCategory::ContractUpgrade,
+        &false,
     );
     assert!(
         matches!(result, Ok(Ok(_))),
@@ -221,6 +225,8 @@ fn proposal_custom_empty_payload_rejected() {
         &String::from_str(&env, "Custom"),
         &String::from_str(&env, "Custom proposal"),
         &empty,
+        &crate::proposals::ProposalCategory::General,
+        &false,
     );
     assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
 }
@@ -255,6 +261,8 @@ fn proposal_treasury_spend_bad_version_prefix_rejected() {
         &String::from_str(&env, "Spend"),
         &String::from_str(&env, "Treasury spend proposal"),
         &bad,
+        &crate::proposals::ProposalCategory::TreasuryTransfer,
+        &false,
     );
     assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
 }

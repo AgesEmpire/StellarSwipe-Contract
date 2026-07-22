@@ -76,4 +76,8 @@ impl GovernanceError {
     pub const ProposalAlreadyWithdrawn: GovernanceError = GovernanceError::ProposalNotActive;
     /// Decay rate is outside the valid range (MIN_DECAY_RATE..=MAX_DECAY_RATE).
     pub const InvalidDecayRate: GovernanceError = GovernanceError::InvalidGovernanceConfig;
+    /// The referenced proposal has not cleared governance voting + the timelock
+    /// delay (`ProposalStatus::Executed`), so it cannot authorize an admin
+    /// action that claims to be DAO-approved (issue #795).
+    pub const ProposalNotExecuted: GovernanceError = GovernanceError::ProposalNotApproved;
 }
