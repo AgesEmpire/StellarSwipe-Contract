@@ -151,6 +151,12 @@ pub enum StorageKey {
     SlashAppeal(u64),
     SlashedFundsHeld(u64),
     AppealWindowSecs,
+    // ── Issue #784: Slash cooldown ───────────────────────────────────────────────
+    /// Ledger sequence at which a provider was last slashed.
+    LastSlashLedger(Address),
+    /// Admin-configurable cooldown (in ledgers) between successive slashes of
+    /// the same provider. Defaults to 100 ledgers (~8 minutes on mainnet).
+    SlashCooldownLedgers,
 }
 
 #[contracterror]
@@ -213,6 +219,11 @@ pub enum StakeVaultError {
     RateLimitExceeded = 31,
     InvalidAmount = 32,
     RemainingStakeBelowMinimum = 33,
+    // ── Issue #784: Slash cooldown ───────────────────────────────────────────────
+    /// A slash was attempted against a provider before their cooldown elapsed.
+    SlashCooldownActive = 34,
+    /// Requested cooldown value is outside the allowed sanity range.
+    InvalidSlashCooldown = 35,
 }
 
 /// A pending unstake request held in the FIFO queue (issue #663).
@@ -255,6 +266,10 @@ pub struct SlashRecord {
     pub slashed_at: u64,
     /// Textual reason passed in to slash_stake.
     pub reason: Symbol,
+    /// Ledger sequence at which this provider's slash cooldown expires
+    /// (issue #784). The provider cannot be slashed again until the current
+    /// ledger sequence reaches this value.
+    pub cooldown_expires_at: u32,
 }
 
 /// Mutable appeal record created when a provider calls `appeal_slash`.
@@ -1290,6 +1305,25 @@ impl StakeVaultContract {
             .get(&StorageKey::StakeToken)
             .ok_or(StakeVaultError::NotInitialized)?;
 
+        // ── Slash cooldown: reject repeated slashes of the same provider
+        // within the configured window (issue #784) ───────────────────────────
+        let current_ledger = env.ledger().sequence();
+        let last_slash_ledger: u32 = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::LastSlashLedger(provider.clone()))
+            .unwrap_or(0);
+        let cooldown_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SlashCooldownLedgers)
+            .unwrap_or(100);
+        if last_slash_ledger != 0
+            && current_ledger.saturating_sub(last_slash_ledger) < cooldown_ledgers
+        {
+            return Err(StakeVaultError::SlashCooldownActive);
+        }
+
         let cfg: SlashTierConfig = env
             .storage()
             .instance()
@@ -1383,6 +1417,7 @@ impl StakeVaultContract {
             .instance()
             .set(&StorageKey::SlashCounter, &next_slash_id);
 
+        let cooldown_expires_at = current_ledger.saturating_add(cooldown_ledgers);
         let record = SlashRecord {
             slash_id,
             provider: provider.clone(),
@@ -1390,10 +1425,14 @@ impl StakeVaultContract {
             slash_amount,
             slashed_at: env.ledger().timestamp(),
             reason: reason.clone(),
+            cooldown_expires_at,
         };
         env.storage()
             .persistent()
             .set(&StorageKey::SlashRecord(slash_id), &record);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::LastSlashLedger(provider.clone()), &current_ledger);
 
         // ── Hold slashed funds pending appeal resolution (issue #689) ──────────
         // Tokens remain in the vault's custody and are NOT burned until the
@@ -1470,6 +1509,47 @@ impl StakeVaultContract {
             .instance()
             .get(&StorageKey::AppealWindowSecs)
             .unwrap_or(0)
+    }
+
+    // ── Issue #784: Slash cooldown ─────────────────────────────────────────────
+
+    /// Set the cooldown (in ledgers) that must elapse between successive
+    /// slashes of the same provider. Defaults to 100 ledgers (~8 minutes on
+    /// Stellar mainnet) when never configured.
+    pub fn set_slash_cooldown(env: Env, ledgers: u32) -> Result<(), StakeVaultError> {
+        if multisig::get_config(&env).is_some() {
+            return Err(StakeVaultError::RequiresMultisig);
+        }
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        // Sanity cap: max ~30 days worth of ledgers (5s/ledger on mainnet).
+        if ledgers > 518_400 {
+            return Err(StakeVaultError::InvalidSlashCooldown);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::SlashCooldownLedgers, &ledgers);
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "slash_cooldown_updated"),
+            ),
+            (ledgers,),
+        );
+        Ok(())
+    }
+
+    /// Returns the configured slash cooldown in ledgers (defaults to 100).
+    pub fn get_slash_cooldown(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::SlashCooldownLedgers)
+            .unwrap_or(100)
     }
 
     /// Provider: submit an appeal for a past slash, attaching off-chain evidence.

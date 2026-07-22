@@ -2102,3 +2102,210 @@ mod slash_appeal_tests {
         assert_eq!(client.get_minimum_stake(), 1_000_000);
     }
 }
+
+// ── Issue #784: Slash cooldown ─────────────────────────────────────────────────
+mod slash_cooldown_tests {
+    use crate::{
+        migration::{MigrationKey, StakeInfoV2},
+        SlashSeverity, StakeVaultContract, StakeVaultContractClient, StakeVaultError,
+    };
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token::StellarAssetClient,
+        Address, Env, Map, Symbol,
+    };
+
+    fn sac_token(env: &Env, admin: &Address) -> Address {
+        env.register_stellar_asset_contract_v2(admin.clone())
+            .address()
+    }
+
+    fn seed(env: &Env, contract_id: &Address, staker: &Address, balance: i128) {
+        env.as_contract(contract_id, || {
+            let mut stakes: Map<Address, StakeInfoV2> = env
+                .storage()
+                .persistent()
+                .get(&MigrationKey::StakesV2)
+                .unwrap_or_else(|| Map::new(env));
+            stakes.set(
+                staker.clone(),
+                StakeInfoV2 {
+                    balance,
+                    locked_until: 0,
+                    last_updated: env.ledger().timestamp(),
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&MigrationKey::StakesV2, &stakes);
+        });
+    }
+
+    /// Convenience setup: returns (env, vault_id, token, admin, signal_registry).
+    fn setup() -> (Env, Address, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let signal_registry = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        StakeVaultContractClient::new(&env, &vault_id)
+            .initialize(&admin, &token, &signal_registry);
+        (env, vault_id, token, admin, signal_registry)
+    }
+
+    // ── set_slash_cooldown / get_slash_cooldown ─────────────────────────────────
+
+    #[test]
+    fn get_slash_cooldown_defaults_to_100_ledgers() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.get_slash_cooldown(), 100);
+    }
+
+    #[test]
+    fn set_slash_cooldown_persists_and_readable() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_slash_cooldown(&250u32);
+        assert_eq!(client.get_slash_cooldown(), 250);
+    }
+
+    #[test]
+    fn set_slash_cooldown_rejects_value_over_sanity_cap() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let result = client.try_set_slash_cooldown(&518_401u32);
+        assert_eq!(result, Err(Ok(StakeVaultError::InvalidSlashCooldown)));
+    }
+
+    #[test]
+    fn set_slash_cooldown_emits_event() {
+        use soroban_sdk::testutils::Events;
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let events_before = env.events().all().len();
+        client.set_slash_cooldown(&50u32);
+        assert!(
+            env.events().all().len() > events_before,
+            "slash_cooldown_updated event not emitted"
+        );
+    }
+
+    // ── slash_stake cooldown enforcement ────────────────────────────────────────
+
+    #[test]
+    fn slash_succeeds_when_no_prior_slash() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        env.ledger().with_mut(|l| l.sequence_number = 1_000);
+
+        let slashed = client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+        assert_eq!(slashed, 50_000); // 5% of 1_000_000
+
+        let record = client.get_slash_record(&0u64).unwrap();
+        assert_eq!(record.cooldown_expires_at, 1_100); // 1_000 + default 100
+    }
+
+    #[test]
+    fn second_slash_within_cooldown_is_rejected() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        env.ledger().with_mut(|l| l.sequence_number = 1_000);
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+
+        // Still within the default 100-ledger cooldown.
+        env.ledger().with_mut(|l| l.sequence_number = 1_099);
+        let result = client.try_slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation_2"),
+        );
+        assert_eq!(result, Err(Ok(StakeVaultError::SlashCooldownActive)));
+    }
+
+    #[test]
+    fn second_slash_after_cooldown_is_accepted() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+        seed(&env, &vault_id, &provider, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        env.ledger().with_mut(|l| l.sequence_number = 1_000);
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+
+        // Cooldown (100 ledgers) has fully elapsed.
+        env.ledger().with_mut(|l| l.sequence_number = 1_100);
+        let slashed = client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation_2"),
+        );
+        assert!(slashed > 0);
+
+        let record = client.get_slash_record(&1u64).unwrap();
+        assert_eq!(record.cooldown_expires_at, 1_200);
+    }
+
+    #[test]
+    fn different_providers_are_not_cross_blocked_by_cooldown() {
+        let (env, vault_id, token, _admin, signal_registry) = setup();
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+        let amount: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &(amount * 2));
+        seed(&env, &vault_id, &provider_a, amount);
+        seed(&env, &vault_id, &provider_b, amount);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        env.ledger().with_mut(|l| l.sequence_number = 1_000);
+        client.slash_stake(
+            &signal_registry,
+            &provider_a,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+
+        // Same ledger, different provider — cooldown is per-provider, must succeed.
+        let slashed_b = client.slash_stake(
+            &signal_registry,
+            &provider_b,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+        assert!(slashed_b > 0);
+    }
+}
