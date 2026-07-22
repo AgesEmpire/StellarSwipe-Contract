@@ -133,6 +133,7 @@ where
     // Cancel if signal expired.
     if plan.signal_expiry_ledger > 0 && current_ledger >= plan.signal_expiry_ledger {
         let intervals_completed = plan.total_intervals - plan.remaining_intervals;
+        let refund_amount = plan.remaining_intervals as i128 * plan.amount_per_interval;
         remove_plan(env, user, signal_id);
         shared::events::emit_dca_plan_cancelled(
             env,
@@ -142,6 +143,7 @@ where
                 signal_id,
                 intervals_completed,
                 reason: 0, // signal_expired
+                refund_amount,
             },
         );
         return Err(ContractError::SignalExpired);
@@ -192,9 +194,31 @@ where
 }
 
 /// Manually cancel a DCA plan. Only the plan owner may cancel.
-pub fn cancel_dca_plan(env: &Env, user: &Address, signal_id: u64) -> Result<(), ContractError> {
+///
+/// Refunds the value of any unexecuted intervals (Issue #790):
+/// `remaining_intervals * amount_per_interval`. The `dca` module has no
+/// direct token-contract dependency (plans are tracked at the signal level,
+/// same as `execute_dca_interval`), so the actual transfer is delegated to
+/// `refund_fn`, which the caller supplies. `refund_fn` is only invoked when
+/// there is a nonzero amount to refund (e.g. cancelling after all intervals
+/// have executed is a no-op transfer).
+pub fn cancel_dca_plan<F>(
+    env: &Env,
+    user: &Address,
+    signal_id: u64,
+    refund_fn: F,
+) -> Result<(), ContractError>
+where
+    F: FnOnce(i128) -> Result<(), ContractError>,
+{
     let plan = load_plan(env, user, signal_id)?;
     let intervals_completed = plan.total_intervals - plan.remaining_intervals;
+    let refund_amount = plan.remaining_intervals as i128 * plan.amount_per_interval;
+
+    if refund_amount > 0 {
+        refund_fn(refund_amount)?;
+    }
+
     remove_plan(env, user, signal_id);
 
     shared::events::emit_dca_plan_cancelled(
@@ -205,6 +229,7 @@ pub fn cancel_dca_plan(env: &Env, user: &Address, signal_id: u64) -> Result<(), 
             signal_id,
             intervals_completed,
             reason: 1, // manual
+            refund_amount,
         },
     );
     Ok(())

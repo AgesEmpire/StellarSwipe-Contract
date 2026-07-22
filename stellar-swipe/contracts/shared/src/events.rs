@@ -395,6 +395,11 @@ pub struct EvtDCAPlanCancelled {
     pub signal_id: u64,
     pub intervals_completed: u32,
     pub reason: u32, // 0 = signal_expired, 1 = manual
+    /// Value of the unexecuted intervals (`remaining_intervals * amount_per_interval`)
+    /// at cancellation time (Issue #790). Only actually returned to the user when
+    /// cancelled via `cancel_dca_plan`, which invokes a caller-supplied refund
+    /// callback with this amount.
+    pub refund_amount: i128,
 }
 
 pub fn emit_dca_interval_executed(env: &Env, evt: EvtDCAIntervalExecuted) {

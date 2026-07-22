@@ -165,8 +165,14 @@ fn manual_cancellation_emits_cancelled_reason_1() {
         // Execute one interval.
         dca::execute_dca_interval(&env, &user, 99, ok_exec).unwrap();
 
-        // Manual cancel.
-        dca::cancel_dca_plan(&env, &user, 99).unwrap();
+        // Manual cancel. 4 of 5 intervals remain at 100 each == 400 refund.
+        let mut refunded = None;
+        dca::cancel_dca_plan(&env, &user, 99, |amount| {
+            refunded = Some(amount);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(refunded, Some(400));
 
         // Plan removed.
         assert_eq!(
@@ -181,6 +187,101 @@ fn manual_cancellation_emits_cancelled_reason_1() {
             soroban_sdk::TryFromVal::try_from_val(&env, &val).unwrap();
         assert_eq!(cancelled.reason, 1);
         assert_eq!(cancelled.intervals_completed, 1);
+        assert_eq!(cancelled.refund_amount, 400);
+    });
+}
+
+// ── Issue #790: proportional refund on cancellation ────────────────────────────
+
+#[test]
+fn cancel_with_zero_executions_refunds_full_amount() {
+    let (env, contract_id) = setup();
+    let user = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        set_ledger(&env, 0);
+        // 10-interval plan, 100 per interval, none executed yet.
+        dca::execute_dca_copy_trade(&env, &user, 10, 1000, 10, 5, 0).unwrap();
+
+        let mut refunded = None;
+        dca::cancel_dca_plan(&env, &user, 10, |amount| {
+            refunded = Some(amount);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(refunded, Some(1000));
+
+        let all = env.events().all();
+        let (_, _, val) = all.last().unwrap();
+        let cancelled: EvtDCAPlanCancelled =
+            soroban_sdk::TryFromVal::try_from_val(&env, &val).unwrap();
+        assert_eq!(cancelled.intervals_completed, 0);
+        assert_eq!(cancelled.refund_amount, 1000);
+    });
+}
+
+#[test]
+fn cancel_after_partial_execution_refunds_remaining_intervals_only() {
+    let (env, contract_id) = setup();
+    let user = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        set_ledger(&env, 0);
+        // 10-interval plan, 100 per interval.
+        dca::execute_dca_copy_trade(&env, &user, 11, 1000, 10, 5, 0).unwrap();
+
+        // Execute 3 of the 10 intervals.
+        for i in 0u32..3 {
+            set_ledger(&env, i * 5);
+            dca::execute_dca_interval(&env, &user, 11, ok_exec).unwrap();
+        }
+
+        // 7 intervals remain unexecuted: 7 * 100 = 700.
+        let mut refunded = None;
+        dca::cancel_dca_plan(&env, &user, 11, |amount| {
+            refunded = Some(amount);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(refunded, Some(700));
+
+        let all = env.events().all();
+        let (_, _, val) = all.last().unwrap();
+        let cancelled: EvtDCAPlanCancelled =
+            soroban_sdk::TryFromVal::try_from_val(&env, &val).unwrap();
+        assert_eq!(cancelled.intervals_completed, 3);
+        assert_eq!(cancelled.refund_amount, 700);
+    });
+}
+
+#[test]
+fn cancel_on_final_interval_after_full_execution_refunds_nothing() {
+    let (env, contract_id) = setup();
+    let user = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        set_ledger(&env, 0);
+        // 3-interval plan, 100 per interval — execute all of them.
+        dca::execute_dca_copy_trade(&env, &user, 12, 300, 3, 5, 0).unwrap();
+        for i in 0u32..3 {
+            set_ledger(&env, i * 5);
+            let done = dca::execute_dca_interval(&env, &user, 12, ok_exec).unwrap();
+            if i == 2 {
+                assert!(done);
+            }
+        }
+
+        // The plan is already removed by the final interval's own completion
+        // (see full_dca_completion_executes_all_intervals_and_emits_completed),
+        // so cancelling afterwards must report the plan as not found rather
+        // than double-refund.
+        let refund_fn_called = core::cell::Cell::new(false);
+        let result = dca::cancel_dca_plan(&env, &user, 12, |_amount| {
+            refund_fn_called.set(true);
+            Ok(())
+        });
+        assert_eq!(result, Err(ContractError::DCAPlanNotFound));
+        assert!(!refund_fn_called.get());
     });
 }
 
@@ -235,7 +336,7 @@ fn cancel_nonexistent_plan_returns_not_found() {
     let user = Address::generate(&env);
 
     env.as_contract(&contract_id, || {
-        let err = dca::cancel_dca_plan(&env, &user, 999).unwrap_err();
+        let err = dca::cancel_dca_plan(&env, &user, 999, ok_exec).unwrap_err();
         assert_eq!(err, ContractError::DCAPlanNotFound);
     });
 }
