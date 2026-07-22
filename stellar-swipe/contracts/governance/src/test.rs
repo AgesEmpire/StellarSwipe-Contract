@@ -15,7 +15,7 @@ use crate::{
     VoteType,
 };
 use soroban_sdk::testutils::{Address as _, Events, Ledger};
-use soroban_sdk::{symbol_short, Address, Bytes, Env, Map, String, Symbol, Vec};
+use soroban_sdk::{symbol_short, Address, Bytes, Env, Map, String, Symbol, TryFromVal, Vec};
 use stellar_swipe_common::Asset;
 
 const SUPPLY: i128 = 1_000_000_000;
@@ -79,6 +79,66 @@ fn fund_user(env: &Env, contract_id: &Address, user: &Address, amount: i128) {
     env.as_contract(contract_id, || {
         crate::add_balance(env, user, amount).unwrap();
     });
+}
+
+/// Creates, votes for, and finalizes a `Custom` proposal so it reaches
+/// `ProposalStatus::Executed`, then returns its id. Issue #795 requires admin
+/// entry points that claim to be DAO-approved (e.g. `approve_treasury_budget`,
+/// `override_committee_decision`, `dissolve_committee`) to reference a real
+/// executed proposal rather than trusting a caller-supplied integer.
+///
+/// Voting requires the ledger to advance past the voting period, so this
+/// temporarily moves `env.ledger().timestamp()` forward and restores it to
+/// its original value before returning, leaving the rest of the calling
+/// test's timestamp sequencing undisturbed.
+///
+/// Callable multiple times per test (e.g. to model re-approval by a second
+/// proposal): tops `community_rewards`' stake up to a fixed target instead of
+/// unconditionally re-staking, since `community_rewards`' 300M allocation
+/// would otherwise be exhausted after 2-3 calls.
+fn create_executed_proposal(
+    env: &Env,
+    client: &GovernanceContractClient<'_>,
+    recipients: &DistributionRecipients,
+) -> u64 {
+    let original_ts = env.ledger().timestamp();
+
+    // 120M clears the 10% quorum on its own (SUPPLY = 1B), so a single voter
+    // is sufficient.
+    let target_stake = 120_000_000i128;
+    let already_staked = client.staked_balance(&recipients.community_rewards);
+    if already_staked < target_stake {
+        client.stake(
+            &recipients.community_rewards,
+            &(target_stake - already_staked),
+        );
+    }
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::Custom(recipients.community_rewards.clone()),
+        &String::from_str(env, "Authorize admin action"),
+        &String::from_str(env, "Governance approval referenced by an admin call"),
+        &Bytes::from_array(env, &[0u8]),
+        &crate::proposals::ProposalCategory::General,
+        &false,
+    );
+
+    env.ledger().set_timestamp(original_ts + 70);
+    client.cast_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+
+    env.ledger().set_timestamp(original_ts + 8 * 86_400);
+    assert_eq!(
+        client.finalize_proposal(&proposal_id),
+        ProposalStatus::Succeeded
+    );
+
+    env.ledger().set_timestamp(original_ts);
+    proposal_id
 }
 
 #[test]
@@ -311,10 +371,11 @@ fn treasury_spend_updates_budget_balances_and_history() {
         &false,
     );
     // governance approval must exist before spending
+    let proposal_id = create_executed_proposal(&env, &client, &recipients);
     client.approve_treasury_budget(
         &admin,
         &String::from_str(&env, "operations"),
-        &114u64,
+        &proposal_id,
         &600i128,
     );
 
@@ -325,7 +386,7 @@ fn treasury_spend_updates_budget_balances_and_history() {
         &xlm,
         &String::from_str(&env, "operations"),
         &String::from_str(&env, "hosting"),
-        &Some(114u64),
+        &Some(proposal_id),
     );
 
     assert_eq!(spend.id, 1);
@@ -360,7 +421,13 @@ fn recurring_payments_reporting_and_rebalance_are_tracked() {
         &true,
     );
     // governance must approve before recurring payments can be scheduled or executed
-    client.approve_treasury_budget(&admin, &String::from_str(&env, "grants"), &1u64, &500i128);
+    let proposal_id = create_executed_proposal(&env, &client, &recipients);
+    client.approve_treasury_budget(
+        &admin,
+        &String::from_str(&env, "grants"),
+        &proposal_id,
+        &500i128,
+    );
     client.create_recurring_payment(
         &admin,
         &Address::generate(&env),
@@ -411,10 +478,11 @@ fn recurring_payment_is_paused_when_balance_is_insufficient() {
         &20u64,
         &true,
     );
+    let proposal_id = create_executed_proposal(&env, &client, &recipients);
     client.approve_treasury_budget(
         &admin,
         &String::from_str(&env, "operations"),
-        &2u64,
+        &proposal_id,
         &500i128,
     );
     client.create_recurring_payment(
@@ -471,10 +539,11 @@ fn committee_executes_delegated_treasury_spend_and_reports_metrics() {
         &true,
     );
     // governance must approve the "technical" budget cap before any spend
+    let budget_proposal_id = create_executed_proposal(&env, &client, &recipients);
     client.approve_treasury_budget(
         &admin,
         &String::from_str(&env, "technical"),
-        &1u64,
+        &budget_proposal_id,
         &20_000i128,
     );
 
@@ -763,8 +832,13 @@ fn committee_override_and_cross_committee_approval_are_tracked() {
     );
     assert_eq!(approved_request.status, CrossCommitteeStatus::Approved);
 
-    let overridden =
-        client.override_committee_decision(&admin, &approving_committee.id, &decision.decision_id);
+    let override_proposal_id = create_executed_proposal(&env, &client, &recipients);
+    let overridden = client.override_committee_decision(
+        &admin,
+        &approving_committee.id,
+        &decision.decision_id,
+        &override_proposal_id,
+    );
     assert_eq!(overridden.status, DecisionStatus::Overridden);
 
     let report = client.committee_report(&approving_committee.id);
@@ -789,6 +863,8 @@ fn governance_proposal_vote_finalize_and_execute() {
         &String::from_str(&env, "Adjust reward"),
         &String::from_str(&env, "Increase by 20%"),
         &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
     );
 
     env.ledger().set_timestamp(70);
@@ -838,6 +914,8 @@ fn timelock_queue_execute_and_cancel_flow() {
         &String::from_str(&env, "Enable feature"),
         &String::from_str(&env, "toggle"),
         &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
     );
 
     env.ledger().set_timestamp(70);
@@ -907,6 +985,8 @@ fn queue_underfunded_treasury_spend_action(
         &String::from_str(env, "Fund payout"),
         &String::from_str(env, "treasury spend"),
         &Bytes::new(env),
+        &crate::proposals::ProposalCategory::TreasuryTransfer,
+        &false,
     );
 
     env.ledger().set_timestamp(70);
@@ -1015,6 +1095,8 @@ fn governance_reputation_tracks_activity() {
         &String::from_str(&env, "Signal"),
         &String::from_str(&env, "Record governance sentiment"),
         &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
     );
 
     env.ledger().set_timestamp(70);
@@ -1088,6 +1170,8 @@ fn upgrade_announcement_event_emitted_on_contract_upgrade_proposal_success() {
         &String::from_str(&env, "Upgrade auto_trade contract"),
         &String::from_str(&env, "Deploy new version"),
         &migration_notes_hash,
+        &crate::proposals::ProposalCategory::ContractUpgrade,
+        &false,
     );
 
     env.ledger().set_timestamp(70);
@@ -1146,6 +1230,8 @@ fn reputation_tier_computed_correctly_from_participation() {
             &String::from_str(&env, "Proposal"),
             &String::from_str(&env, "desc"),
             &Bytes::new(&env),
+            &crate::proposals::ProposalCategory::General,
+            &false,
         );
     }
     // After 60 proposals, tier should be Silver (>=50 actions)
@@ -1170,6 +1256,8 @@ fn decay_applied_after_grace_period() {
         &String::from_str(&env, "Test"),
         &String::from_str(&env, "desc"),
         &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
     );
 
     env.ledger().set_timestamp(170);
@@ -1215,6 +1303,8 @@ fn no_decay_within_grace_period() {
         &String::from_str(&env, "Test"),
         &String::from_str(&env, "desc"),
         &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
     );
 
     let rep_before = client.governance_reputation(&user);
@@ -1248,6 +1338,8 @@ fn staleness_level_detected_correctly() {
         &String::from_str(&env, "Test"),
         &String::from_str(&env, "desc"),
         &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
     );
 
     // Still Active within 30 days
@@ -1288,6 +1380,8 @@ fn refresh_stale_reputation_recalculates_score() {
         &String::from_str(&env, "Test"),
         &String::from_str(&env, "desc"),
         &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
     );
 
     // Go 100 days into the future - reputation should be decayed
@@ -1859,7 +1953,8 @@ fn spend_exceeding_approved_cap_is_rejected() {
         &false,
     );
     // Governance approves only 200 out of 500 allocated
-    client.approve_treasury_budget(&admin, &String::from_str(&env, "ops"), &10u64, &200i128);
+    let proposal_id = create_executed_proposal(&env, &client, &recipients);
+    client.approve_treasury_budget(&admin, &String::from_str(&env, "ops"), &proposal_id, &200i128);
 
     // First draw of 150 succeeds (drawn: 150 ≤ cap 200)
     client.execute_treasury_spend(
@@ -1869,7 +1964,7 @@ fn spend_exceeding_approved_cap_is_rejected() {
         &xlm,
         &String::from_str(&env, "ops"),
         &String::from_str(&env, "hosting"),
-        &Some(10u64),
+        &Some(proposal_id),
     );
 
     // Second draw of 100 would push drawn to 250 > cap 200
@@ -1880,7 +1975,7 @@ fn spend_exceeding_approved_cap_is_rejected() {
         &xlm,
         &String::from_str(&env, "ops"),
         &String::from_str(&env, "extra"),
-        &Some(10u64),
+        &Some(proposal_id),
     );
     assert_eq!(result, Err(Ok(GovernanceError::ApprovedCapExceeded)));
 }
@@ -1902,10 +1997,11 @@ fn approve_cap_exceeding_allocated_is_rejected() {
         &false,
     );
 
+    let proposal_id = create_executed_proposal(&env, &client, &recipients);
     let result = client.try_approve_treasury_budget(
         &admin,
         &String::from_str(&env, "ops"),
-        &5u64,
+        &proposal_id,
         &500i128, // 500 > allocated 200
     );
     assert_eq!(result, Err(Ok(GovernanceError::BudgetExceeded)));
@@ -1930,7 +2026,13 @@ fn re_approval_resets_drawn_and_allows_new_spending() {
         &100u64,
         &false,
     );
-    client.approve_treasury_budget(&admin, &String::from_str(&env, "ops"), &20u64, &300i128);
+    let first_proposal_id = create_executed_proposal(&env, &client, &recipients);
+    client.approve_treasury_budget(
+        &admin,
+        &String::from_str(&env, "ops"),
+        &first_proposal_id,
+        &300i128,
+    );
 
     // Draw down to the cap
     client.execute_treasury_spend(
@@ -1940,7 +2042,7 @@ fn re_approval_resets_drawn_and_allows_new_spending() {
         &xlm,
         &String::from_str(&env, "ops"),
         &String::from_str(&env, "batch"),
-        &Some(20u64),
+        &Some(first_proposal_id),
     );
 
     // Any further spend is rejected
@@ -1951,12 +2053,18 @@ fn re_approval_resets_drawn_and_allows_new_spending() {
         &xlm,
         &String::from_str(&env, "ops"),
         &String::from_str(&env, "over"),
-        &Some(20u64),
+        &Some(first_proposal_id),
     );
     assert_eq!(rejected, Err(Ok(GovernanceError::ApprovedCapExceeded)));
 
     // New governance proposal approves another 150
-    client.approve_treasury_budget(&admin, &String::from_str(&env, "ops"), &21u64, &150i128);
+    let second_proposal_id = create_executed_proposal(&env, &client, &recipients);
+    client.approve_treasury_budget(
+        &admin,
+        &String::from_str(&env, "ops"),
+        &second_proposal_id,
+        &150i128,
+    );
 
     // Spending is now allowed again
     let spend = client.execute_treasury_spend(
@@ -1966,7 +2074,7 @@ fn re_approval_resets_drawn_and_allows_new_spending() {
         &xlm,
         &String::from_str(&env, "ops"),
         &String::from_str(&env, "renewed"),
-        &Some(21u64),
+        &Some(second_proposal_id),
     );
     assert_eq!(spend.amount, 100);
 
@@ -1975,7 +2083,7 @@ fn re_approval_resets_drawn_and_allows_new_spending() {
         .approved_budgets
         .get(String::from_str(&env, "ops"))
         .unwrap();
-    assert_eq!(approval.proposal_id, 21);
+    assert_eq!(approval.proposal_id, second_proposal_id);
     assert_eq!(approval.total_drawn, 100);
 }
 
@@ -1986,10 +2094,11 @@ fn approve_nonexistent_budget_is_rejected() {
     let client = client(&env, &contract_id);
     initialize(&client, &env, &admin, &recipients);
 
+    let proposal_id = create_executed_proposal(&env, &client, &recipients);
     let result = client.try_approve_treasury_budget(
         &admin,
         &String::from_str(&env, "ghost"),
-        &99u64,
+        &proposal_id,
         &100i128,
     );
     assert_eq!(result, Err(Ok(GovernanceError::BudgetNotFound)));
@@ -2014,7 +2123,13 @@ fn recurring_payment_paused_when_approved_cap_exhausted() {
         &100u64,
         &true,
     );
-    client.approve_treasury_budget(&admin, &String::from_str(&env, "grants"), &30u64, &150i128);
+    let proposal_id = create_executed_proposal(&env, &client, &recipients);
+    client.approve_treasury_budget(
+        &admin,
+        &String::from_str(&env, "grants"),
+        &proposal_id,
+        &150i128,
+    );
     client.create_recurring_payment(
         &admin,
         &Address::generate(&env),
@@ -2064,6 +2179,157 @@ fn non_admin_cannot_approve_budget() {
         &100i128,
     );
     assert_eq!(result, Err(Ok(GovernanceError::Unauthorized)));
+}
+
+// ── Timelock bypass audit tests (issue #795) ─────────────────────────────
+//
+// `approve_treasury_budget`, `override_committee_decision`, and
+// `dissolve_committee` all accept a `proposal_id` that is meant to prove a
+// DAO vote authorized the action. These tests confirm the proposal is now
+// actually verified rather than trusted at face value.
+
+/// `approve_treasury_budget` rejects a `proposal_id` that was never created.
+#[test]
+fn approve_treasury_budget_rejects_nonexistent_proposal() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.create_budget(
+        &admin,
+        &String::from_str(&env, "ops"),
+        &500i128,
+        &500i128,
+        &0u64,
+        &100u64,
+        &false,
+    );
+
+    let result = client.try_approve_treasury_budget(
+        &admin,
+        &String::from_str(&env, "ops"),
+        &999u64,
+        &100i128,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::ProposalNotFound)));
+}
+
+/// `approve_treasury_budget` rejects a proposal that exists but has not yet
+/// been executed (e.g. still open for voting) — an admin cannot front-run
+/// the timelock by referencing a proposal that hasn't actually passed.
+#[test]
+fn approve_treasury_budget_rejects_unexecuted_proposal() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.create_budget(
+        &admin,
+        &String::from_str(&env, "ops"),
+        &500i128,
+        &500i128,
+        &0u64,
+        &100u64,
+        &false,
+    );
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+    let pending_proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::Custom(recipients.community_rewards.clone()),
+        &String::from_str(&env, "Still voting"),
+        &String::from_str(&env, "Not yet decided"),
+        &Bytes::from_array(&env, &[0u8]),
+        &crate::proposals::ProposalCategory::General,
+        &false,
+    );
+
+    let result = client.try_approve_treasury_budget(
+        &admin,
+        &String::from_str(&env, "ops"),
+        &pending_proposal_id,
+        &100i128,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::ProposalNotExecuted)));
+}
+
+/// `override_committee_decision` requires an executed governance proposal —
+/// admin authority alone is not enough to overturn a committee vote.
+#[test]
+fn override_committee_decision_rejects_unexecuted_proposal() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let committee_members = members(&env, 3);
+    let chair = committee_members.get(0).unwrap();
+    let committee = client.create_committee(
+        &admin,
+        &String::from_str(&env, "Ops Committee"),
+        &String::from_str(&env, "General operations"),
+        &committee_members,
+        &chair,
+        &3u32,
+        &soroban_sdk::vec![
+            &env,
+            Authority::EmergencyAction(EmergencyActionAuthority {
+                action_types: soroban_sdk::vec![&env, String::from_str(&env, "incident")]
+            })
+        ],
+        &Some(30u32),
+    );
+    let decision = client.propose_committee_decision(
+        &committee.id,
+        &chair,
+        &String::from_str(&env, "Respond to incident"),
+        &CommitteeAction::EmergencyAction(EmergencyActionPayload {
+            action_type: String::from_str(&env, "incident"),
+            details: String::from_str(&env, "rollback"),
+        }),
+    );
+
+    let result = client.try_override_committee_decision(
+        &admin,
+        &committee.id,
+        &decision.decision_id,
+        &999u64,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::ProposalNotFound)));
+}
+
+/// `dissolve_committee` requires an executed governance proposal and, once
+/// one is supplied, dissolves the committee as before.
+#[test]
+fn dissolve_committee_requires_executed_proposal() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let committee_members = members(&env, 3);
+    let chair = committee_members.get(0).unwrap();
+    let committee = client.create_committee(
+        &admin,
+        &String::from_str(&env, "Temporary Committee"),
+        &String::from_str(&env, "Short-lived working group"),
+        &committee_members,
+        &chair,
+        &3u32,
+        &soroban_sdk::vec![
+            &env,
+            Authority::EmergencyAction(EmergencyActionAuthority {
+                action_types: soroban_sdk::vec![&env, String::from_str(&env, "incident")]
+            })
+        ],
+        &Some(30u32),
+    );
+
+    let rejected = client.try_dissolve_committee(&admin, &committee.id, &999u64);
+    assert_eq!(rejected, Err(Ok(GovernanceError::ProposalNotFound)));
+
+    let proposal_id = create_executed_proposal(&env, &client, &recipients);
+    let dissolved = client.dissolve_committee(&admin, &committee.id, &proposal_id);
+    assert!(!dissolved.active);
+    assert!(dissolved.dissolved_at.is_some());
 }
 
 // ── Conviction Calibration tests ─────────────────────────────────────
@@ -2361,6 +2627,8 @@ fn voting_power_uses_snapshot_not_live_balance() {
             "Voting power must be snapshotted at proposal creation",
         ),
         &Bytes::new(&env),
+        &crate::proposals::ProposalCategory::General,
+        &false,
     );
 
     // late_staker stakes AFTER proposal creation — should not gain voting power on this proposal
