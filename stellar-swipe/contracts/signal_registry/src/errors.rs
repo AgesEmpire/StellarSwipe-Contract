@@ -239,6 +239,27 @@ pub enum SubmissionError {
     PriceUnreasonable = 1207,
 }
 
+/// Errors returned by signal input validation (issue #634).
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum SignalValidationError {
+    /// Asset pair is empty or malformed.
+    InvalidAssetPair = 1400,
+    /// Price must be greater than zero.
+    InvalidPrice = 1401,
+    /// Rationale is empty.
+    EmptyRationale = 1402,
+    /// Rationale exceeds the maximum allowed length.
+    RationaleTooLong = 1403,
+    /// Expiry is in the past.
+    InvalidExpiry = 1404,
+    /// Too many tags supplied (max 10).
+    TooManyTags = 1405,
+    /// Provider has exceeded the daily signal creation limit (issue #778).
+    DailyLimitExceeded = 1406,
+}
+
 /// Errors returned by `cancel_signal` (issue #687).
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]

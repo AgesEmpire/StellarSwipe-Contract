@@ -1403,6 +1403,66 @@ fn test_claim_fees_arg_scoped_auth_passes_for_correct_args() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #633: fee calculation performance / optimization tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fee_and_burn_amounts_basic() {
+    // fee = 1_000_000 * 30 / 10_000 = 3_000
+    // burn = 3_000 * 1_000 / 10_000 = 300
+    let (fee, burn) = crate::fee_and_burn_amounts(1_000_000, 30, 1_000).unwrap();
+    assert_eq!(fee, 3_000);
+    assert_eq!(burn, 300);
+}
+
+#[test]
+fn test_fee_and_burn_amounts_zero_burn() {
+    let (fee, burn) = crate::fee_and_burn_amounts(1_000_000, 30, 0).unwrap();
+    assert_eq!(fee, 3_000);
+    assert_eq!(burn, 0);
+}
+
+#[test]
+fn test_fee_and_burn_amounts_full_burn() {
+    let (fee, burn) = crate::fee_and_burn_amounts(1_000_000, 30, 10_000).unwrap();
+    assert_eq!(fee, 3_000);
+    assert_eq!(burn, 3_000); // 100% burn
+}
+
+#[test]
+fn test_fee_and_burn_amounts_overflow_returns_none() {
+    assert!(crate::fee_and_burn_amounts(i128::MAX, 30, 1_000).is_none());
+}
+
+#[test]
+fn test_fee_and_burn_conservation()
+{
+    // burn + distributable must always equal fee exactly (no dust)
+    let cases: &[(i128, u32, u32)] = &[
+        (777_777, 30, 3_333),
+        (9_999, 30, 1_000),
+        (10_000_000, 100, 10_000),
+        (1, 1, 0),
+    ];
+    for &(amount, fee_bps, burn_bps) in cases {
+        if let Some((fee, burn)) = crate::fee_and_burn_amounts(amount, fee_bps, burn_bps) {
+            let distributable = fee - burn;
+            assert_eq!(burn + distributable, fee, "conservation failed for amount={amount}");
+        }
+    }
+}
+
+#[test]
+fn test_fee_amount_floor_matches_fee_and_burn_fee_component() {
+    // fee_and_burn_amounts fee component must equal fee_amount_floor
+    let amount = 500_000i128;
+    let rate = 30u32;
+    let expected = crate::fee_amount_floor(amount, rate).unwrap();
+    let (fee, _) = crate::fee_and_burn_amounts(amount, rate, 1_000).unwrap();
+    assert_eq!(fee, expected);
+}
+
+// ---------------------------------------------------------------------------
 // Congestion-Based Dynamic Fees
 // ---------------------------------------------------------------------------
 

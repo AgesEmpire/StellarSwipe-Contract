@@ -74,6 +74,23 @@ pub fn fee_amount_floor(trade_amount: i128, fee_rate_bps: u32) -> Option<i128> {
         .checked_div(10_000)
 }
 
+/// Compute fee and burn amounts in a single pass, avoiding a second multiply
+/// (issue #633 — reduce computation steps on the hot path).
+///
+/// Returns `(fee_amount, burn_amount)` or `None` on overflow.
+/// `burn_amount = floor(fee_amount * burn_rate_bps / 10_000)`
+pub fn fee_and_burn_amounts(
+    trade_amount: i128,
+    fee_rate_bps: u32,
+    burn_rate_bps: u32,
+) -> Option<(i128, i128)> {
+    let fee = fee_amount_floor(trade_amount, fee_rate_bps)?;
+    let burn = fee
+        .checked_mul(burn_rate_bps as i128)?
+        .checked_div(10_000)?;
+    Some((fee, burn))
+}
+
 /// Maximum fee collections per `batch_collect_fees` call.
 pub const MAX_BATCH_FEE_SIZE: u32 = 20;
 
@@ -763,8 +780,12 @@ impl FeeCollector {
         let fee_cache = fee_cache::load_tx_fee_config(&env);
         let base_rate = rebates::get_fee_rate_for_user(&env, &trader);
         let fee_rate = fee_cache::effective_fee_rate_cached(&env, base_rate, &token, &fee_cache);
-        let fee_amount =
-            fee_amount_floor(trade_amount, fee_rate).ok_or(ContractError::ArithmeticOverflow)?;
+
+        // Compute fee and burn in one pass (issue #633 — fewer multiply operations)
+        let burn_rate = fee_cache.burn_rate;
+        let (fee_amount, burn_amount) =
+            fee_and_burn_amounts(trade_amount, fee_rate, burn_rate)
+                .ok_or(ContractError::ArithmeticOverflow)?;
 
         if fee_amount <= 0 {
             return Err(ContractError::FeeRoundedToZero);
@@ -773,11 +794,6 @@ impl FeeCollector {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&trader, &env.current_contract_address(), &fee_amount);
 
-        let burn_rate = fee_cache.burn_rate;
-        let burn_amount = fee_amount
-            .checked_mul(burn_rate as i128)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(ContractError::ArithmeticOverflow)?;
         let distributable = fee_amount
             .checked_sub(burn_amount)
             .ok_or(ContractError::ArithmeticOverflow)?;
