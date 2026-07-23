@@ -85,6 +85,12 @@ pub enum StorageKey {
     DeadLetterTrade(u64),
     /// Per-user index of dead-lettered trade IDs.
     DeadLetterIds(Address),
+    /// Global index of all dead-lettered trade IDs across every user, used by
+    /// `prune_dead_letter_queue` when sweeping without a `user` filter.
+    DeadLetterAllIds,
+    /// Retention window (in ledgers) after which a dead-lettered trade becomes
+    /// eligible for removal via `prune_dead_letter_queue`.
+    DeadLetterRetentionLedgers,
     /// Priority-lane configuration (PriorityConfig).
     PriorityConfig,
     /// The most recent trade order awaiting confirmation-depth finalization.
@@ -130,6 +136,10 @@ pub const DEFAULT_GRACE_PERIOD_LEDGERS: u32 = 10;
 /// Default maximum execution attempts before a trade is dead-lettered (3 attempts total).
 pub const DEFAULT_MAX_RETRY_COUNT: u32 = 3;
 
+/// Default dead-letter retention window: ~30 days at 5s/ledger
+/// (30 * 24 * 60 * 60 / 5 = 518_400 ledgers).
+pub const DEFAULT_DEAD_LETTER_RETENTION_LEDGERS: u32 = 518_400;
+
 /// A trade that has exhausted all retry attempts and been moved to the dead-letter queue.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,6 +166,15 @@ pub struct TradeDeadLettered {
     pub user: Address,
     pub failure_code: u32,
     pub retry_count: u32,
+}
+
+/// Event emitted when a dead-lettered trade is removed by `prune_dead_letter_queue`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeadLetterPruned {
+    pub user: Address,
+    pub trade_id: u64,
+    pub reason: String,
 }
 
 /// A single trade input for [`TradeExecutorContract::batch_execute`].
@@ -807,6 +826,7 @@ fn dead_letter_trade_internal(env: &Env, trade: &QueuedTrade, failure_code: u32)
     env.storage()
         .instance()
         .set(&StorageKey::DeadLetterIds(trade.user.clone()), &ids);
+    add_dead_letter_index(env, trade.queued_trade_id);
 
     env.events().publish(
         (
@@ -818,6 +838,83 @@ fn dead_letter_trade_internal(env: &Env, trade: &QueuedTrade, failure_code: u32)
             user: trade.user.clone(),
             failure_code,
             retry_count: trade.retry_count.saturating_add(1),
+        },
+    );
+}
+
+/// Return the configured dead-letter retention window in ledgers
+/// (defaults to [`DEFAULT_DEAD_LETTER_RETENTION_LEDGERS`]).
+fn effective_dead_letter_retention(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::DeadLetterRetentionLedgers)
+        .unwrap_or(DEFAULT_DEAD_LETTER_RETENTION_LEDGERS)
+}
+
+/// Add `id` to the global index of all dead-lettered trade IDs.
+fn add_dead_letter_index(env: &Env, id: u64) {
+    let mut all: Vec<u64> = env
+        .storage()
+        .instance()
+        .get(&StorageKey::DeadLetterAllIds)
+        .unwrap_or_else(|| Vec::new(env));
+    all.push_back(id);
+    env.storage()
+        .instance()
+        .set(&StorageKey::DeadLetterAllIds, &all);
+}
+
+/// Remove `id` from the global index of all dead-lettered trade IDs.
+fn remove_dead_letter_index(env: &Env, id: u64) {
+    let mut all: Vec<u64> = env
+        .storage()
+        .instance()
+        .get(&StorageKey::DeadLetterAllIds)
+        .unwrap_or_else(|| Vec::new(env));
+    let mut i = 0;
+    while i < all.len() {
+        if all.get(i).unwrap() == id {
+            all.remove(i);
+            break;
+        }
+        i += 1;
+    }
+    env.storage()
+        .instance()
+        .set(&StorageKey::DeadLetterAllIds, &all);
+}
+
+/// Remove `id` from `user`'s per-user dead-letter index.
+fn remove_dead_letter_id(env: &Env, user: &Address, id: u64) {
+    let mut ids: Vec<u64> = env
+        .storage()
+        .instance()
+        .get(&StorageKey::DeadLetterIds(user.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    let mut i = 0;
+    while i < ids.len() {
+        if ids.get(i).unwrap() == id {
+            ids.remove(i);
+            break;
+        }
+        i += 1;
+    }
+    env.storage()
+        .instance()
+        .set(&StorageKey::DeadLetterIds(user.clone()), &ids);
+}
+
+/// Emit a `dead_letter_pruned` event for a single removed entry.
+fn emit_dead_letter_pruned(env: &Env, user: Address, trade_id: u64) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "dead_letter_pruned"),
+        ),
+        DeadLetterPruned {
+            user,
+            trade_id,
+            reason: String::from_str(env, "retention_expired"),
         },
     );
 }
@@ -2024,22 +2121,8 @@ impl TradeExecutorContract {
         env.storage()
             .instance()
             .remove(&StorageKey::DeadLetterTrade(trade_id));
-        let mut dl_ids: Vec<u64> = env
-            .storage()
-            .instance()
-            .get(&StorageKey::DeadLetterIds(failed.user.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut i = 0;
-        while i < dl_ids.len() {
-            if dl_ids.get(i).unwrap() == trade_id {
-                dl_ids.remove(i);
-                break;
-            }
-            i += 1;
-        }
-        env.storage()
-            .instance()
-            .set(&StorageKey::DeadLetterIds(failed.user.clone()), &dl_ids);
+        remove_dead_letter_id(&env, &failed.user, trade_id);
+        remove_dead_letter_index(&env, trade_id);
 
         // Re-queue with a fresh retry_count.
         let trade = QueuedTrade {
@@ -2067,23 +2150,83 @@ impl TradeExecutorContract {
         env.storage()
             .instance()
             .remove(&StorageKey::DeadLetterTrade(trade_id));
-        let mut dl_ids: Vec<u64> = env
-            .storage()
+        remove_dead_letter_id(&env, &failed.user, trade_id);
+        remove_dead_letter_index(&env, trade_id);
+        Ok(())
+    }
+
+    /// Admin: configure the dead-letter retention window (in ledgers) used by
+    /// `prune_dead_letter_queue`. Default is
+    /// [`DEFAULT_DEAD_LETTER_RETENTION_LEDGERS`] (~30 days at 5s/ledger).
+    pub fn set_dead_letter_retention(env: Env, ledgers: u32) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        env.storage()
             .instance()
-            .get(&StorageKey::DeadLetterIds(failed.user.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
+            .set(&StorageKey::DeadLetterRetentionLedgers, &ledgers);
+        Ok(())
+    }
+
+    /// Return the configured dead-letter retention window in ledgers.
+    pub fn get_dead_letter_retention(env: Env) -> u32 {
+        effective_dead_letter_retention(&env)
+    }
+
+    /// Admin: prune dead-lettered trades older than the configured retention
+    /// window (see [`Self::set_dead_letter_retention`]).
+    ///
+    /// When `user` is `Some`, only that user's dead-letter queue is scanned;
+    /// when `None`, every dead-lettered trade across all users is scanned.
+    /// At most `max_entries` stale entries are removed per call, bounding the
+    /// resource cost of a single invocation — callers sweeping a larger
+    /// backlog should call this repeatedly.
+    ///
+    /// Emits `dead_letter_pruned` for each entry removed. Returns the count removed.
+    pub fn prune_dead_letter_queue(
+        env: Env,
+        user: Option<Address>,
+        max_entries: u32,
+    ) -> Result<u32, ContractError> {
+        require_admin(&env)?;
+
+        let retention = effective_dead_letter_retention(&env);
+        let current_ledger = env.ledger().sequence();
+
+        let ids: Vec<u64> = match &user {
+            Some(u) => env
+                .storage()
+                .instance()
+                .get(&StorageKey::DeadLetterIds(u.clone()))
+                .unwrap_or_else(|| Vec::new(&env)),
+            None => env
+                .storage()
+                .instance()
+                .get(&StorageKey::DeadLetterAllIds)
+                .unwrap_or_else(|| Vec::new(&env)),
+        };
+
+        let mut removed: u32 = 0;
         let mut i = 0;
-        while i < dl_ids.len() {
-            if dl_ids.get(i).unwrap() == trade_id {
-                dl_ids.remove(i);
-                break;
+        while i < ids.len() && removed < max_entries {
+            let id = ids.get(i).unwrap();
+            if let Some(failed) = env
+                .storage()
+                .instance()
+                .get::<_, FailedTrade>(&StorageKey::DeadLetterTrade(id))
+            {
+                if current_ledger.saturating_sub(failed.dead_lettered_at_ledger) >= retention {
+                    env.storage()
+                        .instance()
+                        .remove(&StorageKey::DeadLetterTrade(id));
+                    remove_dead_letter_id(&env, &failed.user, id);
+                    remove_dead_letter_index(&env, id);
+                    emit_dead_letter_pruned(&env, failed.user.clone(), id);
+                    removed = removed.saturating_add(1);
+                }
             }
             i += 1;
         }
-        env.storage()
-            .instance()
-            .set(&StorageKey::DeadLetterIds(failed.user.clone()), &dl_ids);
-        Ok(())
+
+        Ok(removed)
     }
 
     // ── Feature flag registry ─────────────────────────────────────────────────
