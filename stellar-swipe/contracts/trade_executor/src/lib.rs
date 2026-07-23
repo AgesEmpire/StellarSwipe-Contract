@@ -24,7 +24,9 @@ use soroban_sdk::{
     Val, Vec,
 };
 
-use stellar_swipe_common::replay_protection::verify_and_commit;
+use stellar_swipe_common::replay_protection::{
+    purge_expired_nonces as replay_purge_expired_nonces, verify_and_commit, ReplayError,
+};
 use triggers::{ORACLE_KEY, PORTFOLIO_KEY};
 use wire::TRADE_TIMEOUT_LEDGERS;
 
@@ -294,6 +296,17 @@ fn effective_estimated_fee(env: &Env) -> i128 {
 fn require_admin(env: &Env) -> Result<Address, ContractError> {
     oracle::require_admin(env)
 }
+
+/// Map a low-level [`ReplayError`] onto the contract's public error surface so
+/// callers can distinguish "already used" from "expired" (Issue: nonce replay
+/// attack prevention audit).
+fn map_replay_error(err: ReplayError) -> ContractError {
+    match err {
+        ReplayError::Expired => ContractError::TradeExpired,
+        ReplayError::InvalidNonce | ReplayError::DuplicateTx => ContractError::NonceAlreadyUsed,
+    }
+}
+
 fn get_confirmation_depth(env: &Env) -> u32 {
     env.storage()
         .instance()
@@ -1229,7 +1242,7 @@ impl TradeExecutorContract {
         expiry_ts: u64,
     ) -> Result<(), ContractError> {
         verify_and_commit(&env, &user, nonce, tx_hash, expiry_ts)
-            .map_err(|_| ContractError::ReplayDetected)?;
+            .map_err(map_replay_error)?;
         feature_flags::require_feature_enabled(&env, feature_flags::FEAT_COPY_TRADE)?;
         match order_type {
             OrderType::Market => {
@@ -1276,6 +1289,18 @@ impl TradeExecutorContract {
                 Ok(())
             }
         }
+    }
+
+    /// Admin/keeper maintenance call: reclaim persistent storage held by
+    /// replay-protection tx-hash entries that are past their `expiry_ts`.
+    ///
+    /// Scans at most `max` entries from the front of the internal purge queue and
+    /// removes the ones that are objectively expired, so it can never break the
+    /// replay guarantee for a still-valid nonce/tx_hash. Returns the number of
+    /// entries removed. See the nonce replay attack prevention audit.
+    pub fn purge_expired_nonces(env: Env, max: u32) -> Result<u32, ContractError> {
+        require_admin(&env)?;
+        Ok(replay_purge_expired_nonces(&env, max))
     }
 
     // ── SDEX router configuration ─────────────────────────────────────────────
@@ -1719,7 +1744,7 @@ impl TradeExecutorContract {
         replay: ReplayParams,
     ) -> Result<(), ContractError> {
         verify_and_commit(&env, &user, replay.nonce, replay.tx_hash, replay.expiry_ts)
-            .map_err(|_| ContractError::ReplayDetected)?;
+            .map_err(map_replay_error)?;
         caller.require_auth();
         if caller != user {
             return Err(ContractError::Unauthorized);

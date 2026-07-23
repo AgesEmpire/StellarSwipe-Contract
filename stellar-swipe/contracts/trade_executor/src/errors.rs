@@ -71,6 +71,14 @@ pub enum ContractError {
     ConfirmationDepthNotReached = 30,
     /// The user already holds the maximum number of concurrent open positions.
     TooManyOpenPositions = 31,
+    /// The submitted nonce has already been committed (replay of a previously
+    /// executed or currently in-flight trade). See the replay-protection audit
+    /// (Issue: nonce replay attack prevention).
+    NonceAlreadyUsed = 32,
+    /// The trade's `expiry_ts` has passed; the replay-protection window for this
+    /// nonce/tx_hash has closed. See the replay-protection audit
+    /// (Issue: nonce replay attack prevention).
+    TradeExpired = 33,
 }
 
 /// Populated when [`ContractError::InsufficientLiquidity`] is returned.

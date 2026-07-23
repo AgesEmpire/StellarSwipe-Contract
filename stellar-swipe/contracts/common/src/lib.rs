@@ -75,7 +75,10 @@ pub use rate_limit::{
     check_rate_limit, record_action, set_config as set_rate_limit_config, ActionType,
     RateLimitConfig, RateLimitError,
 };
-pub use replay_protection::{current_nonce, verify_and_commit, ReplayError};
+pub use replay_protection::{
+    current_nonce, purge_expired_nonces, verify_and_commit, PendingNonceRecord, ReplayError,
+    ReplayKey,
+};
 pub use retry_backoff::{
     has_remaining_attempts, next_retry_state, should_retry, RetryConfig, RetryState,
 };

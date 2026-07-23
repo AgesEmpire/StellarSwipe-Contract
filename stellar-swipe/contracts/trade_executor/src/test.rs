@@ -1186,7 +1186,7 @@ fn cancel_copy_trade_replay_nonce_rejected() {
             },
         )
     });
-    assert_eq!(err, Err(ContractError::ReplayDetected));
+    assert_eq!(err, Err(ContractError::NonceAlreadyUsed));
 }
 
 // ── Event format tests ────────────────────────────────────────────────────────

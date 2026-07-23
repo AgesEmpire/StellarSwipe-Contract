@@ -1,21 +1,41 @@
 //! Replay protection: sequential nonces + tx-hash deduplication with 1-hour TTL.
 //!
 //! Storage layout:
-//!   UserNonce(Address)          -> u64   (persistent) — current committed nonce
-//!   TxHash([u8;32])             -> u64   (persistent) — ledger timestamp of execution
+//!   UserNonce(Address)          -> u64   (persistent, per-entry TTL) — current committed nonce
+//!   TxHash([u8;32])             -> u64   (persistent, per-entry TTL) — ledger timestamp of execution
+//!   PendingQueue                -> Vec<PendingNonceRecord> (persistent) — FIFO index of
+//!                                  committed tx hashes so `purge_expired_nonces` can find
+//!                                  and evict expired entries without key enumeration.
 //!
 //! Usage per transaction:
 //!   1. `verify_and_commit(env, user, nonce, tx_hash, expiry_ts)` — call once per action.
-//!      Returns `Err(ReplayError)` on any violation; on success the nonce is incremented
-//!      and the hash is stored.
+//!      Returns `Err(ReplayError)` on any violation; on success the nonce is incremented,
+//!      the hash is stored, both entries' TTLs are extended to cover `expiry_ts`, and a
+//!      `PendingNonceRecord` is appended to the purge queue.
+//!   2. `purge_expired_nonces(env, max)` — keeper/admin maintenance call. Scans up to
+//!      `max` entries from the front of the purge queue and removes the ones whose
+//!      `expiry_ts` has passed, reclaiming persistent storage without breaking the
+//!      replay guarantee (only entries already past their usable window are removed).
 
 #![allow(dead_code)]
 
-use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env, Symbol, Vec};
+
+use crate::constants::LEDGER_CLOSE_TIME_SECONDS;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const TX_HASH_TTL_SECS: u64 = 3_600; // 1 hour
+
+/// Floor applied to per-entry TTL extensions so a `expiry_ts` very close to `now`
+/// doesn't produce a near-zero TTL that gets evicted before the tx can even settle.
+const MIN_TTL_LEDGERS: u32 = 17_280; // ~24 hours at 5s/ledger, matches shared::auth::NONCE_TTL_LEDGERS
+
+/// Convert a duration in seconds to an approximate ledger count.
+fn seconds_to_ledgers(seconds: u64) -> u32 {
+    let ledgers = seconds / (LEDGER_CLOSE_TIME_SECONDS as u64);
+    core::cmp::max(ledgers.min(u32::MAX as u64) as u32, MIN_TTL_LEDGERS)
+}
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -36,6 +56,19 @@ pub enum ReplayError {
 pub enum ReplayKey {
     UserNonce(Address),
     TxHash(Bytes),
+    /// FIFO queue of committed tx hashes, used by [`purge_expired_nonces`] to find
+    /// expired entries without relying on persistent-storage key enumeration
+    /// (which Soroban does not support).
+    PendingQueue,
+}
+
+/// One entry in the [`ReplayKey::PendingQueue`] index.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingNonceRecord {
+    pub user: Address,
+    pub tx_hash: Bytes,
+    pub expiry_ts: u64,
 }
 
 // ── Core API ──────────────────────────────────────────────────────────────────
@@ -89,12 +122,76 @@ pub fn verify_and_commit(
     }
 
     // 4. Commit
-    env.storage()
-        .persistent()
-        .set(&ReplayKey::UserNonce(user.clone()), &nonce);
+    let nonce_key = ReplayKey::UserNonce(user.clone());
+    env.storage().persistent().set(&nonce_key, &nonce);
     env.storage().persistent().set(&hash_key, &now);
 
+    // 5. Extend TTL on both persistent entries to cover the trade's expiry window
+    // (Issue: replay attack prevention audit — nonces must not be evicted while
+    // still within their usable window).
+    let ttl_ledgers = seconds_to_ledgers(expiry_ts.saturating_sub(now));
+    env.storage()
+        .persistent()
+        .extend_ttl(&nonce_key, ttl_ledgers, ttl_ledgers);
+    env.storage()
+        .persistent()
+        .extend_ttl(&hash_key, ttl_ledgers, ttl_ledgers);
+
+    // 6. Index this hash in the purge queue so `purge_expired_nonces` can reclaim it
+    // once `expiry_ts` has passed.
+    let queue_key = ReplayKey::PendingQueue;
+    let mut queue: Vec<PendingNonceRecord> = env
+        .storage()
+        .persistent()
+        .get(&queue_key)
+        .unwrap_or_else(|| Vec::new(env));
+    queue.push_back(PendingNonceRecord {
+        user: user.clone(),
+        tx_hash,
+        expiry_ts,
+    });
+    env.storage().persistent().set(&queue_key, &queue);
+    env.storage()
+        .persistent()
+        .extend_ttl(&queue_key, ttl_ledgers, ttl_ledgers);
+
     Ok(())
+}
+
+/// Purge tx-hash entries whose `expiry_ts` has passed, scanning at most `max` entries
+/// from the front of the purge queue.
+///
+/// This only removes entries that are objectively past their usable window — it
+/// never touches an entry that could still be legitimately referenced, so it cannot
+/// weaken the replay guarantee. Entries within the scanned window that are not yet
+/// expired are kept in the queue for a future purge pass.
+///
+/// Returns the number of entries removed.
+pub fn purge_expired_nonces(env: &Env, max: u32) -> u32 {
+    let now = env.ledger().timestamp();
+    let queue_key = ReplayKey::PendingQueue;
+    let queue: Vec<PendingNonceRecord> = env
+        .storage()
+        .persistent()
+        .get(&queue_key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    let mut remaining: Vec<PendingNonceRecord> = Vec::new(env);
+    let mut purged: u32 = 0;
+
+    for (i, record) in queue.iter().enumerate() {
+        if (i as u32) < max && record.expiry_ts < now {
+            let hash_key = ReplayKey::TxHash(record.tx_hash.clone());
+            env.storage().persistent().remove(&hash_key);
+            emit_purged(env, &record.user, &record.tx_hash);
+            purged = purged.saturating_add(1);
+        } else {
+            remaining.push_back(record.clone());
+        }
+    }
+
+    env.storage().persistent().set(&queue_key, &remaining);
+    purged
 }
 
 // ── Event ─────────────────────────────────────────────────────────────────────
@@ -103,6 +200,12 @@ fn emit_replay(env: &Env, user: &Address, tx_hash: &Bytes, reason: soroban_sdk::
     let topics = (Symbol::new(env, "replay_detected"),);
     env.events()
         .publish(topics, (user.clone(), reason, tx_hash.clone()));
+}
+
+fn emit_purged(env: &Env, user: &Address, tx_hash: &Bytes) {
+    let topics = (Symbol::new(env, "nonce_purged"),);
+    env.events()
+        .publish(topics, (user.clone(), tx_hash.clone()));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
