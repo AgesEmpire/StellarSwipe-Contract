@@ -76,4 +76,8 @@ impl GovernanceError {
     pub const ProposalAlreadyWithdrawn: GovernanceError = GovernanceError::ProposalNotActive;
     /// Decay rate is outside the valid range (MIN_DECAY_RATE..=MAX_DECAY_RATE).
     pub const InvalidDecayRate: GovernanceError = GovernanceError::InvalidGovernanceConfig;
+    /// A succeeded proposal's execution window (`execution_deadline`) has
+    /// passed — it can no longer be executed and must instead be reclaimed
+    /// via `reclaim_expired_proposal` (Issue #796).
+    pub const ProposalExpired: GovernanceError = GovernanceError::BudgetPeriodEnded;
 }

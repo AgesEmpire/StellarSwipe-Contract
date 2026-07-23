@@ -60,10 +60,11 @@ pub use errors::GovernanceError;
 pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
 use proposals::{
     calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
-    default_governance_config, execute_proposal, finalize_proposal, get_all_proposals,
-    get_category_threshold, get_governance_config, get_proposal, set_category_thresholds,
-    withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalType, Vote,
-    VoteDelegation, VoteType as GovernanceVoteType,
+    default_governance_config, execute_proposal, finalize_proposal, get_active_proposals,
+    get_all_proposals, get_category_threshold, get_governance_config, get_proposal,
+    reclaim_expired_proposal, set_category_thresholds, withdraw_proposal, Proposal,
+    ProposalStatistics, ProposalStatus, ProposalType, Vote, VoteDelegation,
+    VoteType as GovernanceVoteType,
 };
 use quadratic_voting::{
     allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
@@ -589,6 +590,38 @@ impl GovernanceContract {
     ) -> Result<ProposalStatus, GovernanceError> {
         require_initialized(&env)?;
         proposals::cancel_proposal(&env, proposal_id, canceller)
+    }
+
+    /// # Summary
+    /// List proposals still eligible for voting or execution — i.e. not
+    /// `Cancelled`/`Failed`/`Executed`/`Withdrawn`/`Expired`, and not past
+    /// their `execution_deadline` even if their stored status hasn't caught
+    /// up yet (Issue #796).
+    pub fn get_active_proposals(env: Env) -> Result<Vec<Proposal>, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(proposals::get_active_proposals(&env))
+    }
+
+    /// # Summary
+    /// Reclaim a `Succeeded` treasury spend proposal that was never executed
+    /// before its `execution_deadline` elapsed. Callable by **any** address —
+    /// not admin-gated — so DAO members can free up stale spend
+    /// authorisations without waiting on an admin. Removes the proposal and
+    /// emits a `TreasuryProposalExpired` event.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::NotInitialized`] — contract not initialized.
+    /// - [`GovernanceError::ProposalNotFound`] — `proposal_id` does not exist.
+    /// - [`GovernanceError::ProposalNotApproved`] — proposal never succeeded.
+    /// - [`GovernanceError::InvalidDuration`] — execution window hasn't closed yet.
+    pub fn reclaim_expired_proposal(
+        env: Env,
+        proposal_id: u64,
+        caller: Address,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        require_not_paused(&env)?;
+        proposals::reclaim_expired_proposal(&env, proposal_id, caller)
     }
 
     /// # Summary
