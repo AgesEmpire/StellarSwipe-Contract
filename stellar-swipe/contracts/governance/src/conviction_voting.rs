@@ -2,6 +2,7 @@ use core::cmp::max;
 
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, String, Vec};
 
+use crate::proposals::isqrt;
 use crate::{checked_mul, GovernanceError, StorageKey};
 
 const PRECISION: i128 = 10_000;
@@ -618,7 +619,7 @@ pub fn calculate_conviction(
         return 0;
     }
 
-    let sqrt_days = integer_sqrt(days_elapsed as i128);
+    let sqrt_days = isqrt(days_elapsed as i128);
     let mut conviction = tokens.saturating_mul(sqrt_days) / 1000;
 
     // ── Apply exponential decay based on decay_rate_bps ──────────────────
@@ -672,19 +673,6 @@ fn calculate_conviction_threshold(
     let threshold =
         checked_mul(ratio_squared, total_conviction)?.saturating_mul(alpha) / (PRECISION * 100);
     Ok(max(1000, threshold))
-}
-
-fn integer_sqrt(n: i128) -> i128 {
-    if n <= 0 {
-        return 0;
-    }
-    let mut x = n;
-    let mut y = (x + 1) / 2;
-    while y < x {
-        x = y;
-        y = (x + n / x) / 2;
-    }
-    x
 }
 
 fn update_vote_conviction(env: &Env, vote: &mut ConvictionVote) -> Result<(), GovernanceError> {

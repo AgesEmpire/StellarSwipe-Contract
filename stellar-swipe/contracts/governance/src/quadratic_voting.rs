@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(10i128 * 10, 100);
         // 100 credits → 10 votes (√100 = 10)
         let credits: i128 = 100;
-        let votes = integer_sqrt(credits);
+        let votes = crate::proposals::isqrt(credits);
         assert_eq!(votes, 10);
     }
 
@@ -576,18 +576,5 @@ mod tests {
         let new_credits_required: i128 = 25;
         let refund = original_credits_spent - new_credits_required;
         assert_eq!(refund, 75);
-    }
-
-    fn integer_sqrt(value: i128) -> i128 {
-        if value <= 0 {
-            return 0;
-        }
-        let mut x0 = value;
-        let mut x1 = (x0 + value / x0) / 2;
-        while x1 < x0 {
-            x0 = x1;
-            x1 = (x0 + value / x0) / 2;
-        }
-        x0
     }
 }
