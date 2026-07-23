@@ -126,7 +126,20 @@ pub struct Proposal {
     /// Sum of floor(sqrt(p)) for all snapshotted holders at proposal creation.
     /// Used as the quadratic-adjusted total supply for quorum checks.
     pub quadratic_total_supply: i128,
+    // ── #796: Treasury spend proposal execution expiry ───────────────────────
+    /// Ledger timestamp after which a `Succeeded` proposal can no longer be
+    /// executed. Set at creation as `voting_ends + EXECUTION_WINDOW`. Prevents
+    /// approved-but-unexecuted spend authorisations from locking treasury
+    /// funds indefinitely — once past this deadline, `execute_proposal`
+    /// rejects with `GovernanceError::ProposalExpired` and any DAO member may
+    /// call `reclaim_expired_proposal` to clear the entry.
+    pub execution_deadline: u64,
 }
+
+/// Execution window after `voting_ends` during which a `Succeeded` proposal
+/// may still be executed (Issue #796). Mirrors the 7-day period used
+/// elsewhere in this module for the default voting period.
+pub const EXECUTION_WINDOW: u64 = 7 * 24 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -315,6 +328,10 @@ pub fn create_proposal(
         0
     };
 
+    let voting_ends = now
+        .saturating_add(config.voting_delay)
+        .saturating_add(config.voting_period);
+
     let proposal = Proposal {
         id,
         proposer: proposer.clone(),
@@ -323,9 +340,7 @@ pub fn create_proposal(
         description,
         execution_payload,
         voting_starts: now.saturating_add(config.voting_delay),
-        voting_ends: now
-            .saturating_add(config.voting_delay)
-            .saturating_add(config.voting_period),
+        voting_ends,
         votes_for: 0,
         votes_against: 0,
         votes_abstain: 0,
@@ -337,6 +352,7 @@ pub fn create_proposal(
         category,
         use_quadratic_voting,
         quadratic_total_supply,
+        execution_deadline: voting_ends.saturating_add(EXECUTION_WINDOW),
     };
 
     state.proposals.set(id, proposal.clone());
@@ -543,8 +559,19 @@ pub fn execute_proposal(
     let ready = proposal
         .voting_ends
         .saturating_add(get_governance_config(env).execution_delay);
-    if env.ledger().timestamp() < ready {
+    let now = env.ledger().timestamp();
+    if now < ready {
         return Err(GovernanceError::InvalidDuration);
+    }
+
+    // ── #796: Reject execution once the proposal's execution window has
+    // closed. Approved-but-unexecuted proposals must be reclaimed instead of
+    // executed once expired, so treasury funds don't stay conceptually locked
+    // forever behind a stale authorisation.
+    if now > proposal.execution_deadline {
+        proposal.status = ProposalStatus::Expired;
+        put_proposal(env, &proposal)?;
+        return Err(GovernanceError::ProposalExpired);
     }
 
     execute_proposal_action(env, &proposal)?;
@@ -834,6 +861,95 @@ pub fn get_all_proposals(env: &Env) -> Vec<Proposal> {
         i += 1;
     }
     out
+}
+
+// ── #796: Treasury spend proposal execution expiry ───────────────────────────
+
+/// Reclaim a `Succeeded` proposal whose execution window has closed without
+/// ever being executed. Callable by **any** address (not admin-only) — any
+/// DAO member can clear a stale authorisation once it has expired. Removes
+/// the proposal entry entirely and emits a `TreasuryProposalExpired` event.
+///
+/// # Errors
+/// - [`GovernanceError::ProposalNotFound`] — `proposal_id` does not exist.
+/// - [`GovernanceError::ProposalNotApproved`] — proposal never reached
+///   `Succeeded` status (nothing to reclaim).
+/// - [`GovernanceError::InvalidDuration`] — the execution window has not
+///   closed yet; the proposal can still be executed normally.
+pub fn reclaim_expired_proposal(
+    env: &Env,
+    proposal_id: u64,
+    caller: Address,
+) -> Result<(), GovernanceError> {
+    caller.require_auth();
+
+    let mut state = get_proposals_state(env);
+    let proposal = state
+        .proposals
+        .get(proposal_id)
+        .ok_or(GovernanceError::ProposalNotFound)?;
+
+    // A proposal is reclaimable once it succeeded but was never executed —
+    // whether its status is still `Succeeded` or a prior `execute_proposal`
+    // call already flipped it to `Expired` after the deadline passed.
+    if proposal.status != ProposalStatus::Succeeded && proposal.status != ProposalStatus::Expired {
+        return Err(GovernanceError::ProposalNotApproved);
+    }
+    if env.ledger().timestamp() <= proposal.execution_deadline {
+        return Err(GovernanceError::InvalidDuration);
+    }
+
+    state.proposals.remove(proposal_id);
+    remove_proposal_id(&mut state.proposal_ids, proposal_id);
+    put_proposals_state(env, &state);
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("treasury"), symbol_short!("propexp")),
+        (
+            proposal_id,
+            proposal.proposer,
+            caller,
+            env.ledger().timestamp(),
+        ),
+    );
+
+    Ok(())
+}
+
+/// Proposals that are still eligible for voting or execution: `Pending`,
+/// `Active`, or `Succeeded` (awaiting execution) *and* not past their
+/// `execution_deadline`. Proposals whose execution window has closed are
+/// excluded even if their on-chain status hasn't been transitioned to
+/// `Expired` yet (Issue #796).
+pub fn get_active_proposals(env: &Env) -> Vec<Proposal> {
+    let now = env.ledger().timestamp();
+    let all = get_all_proposals(env);
+    let mut out = Vec::new(env);
+    let mut i = 0;
+    while i < all.len() {
+        let p = all.get(i).unwrap();
+        let active_status = matches!(
+            p.status,
+            ProposalStatus::Pending | ProposalStatus::Active | ProposalStatus::Succeeded
+        );
+        if active_status && now <= p.execution_deadline {
+            out.push_back(p);
+        }
+        i += 1;
+    }
+    out
+}
+
+fn remove_proposal_id(ids: &mut Vec<u64>, target: u64) {
+    let mut i = 0;
+    while i < ids.len() {
+        if ids.get(i).unwrap() == target {
+            ids.remove(i);
+            return;
+        }
+        i += 1;
+    }
 }
 
 pub fn delegate_voting_power(

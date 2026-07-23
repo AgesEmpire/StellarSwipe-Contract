@@ -5,7 +5,7 @@ use crate::distribution::{
     TEAM_VESTING_DURATION, YEAR_SECONDS,
 };
 use crate::proposals::{
-    GovernanceConfig, ProposalStatus, ProposalType, VoteType as GovernanceVoteType,
+    GovernanceConfig, ProposalCategory, ProposalStatus, ProposalType, VoteType as GovernanceVoteType,
 };
 use crate::{
     Authority, CommitteeAction, CommitteeElectionStatus, CrossCommitteeStatus, DecisionStatus,
@@ -2795,9 +2795,151 @@ fn conviction_score_bounded_across_valid_decay_rates() {
         // After decay, it should be less than or equal to the base (no decay case)
         // The maximum possible conviction without decay would be tokens * sqrt(days) / 1000
         let max_possible = tokens * (30i128).checked_mul(1).unwrap_or(1) / 1000;
-        assert!(conviction <= max_possible + 100, 
-            "Conviction {} exceeds max possible {} for decay_rate={}", 
+        assert!(conviction <= max_possible + 100,
+            "Conviction {} exceeds max possible {} for decay_rate={}",
             conviction, max_possible, decay_rate);
     }
+}
+
+// ── Issue #796: Treasury spend proposal execution expiry ──────────────────────
+
+/// Shared setup for the execution-expiry tests below: initializes the
+/// contract, configures a non-zero `execution_delay` (so `finalize_proposal`
+/// does not auto-execute the proposal), funds the treasury, stakes voting
+/// power for two holders, creates a `TreasurySpend` proposal, votes it to
+/// `Succeeded`, and returns the proposal id plus the recipient/asset used.
+fn setup_succeeded_treasury_spend_proposal(
+    env: &Env,
+    client: &GovernanceContractClient<'_>,
+    admin: &Address,
+    recipients: &DistributionRecipients,
+) -> (u64, Address, Asset) {
+    let cfg = GovernanceConfig {
+        min_proposal_threshold: 1_000,
+        voting_period: 7 * 86_400,
+        voting_delay: 60,
+        quorum_threshold: 1_000,
+        approval_threshold: 5_000,
+        execution_delay: 60,
+        discussion_duration: 0,
+    };
+    client.configure_governance(admin, &cfg);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+    client.stake(&recipients.public_sale, &40_000_000i128);
+
+    let spend_asset = asset(env, "USDC");
+    client.set_treasury_asset(admin, &spend_asset, &10_000i128);
+    let payout_recipient = Address::generate(env);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::TreasurySpend(
+            payout_recipient.clone(),
+            500i128,
+            spend_asset.clone(),
+            String::from_str(env, "payout"),
+        ),
+        &String::from_str(env, "Fund payout"),
+        &String::from_str(env, "treasury spend"),
+        &Bytes::new(env),
+        &ProposalCategory::TreasuryTransfer,
+        &false,
+    );
+
+    env.ledger().set_timestamp(70);
+    client.cast_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    client.cast_vote(
+        &proposal_id,
+        &recipients.public_sale,
+        &GovernanceVoteType::For,
+    );
+
+    // voting_ends = 60 (delay) + 7 * 86_400 (period) = 604_860.
+    env.ledger().set_timestamp(8 * 86_400);
+    assert_eq!(
+        client.finalize_proposal(&proposal_id),
+        ProposalStatus::Succeeded
+    );
+
+    (proposal_id, payout_recipient, spend_asset)
+}
+
+#[test]
+fn treasury_spend_proposal_executes_within_execution_window() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let (proposal_id, payout_recipient, spend_asset) =
+        setup_succeeded_treasury_spend_proposal(&env, &client, &admin, &recipients);
+
+    // Still well inside the 7-day execution window (voting_ends + 7 days).
+    let status = client.execute_proposal(&proposal_id, &recipients.community_rewards);
+    assert_eq!(status, ProposalStatus::Executed);
+
+    let treasury = client.treasury();
+    assert_eq!(treasury.assets.get(spend_asset).unwrap(), 9_500);
+    assert_eq!(client.balance(&payout_recipient), 500);
+}
+
+#[test]
+fn treasury_spend_proposal_execution_past_deadline_is_rejected() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let (proposal_id, _payout_recipient, _spend_asset) =
+        setup_succeeded_treasury_spend_proposal(&env, &client, &admin, &recipients);
+
+    // execution_deadline = voting_ends (604_860) + EXECUTION_WINDOW (7 days) = 1_209_660.
+    // Jump well past it.
+    env.ledger().set_timestamp(1_209_661);
+
+    let result = client.try_execute_proposal(&proposal_id, &recipients.community_rewards);
+    assert_eq!(result, Err(Ok(GovernanceError::ProposalExpired)));
+
+    let proposal = client.proposal(&proposal_id);
+    assert_eq!(proposal.status, ProposalStatus::Expired);
+}
+
+#[test]
+fn reclaim_expired_proposal_removes_entry_and_is_callable_by_anyone() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let (proposal_id, _payout_recipient, _spend_asset) =
+        setup_succeeded_treasury_spend_proposal(&env, &client, &admin, &recipients);
+
+    // Too early: execution window hasn't closed yet.
+    let too_early = client.try_reclaim_expired_proposal(&proposal_id, &recipients.public_sale);
+    assert_eq!(too_early, Err(Ok(GovernanceError::InvalidDuration)));
+
+    env.ledger().set_timestamp(1_209_661);
+
+    // Any address (not just admin) may reclaim once the deadline has passed.
+    let random_caller = Address::generate(&env);
+    client.reclaim_expired_proposal(&proposal_id, &random_caller);
+
+    // The proposal entry is gone entirely.
+    let missing = client.try_proposal(&proposal_id);
+    assert_eq!(missing, Err(Ok(GovernanceError::ProposalNotFound)));
+
+    // It no longer shows up in the active-proposals listing either.
+    let active = client.get_active_proposals();
+    let mut i = 0;
+    let mut found = false;
+    while i < active.len() {
+        if active.get(i).unwrap().id == proposal_id {
+            found = true;
+        }
+        i += 1;
+    }
+    assert!(!found);
 }
 
