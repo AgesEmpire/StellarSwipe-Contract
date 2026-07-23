@@ -673,6 +673,7 @@ dependencies = [
 name = "governance"
 version = "0.0.0"
 dependencies = [
+ "proptest",
  "shared",
  "soroban-sdk",
  "stellar_swipe_common",

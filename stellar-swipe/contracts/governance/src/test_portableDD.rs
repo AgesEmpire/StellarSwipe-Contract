@@ -1,7 +1,7 @@
 extern crate std;
 
 use crate::distribution::{DistributionRecipients, YEAR_SECONDS};
-use crate::proposals::{ProposalType, VoteType as GovernanceVoteType};
+use crate::proposals::{ProposalCategory, ProposalType, VoteType as GovernanceVoteType};
 use crate::{GovernanceContract, GovernanceContractClient, GovernanceError};
 use soroban_sdk::testutils::{Address as _, Events, Ledger};
 use soroban_sdk::{Address, Bytes, Env, String, Symbol, TryFromVal, Val};
@@ -176,6 +176,8 @@ fn proposal_contract_upgrade_invalid_payload_rejected() {
         &String::from_str(&env, "Upgrade"),
         &String::from_str(&env, "Upgrade the contract"),
         &bad_payload,
+        &ProposalCategory::General,
+        &false,
     );
     assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
 }
@@ -197,6 +199,8 @@ fn proposal_contract_upgrade_valid_payload_accepted() {
         &String::from_str(&env, "Upgrade"),
         &String::from_str(&env, "Upgrade the contract"),
         &hash,
+        &ProposalCategory::General,
+        &false,
     );
     assert!(
         matches!(result, Ok(Ok(_))),
@@ -221,6 +225,8 @@ fn proposal_custom_empty_payload_rejected() {
         &String::from_str(&env, "Custom"),
         &String::from_str(&env, "Custom proposal"),
         &empty,
+        &ProposalCategory::General,
+        &false,
     );
     assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
 }
@@ -255,6 +261,8 @@ fn proposal_treasury_spend_bad_version_prefix_rejected() {
         &String::from_str(&env, "Spend"),
         &String::from_str(&env, "Treasury spend proposal"),
         &bad,
+        &ProposalCategory::General,
+        &false,
     );
     assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
 }
