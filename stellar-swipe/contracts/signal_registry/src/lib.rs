@@ -175,6 +175,12 @@ pub enum StorageKey {
     /// Keeper addresses allowlisted (by the admin) to call
     /// `prune_expired_signals` alongside the admin (issue #779).
     PruneKeepers,
+    /// Admin-configured maximum signals a provider may create per ledger day.
+    /// 0 (default) disables the daily cap (issue #778).
+    DailySignalLimit,
+    /// Per-provider count of signals created on the current ledger day (issue #778).
+    /// Key: (provider, day_bucket) where day_bucket = timestamp / 86400.
+    ProviderDailySignalCount(Address, u64),
 }
 
 #[contracttype]
@@ -302,6 +308,29 @@ impl SignalRegistry {
             .instance()
             .get(&StorageKey::SubmissionCooldown)
             .unwrap_or(0u64)
+    }
+
+    /// Admin: set the maximum number of signals a provider may create per ledger day.
+    /// A value of 0 disables the daily cap (issue #778).
+    pub fn set_daily_signal_limit(
+        env: Env,
+        caller: Address,
+        limit: u32,
+    ) -> Result<(), AdminError> {
+        admin::require_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::DailySignalLimit, &limit);
+        Ok(())
+    }
+
+    /// Returns the current per-provider daily signal creation cap (0 = disabled).
+    pub fn get_daily_signal_limit(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DailySignalLimit)
+            .unwrap_or(0u32)
     }
 
     /// User stakes tokens. Rate-limited to 5 changes per day.
@@ -1043,6 +1072,20 @@ impl SignalRegistry {
         admin::require_not_paused(env, String::from_str(env, CAT_SIGNALS))?;
         admin::require_not_paused(env, String::from_str(env, CAT_TRADING))?;
 
+        // Comprehensive input validation (issue #634)
+        validation::validate_signal_input(env, &asset_pair, price, &rationale, expiry, tags.len())
+            .map_err(|e| match e {
+                errors::SignalValidationError::InvalidAssetPair => AdminError::InvalidAssetPair,
+                errors::SignalValidationError::InvalidPrice
+                | errors::SignalValidationError::EmptyRationale
+                | errors::SignalValidationError::RationaleTooLong
+                | errors::SignalValidationError::InvalidExpiry
+                | errors::SignalValidationError::TooManyTags => AdminError::InvalidParameter,
+                errors::SignalValidationError::DailyLimitExceeded => {
+                    AdminError::SignalLimitExceeded
+                }
+            })?;
+
         // Issue #424: Banned providers cannot submit signals
         if providers::is_provider_banned(env, &provider) {
             return Err(AdminError::Unauthorized);
@@ -1094,6 +1137,28 @@ impl SignalRegistry {
                     .unwrap_or(0u64);
                 if last_signal_time > 0 && env.ledger().timestamp() < last_signal_time + cooldown {
                     return Err(AdminError::CooldownNotElapsed);
+                }
+            }
+        }
+
+        // Per-provider daily signal creation rate limit (issue #778)
+        {
+            let daily_limit: u32 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::DailySignalLimit)
+                .unwrap_or(0u32);
+            if daily_limit > 0 {
+                let day_bucket = env.ledger().timestamp() / 86_400;
+                let count_key =
+                    StorageKey::ProviderDailySignalCount(provider.clone(), day_bucket);
+                let daily_count: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&count_key)
+                    .unwrap_or(0u32);
+                if daily_count >= daily_limit {
+                    return Err(AdminError::SignalLimitExceeded);
                 }
             }
         }
@@ -1191,6 +1256,20 @@ impl SignalRegistry {
         env.storage()
             .persistent()
             .set(&StorageKey::ProviderLastSignal(provider.clone()), &now);
+
+        // Increment per-provider daily signal count (issue #778)
+        {
+            let day_bucket = now / 86_400;
+            let count_key = StorageKey::ProviderDailySignalCount(provider.clone(), day_bucket);
+            let current: u32 = env
+                .storage()
+                .persistent()
+                .get(&count_key)
+                .unwrap_or(0u32);
+            env.storage()
+                .persistent()
+                .set(&count_key, &current.saturating_add(1));
+        }
 
         Ok(id)
     }
@@ -3452,6 +3531,8 @@ mod test_adoption;
 /// Signal categorization query tests (Issue #660).
 #[cfg(test)]
 mod test_categorization;
+#[cfg(test)]
+mod test_daily_signal_limit;
 #[cfg(test)]
 mod test_emergency;
 #[cfg(test)]

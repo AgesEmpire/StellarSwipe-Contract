@@ -1,8 +1,45 @@
 use crate::admin;
-use crate::errors::AdminError;
+use crate::errors::{AdminError, SignalValidationError};
 use crate::submission::{Action, Signal as SubmissionSignal};
 use crate::types::{Outcome, ProviderProfile, Signal, SignalStatus};
 use soroban_sdk::{contracttype, Address, BytesN, Env, Map, String};
+
+/// Maximum allowed rationale length in bytes (issue #634).
+pub const MAX_RATIONALE_LEN: u32 = 1_000;
+
+/// Validate all signal creation inputs in one place (issue #634).
+///
+/// Returns `Ok(())` when all inputs are valid, or the first
+/// [`SignalValidationError`] encountered.
+pub fn validate_signal_input(
+    env: &Env,
+    asset_pair: &String,
+    price: i128,
+    rationale: &String,
+    expiry: u64,
+    tags_len: u32,
+) -> Result<(), SignalValidationError> {
+    if asset_pair.len() == 0 {
+        return Err(SignalValidationError::InvalidAssetPair);
+    }
+    if price <= 0 {
+        return Err(SignalValidationError::InvalidPrice);
+    }
+    let rat_len = rationale.len();
+    if rat_len == 0 {
+        return Err(SignalValidationError::EmptyRationale);
+    }
+    if rat_len > MAX_RATIONALE_LEN {
+        return Err(SignalValidationError::RationaleTooLong);
+    }
+    if expiry <= env.ledger().timestamp() {
+        return Err(SignalValidationError::InvalidExpiry);
+    }
+    if tags_len > 10 {
+        return Err(SignalValidationError::TooManyTags);
+    }
+    Ok(())
+}
 
 /// Persistent cache: active signal count per provider (O(1) limit checks).
 #[contracttype]
