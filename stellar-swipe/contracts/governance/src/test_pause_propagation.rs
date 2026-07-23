@@ -15,7 +15,7 @@
 extern crate std;
 
 use crate::distribution::DistributionRecipients;
-use crate::proposals::{ProposalStatus, ProposalType};
+use crate::proposals::{ProposalCategory, ProposalStatus, ProposalType};
 use crate::timelock::ActionType;
 use crate::{GovernanceContract, GovernanceContractClient, GovernanceError};
 use soroban_sdk::testutils::{Address as _, Ledger};
@@ -89,6 +89,8 @@ fn make_proposal(c: &GovernanceContractClient<'_>, env: &Env, proposer: &Address
         &String::from_str(env, "Title"),
         &String::from_str(env, "Description"),
         &Bytes::new(env),
+        &ProposalCategory::General,
+        &false,
     )
 }
 
@@ -113,6 +115,8 @@ fn paused_blocks_create_proposal() {
         &String::from_str(&env, "T"),
         &String::from_str(&env, "D"),
         &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
     );
     assert_eq!(result, Err(Ok(GovernanceError::ContractPaused)));
 }

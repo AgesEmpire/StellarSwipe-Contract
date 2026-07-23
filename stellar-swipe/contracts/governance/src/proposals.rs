@@ -398,6 +398,21 @@ pub fn get_proposal(env: &Env, proposal_id: u64) -> Result<Proposal, GovernanceE
         .ok_or(GovernanceError::ProposalNotFound)
 }
 
+/// #796: `execute_proposal` cannot persist a `status = Expired` write when it
+/// rejects a past-deadline execution — Soroban rolls back all storage writes
+/// made during an invocation that returns `Err`, so that assignment is a
+/// no-op in practice. Callers that need to *observe* the effective status
+/// (as opposed to internal state-machine code, which gates on the raw stored
+/// status) should use this instead of the raw stored value, mirroring the
+/// deadline check `get_active_proposals` already does independently of it.
+pub fn effective_status(env: &Env, proposal: &Proposal) -> ProposalStatus {
+    if proposal.status == ProposalStatus::Succeeded && env.ledger().timestamp() > proposal.execution_deadline {
+        ProposalStatus::Expired
+    } else {
+        proposal.status.clone()
+    }
+}
+
 pub fn put_proposal(env: &Env, proposal: &Proposal) -> Result<(), GovernanceError> {
     let mut state = get_proposals_state(env);
     if !state.proposals.contains_key(proposal.id) {
@@ -584,9 +599,13 @@ pub fn execute_proposal(
     // closed. Approved-but-unexecuted proposals must be reclaimed instead of
     // executed once expired, so treasury funds don't stay conceptually locked
     // forever behind a stale authorisation.
+    //
+    // Note: an `Err`-returning invocation rolls back every storage write it
+    // made, so there is no point writing `status = Expired` here — it would
+    // never persist. `effective_status` computes it lazily for readers
+    // instead; `reclaim_expired_proposal` already tolerates the stored status
+    // still reading `Succeeded` past the deadline.
     if now > proposal.execution_deadline {
-        proposal.status = ProposalStatus::Expired;
-        put_proposal(env, &proposal)?;
         return Err(GovernanceError::ProposalExpired);
     }
 

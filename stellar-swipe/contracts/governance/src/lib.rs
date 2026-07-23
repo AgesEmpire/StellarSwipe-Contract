@@ -60,9 +60,9 @@ pub use errors::GovernanceError;
 pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
 use proposals::{
     calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
-    default_governance_config, execute_proposal, finalize_proposal, get_active_proposals,
-    get_all_proposals, get_category_threshold, get_governance_config, get_proposal,
-    reclaim_expired_proposal, set_category_thresholds, withdraw_proposal, Proposal,
+    default_governance_config, effective_status, execute_proposal, finalize_proposal,
+    get_active_proposals, get_all_proposals, get_category_threshold, get_governance_config,
+    get_proposal, reclaim_expired_proposal, set_category_thresholds, withdraw_proposal, Proposal,
     ProposalStatistics, ProposalStatus, ProposalType, Vote, VoteDelegation,
     VoteType as GovernanceVoteType,
 };
@@ -501,12 +501,23 @@ impl GovernanceContract {
 
     pub fn proposal(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
         require_initialized(&env)?;
-        get_proposal(&env, proposal_id)
+        let mut proposal = get_proposal(&env, proposal_id)?;
+        proposal.status = effective_status(&env, &proposal);
+        Ok(proposal)
     }
 
     pub fn proposals(env: Env) -> Result<Vec<Proposal>, GovernanceError> {
         require_initialized(&env)?;
-        Ok(get_all_proposals(&env))
+        let all = get_all_proposals(&env);
+        let mut out = Vec::new(&env);
+        let mut i = 0;
+        while i < all.len() {
+            let mut proposal = all.get(i).unwrap();
+            proposal.status = effective_status(&env, &proposal);
+            out.push_back(proposal);
+            i += 1;
+        }
+        Ok(out)
     }
 
     /// # Summary
