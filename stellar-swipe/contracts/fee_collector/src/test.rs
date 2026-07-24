@@ -1524,7 +1524,7 @@ fn test_congestion_high() {
     disable_revenue_share(&client);
 
     // Set high congestion signal: 2.0x (20_000 bps)
-    client.set_congestion_signal(&20_000u32);
+    client.set_congestion_signal(&admin, &20_000u32);
 
     let trade_amount: i128 = 10_000_000;
     StellarAssetClient::new(&env, &token).mint(&trader, &trade_amount);
@@ -1558,7 +1558,7 @@ fn test_congestion_stale_fallback() {
 
     // Set high congestion signal: 2.0x
     env.ledger().set_timestamp(100);
-    client.set_congestion_signal(&20_000u32);
+    client.set_congestion_signal(&admin, &20_000u32);
 
     // Advance time past staleness threshold (300 secs)
     env.ledger().set_timestamp(100 + 301);
@@ -1583,6 +1583,6 @@ fn test_congestion_bounded() {
     client.initialize(&admin);
 
     // Max multiplier is 5.0x by default. Try 6.0x -> Should fail bounds check.
-    let result = client.try_set_congestion_signal(&60_000u32);
+    let result = client.try_set_congestion_signal(&admin, &60_000u32);
     assert_eq!(result, Err(Ok(ContractError::InvalidMultiplierBounds)));
 }

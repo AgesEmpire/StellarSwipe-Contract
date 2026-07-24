@@ -58,6 +58,9 @@ pub enum VersionKey {
 #[repr(u32)]
 pub enum VersionError {
     IncompatibleContractVersion = 1,
+    /// An `upgrade()` call proposed a `new_version` that is not strictly
+    /// greater than the contract's currently stored version.
+    DowngradeRejected = 2,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -102,6 +105,29 @@ pub fn require_compatible(env: &Env, callee_version: u32, kind: ContractKind) {
 pub fn emit_version_checked(env: &Env, callee_version: u32, compatible: bool) {
     env.events()
         .publish((symbol_short!("ver_chk"), callee_version), compatible);
+}
+
+/// Guard an `upgrade()` call: the proposed `new_version` must be strictly
+/// greater than `current_version`.
+///
+/// Upgrades must move forward — re-deploying the same version or an older
+/// one is rejected. This prevents an admin key compromise (or a scripting
+/// mistake) from silently rolling a contract back to a version with a known
+/// bug or an incompatible storage layout. Pair with [`set_contract_version`]
+/// after a successful [`soroban_sdk::deploy::Deployer::update_current_contract_wasm`]
+/// call so the stored version and the deployed code stay in lockstep.
+pub fn guard_upgrade(current_version: u32, new_version: u32) -> Result<(), VersionError> {
+    if new_version <= current_version {
+        Err(VersionError::DowngradeRejected)
+    } else {
+        Ok(())
+    }
+}
+
+/// Emit an event recording a completed contract upgrade (old → new version).
+pub fn emit_contract_upgraded(env: &Env, old_version: u32, new_version: u32) {
+    env.events()
+        .publish((symbol_short!("upgraded"),), (old_version, new_version));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -207,5 +233,24 @@ mod tests {
         env.as_contract(&addr, || {
             require_compatible(&env, 0, ContractKind::SignalRegistry);
         });
+    }
+
+    // --- guard_upgrade ---
+
+    #[test]
+    fn guard_upgrade_allows_strictly_increasing_version() {
+        assert!(guard_upgrade(1, 2).is_ok());
+        assert!(guard_upgrade(2, 100).is_ok());
+    }
+
+    #[test]
+    fn guard_upgrade_rejects_same_version() {
+        assert_eq!(guard_upgrade(3, 3), Err(VersionError::DowngradeRejected));
+    }
+
+    #[test]
+    fn guard_upgrade_rejects_downgrade() {
+        assert_eq!(guard_upgrade(5, 4), Err(VersionError::DowngradeRejected));
+        assert_eq!(guard_upgrade(5, 0), Err(VersionError::DowngradeRejected));
     }
 }

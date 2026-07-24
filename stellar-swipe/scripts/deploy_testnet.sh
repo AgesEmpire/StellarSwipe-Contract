@@ -49,6 +49,22 @@ die() { echo "error: $*" >&2; exit 1; }
 command -v stellar >/dev/null || die "stellar CLI not found (install stellar-cli)"
 command -v jq >/dev/null || die "jq not found"
 
+# Issue #822: validate the deployment manifest (if one exists for this
+# network) before touching any contract. Invalid addresses, version
+# incompatibilities, or dependency misconfigurations fail the release here
+# instead of surfacing mid-deploy. Manifests are optional (new, opt-in
+# infrastructure): a run with no deployments/$NET.manifest.json proceeds as
+# before, with a note.
+MANIFEST="$ROOT/deployments/$NET.manifest.json"
+if [[ -f "$MANIFEST" ]]; then
+  command -v python3 >/dev/null || die "python3 not found (required to validate $MANIFEST)"
+  echo "==> validating deployment manifest: $MANIFEST"
+  python3 "$SWIPE/scripts/validate_deployment_manifest.py" "$MANIFEST" \
+    || die "deployment manifest validation failed — see errors above"
+else
+  echo "==> no deployment manifest at $MANIFEST — skipping manifest validation"
+fi
+
 [[ -n "${STELLAR_SOURCE_ACCOUNT:-${STELLAR_ACCOUNT:-}}" ]] || die "set STELLAR_SOURCE_ACCOUNT or STELLAR_ACCOUNT (signing key / identity)"
 SOURCE="${STELLAR_SOURCE_ACCOUNT:-${STELLAR_ACCOUNT}}"
 

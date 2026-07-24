@@ -67,7 +67,10 @@ use admin::{
     get_admin, get_admin_config, init_admin, is_trading_paused,
     require_not_paused_legacy as require_not_paused,
 };
-use shared::version::{set_contract_version, SIGNAL_REGISTRY_VERSION};
+use shared::version::{
+    emit_contract_upgraded, get_contract_version as shared_get_contract_version, guard_upgrade,
+    set_contract_version, SIGNAL_REGISTRY_VERSION,
+};
 use stellar_swipe_common::emergency::{PauseState, CAT_SIGNALS, CAT_TRADING};
 use stellar_swipe_common::rate_limit::{self as rl, ActionType as RLAction, RateLimitConfig};
 use stellar_swipe_common::SECONDS_PER_30_DAY_MONTH;
@@ -97,8 +100,8 @@ use reputation::{
     TrustScoreDetails, TrustScoreTier,
 };
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, Env, IntoVal, Map, String, Symbol, Val,
-    Vec,
+    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal, Map, String,
+    Symbol, Val, Vec,
 };
 use stellar_swipe_common::placeholder_admin;
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
@@ -142,6 +145,10 @@ pub enum StorageKey {
     MigrationPreSnapshot,
     /// Result of reconciling the pre-migration snapshot against migrated v2 data (issue #597).
     MigrationVerification,
+    /// Issue #812: on-chain storage schema version. Checked by
+    /// `migration::verify_storage_layout` before any migration logic runs.
+    /// See [`migration::SIGNAL_SCHEMA_V1`] / [`migration::SIGNAL_SCHEMA_V2`].
+    SchemaVersion,
     ProviderStats,
     /// Per-provider stake balances for trust and submission gates.
     ProviderStakes,
@@ -214,6 +221,52 @@ impl SignalRegistry {
     pub fn initialize(env: Env, admin: Address) -> Result<(), AdminError> {
         init_admin(&env, admin)?;
         set_contract_version(&env, SIGNAL_REGISTRY_VERSION);
+        // Issue #812: a freshly-deployed contract has no legacy `SignalsV1`
+        // rows (new signals are written directly in the current `Signal`
+        // (v2) shape), so it starts at the current schema version. Contracts
+        // upgraded in place from before this guard existed never call
+        // `initialize` again; for them `migration::get_schema_version`
+        // defaults to `SIGNAL_SCHEMA_V1`, which is what they actually are.
+        migration::set_schema_version(&env, migration::SIGNAL_SCHEMA_V2);
+        Ok(())
+    }
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+
+    /// Returns this contract's stored version. Cross-contract callers can use
+    /// this to enforce a minimum compatible version before invoking this
+    /// contract (see `shared::version::validate_callee_version`).
+    pub fn get_contract_version(env: Env) -> u32 {
+        shared_get_contract_version(&env)
+    }
+
+    /// Admin-only: replace this contract's executable with `new_wasm_hash`
+    /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
+    /// `new_version` as the contract's version.
+    ///
+    /// `new_version` must be strictly greater than the currently stored
+    /// version, rejecting accidental or malicious downgrades.
+    ///
+    /// # Errors
+    /// - [`AdminError::Unauthorized`] — caller is not the admin.
+    /// - [`AdminError::IncompatibleContractVersion`] — `new_version` is not
+    ///   strictly greater than the currently stored version.
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), AdminError> {
+        admin::require_admin(&env, &caller)?;
+        caller.require_auth();
+
+        let current_version = shared_get_contract_version(&env);
+        guard_upgrade(current_version, new_version)
+            .map_err(|_| AdminError::IncompatibleContractVersion)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        set_contract_version(&env, new_version);
+        emit_contract_upgraded(&env, current_version, new_version);
         Ok(())
     }
 
