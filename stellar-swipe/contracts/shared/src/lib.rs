@@ -6,6 +6,7 @@ pub use expiry::Expirable;
 
 pub mod access_control;
 /// Asset metadata registry (Issue #700).
+#[cfg(any(test, feature = "testutils"))]
 pub mod asset_registry;
 pub mod multisig;
 pub use multisig::{
@@ -13,8 +14,8 @@ pub use multisig::{
     get_proposal as multisig_get_proposal, has_approved as multisig_has_approved,
     is_signer as multisig_is_signer, mark_executed as multisig_mark_executed,
     propose as multisig_propose, require_can_execute as multisig_require_can_execute,
-    set_config as multisig_set_config, validate_config as multisig_validate_config,
-    MultisigConfig, MultisigError, MultisigStorageKey, Proposal, ProposalStatus,
+    set_config as multisig_set_config, validate_config as multisig_validate_config, MultisigConfig,
+    MultisigError, MultisigStorageKey, Proposal, ProposalStatus,
 };
 
 pub mod auth;

@@ -4,7 +4,9 @@
 
 use crate::{StakeVaultContract, StakeVaultContractClient, StakeVaultError};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger}, token::StellarAssetClient, vec, Address, Env, Vec,
+    testutils::{Address as _, Ledger},
+    token::StellarAssetClient,
+    vec, Address, Env, Vec,
 };
 
 fn setup(env: &Env) -> (Address, Address, Address) {
@@ -117,7 +119,8 @@ fn test_request_expiry_without_threshold() {
     client.request_emergency_unstake(&staker);
 
     // Advance time past the timeout.
-    env.ledger().with_mut(|l| l.timestamp = 1_000 + timeout_secs + 1);
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1_000 + timeout_secs + 1);
 
     // expire_request should succeed and remove the stale request.
     client.expire_emergency_request(&staker);

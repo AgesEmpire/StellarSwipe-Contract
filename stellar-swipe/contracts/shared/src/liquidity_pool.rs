@@ -265,10 +265,7 @@ mod tests {
         let caller = Address::generate(&env);
         client.withdraw(&caller, &pool_id, &200);
 
-        assert_eq!(
-            token::Client::new(&env, &token).balance(&pool_id),
-            800
-        );
+        assert_eq!(token::Client::new(&env, &token).balance(&pool_id), 800);
     }
 
     #[test]

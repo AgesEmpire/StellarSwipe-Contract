@@ -51,9 +51,7 @@ use signal_registry::{
     RiskLevel, SignalAction, SignalCategory, SignalRegistry, SignalRegistryClient, SignalStatus,
 };
 use soroban_sdk::{
-    contract, contractimpl, contracttype,
-    testutils::Address as _,
-    token::StellarAssetClient,
+    contract, contractimpl, contracttype, testutils::Address as _, token::StellarAssetClient,
     Address, Env, String, Symbol,
 };
 use stake_vault::{StakeVaultContract, StakeVaultContractClient};
@@ -115,12 +113,17 @@ impl MaliciousStakeVault {
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn sac_token(env: &Env, admin: &Address) -> Address {
-    env.register_stellar_asset_contract_v2(admin.clone()).address()
+    env.register_stellar_asset_contract_v2(admin.clone())
+        .address()
 }
 
 /// Deploy `SignalRegistry`, initialize it, stake and submit one signal for
 /// `provider`. Returns (client, signal_id).
-fn setup_registry_with_signal(env: &Env, admin: &Address, provider: &Address) -> (SignalRegistryClient<'static>, u64) {
+fn setup_registry_with_signal(
+    env: &Env,
+    admin: &Address,
+    provider: &Address,
+) -> (SignalRegistryClient<'static>, u64) {
     let registry_id = env.register(SignalRegistry, ());
     let registry = SignalRegistryClient::new(env, &registry_id);
     registry.initialize(admin);
@@ -171,7 +174,12 @@ fn test_malicious_reentry_reverts_whole_call() {
     let vault_for_call = vault_id.clone();
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        registry_for_call.ban_provider(&admin_for_call, &provider_for_call, &reason_for_call, &vault_for_call);
+        registry_for_call.ban_provider(
+            &admin_for_call,
+            &provider_for_call,
+            &reason_for_call,
+            &vault_for_call,
+        );
     }));
 
     assert!(

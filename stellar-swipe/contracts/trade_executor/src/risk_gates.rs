@@ -126,7 +126,7 @@ pub fn resolve_trade_amount(
 /// Replaces the previous two-call pattern:
 ///   - call A: `get_open_position_count(user) -> u32`
 ///   - call B: `record_copy_position(user)`
-/// with a single batched call:
+///     with a single batched call:
 ///   - call A: `validate_and_record(user, max_positions) -> u32`
 ///
 /// Cross-contract call count in `execute_copy_trade`: **3 → 2** (−1 call, ≥33% reduction).

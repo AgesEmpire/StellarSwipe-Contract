@@ -1,14 +1,14 @@
 #![cfg(test)]
 
 use crate::{
+    action, encode_action, encode_i128_bytes,
     migration::{MigrationKey, StakeInfoV2},
-    action, encode_action, encode_i128_bytes, SlashSeverity, StakeVaultContract,
-    StakeVaultContractClient, StakeVaultError,
+    SlashSeverity, StakeVaultContract, StakeVaultContractClient, StakeVaultError,
 };
 use shared::multisig::MultisigConfig;
 use soroban_sdk::{
-    contract, contractimpl, testutils::Address as _, token::StellarAssetClient, Address, Bytes, Env,
-    Map, MuxedAddress, Symbol, Vec,
+    contract, contractimpl, testutils::Address as _, token::StellarAssetClient, Address, Bytes,
+    Env, Map, MuxedAddress, Symbol, Vec,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -275,10 +275,18 @@ pub struct TransferRecordingToken;
 impl TransferRecordingToken {
     pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
         let to_addr = to.address();
-        env.storage().instance().set(&soroban_sdk::symbol_short!("called"), &true);
-        env.storage().instance().set(&soroban_sdk::symbol_short!("from"), &from);
-        env.storage().instance().set(&soroban_sdk::symbol_short!("to"), &to_addr);
-        env.storage().instance().set(&soroban_sdk::symbol_short!("amount"), &amount);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("called"), &true);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("from"), &from);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("to"), &to_addr);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("amount"), &amount);
     }
     pub fn transfer_was_called(env: Env) -> bool {
         env.storage()
@@ -307,8 +315,22 @@ impl TransferRecordingToken {
     pub fn balance(_env: Env, _id: Address) -> i128 {
         0
     }
-    pub fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {}
-    pub fn approve(_env: Env, _from: Address, _spender: Address, _amount: i128, _expiration_ledger: u32) {}
+    pub fn transfer_from(
+        _env: Env,
+        _spender: Address,
+        _from: Address,
+        _to: Address,
+        _amount: i128,
+    ) {
+    }
+    pub fn approve(
+        _env: Env,
+        _from: Address,
+        _spender: Address,
+        _amount: i128,
+        _expiration_ledger: u32,
+    ) {
+    }
     pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 {
         0
     }
@@ -816,10 +838,15 @@ mod slash_severity_tests {
         SlashSeverity, SlashTierConfig, StakeVaultContract, StakeVaultContractClient,
         StakeVaultError,
     };
-    use soroban_sdk::{testutils::{Address as _, Ledger}, token::StellarAssetClient, Address, Env, Map, Symbol};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token::StellarAssetClient,
+        Address, Env, Map, Symbol,
+    };
 
     fn sac_token(env: &Env, admin: &Address) -> Address {
-        env.register_stellar_asset_contract_v2(admin.clone()).address()
+        env.register_stellar_asset_contract_v2(admin.clone())
+            .address()
     }
 
     fn seed(env: &Env, contract_id: &Address, staker: &Address, balance: i128) {
@@ -829,8 +856,17 @@ mod slash_severity_tests {
                 .persistent()
                 .get(&MigrationKey::StakesV2)
                 .unwrap_or_else(|| Map::new(env));
-            stakes.set(staker.clone(), StakeInfoV2 { balance, locked_until: 0, last_updated: 0 });
-            env.storage().persistent().set(&MigrationKey::StakesV2, &stakes);
+            stakes.set(
+                staker.clone(),
+                StakeInfoV2 {
+                    balance,
+                    locked_until: 0,
+                    last_updated: 0,
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&MigrationKey::StakesV2, &stakes);
         });
     }
 
@@ -854,7 +890,12 @@ mod slash_severity_tests {
         seed(&env, &vault_id, &provider, balance);
 
         let client = StakeVaultContractClient::new(&env, &vault_id);
-        let slashed = client.slash_stake(&registry, &provider, &SlashSeverity::Minor, &Symbol::new(&env, "bad"));
+        let slashed = client.slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "bad"),
+        );
         assert_eq!(slashed, 50_000); // 5% of 1_000_000
         assert_eq!(client.get_stake(&provider), 950_000);
     }
@@ -868,7 +909,12 @@ mod slash_severity_tests {
         seed(&env, &vault_id, &provider, balance);
 
         let client = StakeVaultContractClient::new(&env, &vault_id);
-        let slashed = client.slash_stake(&registry, &provider, &SlashSeverity::Major, &Symbol::new(&env, "fraud"));
+        let slashed = client.slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Major,
+            &Symbol::new(&env, "fraud"),
+        );
         assert_eq!(slashed, 300_000); // 30%
         assert_eq!(client.get_stake(&provider), 700_000);
     }
@@ -882,7 +928,12 @@ mod slash_severity_tests {
         seed(&env, &vault_id, &provider, balance);
 
         let client = StakeVaultContractClient::new(&env, &vault_id);
-        let slashed = client.slash_stake(&registry, &provider, &SlashSeverity::Critical, &Symbol::new(&env, "attack"));
+        let slashed = client.slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Critical,
+            &Symbol::new(&env, "attack"),
+        );
         assert_eq!(slashed, balance);
         assert_eq!(client.get_stake(&provider), 0);
     }
@@ -897,7 +948,12 @@ mod slash_severity_tests {
 
         let client = StakeVaultContractClient::new(&env, &vault_id);
         client.configure_slash_tiers(&100, &2_000, &10_000); // minor = 1%
-        let slashed = client.slash_stake(&registry, &provider, &SlashSeverity::Minor, &Symbol::new(&env, "test"));
+        let slashed = client.slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "test"),
+        );
         assert_eq!(slashed, 10_000); // 1%
     }
 
@@ -921,7 +977,12 @@ mod slash_severity_tests {
 
         let client = StakeVaultContractClient::new(&env, &vault_id);
         assert_eq!(
-            client.try_slash_stake(&attacker, &provider, &SlashSeverity::Major, &Symbol::new(&env, "x")),
+            client.try_slash_stake(
+                &attacker,
+                &provider,
+                &SlashSeverity::Major,
+                &Symbol::new(&env, "x")
+            ),
             Err(Ok(StakeVaultError::Unauthorized))
         );
     }
@@ -996,7 +1057,10 @@ mod slash_severity_tests {
 
         env.ledger().with_mut(|l| l.timestamp = 7202);
 
-        assert_eq!(client.get_voting_power(&staker), first_deposit + second_deposit);
+        assert_eq!(
+            client.get_voting_power(&staker),
+            first_deposit + second_deposit
+        );
     }
 
     #[test]
@@ -1174,8 +1238,8 @@ mod slash_severity_tests {
         StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
         seed(&env, &vault_id, &staker, total);
 
-        let result = StakeVaultContractClient::new(&env, &vault_id)
-            .try_partial_unstake(&staker, &total);
+        let result =
+            StakeVaultContractClient::new(&env, &vault_id).try_partial_unstake(&staker, &total);
         assert_eq!(result, Err(Ok(StakeVaultError::InvalidAmount)));
     }
 
@@ -1188,8 +1252,8 @@ mod slash_severity_tests {
         StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
         seed(&env, &vault_id, &staker, total);
 
-        let result = StakeVaultContractClient::new(&env, &vault_id)
-            .try_partial_unstake(&staker, &0i128);
+        let result =
+            StakeVaultContractClient::new(&env, &vault_id).try_partial_unstake(&staker, &0i128);
         assert_eq!(result, Err(Ok(StakeVaultError::InvalidAmount)));
     }
 
@@ -1315,8 +1379,8 @@ mod slash_severity_tests {
         StellarAssetClient::new(&env, &token).mint(&vault_id, &total);
         seed(&env, &vault_id, &staker, total);
 
-        let result = StakeVaultContractClient::new(&env, &vault_id)
-            .try_partial_unstake(&staker, &withdraw);
+        let result =
+            StakeVaultContractClient::new(&env, &vault_id).try_partial_unstake(&staker, &withdraw);
         assert_eq!(result, Err(Ok(StakeVaultError::TimelockRequired)));
     }
 
@@ -1352,7 +1416,10 @@ mod slash_severity_tests {
 
         let events_before = env.events().all().len();
         StakeVaultContractClient::new(&env, &vault_id).partial_unstake(&staker, &withdraw);
-        assert!(env.events().all().len() > events_before, "partial_unstake event not emitted");
+        assert!(
+            env.events().all().len() > events_before,
+            "partial_unstake event not emitted"
+        );
     }
 
     #[test]
@@ -1426,9 +1493,9 @@ mod slash_severity_tests {
 #[cfg(test)]
 mod slash_appeal_tests {
     use crate::{
+        action, encode_action, encode_i128_bytes,
         migration::{MigrationKey, StakeInfoV2},
-        action, encode_action, encode_i128_bytes, AppealStatus, SlashSeverity,
-        StakeVaultContract, StakeVaultContractClient, StakeVaultError,
+        AppealStatus, SlashSeverity, StakeVaultContract, StakeVaultContractClient, StakeVaultError,
     };
     use shared::multisig::MultisigConfig;
     use soroban_sdk::{
@@ -1471,8 +1538,7 @@ mod slash_appeal_tests {
         let signal_registry = Address::generate(&env);
         let token = sac_token(&env, &admin);
         let vault_id = env.register(StakeVaultContract, ());
-        StakeVaultContractClient::new(&env, &vault_id)
-            .initialize(&admin, &token, &signal_registry);
+        StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token, &signal_registry);
         (env, vault_id, token, admin, signal_registry)
     }
 
@@ -1549,11 +1615,7 @@ mod slash_appeal_tests {
         );
 
         let events_before = env.events().all().len();
-        client.appeal_slash(
-            &provider,
-            &0u64,
-            &String::from_str(&env, "ipfs://evidence"),
-        );
+        client.appeal_slash(&provider, &0u64, &String::from_str(&env, "ipfs://evidence"));
         assert!(
             env.events().all().len() > events_before,
             "slash_appealed event not emitted"
@@ -1610,11 +1672,8 @@ mod slash_appeal_tests {
             &Symbol::new(&env, "misconduct"),
         );
 
-        let result = client.try_appeal_slash(
-            &provider,
-            &0u64,
-            &String::from_str(&env, "ipfs://evidence"),
-        );
+        let result =
+            client.try_appeal_slash(&provider, &0u64, &String::from_str(&env, "ipfs://evidence"));
         assert_eq!(result, Err(Ok(StakeVaultError::AppealWindowClosed)));
     }
 
@@ -1687,11 +1746,8 @@ mod slash_appeal_tests {
             &Symbol::new(&env, "violation"),
         );
 
-        let result = client.try_appeal_slash(
-            &attacker,
-            &0u64,
-            &String::from_str(&env, "ipfs://evidence"),
-        );
+        let result =
+            client.try_appeal_slash(&attacker, &0u64, &String::from_str(&env, "ipfs://evidence"));
         assert_eq!(result, Err(Ok(StakeVaultError::Unauthorized)));
     }
 
@@ -1809,11 +1865,7 @@ mod slash_appeal_tests {
             &SlashSeverity::Minor,
             &Symbol::new(&env, "violation"),
         );
-        client.appeal_slash(
-            &provider,
-            &0u64,
-            &String::from_str(&env, "ipfs://evidence"),
-        );
+        client.appeal_slash(&provider, &0u64, &String::from_str(&env, "ipfs://evidence"));
 
         let events_before = env.events().all().len();
         client.resolve_appeal(&0u64, &false);
@@ -1843,11 +1895,7 @@ mod slash_appeal_tests {
             &SlashSeverity::Minor,
             &Symbol::new(&env, "violation"),
         );
-        client.appeal_slash(
-            &provider,
-            &0u64,
-            &String::from_str(&env, "ipfs://evidence"),
-        );
+        client.appeal_slash(&provider, &0u64, &String::from_str(&env, "ipfs://evidence"));
         client.resolve_appeal(&0u64, &true);
 
         // Second resolution should fail.
@@ -1923,8 +1971,18 @@ mod slash_appeal_tests {
         seed(&env, &vault_id, &p2, amount);
 
         let client = StakeVaultContractClient::new(&env, &vault_id);
-        client.slash_stake(&signal_registry, &p1, &SlashSeverity::Minor, &Symbol::new(&env, "r1"));
-        client.slash_stake(&signal_registry, &p2, &SlashSeverity::Minor, &Symbol::new(&env, "r2"));
+        client.slash_stake(
+            &signal_registry,
+            &p1,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "r1"),
+        );
+        client.slash_stake(
+            &signal_registry,
+            &p2,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "r2"),
+        );
 
         assert_eq!(client.get_slash_record(&0u64).unwrap().provider, p1);
         assert_eq!(client.get_slash_record(&1u64).unwrap().provider, p2);
@@ -1979,7 +2037,11 @@ mod slash_appeal_tests {
         // Proposer encodes the action
         let payload = {
             let e = &env;
-            encode_action(e, action::SET_MINIMUM_STAKE, &encode_i128_bytes(500_000i128))
+            encode_action(
+                e,
+                action::SET_MINIMUM_STAKE,
+                &encode_i128_bytes(500_000i128),
+            )
         };
 
         // Propose by signer A
@@ -2035,7 +2097,11 @@ mod slash_appeal_tests {
 
         let payload = {
             let e = &env;
-            encode_action(e, action::SET_MINIMUM_STAKE, &encode_i128_bytes(100_000i128))
+            encode_action(
+                e,
+                action::SET_MINIMUM_STAKE,
+                &encode_i128_bytes(100_000i128),
+            )
         };
 
         let id = client.propose_action(&signers.get(0).unwrap(), &payload);

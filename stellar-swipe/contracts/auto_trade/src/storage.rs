@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 use soroban_sdk::{contracttype, symbol_short, Address, Env};
-use stellar_swipe_common::storage_crud::{crud_get, crud_get_or, crud_has, crud_remove, crud_set, StorageTier};
+use stellar_swipe_common::storage_crud::{
+    crud_get, crud_get_or, crud_has, crud_remove, crud_set, StorageTier,
+};
 
 use crate::auth::{AuthConfig, AuthKey};
 
@@ -59,22 +61,45 @@ pub fn authorize_user_with_limits(
         expires_at: env.ledger().timestamp() + (duration_days as u64 * 86400),
         granted_at: env.ledger().timestamp(),
     };
-    crud_set(env, StorageTier::Persistent, &AuthKey::Authorization(user.clone()), &config);
-    crud_set(env, StorageTier::Temporary, &(user.clone(), symbol_short!("balance")), &i128::MAX);
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &AuthKey::Authorization(user.clone()),
+        &config,
+    );
+    crud_set(
+        env,
+        StorageTier::Temporary,
+        &(user.clone(), symbol_short!("balance")),
+        &i128::MAX,
+    );
 }
 
 pub fn revoke_user_authorization(env: &Env, user: &Address) {
-    crud_remove(env, StorageTier::Persistent, &AuthKey::Authorization(user.clone()));
+    crud_remove(
+        env,
+        StorageTier::Persistent,
+        &AuthKey::Authorization(user.clone()),
+    );
 }
 
 /// Get the stored rate-limit info for a user, if any.
 pub fn get_rate_limit_info(env: &Env, user: &Address) -> Option<RateLimitInfo> {
-    crud_get(env, StorageTier::Persistent, &DataKey::RateLimitInfo(user.clone()))
+    crud_get(
+        env,
+        StorageTier::Persistent,
+        &DataKey::RateLimitInfo(user.clone()),
+    )
 }
 
 /// Persist rate-limit info for a user.
 pub fn set_rate_limit_info(env: &Env, user: &Address, info: &RateLimitInfo) {
-    crud_set(env, StorageTier::Persistent, &DataKey::RateLimitInfo(user.clone()), info);
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &DataKey::RateLimitInfo(user.clone()),
+        info,
+    );
 }
 
 /// Whether a user is currently rate limited (flag set and not yet expired).
@@ -127,37 +152,70 @@ pub enum LossStreakKey {
 
 /// Get the per-user consecutive-loss counter.
 pub fn get_loss_streak_counter(env: &Env, user: &Address) -> LossStreakCounter {
-    crud_get_or(env, StorageTier::Persistent, &LossStreakKey::Counter(user.clone()), LossStreakCounter::default())
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &LossStreakKey::Counter(user.clone()),
+        LossStreakCounter::default(),
+    )
 }
 
 /// Set the per-user consecutive-loss counter.
 pub fn set_loss_streak_counter(env: &Env, user: &Address, counter: &LossStreakCounter) {
-    crud_set(env, StorageTier::Persistent, &LossStreakKey::Counter(user.clone()), counter);
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &LossStreakKey::Counter(user.clone()),
+        counter,
+    );
 }
 
 /// Get the loss-streak threshold config.
 pub fn get_loss_streak_config(env: &Env) -> LossStreakConfig {
-    crud_get_or(env, StorageTier::Instance, &LossStreakKey::ConfigState, LossStreakConfig::default())
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &LossStreakKey::ConfigState,
+        LossStreakConfig::default(),
+    )
 }
 
 /// Set the loss-streak threshold config (admin only).
 pub fn set_loss_streak_config(env: &Env, config: &LossStreakConfig) {
-    crud_set(env, StorageTier::Instance, &LossStreakKey::ConfigState, config);
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &LossStreakKey::ConfigState,
+        config,
+    );
 }
 
 /// Whether the user is currently paused due to a loss-streak.
 pub fn is_loss_streak_paused(env: &Env, user: &Address) -> bool {
-    crud_has(env, StorageTier::Persistent, &LossStreakKey::Paused(user.clone()))
+    crud_has(
+        env,
+        StorageTier::Persistent,
+        &LossStreakKey::Paused(user.clone()),
+    )
 }
 
 /// Mark a user as paused due to loss-streak.
 pub fn set_loss_streak_paused(env: &Env, user: &Address) {
-    crud_set(env, StorageTier::Persistent, &LossStreakKey::Paused(user.clone()), &true);
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &LossStreakKey::Paused(user.clone()),
+        &true,
+    );
 }
 
 /// Clear the loss-streak pause for a user.
 pub fn clear_loss_streak_paused(env: &Env, user: &Address) {
-    crud_remove(env, StorageTier::Persistent, &LossStreakKey::Paused(user.clone()));
+    crud_remove(
+        env,
+        StorageTier::Persistent,
+        &LossStreakKey::Paused(user.clone()),
+    );
 }
 
 // ── Daily Execution Cap ───────────────────────────────────────────────────────

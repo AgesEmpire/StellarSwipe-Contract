@@ -20,7 +20,7 @@
 //! - [`forfeit_expired`] lets anyone clear a timed-out slot, preventing permanent
 //!   state lock-up. Callers MUST NOT lock funds before a successful reveal.
 
-use soroban_sdk::{contracttype, contracterror, Address, Bytes, BytesN, Env, String, Symbol};
+use soroban_sdk::{contracterror, contracttype, Address, Bytes, BytesN, Env, String, Symbol};
 
 /// `SHA-256( "sw_exec_v1" || user || signal_id || amount || min_out || salt
 /// || valid_until_ledger )` as a [`BytesN<32>`].

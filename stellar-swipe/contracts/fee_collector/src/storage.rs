@@ -67,6 +67,7 @@ pub const SILVER_TIER_VOLUME_USD: i128 = 10_000 * 10_000_000; // $10k, 7 decimal
 pub const GOLD_TIER_VOLUME_USD: i128 = 50_000 * 10_000_000; // $50k, 7 decimals
 pub const SILVER_DISCOUNT_BPS: u32 = 5;
 pub const GOLD_DISCOUNT_BPS: u32 = 10;
+pub const DEFAULT_REFERRAL_FEE_SHARE_BPS: u32 = 0;
 
 #[contracttype]
 pub enum StorageKey {
@@ -110,6 +111,10 @@ pub enum StorageKey {
     WaterfallConfig,
     /// #691: Per-provider preferred payout token.
     ProviderPayoutCurrency(Address),
+    /// Referral mapping from referee to referrer.
+    Referrer(Address),
+    /// Referral fee share in basis points.
+    ReferralFeeShareBps,
     /// #664: Admin-configured volume-based discount tiers.
     VolumeDiscountConfig,
     /// #665: Fee forecast configuration.
@@ -642,6 +647,43 @@ pub fn remove_provider_payout_currency(env: &Env, provider: &Address) {
         env,
         StorageTier::Persistent,
         &StorageKey::ProviderPayoutCurrency(provider.clone()),
+    );
+}
+
+// ── Referral storage ────────────────────────────────────────────────────────
+
+pub fn get_referrer(env: &Env, referee: &Address) -> Option<Address> {
+    crud_get(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::Referrer(referee.clone()),
+    )
+}
+
+pub fn set_referrer(env: &Env, referee: &Address, referrer: &Address) {
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::Referrer(referee.clone()),
+        referrer,
+    );
+}
+
+pub fn get_referral_fee_share_bps(env: &Env) -> u32 {
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &StorageKey::ReferralFeeShareBps,
+        DEFAULT_REFERRAL_FEE_SHARE_BPS,
+    )
+}
+
+pub fn set_referral_fee_share_bps(env: &Env, share_bps: u32) {
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::ReferralFeeShareBps,
+        &share_bps,
     );
 }
 

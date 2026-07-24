@@ -4,9 +4,9 @@ use soroban_sdk::{contracttype, symbol_short, Address, Env};
 use crate::errors::AutoTradeError;
 use crate::storage::Signal;
 
-/// ==========================
-/// Types
-/// ==========================
+// ==========================
+// Types
+// ==========================
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionResult {
@@ -14,9 +14,9 @@ pub struct ExecutionResult {
     pub executed_price: i128,
 }
 
-/// ==========================
-/// Balance Check
-/// ==========================
+// ==========================
+// Balance Check
+// ==========================
 pub fn has_sufficient_balance(env: &Env, user: &Address, _asset: &u32, amount: i128) -> bool {
     let key = (user.clone(), symbol_short!("balance"));
     let balance: i128 = env.storage().temporary().get(&key).unwrap_or(0);
@@ -33,9 +33,9 @@ pub fn get_current_price(env: &Env, signal: &Signal) -> i128 {
     env.storage().temporary().get(&key).unwrap_or(signal.price)
 }
 
-/// ==========================
-/// Market Order
-/// ==========================
+// ==========================
+// Market Order
+// ==========================
 pub fn execute_market_order(
     env: &Env,
     _user: &Address,
@@ -62,9 +62,9 @@ pub fn execute_market_order(
     })
 }
 
-/// ==========================
-/// Limit Order
-/// ==========================
+// ==========================
+// Limit Order
+// ==========================
 pub fn execute_limit_order(
     env: &Env,
     _user: &Address,

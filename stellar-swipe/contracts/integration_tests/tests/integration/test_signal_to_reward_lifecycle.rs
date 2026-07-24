@@ -146,7 +146,10 @@ fn test_signal_to_reward_lifecycle() {
     let adoption_count = env.as_contract(&executor_id, || {
         registry.increment_adoption(&executor_id, &signal_id, &1u64)
     });
-    assert_eq!(adoption_count, 1u32, "adoption count must be 1 after first copy");
+    assert_eq!(
+        adoption_count, 1u32,
+        "adoption count must be 1 after first copy"
+    );
 
     let signal = registry.get_signal(&signal_id).unwrap();
     assert_eq!(signal.adoption_count, 1u32);
@@ -155,7 +158,10 @@ fn test_signal_to_reward_lifecycle() {
     let trade_amount: i128 = 5_000_000;
     let breakdown: FeeBreakdown = registry.calculate_fee_preview(&trade_amount);
     // Default fee is 0.1% (10 bps); platform=70%, provider=30%.
-    assert_eq!(breakdown.total_fee, 5_000i128, "total fee must be 0.1% of 5_000_000");
+    assert_eq!(
+        breakdown.total_fee, 5_000i128,
+        "total fee must be 0.1% of 5_000_000"
+    );
     assert_eq!(breakdown.platform_fee, 3_500i128);
     assert_eq!(breakdown.provider_fee, 1_500i128);
     assert_eq!(
@@ -179,7 +185,10 @@ fn test_signal_to_reward_lifecycle() {
     let perf = registry.get_signal_performance(&signal_id).unwrap();
     assert_eq!(perf.executions, 1u32);
     assert_eq!(perf.total_volume, trade_amount);
-    assert!(perf.average_roi > 0i128, "profitable trade must show positive ROI");
+    assert!(
+        perf.average_roi > 0i128,
+        "profitable trade must show positive ROI"
+    );
 
     // Assert: provider performance stats reflect the trade.
     // (Stats update when signal transitions from Active; it may not yet here.)
@@ -277,7 +286,10 @@ fn test_fee_collection_consistent_across_trade_sizes() {
     for amount in [1_000_000i128, 5_000_000, 10_000_000, 100_000_000] {
         let bd = registry.calculate_fee_preview(&amount);
         let expected_fee = amount / 1_000; // 0.1% = 10bps
-        assert_eq!(bd.total_fee, expected_fee, "fee must be 0.1% for amount {amount}");
+        assert_eq!(
+            bd.total_fee, expected_fee,
+            "fee must be 0.1% for amount {amount}"
+        );
         assert_eq!(
             bd.platform_fee + bd.provider_fee,
             bd.total_fee,
@@ -312,8 +324,7 @@ fn test_vault_delegation_independent_of_registry_stake() {
     assert_eq!(registry.get_stake(&provider), 100_000_000i128);
 
     // Delegator delegates into the vault (separate contract, separate token).
-    soroban_sdk::token::StellarAssetClient::new(&env, &token)
-        .mint(&delegator, &50_000_000i128);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&delegator, &50_000_000i128);
     vault.delegate_stake(&delegator, &provider, &50_000_000i128);
 
     // registry stake unchanged.

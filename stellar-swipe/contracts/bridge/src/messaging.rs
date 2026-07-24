@@ -263,12 +263,16 @@ pub fn confirm_message_delivery(
         if msg.nonce < expected {
             return Err(String::from_str(env, "Duplicate nonce: already delivered"));
         }
-        return Err(String::from_str(env, "Out-of-order nonce: expected lower sequence"));
+        return Err(String::from_str(
+            env,
+            "Out-of-order nonce: expected lower sequence",
+        ));
     }
     // Advance the expected delivery nonce for this target chain.
-    env.storage()
-        .persistent()
-        .set(&MessagingKey::ExpectedNonce(msg.target_chain as u32), &(expected + 1));
+    env.storage().persistent().set(
+        &MessagingKey::ExpectedNonce(msg.target_chain as u32),
+        &(expected + 1),
+    );
 
     verify_delivery_proof(env, msg.target_chain, message_id, &delivery_proof)?;
 
@@ -655,7 +659,9 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(confirm_message_delivery(&env, id, validators.get(0).unwrap(), proof(&env)).is_err());
+        assert!(
+            confirm_message_delivery(&env, id, validators.get(0).unwrap(), proof(&env)).is_err()
+        );
     }
 
     #[test]

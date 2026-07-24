@@ -9,7 +9,7 @@ use soroban_sdk::{contracttype, symbol_short, token, Address, Env, Vec};
 
 use crate::{
     migration::{MigrationKey, StakeInfoV2},
-    StorageKey, StakeVaultError,
+    StakeVaultError, StorageKey,
 };
 
 // ── Types ──────────────────────────────────────────────────────────────────────

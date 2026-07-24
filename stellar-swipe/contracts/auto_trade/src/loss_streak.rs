@@ -4,8 +4,8 @@ use crate::admin;
 use crate::errors::AutoTradeError;
 use crate::storage::{
     self, clear_loss_streak_paused, get_loss_streak_config, get_loss_streak_counter,
-    is_loss_streak_paused, set_loss_streak_counter, set_loss_streak_paused,
-    LossStreakConfig, LossStreakCounter,
+    is_loss_streak_paused, set_loss_streak_counter, set_loss_streak_paused, LossStreakConfig,
+    LossStreakCounter,
 };
 use crate::TradeStatus;
 
@@ -28,11 +28,7 @@ pub fn check_loss_streak_paused(env: &Env, user: &Address) -> Result<(), AutoTra
     Ok(())
 }
 
-pub fn record_trade_outcome(
-    env: &Env,
-    user: &Address,
-    status: &TradeStatus,
-) {
+pub fn record_trade_outcome(env: &Env, user: &Address, status: &TradeStatus) {
     let now = env.ledger().timestamp();
 
     match status {
@@ -85,10 +81,7 @@ pub fn set_loss_streak_threshold(
     Ok(())
 }
 
-pub fn resume_after_loss_streak(
-    env: &Env,
-    user: &Address,
-) -> Result<(), AutoTradeError> {
+pub fn resume_after_loss_streak(env: &Env, user: &Address) -> Result<(), AutoTradeError> {
     if !is_loss_streak_paused(env, user) {
         return Err(AutoTradeError::NotPaused);
     }

@@ -46,7 +46,7 @@ fn require_position_owner(env: &Env, user: &Address, position_id: u64) {
 
 /// Validate that a tag string is within the allowed length bounds.
 fn validate_tag(env: &Env, tag: &String) {
-    if tag.len() == 0 || tag.len() > MAX_TAG_LENGTH {
+    if tag.is_empty() || tag.len() > MAX_TAG_LENGTH {
         panic!("tag must be between 1 and {MAX_TAG_LENGTH} characters");
     }
 }
@@ -57,12 +57,7 @@ fn validate_tag(env: &Env, tag: &String) {
 /// - `tag` must be 1–32 characters.
 /// - If the position was previously tagged, the old tag index is cleaned up.
 /// - Emits `PositionTagged` event.
-pub fn tag_position(
-    env: &Env,
-    user: Address,
-    position_id: u64,
-    tag: String,
-) -> Result<(), ()> {
+pub fn tag_position(env: &Env, user: Address, position_id: u64, tag: String) -> Result<(), ()> {
     user.require_auth();
     require_position_owner(env, &user, position_id);
     validate_tag(env, &tag);
@@ -84,7 +79,7 @@ pub fn tag_position(
                 }
             }
         }
-        if updated.len() > 0 {
+        if !updated.is_empty() {
             env.storage().persistent().set(&old_index_key, &updated);
         } else {
             env.storage().persistent().remove(&old_index_key);
@@ -145,7 +140,7 @@ pub fn untag_position(env: &Env, user: Address, position_id: u64) {
                 }
             }
         }
-        if updated.len() > 0 {
+        if !updated.is_empty() {
             env.storage().persistent().set(&old_index_key, &updated);
         } else {
             env.storage().persistent().remove(&old_index_key);
@@ -171,7 +166,6 @@ pub fn get_position_tag(env: &Env, user: Address, position_id: u64) -> Option<St
         .persistent()
         .get(&DataKey::PositionTag(user, position_id))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -241,10 +235,8 @@ mod tests {
             tag_position(&env, user.clone(), 1, tag1).unwrap();
             tag_position(&env, user.clone(), 1, tag2.clone()).unwrap();
 
-            let old_ids = get_positions_by_tag(
-                &env, user.clone(),
-                String::from_str(&env, "experimental"),
-            );
+            let old_ids =
+                get_positions_by_tag(&env, user.clone(), String::from_str(&env, "experimental"));
             assert_eq!(old_ids.len(), 0);
 
             let new_ids = get_positions_by_tag(&env, user, tag2);
@@ -283,10 +275,8 @@ mod tests {
             let user = Address::generate(&env);
             TagHarness::simulate_open_position(env.clone(), user.clone(), 1);
 
-            let long_tag = String::from_str(
-                &env,
-                "this-tag-is-way-too-long-to-be-allowed-123456789",
-            );
+            let long_tag =
+                String::from_str(&env, "this-tag-is-way-too-long-to-be-allowed-123456789");
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tag_position(&env, user.clone(), 1, long_tag).unwrap();
             }));

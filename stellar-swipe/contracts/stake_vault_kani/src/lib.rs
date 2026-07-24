@@ -233,7 +233,10 @@ mod proofs {
         kani::assume!(amount > 0 && amount <= MAX_AMOUNT);
 
         vault.deposit(0, amount);
-        assert!(vault.invariant_holds(), "deposit broke the balance invariant");
+        assert!(
+            vault.invariant_holds(),
+            "deposit broke the balance invariant"
+        );
     }
 
     /// Deposit then withdraw: invariant holds at both checkpoints.

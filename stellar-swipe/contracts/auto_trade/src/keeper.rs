@@ -28,7 +28,9 @@ fn load_keepers(env: &Env) -> Vec<Address> {
 }
 
 fn save_keepers(env: &Env, keepers: &Vec<Address>) {
-    env.storage().persistent().set(&KeeperKey::Registry, keepers);
+    env.storage()
+        .persistent()
+        .set(&KeeperKey::Registry, keepers);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

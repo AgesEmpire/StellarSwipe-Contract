@@ -77,10 +77,7 @@ mod tests {
             &symbol_short!("noop_read"),
             soroban_sdk::vec![
                 &env,
-                soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(
-                    &symbol_short!("k"),
-                    &env,
-                ),
+                soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&symbol_short!("k"), &env,),
             ],
         );
         let cost = env.budget().cpu_instruction_cost();

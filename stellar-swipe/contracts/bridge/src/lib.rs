@@ -137,37 +137,24 @@ pub enum DataKey {
 
 const DAY_SECONDS: u64 = 86_400;
 
-pub mod monitoring;
-pub mod governance;
 pub mod analytics;
 pub mod fees;
-pub mod messaging;
+pub mod governance;
 mod liquidity;
+pub mod messaging;
+pub mod monitoring;
 
 pub use liquidity::{LiquidityPool, LiquidityPosition, PoolHealth, PoolType, SwapResult};
 
 pub use messaging::{
-    CrossChainMessage, MessageStatus,
-    MAX_MESSAGE_SIZE, MESSAGE_TIMEOUT,
-    register_bridge_for_chain,
-    send_cross_chain_message,
-    relay_message_to_target_chain,
-    confirm_message_delivery,
-    receive_message_callback,
-    mark_message_failed,
-    retry_failed_message,
-    expire_timed_out_message,
-    get_cross_chain_message,
+    confirm_message_delivery, expire_timed_out_message, get_cross_chain_message,
+    mark_message_failed, receive_message_callback, register_bridge_for_chain,
+    relay_message_to_target_chain, retry_failed_message, send_cross_chain_message,
+    CrossChainMessage, MessageStatus, MAX_MESSAGE_SIZE, MESSAGE_TIMEOUT,
 };
 
-soroban_sdk::contractmeta!(
-    key = "SourceHash",
-    val = env!("STELLAR_SOURCE_HASH")
-);
-soroban_sdk::contractmeta!(
-    key = "GitCommit",
-    val = env!("STELLAR_GIT_COMMIT")
-);
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct BridgeContract;
@@ -387,7 +374,11 @@ impl BridgeContract {
             .persistent()
             .set(&balance_key, &(balance + transfer.amount));
 
-        let total_minted: i128 = env.storage().persistent().get(&DataKey::TotalMinted).unwrap_or(0);
+        let total_minted: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalMinted)
+            .unwrap_or(0);
         env.storage()
             .persistent()
             .set(&DataKey::TotalMinted, &(total_minted + transfer.amount));
@@ -431,7 +422,11 @@ impl BridgeContract {
             .persistent()
             .set(&balance_key, &(balance - amount));
 
-        let total_minted: i128 = env.storage().persistent().get(&DataKey::TotalMinted).unwrap_or(0);
+        let total_minted: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalMinted)
+            .unwrap_or(0);
         env.storage()
             .persistent()
             .set(&DataKey::TotalMinted, &(total_minted - amount));
@@ -573,8 +568,16 @@ impl BridgeContract {
             return Err(BridgeError::InvalidAmount);
         }
 
-        let total_minted = env.storage().persistent().get(&DataKey::TotalMinted).unwrap_or(0i128);
-        let threshold = env.storage().persistent().get(&DataKey::ReserveThreshold).unwrap_or(9500u32);
+        let total_minted = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalMinted)
+            .unwrap_or(0i128);
+        let threshold = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReserveThreshold)
+            .unwrap_or(9500u32);
 
         let ratio = if total_minted > 0 {
             (actual_locked * 10000) / total_minted
@@ -604,16 +607,24 @@ impl BridgeContract {
         if threshold_bps > 10000 {
             return Err(BridgeError::InvalidThreshold);
         }
-        env.storage().persistent().set(&DataKey::ReserveThreshold, &threshold_bps);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReserveThreshold, &threshold_bps);
         Ok(())
     }
 
     pub fn get_reserve_threshold(env: Env) -> u32 {
-        env.storage().persistent().get(&DataKey::ReserveThreshold).unwrap_or(9500u32)
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReserveThreshold)
+            .unwrap_or(9500u32)
     }
 
     pub fn get_total_minted(env: Env) -> i128 {
-        env.storage().persistent().get(&DataKey::TotalMinted).unwrap_or(0)
+        env.storage()
+            .persistent()
+            .get(&DataKey::TotalMinted)
+            .unwrap_or(0)
     }
 
     pub fn create_liquidity_pool(
@@ -694,8 +705,18 @@ impl BridgeContract {
 
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
-        m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
-        m.set(soroban_sdk::String::from_str(&env, "git_commit"), soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")));
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
+        );
         m
     }
 
@@ -708,7 +729,11 @@ impl BridgeContract {
 
     /// Admin: record the current available liquidity buffer.
     /// This is used to compute the dynamic per-transfer withdrawal cap.
-    pub fn update_liquidity_buffer(env: Env, admin: Address, buffer: i128) -> Result<(), BridgeError> {
+    pub fn update_liquidity_buffer(
+        env: Env,
+        admin: Address,
+        buffer: i128,
+    ) -> Result<(), BridgeError> {
         require_admin(&env, &admin)?;
         if !cfg!(test) {
             admin.require_auth();
@@ -716,23 +741,35 @@ impl BridgeContract {
         if buffer < 0 {
             return Err(BridgeError::InvalidAmount);
         }
-        env.storage().persistent().set(&DataKey::LiquidityBuffer, &buffer);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LiquidityBuffer, &buffer);
         #[allow(deprecated)]
         env.events().publish(
-            (Symbol::new(&env, "bridge"), Symbol::new(&env, "liquidity_buffer_updated")),
+            (
+                Symbol::new(&env, "bridge"),
+                Symbol::new(&env, "liquidity_buffer_updated"),
+            ),
             buffer,
         );
         Ok(())
     }
 
     pub fn get_liquidity_buffer(env: Env) -> i128 {
-        env.storage().persistent().get(&DataKey::LiquidityBuffer).unwrap_or(i128::MAX)
+        env.storage()
+            .persistent()
+            .get(&DataKey::LiquidityBuffer)
+            .unwrap_or(i128::MAX)
     }
 
     // ── #669: Destination-chain allowlist ─────────────────────────────────────
 
     /// Admin: add `chain` to the supported destination-chain allowlist.
-    pub fn add_supported_chain(env: Env, admin: Address, chain: ChainId) -> Result<(), BridgeError> {
+    pub fn add_supported_chain(
+        env: Env,
+        admin: Address,
+        chain: ChainId,
+    ) -> Result<(), BridgeError> {
         require_admin(&env, &admin)?;
         if !cfg!(test) {
             admin.require_auth();
@@ -744,17 +781,21 @@ impl BridgeContract {
             }
         }
         chains.push_back(chain);
-        env.storage().instance().set(&DataKey::SupportedChains, &chains);
+        env.storage()
+            .instance()
+            .set(&DataKey::SupportedChains, &chains);
         #[allow(deprecated)]
-        env.events().publish(
-            (Symbol::new(&env, "chain_added"),),
-            chain as u32,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "chain_added"),), chain as u32);
         Ok(())
     }
 
     /// Admin: remove `chain` from the supported destination-chain allowlist.
-    pub fn remove_supported_chain(env: Env, admin: Address, chain: ChainId) -> Result<(), BridgeError> {
+    pub fn remove_supported_chain(
+        env: Env,
+        admin: Address,
+        chain: ChainId,
+    ) -> Result<(), BridgeError> {
         require_admin(&env, &admin)?;
         if !cfg!(test) {
             admin.require_auth();
@@ -768,12 +809,12 @@ impl BridgeContract {
                 }
             }
         }
-        env.storage().instance().set(&DataKey::SupportedChains, &updated);
+        env.storage()
+            .instance()
+            .set(&DataKey::SupportedChains, &updated);
         #[allow(deprecated)]
-        env.events().publish(
-            (Symbol::new(&env, "chain_removed"),),
-            chain as u32,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "chain_removed"),), chain as u32);
         Ok(())
     }
 
@@ -1205,13 +1246,18 @@ mod test {
 
             // 500 is exactly 10% — should pass
             BridgeContract::initiate_lock_mint(
-                env.clone(), user.clone(),
-                ChainId::Ethereum, ChainId::Polygon,
-                String::from_str(&env, "ETH"), String::from_str(&env, "wETH"),
+                env.clone(),
+                user.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
                 500,
-                String::from_str(&env, "0xa"), 1,
+                String::from_str(&env, "0xa"),
+                1,
                 String::from_str(&env, "r"),
-            ).unwrap();
+            )
+            .unwrap();
         });
     }
 
@@ -1225,11 +1271,15 @@ mod test {
             BridgeContract::update_liquidity_buffer(env.clone(), admin.clone(), 100).unwrap();
 
             let result = BridgeContract::initiate_lock_mint(
-                env.clone(), user.clone(),
-                ChainId::Ethereum, ChainId::Polygon,
-                String::from_str(&env, "ETH"), String::from_str(&env, "wETH"),
+                env.clone(),
+                user.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
                 50,
-                String::from_str(&env, "0xb"), 2,
+                String::from_str(&env, "0xb"),
+                2,
                 String::from_str(&env, "r"),
             );
             assert_eq!(result, Err(BridgeError::DynamicLiquidityLimitExceeded));
@@ -1253,13 +1303,18 @@ mod test {
             init(&env, &admin, &validators);
             // No buffer update — dynamic limit is effectively infinite
             BridgeContract::initiate_lock_mint(
-                env.clone(), user,
-                ChainId::Ethereum, ChainId::Polygon,
-                String::from_str(&env, "ETH"), String::from_str(&env, "wETH"),
+                env.clone(),
+                user,
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
                 999,
-                String::from_str(&env, "0xc"), 3,
+                String::from_str(&env, "0xc"),
+                3,
                 String::from_str(&env, "r"),
-            ).unwrap();
+            )
+            .unwrap();
         });
     }
 
@@ -1278,16 +1333,33 @@ mod test {
 
             // Perform lock-mint to mint 1000 tokens
             let transfer_id = BridgeContract::initiate_lock_mint(
-                env.clone(), user.clone(),
-                ChainId::Ethereum, ChainId::Polygon,
-                String::from_str(&env, "ETH"), String::from_str(&env, "wETH"),
+                env.clone(),
+                user.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
                 1000,
-                String::from_str(&env, "0xa"), 1,
+                String::from_str(&env, "0xa"),
+                1,
                 String::from_str(&env, "r"),
-            ).unwrap();
+            )
+            .unwrap();
 
-            BridgeContract::approve_lock_mint(env.clone(), validators.get(0).unwrap(), transfer_id, String::from_str(&env, "sig1")).unwrap();
-            BridgeContract::approve_lock_mint(env.clone(), validators.get(1).unwrap(), transfer_id, String::from_str(&env, "sig2")).unwrap();
+            BridgeContract::approve_lock_mint(
+                env.clone(),
+                validators.get(0).unwrap(),
+                transfer_id,
+                String::from_str(&env, "sig1"),
+            )
+            .unwrap();
+            BridgeContract::approve_lock_mint(
+                env.clone(),
+                validators.get(1).unwrap(),
+                transfer_id,
+                String::from_str(&env, "sig2"),
+            )
+            .unwrap();
             BridgeContract::execute_lock_mint(env.clone(), admin.clone(), transfer_id).unwrap();
 
             // Total minted should now be 1000
@@ -1298,7 +1370,8 @@ mod test {
             assert!(attest_res.is_ok());
 
             // Attest unhealthy reserve: 900 locked (900/1000 = 90% < 95%)
-            let attest_res_unhealthy = BridgeContract::attest_reserves(env.clone(), user.clone(), 900);
+            let attest_res_unhealthy =
+                BridgeContract::attest_reserves(env.clone(), user.clone(), 900);
             assert!(attest_res_unhealthy.is_ok());
 
             // Change threshold to 8000 bps (80%)
@@ -1306,7 +1379,8 @@ mod test {
             assert_eq!(BridgeContract::get_reserve_threshold(env.clone()), 8000);
 
             // Now 900 locked is healthy (900/1000 = 90% >= 80%)
-            let attest_res_healthy_now = BridgeContract::attest_reserves(env.clone(), user.clone(), 900);
+            let attest_res_healthy_now =
+                BridgeContract::attest_reserves(env.clone(), user.clone(), 900);
             assert!(attest_res_healthy_now.is_ok());
         });
     }

@@ -273,14 +273,8 @@ pub struct SlashAppeal {
     pub status: AppealStatus,
 }
 
-soroban_sdk::contractmeta!(
-    key = "SourceHash",
-    val = env!("STELLAR_SOURCE_HASH")
-);
-soroban_sdk::contractmeta!(
-    key = "GitCommit",
-    val = env!("STELLAR_GIT_COMMIT")
-);
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 // ── Multi-sig action discriminators ──────────────────────────────────────────
 
@@ -327,8 +321,18 @@ pub struct StakeVaultContract;
 impl StakeVaultContract {
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
-        m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
-        m.set(soroban_sdk::String::from_str(&env, "git_commit"), soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")));
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
+        );
         m
     }
 
@@ -625,8 +629,7 @@ impl StakeVaultContract {
             return Err(StakeVaultError::Unauthorized);
         }
         if let Some(cfg) = config {
-            multisig::set_config(&env, &cfg)
-                .map_err(|_| StakeVaultError::InvalidMultiSigConfig)?;
+            multisig::set_config(&env, &cfg).map_err(|_| StakeVaultError::InvalidMultiSigConfig)?;
         } else {
             env.storage()
                 .instance()
@@ -643,8 +646,7 @@ impl StakeVaultContract {
         payload: Bytes,
     ) -> Result<u64, StakeVaultError> {
         caller.require_auth();
-        multisig::propose(&env, &caller, payload)
-            .map_err(|_| StakeVaultError::Unauthorized)
+        multisig::propose(&env, &caller, payload).map_err(|_| StakeVaultError::Unauthorized)
     }
 
     /// Approve a pending proposal. `caller` must be a registered signer.
@@ -655,19 +657,18 @@ impl StakeVaultContract {
         proposal_id: u64,
     ) -> Result<u32, StakeVaultError> {
         caller.require_auth();
-        multisig::approve(&env, &caller, proposal_id)
-            .map_err(|e| -> StakeVaultError {
-                match e {
-                    multisig::MultisigError::ProposalNotFound => {
-                        StakeVaultError::EmergencyRequestNotFound
-                    }
-                    multisig::MultisigError::AlreadyApproved => StakeVaultError::AlreadyApproved,
-                    multisig::MultisigError::ProposalExpired => {
-                        StakeVaultError::EmergencyRequestExpired
-                    }
-                    _ => StakeVaultError::Unauthorized,
+        multisig::approve(&env, &caller, proposal_id).map_err(|e| -> StakeVaultError {
+            match e {
+                multisig::MultisigError::ProposalNotFound => {
+                    StakeVaultError::EmergencyRequestNotFound
                 }
-            })
+                multisig::MultisigError::AlreadyApproved => StakeVaultError::AlreadyApproved,
+                multisig::MultisigError::ProposalExpired => {
+                    StakeVaultError::EmergencyRequestExpired
+                }
+                _ => StakeVaultError::Unauthorized,
+            }
+        })
     }
 
     /// Execute an approved proposal. Decodes the action payload and performs
@@ -680,21 +681,18 @@ impl StakeVaultContract {
         caller.require_auth();
         let proposal = multisig::get_proposal(&env, proposal_id)
             .map_err(|_| StakeVaultError::EmergencyRequestNotFound)?;
-        multisig::require_can_execute(&env, &proposal)
-            .map_err(|e| -> StakeVaultError {
-                match e {
-                    multisig::MultisigError::AlreadyExecuted => {
-                        StakeVaultError::EmergencyRequestNotFound
-                    }
-                    multisig::MultisigError::ThresholdNotMet => {
-                        StakeVaultError::Unauthorized
-                    }
-                    multisig::MultisigError::ProposalExpired => {
-                        StakeVaultError::EmergencyRequestExpired
-                    }
-                    _ => StakeVaultError::Unauthorized,
+        multisig::require_can_execute(&env, &proposal).map_err(|e| -> StakeVaultError {
+            match e {
+                multisig::MultisigError::AlreadyExecuted => {
+                    StakeVaultError::EmergencyRequestNotFound
                 }
-            })?;
+                multisig::MultisigError::ThresholdNotMet => StakeVaultError::Unauthorized,
+                multisig::MultisigError::ProposalExpired => {
+                    StakeVaultError::EmergencyRequestExpired
+                }
+                _ => StakeVaultError::Unauthorized,
+            }
+        })?;
 
         let payload = proposal.payload;
         let tag = payload.get(0).ok_or(StakeVaultError::Unauthorized)?;
@@ -753,8 +751,7 @@ impl StakeVaultContract {
             _ => return Err(StakeVaultError::Unauthorized),
         }
 
-        multisig::mark_executed(&env, proposal_id)
-            .map_err(|_| StakeVaultError::Unauthorized)?;
+        multisig::mark_executed(&env, proposal_id).map_err(|_| StakeVaultError::Unauthorized)?;
         Ok(())
     }
 
@@ -912,10 +909,7 @@ impl StakeVaultContract {
             .persistent()
             .get(&MigrationKey::StakesV2)
             .unwrap_or_else(|| soroban_sdk::Map::new(&env));
-        let amount_to_withdraw = stakes
-            .get(staker.clone())
-            .map(|i| i.balance)
-            .unwrap_or(0);
+        let amount_to_withdraw = stakes.get(staker.clone()).map(|i| i.balance).unwrap_or(0);
 
         let mut auth_args: Vec<Val> = Vec::new(&env);
         auth_args.push_back(staker.clone().into_val(&env));
@@ -1050,7 +1044,11 @@ impl StakeVaultContract {
     ///   has been configured.
     /// - Same flash-loan, large-withdrawal time-lock, and reentrancy protections
     ///   as `withdraw_stake` apply.
-    pub fn partial_unstake(env: Env, staker: Address, amount: i128) -> Result<i128, StakeVaultError> {
+    pub fn partial_unstake(
+        env: Env,
+        staker: Address,
+        amount: i128,
+    ) -> Result<i128, StakeVaultError> {
         Self::require_not_paused(&env)?;
 
         if amount <= 0 {
@@ -1098,7 +1096,11 @@ impl StakeVaultContract {
         result
     }
 
-    fn do_partial_unstake(env: &Env, staker: &Address, amount: i128) -> Result<i128, StakeVaultError> {
+    fn do_partial_unstake(
+        env: &Env,
+        staker: &Address,
+        amount: i128,
+    ) -> Result<i128, StakeVaultError> {
         let token: Address = env
             .storage()
             .instance()
@@ -1354,9 +1356,10 @@ impl StakeVaultContract {
         }
 
         if delegated_slash_total > 0 {
-            env.storage()
-                .persistent()
-                .set(&StorageKey::ProviderDelegatedStakes(provider.clone()), &delegated);
+            env.storage().persistent().set(
+                &StorageKey::ProviderDelegatedStakes(provider.clone()),
+                &delegated,
+            );
 
             let total_delegated: i128 = env
                 .storage()
@@ -1422,7 +1425,13 @@ impl StakeVaultContract {
                 Symbol::new(&env, "stake_vault"),
                 Symbol::new(&env, "stake_slashed"),
             ),
-            (provider.clone(), severity as u32, slash_amount, slash_id, reason),
+            (
+                provider.clone(),
+                severity as u32,
+                slash_amount,
+                slash_id,
+                reason,
+            ),
         );
 
         Ok(slash_amount)
@@ -1553,11 +1562,7 @@ impl StakeVaultContract {
     ///
     /// Resolving an appeal that does not exist or has already been resolved
     /// returns an error.
-    pub fn resolve_appeal(
-        env: Env,
-        slash_id: u64,
-        uphold: bool,
-    ) -> Result<(), StakeVaultError> {
+    pub fn resolve_appeal(env: Env, slash_id: u64, uphold: bool) -> Result<(), StakeVaultError> {
         let admin: Address = env
             .storage()
             .instance()
@@ -1604,8 +1609,7 @@ impl StakeVaultContract {
                 env.storage()
                     .persistent()
                     .remove(&StorageKey::SlashedFundsHeld(slash_id));
-                token::Client::new(&env, &token)
-                    .burn(&env.current_contract_address(), &held);
+                token::Client::new(&env, &token).burn(&env.current_contract_address(), &held);
             }
         } else {
             // Reversed — tokens are still in the vault; credit provider's stake.
@@ -1717,10 +1721,7 @@ impl StakeVaultContract {
     ///
     /// The request will only execute once `required` multi-sig admins have called
     /// `approve_emergency_unstake`. Until then, no funds move.
-    pub fn request_emergency_unstake(
-        env: Env,
-        staker: Address,
-    ) -> Result<(), StakeVaultError> {
+    pub fn request_emergency_unstake(env: Env, staker: Address) -> Result<(), StakeVaultError> {
         staker.require_auth();
         emergency_unstake::request(&env, &staker)
     }
@@ -1744,10 +1745,7 @@ impl StakeVaultContract {
     }
 
     /// Anyone may call this to clean up an expired emergency request.
-    pub fn expire_emergency_request(
-        env: Env,
-        staker: Address,
-    ) -> Result<(), StakeVaultError> {
+    pub fn expire_emergency_request(env: Env, staker: Address) -> Result<(), StakeVaultError> {
         emergency_unstake::expire_request(&env, &staker)
     }
 
@@ -1791,9 +1789,10 @@ impl StakeVaultContract {
         let current = delegated.get(delegator.clone()).unwrap_or(0);
         let new_amount = current.checked_add(amount).unwrap_or(i128::MAX);
         delegated.set(delegator.clone(), new_amount);
-        env.storage()
-            .persistent()
-            .set(&StorageKey::ProviderDelegatedStakes(provider.clone()), &delegated);
+        env.storage().persistent().set(
+            &StorageKey::ProviderDelegatedStakes(provider.clone()),
+            &delegated,
+        );
 
         let total_delegated: i128 = env
             .storage()
@@ -1801,13 +1800,14 @@ impl StakeVaultContract {
             .get(&StorageKey::ProviderTotalDelegated(provider.clone()))
             .unwrap_or(0);
         let new_total = total_delegated.checked_add(amount).unwrap_or(i128::MAX);
-        env.storage()
-            .persistent()
-            .set(&StorageKey::ProviderTotalDelegated(provider.clone()), &new_total);
+        env.storage().persistent().set(
+            &StorageKey::ProviderTotalDelegated(provider.clone()),
+            &new_total,
+        );
 
         token::Client::new(&env, &token).transfer(
             &delegator,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &amount,
         );
 

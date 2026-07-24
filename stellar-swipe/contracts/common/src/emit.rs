@@ -21,9 +21,7 @@
 #[macro_export]
 macro_rules! emit_event {
     ($env:expr, $name:literal, $data:expr) => {
-        $env.events().publish(
-            (soroban_sdk::Symbol::new($env, $name),),
-            $data,
-        )
+        $env.events()
+            .publish((soroban_sdk::Symbol::new($env, $name),), $data)
     };
 }

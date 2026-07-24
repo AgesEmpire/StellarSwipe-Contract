@@ -205,8 +205,10 @@ pub fn get_diversification(
     while idx < allocations.len() {
         let mut alloc = allocations.get(idx).unwrap();
         if total_value_usd > 0 {
-            alloc.concentration_bps =
-                checked_div(checked_mul(alloc.value_usd, BPS_DENOMINATOR)?, total_value_usd)?;
+            alloc.concentration_bps = checked_div(
+                checked_mul(alloc.value_usd, BPS_DENOMINATOR)?,
+                total_value_usd,
+            )?;
         }
         if alloc.concentration_bps > largest_holding_bps {
             largest_holding_bps = alloc.concentration_bps;

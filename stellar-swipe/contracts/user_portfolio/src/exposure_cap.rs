@@ -88,15 +88,17 @@ pub fn check_cap(
 /// Record an increase in exposure when a capped position is opened.
 pub fn add_exposure(env: &Env, user: &Address, asset_id: u32, amount: i128) {
     let current = get_exposure(env, user, asset_id);
-    env.storage()
-        .persistent()
-        .set(&exposure_key(user, asset_id), &current.saturating_add(amount));
+    env.storage().persistent().set(
+        &exposure_key(user, asset_id),
+        &current.saturating_add(amount),
+    );
 }
 
 /// Record a decrease in exposure when a capped position is closed.
 pub fn remove_exposure(env: &Env, user: &Address, asset_id: u32, amount: i128) {
     let current = get_exposure(env, user, asset_id);
-    env.storage()
-        .persistent()
-        .set(&exposure_key(user, asset_id), &current.saturating_sub(amount));
+    env.storage().persistent().set(
+        &exposure_key(user, asset_id),
+        &current.saturating_sub(amount),
+    );
 }

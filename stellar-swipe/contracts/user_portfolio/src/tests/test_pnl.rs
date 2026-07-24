@@ -315,7 +315,7 @@ fn fifo_three_lots_sequential_closes_validate_ordering() {
 
     client.add_cost_lot(&user, &100, &100); // lot A
     client.add_cost_lot(&user, &120, &100); // lot B
-    client.add_cost_lot(&user, &80, &100);  // lot C
+    client.add_cost_lot(&user, &80, &100); // lot C
 
     let pnl_a = client.close_fifo(&user, &100, &110);
     assert_eq!(pnl_a, 10);

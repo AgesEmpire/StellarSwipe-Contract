@@ -474,7 +474,10 @@ pub fn cast_reputation_weighted_vote(
     Ok(())
 }
 
-pub fn get_reputation_leaderboard(env: &Env, limit: u32) -> Result<Vec<(Address, u32)>, GovernanceError> {
+pub fn get_reputation_leaderboard(
+    env: &Env,
+    limit: u32,
+) -> Result<Vec<(Address, u32)>, GovernanceError> {
     let state = get_reputation_state(env);
     if state.users.len() > MAX_REPUTATION_USERS {
         return Err(GovernanceError::IterationLimitExceeded);

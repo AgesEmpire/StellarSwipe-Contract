@@ -39,7 +39,11 @@ where
     if !storage.has(key) {
         return;
     }
-    storage.extend_ttl(key, HOT_KEY_TTL_THRESHOLD_LEDGERS, HOT_KEY_TTL_TARGET_LEDGERS);
+    storage.extend_ttl(
+        key,
+        HOT_KEY_TTL_THRESHOLD_LEDGERS,
+        HOT_KEY_TTL_TARGET_LEDGERS,
+    );
 }
 
 /// Unconditionally extend the TTL of a persistent entry to
@@ -89,9 +93,11 @@ mod tests {
         env.as_contract(&id, || {
             env.storage().persistent().set(&TestKey::Hot, &42u32);
             // Start with a low TTL (below threshold) so bump_persistent_if_needed fires.
-            env.storage()
-                .persistent()
-                .extend_ttl(&TestKey::Hot, 0, HOT_KEY_TTL_THRESHOLD_LEDGERS - 1);
+            env.storage().persistent().extend_ttl(
+                &TestKey::Hot,
+                0,
+                HOT_KEY_TTL_THRESHOLD_LEDGERS - 1,
+            );
 
             let ttl_before = env.storage().persistent().get_ttl(&TestKey::Hot);
             bump_persistent_if_needed(&env, &TestKey::Hot);
@@ -117,7 +123,10 @@ mod tests {
             // With threshold-based extend_ttl the host skips when TTL >= threshold.
             bump_persistent_if_needed(&env, &TestKey::Hot);
             let ttl_after = env.storage().persistent().get_ttl(&TestKey::Hot);
-            assert!(ttl_after >= ttl_before, "TTL must not decrease on no-op bump");
+            assert!(
+                ttl_after >= ttl_before,
+                "TTL must not decrease on no-op bump"
+            );
         });
     }
 

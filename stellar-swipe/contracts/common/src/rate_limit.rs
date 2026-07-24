@@ -154,7 +154,8 @@ pub fn check_rate_limit(
     match rate_limiter::check(env, &use_case, user, config.window_secs, max) {
         Ok(_) => Ok(()),
         Err(rate_limiter::RateLimitError::Exceeded) => {
-            let recent_count = rate_limiter::current_count(env, &use_case, user, config.window_secs);
+            let recent_count =
+                rate_limiter::current_count(env, &use_case, user, config.window_secs);
             emit_rate_limit_hit(env, user.clone(), action, recent_count, max);
             Err(RateLimitError::Exceeded)
         }

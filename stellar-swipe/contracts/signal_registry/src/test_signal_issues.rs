@@ -206,7 +206,13 @@ fn issue170_first_profit_updates_reputation() {
     );
     env.ledger().set_timestamp(expiry + 1);
     client.cleanup_expired_signals(&100);
-    client.record_signal_outcome(&executor, &signal_id, &SignalOutcome::Profit);
+    client.record_signal_outcome(
+        &executor,
+        &signal_id,
+        &SignalOutcome::Profit,
+        &0i128,
+        &0i128,
+    );
     let score = client.get_provider_reputation_score(&provider);
     assert_eq!(score, (50u32 * 9 + 100) / 10);
 }
@@ -238,8 +244,20 @@ fn issue170_outcome_twice_fails() {
     );
     env.ledger().set_timestamp(expiry + 1);
     client.cleanup_expired_signals(&100);
-    client.record_signal_outcome(&executor, &signal_id, &SignalOutcome::Neutral);
-    let r = client.try_record_signal_outcome(&executor, &signal_id, &SignalOutcome::Loss);
+    client.record_signal_outcome(
+        &executor,
+        &signal_id,
+        &SignalOutcome::Neutral,
+        &0i128,
+        &0i128,
+    );
+    let r = client.try_record_signal_outcome(
+        &executor,
+        &signal_id,
+        &SignalOutcome::Loss,
+        &0i128,
+        &0i128,
+    );
     assert!(r.is_err());
 }
 
@@ -271,7 +289,13 @@ fn issue170_non_executor_rejected() {
     );
     env.ledger().set_timestamp(expiry + 1);
     client.cleanup_expired_signals(&100);
-    let r = client.try_record_signal_outcome(&rando, &signal_id, &SignalOutcome::Profit);
+    let r = client.try_record_signal_outcome(
+        &rando,
+        &signal_id,
+        &SignalOutcome::Profit,
+        &0i128,
+        &0i128,
+    );
     assert!(r.is_err());
 }
 

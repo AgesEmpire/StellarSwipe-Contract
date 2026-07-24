@@ -482,7 +482,7 @@ fn test_get_normalized_price_same_decimals() {
     client.set_feed_decimals(&admin, &pair, &6u32);
 
     // Requesting target_decimals == native_decimals → no rescaling.
-    let price = client.get_normalized_price(&pair, &6u32).unwrap();
+    let price = client.get_normalized_price(&pair, &6u32);
     assert_eq!(price, 1_000_000i128);
 }
 
@@ -498,7 +498,7 @@ fn test_get_normalized_price_scale_up() {
     client.set_price(&pair_a, &1_000_000i128); // 1.000000 USDC
     client.set_feed_decimals(&admin, &pair_a, &6u32);
 
-    let norm = client.get_normalized_price(&pair_a, &8u32).unwrap();
+    let norm = client.get_normalized_price(&pair_a, &8u32);
     assert_eq!(norm, 100_000_000i128); // 1.000000 → 1.00000000
 }
 
@@ -514,7 +514,7 @@ fn test_get_normalized_price_scale_down() {
     client.set_price(&pair_b, &6_000_000_000_000i128); // 60_000.00000000 USD (8 dec)
     client.set_feed_decimals(&admin, &pair_b, &8u32);
 
-    let norm = client.get_normalized_price(&pair_b, &6u32).unwrap();
+    let norm = client.get_normalized_price(&pair_b, &6u32);
     assert_eq!(norm, 60_000_000_000i128); // 60_000.000000 (6 dec)
 }
 
@@ -529,19 +529,19 @@ fn test_get_normalized_price_differing_native_decimals_to_common_target() {
     let pair_usdc = make_pair(&env, "USDC", "USD");
 
     // XLM stored with 7 decimals (Stellar native), USDC with 6 decimals.
-    client.set_price(&pair_xlm, &1_100_0000i128); // 1.1000000 USD (7 dec)
+    client.set_price(&pair_xlm, &11_000_000_i128); // 1.1000000 USD (7 dec)
     client.set_feed_decimals(&admin, &pair_xlm, &7u32);
 
     client.set_price(&pair_usdc, &1_000_000i128); // 1.000000 USD (6 dec)
     client.set_feed_decimals(&admin, &pair_usdc, &6u32);
 
     // Normalise both to 8 decimals for consistent comparison.
-    let xlm_norm = client.get_normalized_price(&pair_xlm, &8u32).unwrap();
-    let usdc_norm = client.get_normalized_price(&pair_usdc, &8u32).unwrap();
+    let xlm_norm = client.get_normalized_price(&pair_xlm, &8u32);
+    let usdc_norm = client.get_normalized_price(&pair_usdc, &8u32);
 
-    assert_eq!(xlm_norm, 110_000_000i128);  // 1.10000000
+    assert_eq!(xlm_norm, 110_000_000i128); // 1.10000000
     assert_eq!(usdc_norm, 100_000_000i128); // 1.00000000
-    // XLM is now priced above USDC, as expected.
+                                            // XLM is now priced above USDC, as expected.
     assert!(xlm_norm > usdc_norm);
 }
 

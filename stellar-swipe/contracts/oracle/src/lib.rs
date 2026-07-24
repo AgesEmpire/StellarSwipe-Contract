@@ -7,12 +7,12 @@ mod conversion;
 mod deviation;
 mod errors;
 // Closes #755 — single-update price-deviation circuit breaker
-mod price_cb;
 #[allow(deprecated)]
 mod events;
 mod external_adapter;
 mod history;
 mod multi_hop;
+mod price_cb;
 mod reputation;
 mod sdex;
 // Closes #670 — per-asset update frequency SLA monitoring
@@ -44,14 +44,8 @@ pub use multi_hop::{calculate_multi_hop_price, find_optimal_path, LiquidityPath}
 pub use sla::{get_feed_health, record_update as sla_record_update, set_sla, FeedHealth};
 pub use storage::{get_base_currency, get_price, set_base_currency, set_price};
 
-soroban_sdk::contractmeta!(
-    key = "SourceHash",
-    val = env!("STELLAR_SOURCE_HASH")
-);
-soroban_sdk::contractmeta!(
-    key = "GitCommit",
-    val = env!("STELLAR_GIT_COMMIT")
-);
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct OracleContract;
@@ -68,8 +62,18 @@ impl OracleContract {
     ///
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
-        m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
-        m.set(soroban_sdk::String::from_str(&env, "git_commit"), soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")));
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
+        );
         m
     }
 
@@ -156,7 +160,7 @@ impl OracleContract {
     }
 
     /// Returns true if the single-update deviation breaker has tripped for this pair.
-    pub fn is_update_deviation_breaker_tripped(env: Env, pair: AssetPair) -> bool {
+    pub fn is_update_dev_breaker_tripped(env: Env, pair: AssetPair) -> bool {
         price_cb::is_breaker_tripped(&env, &pair)
     }
 
@@ -178,10 +182,10 @@ impl OracleContract {
         // Check cache first
         let base = storage::get_base_currency(&env);
         if let Some(cached) = storage::get_cached_conversion(&env, &asset, &base) {
-            return Ok(amount
+            return amount
                 .checked_mul(cached.rate)
                 .and_then(|v| v.checked_div(10_000_000))
-                .ok_or(OracleError::ConversionOverflow)?);
+                .ok_or(OracleError::ConversionOverflow);
         }
 
         // Perform conversion
@@ -459,7 +463,7 @@ impl OracleContract {
         let consensus_data = ConsensusPriceData {
             price: consensus_price,
             timestamp: env.ledger().timestamp(),
-            num_oracles: submissions.len() as u32,
+            num_oracles: submissions.len(),
         };
         env.storage()
             .persistent()
@@ -722,7 +726,7 @@ impl OracleContract {
             .instance()
             .get(&StorageKey::MinSourceCount)
             .unwrap_or(0);
-        if min_count > 0 && (fresh_prices.len() as u32) < min_count {
+        if min_count > 0 && fresh_prices.len() < min_count {
             return Err(OracleError::InsufficientSources);
         }
 
@@ -830,7 +834,7 @@ impl OracleContract {
             .unwrap_or(Vec::new(&env));
 
         let new_entry = PriceData {
-            asset_pair: pair,
+            asset_pair: pair.clone(),
             price,
             timestamp: env.ledger().timestamp(),
             source,

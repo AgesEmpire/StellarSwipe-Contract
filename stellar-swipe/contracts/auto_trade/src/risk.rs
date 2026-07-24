@@ -3,9 +3,9 @@ use soroban_sdk::{contracttype, Address, Env, Map, Vec};
 
 use crate::errors::AutoTradeError;
 
-/// ==========================
-/// Risk Configuration Types
-/// ==========================
+// ==========================
+// Risk Configuration Types
+// ==========================
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,9 +81,9 @@ pub enum RiskDataKey {
 pub const DEFAULT_VOLATILITY_BPS: i128 = 2000;
 pub const MIN_PRICE_HISTORY: usize = 2;
 
-/// ==========================
-/// Risk Configuration Management
-/// ==========================
+// ==========================
+// Risk Configuration Management
+// ==========================
 pub fn get_risk_config(env: &Env, user: &Address) -> RiskConfig {
     env.storage()
         .persistent()
@@ -110,9 +110,9 @@ pub fn set_risk_parity_config(env: &Env, user: &Address, config: &RiskParityConf
         .set(&RiskDataKey::UserRiskParityConfig(user.clone()), config);
 }
 
-/// ==========================
-/// Volatility Calculation
-/// ==========================
+// ==========================
+// Volatility Calculation
+// ==========================
 
 pub fn record_price(env: &Env, asset_id: u32, price: i128) {
     let count: u32 = env
@@ -207,9 +207,9 @@ pub fn calculate_volatility(env: &Env, asset_id: u32, window: u32) -> i128 {
     }
 }
 
-/// ==========================
-/// Position Management
-/// ==========================
+// ==========================
+// Position Management
+// ==========================
 pub fn get_user_positions(env: &Env, user: &Address) -> Map<u32, Position> {
     env.storage()
         .persistent()
@@ -261,9 +261,9 @@ pub fn update_position(env: &Env, user: &Address, asset_id: u32, amount: i128, p
         .set(&RiskDataKey::UserPositions(user.clone()), &positions);
 }
 
-/// ==========================
-/// Trade History Management
-/// ==========================
+// ==========================
+// Trade History Management
+// ==========================
 pub fn get_trade_history(env: &Env, user: &Address) -> Vec<TradeRecord> {
     env.storage()
         .persistent()
@@ -287,9 +287,9 @@ pub fn add_trade_record(env: &Env, user: &Address, signal_id: u64, amount: i128)
         .set(&RiskDataKey::UserTradeHistory(user.clone()), &history);
 }
 
-/// ==========================
-/// Price Management
-/// ==========================
+// ==========================
+// Price Management
+// ==========================
 pub fn get_asset_price(env: &Env, asset_id: u32) -> Option<i128> {
     env.storage()
         .temporary()
@@ -302,9 +302,9 @@ pub fn set_asset_price(env: &Env, asset_id: u32, price: i128) {
         .set(&RiskDataKey::AssetPrice(asset_id), &price);
 }
 
-/// ==========================
-/// Risk Checks
-/// ==========================
+// ==========================
+// Risk Checks
+// ==========================
 /// Check if daily trade limit is exceeded
 pub fn check_daily_trade_limit(
     env: &Env,

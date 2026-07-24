@@ -511,6 +511,6 @@ pub fn analyze_volume_trend(env: &Env, bridge_id: u64, days: u32) -> Result<Tren
         trend,
         slope,
         avg_daily_volume: total_v / len as i128,
-        data_points: len as u32,
+        data_points: len,
     })
 }

@@ -128,9 +128,7 @@ fn get_next_id(env: &Env) -> u64 {
 
 /// Return the stored multi-sig configuration, or a sensible default.
 pub fn get_config(env: &Env) -> Option<MultisigConfig> {
-    env.storage()
-        .instance()
-        .get(&MultisigStorageKey::Config)
+    env.storage().instance().get(&MultisigStorageKey::Config)
 }
 
 /// Persist a new multi-sig configuration.
@@ -193,11 +191,7 @@ pub fn is_signer(config: &MultisigConfig, address: &Address) -> bool {
 /// # Errors
 /// - [`MultisigError::Unauthorized`] — proposer is not a registered signer.
 /// - [`MultisigError::InvalidConfig`] — no multi-sig config has been set.
-pub fn propose(
-    env: &Env,
-    proposer: &Address,
-    payload: Bytes,
-) -> Result<u64, MultisigError> {
+pub fn propose(env: &Env, proposer: &Address, payload: Bytes) -> Result<u64, MultisigError> {
     let config = get_config(env).ok_or(MultisigError::InvalidConfig)?;
     if !is_signer(&config, proposer) {
         return Err(MultisigError::Unauthorized);
@@ -377,9 +371,7 @@ mod tests {
         let proposer = signers.get(0).unwrap();
         let payload = Bytes::new(&env);
 
-        let id = env.as_contract(&cid, || {
-            propose(&env, &proposer, payload).unwrap()
-        });
+        let id = env.as_contract(&cid, || propose(&env, &proposer, payload).unwrap());
 
         let proposal = env.as_contract(&cid, || get_proposal(&env, id).unwrap());
         assert_eq!(proposal.proposer, proposer);

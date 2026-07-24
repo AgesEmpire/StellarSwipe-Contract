@@ -46,9 +46,9 @@ use conviction_voting::{
     analyze_conviction_proposal, change_conviction_vote, create_conviction_pool,
     create_conviction_proposal, execute_conviction_funding, get_conviction_calibration,
     get_conviction_growth_curve, put_conviction_calibration, refill_conviction_pool,
-    set_conviction_decay_rate, update_proposal_conviction, vote_conviction, withdraw_conviction_vote,
-    ConvictionAnalytics, ConvictionCalibration, ConvictionStatus, ConvictionVotingPool,
-    MIN_DECAY_RATE, MAX_DECAY_RATE,
+    set_conviction_decay_rate, update_proposal_conviction, vote_conviction,
+    withdraw_conviction_vote, ConvictionAnalytics, ConvictionCalibration, ConvictionStatus,
+    ConvictionVotingPool, MAX_DECAY_RATE, MIN_DECAY_RATE,
 };
 use distribution::{
     circulating_supply as calculate_circulating_supply, create_vesting_schedule as create_schedule,
@@ -57,7 +57,6 @@ use distribution::{
     DistributionRecipients, DistributionState, VestingCategory, VestingSchedule,
 };
 pub use errors::GovernanceError;
-pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
 use proposals::{
     calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
     default_governance_config, effective_status, execute_proposal, finalize_proposal,
@@ -66,6 +65,7 @@ use proposals::{
     ProposalStatistics, ProposalStatus, ProposalType, Vote, VoteDelegation,
     VoteType as GovernanceVoteType,
 };
+pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
 use quadratic_voting::{
     allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
     get_quadratic_vote, get_quadratic_voting_config, get_vote_credits, reallocate_quadratic_votes,
@@ -120,14 +120,8 @@ pub struct SimulationResult {
     pub new_value: i128,
 }
 
-soroban_sdk::contractmeta!(
-    key = "SourceHash",
-    val = env!("STELLAR_SOURCE_HASH")
-);
-soroban_sdk::contractmeta!(
-    key = "GitCommit",
-    val = env!("STELLAR_GIT_COMMIT")
-);
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct GovernanceContract;
@@ -324,8 +318,18 @@ impl GovernanceContract {
 
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
-        m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
-        m.set(soroban_sdk::String::from_str(&env, "git_commit"), soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")));
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
+        );
         m
     }
 
@@ -702,10 +706,7 @@ impl GovernanceContract {
             }
             ProposalType::TreasurySpend(_recipient, amount, asset, _category) => {
                 let treasury = get_treasury(&env);
-                let current_balance = treasury
-                    .assets
-                    .get(asset.clone())
-                    .unwrap_or(0);
+                let current_balance = treasury.assets.get(asset.clone()).unwrap_or(0);
                 (current_balance, current_balance.saturating_sub(*amount))
             }
             ProposalType::FeatureToggle(name, enabled) => {
@@ -732,10 +733,7 @@ impl GovernanceContract {
 
         #[allow(deprecated)]
         env.events().publish(
-            (
-                symbol_short!("gov"),
-                symbol_short!("sim_done"),
-            ),
+            (symbol_short!("gov"), symbol_short!("sim_done")),
             (
                 proposal_id,
                 executable,

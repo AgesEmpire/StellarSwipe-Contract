@@ -9,6 +9,7 @@ use events::{
     emit_effective_multiplier_changed, emit_error_reported, emit_fee_collected, emit_fee_forecast,
     emit_fee_rate_updated, emit_fees_claimed, emit_fees_claimed_converted,
     emit_first_trade_fee_waived, emit_network_condition_updated, emit_payout_currency_set,
+    emit_referral_fee_paid, emit_referral_fee_share_updated, emit_referral_registered,
     emit_retry_attempted, emit_treasury_withdrawal, emit_volume_discount_config_updated,
     emit_waterfall_distribution, emit_withdrawal_queued, EvtEffectiveMultiplierChanged,
     EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed,
@@ -31,21 +32,22 @@ use storage::{
     get_daily_fee_total, get_failed_fee_collection, get_fee_optimization_config, get_fee_rate,
     get_forecast_config, get_last_error_report, get_last_forecast_day, get_monthly_trade_volume,
     get_network_condition_score, get_oracle_contract, get_pending_fees,
-    get_provider_payout_currency, get_queued_withdrawal, get_treasury_balance,
-    get_volume_discount_config, get_waterfall_config, has_traded, is_initialized,
-    remove_failed_fee_collection, remove_monthly_trade_volume, remove_provider_payout_currency,
-    remove_queued_withdrawal, set_admin, set_burn_rate as set_burn_rate_storage,
-    set_congestion_config, set_congestion_signal, set_failed_fee_collection,
-    set_fee_optimization_config, set_fee_rate as set_fee_rate_storage, set_forecast_config_storage,
-    set_has_traded, set_initialized, set_last_error_report, set_last_forecast_day,
-    set_monthly_trade_volume, set_network_condition_score,
+    get_provider_payout_currency, get_queued_withdrawal, get_referral_fee_share_bps, get_referrer,
+    get_treasury_balance, get_volume_discount_config, get_waterfall_config, has_traded,
+    is_initialized, remove_failed_fee_collection, remove_monthly_trade_volume,
+    remove_provider_payout_currency, remove_queued_withdrawal, set_admin,
+    set_burn_rate as set_burn_rate_storage, set_congestion_config, set_congestion_signal,
+    set_failed_fee_collection, set_fee_optimization_config, set_fee_rate as set_fee_rate_storage,
+    set_forecast_config_storage, set_has_traded, set_initialized, set_last_error_report,
+    set_last_forecast_day, set_monthly_trade_volume, set_network_condition_score,
     set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
-    set_provider_payout_currency, set_queued_withdrawal, set_treasury_balance,
-    set_volume_discount_config_storage, set_waterfall_config as set_waterfall_config_storage,
-    CongestionConfig, CongestionSignal, ErrorReport, FailedFeeCollection, FeeOptimizationConfig,
-    ForecastConfigData, MonthlyTradeVolume, QueuedWithdrawal, StorageKey, VolumeDiscountConfig,
-    VolumeTier, WaterfallConfig, WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS,
-    MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
+    set_provider_payout_currency, set_queued_withdrawal, set_referral_fee_share_bps, set_referrer,
+    set_treasury_balance, set_volume_discount_config_storage,
+    set_waterfall_config as set_waterfall_config_storage, CongestionConfig, CongestionSignal,
+    ErrorReport, FailedFeeCollection, FeeOptimizationConfig, ForecastConfigData,
+    MonthlyTradeVolume, QueuedWithdrawal, StorageKey, VolumeDiscountConfig, VolumeTier,
+    WaterfallConfig, WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS,
+    MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
 };
 
 use soroban_sdk::{
@@ -129,8 +131,12 @@ impl FeeCollector {
             soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
         );
         m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
             soroban_sdk::String::from_str(&env, "git_commit"),
-            soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
         );
         m
     }
@@ -783,16 +789,15 @@ impl FeeCollector {
 
         // Compute fee and burn in one pass (issue #633 — fewer multiply operations)
         let burn_rate = fee_cache.burn_rate;
-        let (fee_amount, burn_amount) =
-            fee_and_burn_amounts(trade_amount, fee_rate, burn_rate)
-                .ok_or(ContractError::ArithmeticOverflow)?;
+        let (fee_amount, burn_amount) = fee_and_burn_amounts(trade_amount, fee_rate, burn_rate)
+            .ok_or(ContractError::ArithmeticOverflow)?;
 
         if fee_amount <= 0 {
             return Err(ContractError::FeeRoundedToZero);
         }
 
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&trader, &env.current_contract_address(), &fee_amount);
+        token_client.transfer(&trader, env.current_contract_address(), &fee_amount);
 
         let distributable = fee_amount
             .checked_sub(burn_amount)
@@ -816,7 +821,7 @@ impl FeeCollector {
                 .checked_mul(referral_bps as i128)
                 .and_then(|v| v.checked_div(10_000))
                 .unwrap_or(0);
-            
+
             if referral_amount > remaining_distributable {
                 referral_amount = remaining_distributable;
             }
@@ -834,11 +839,11 @@ impl FeeCollector {
             .checked_mul(revenue_share_rate as i128)
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or(0);
-            
+
         if revenue_share_amount > remaining_distributable {
             revenue_share_amount = remaining_distributable;
         }
-        
+
         let treasury_credit = remaining_distributable.saturating_sub(revenue_share_amount);
 
         if revenue_share_amount > 0 {
@@ -1505,7 +1510,11 @@ impl FeeCollector {
     // ── Referral System ─────────────────────────────────────────────────────────
 
     /// Register a referral mapping for a trader (referee) to a referrer.
-    pub fn register_referral(env: Env, referrer: Address, referee: Address) -> Result<(), ContractError> {
+    pub fn register_referral(
+        env: Env,
+        referrer: Address,
+        referee: Address,
+    ) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
@@ -1525,7 +1534,12 @@ impl FeeCollector {
     }
 
     /// Admin override to forcibly change a referral mapping.
-    pub fn admin_override_referral(env: Env, admin: Address, referrer: Address, referee: Address) -> Result<(), ContractError> {
+    pub fn admin_override_referral(
+        env: Env,
+        admin: Address,
+        referrer: Address,
+        referee: Address,
+    ) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
@@ -1545,7 +1559,11 @@ impl FeeCollector {
     }
 
     /// Admin configuration to set the referral fee share percentage in basis points.
-    pub fn set_referral_fee_share(env: Env, admin: Address, share_bps: u32) -> Result<(), ContractError> {
+    pub fn set_referral_fee_share(
+        env: Env,
+        admin: Address,
+        share_bps: u32,
+    ) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }

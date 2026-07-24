@@ -8,8 +8,8 @@ pub use sanitize::{sanitize_string, SanitizeError};
 
 #[allow(deprecated)]
 pub mod amm_bridge;
-pub mod retry_backoff;
 pub mod assets;
+pub mod budget_regression;
 /// Checked-arithmetic wrapper for financial amounts (issue #599).
 pub mod checked_amount;
 pub mod commit_reveal;
@@ -26,10 +26,10 @@ pub mod perf;
 pub mod rate_limit;
 #[allow(deprecated)]
 pub mod replay_protection;
-pub mod ttl_manager;
-pub mod budget_regression;
+pub mod retry_backoff;
 /// Generic CRUD helpers to replace per-contract storage boilerplate (Issue #579).
 pub mod storage_crud;
+pub mod ttl_manager;
 
 pub use amm_bridge::{
     build_fallback_chain, emit_fallback_used, emit_quote_discovered, emit_route_planned,

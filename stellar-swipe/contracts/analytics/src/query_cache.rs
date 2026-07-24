@@ -112,9 +112,11 @@ pub fn write(env: &Env, query_type: QueryType, value: i128) {
 
     // Keep the temporary entry alive for the TTL duration (in ledgers ~5 s each).
     let ttl_ledgers = (ttl / 5).max(1) as u32;
-    env.storage()
-        .temporary()
-        .extend_ttl(&CacheKey::Entry(query_type as u32), ttl_ledgers, ttl_ledgers);
+    env.storage().temporary().extend_ttl(
+        &CacheKey::Entry(query_type as u32),
+        ttl_ledgers,
+        ttl_ledgers,
+    );
 
     #[allow(deprecated)]
     env.events().publish(
