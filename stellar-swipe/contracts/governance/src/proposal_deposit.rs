@@ -173,61 +173,71 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env};
 
-    fn make_env() -> (Env, Address) {
+    fn make_env() -> (Env, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        // Bootstrap minimal storage so governance helpers work.
-        env.storage().instance().set(
-            &StorageKey::Balances,
-            &soroban_sdk::Map::<Address, i128>::new(&env),
-        );
-        env.storage().instance().set(
-            &StorageKey::Holders,
-            &soroban_sdk::Vec::<Address>::new(&env),
-        );
+        // Persistent-storage access (used by lock/settle_proposal_deposit)
+        // requires an active contract context in soroban-sdk 23.x, so tests
+        // register the real contract and run through `env.as_contract`.
+        let contract_id = env.register(crate::GovernanceContract, ());
+        env.as_contract(&contract_id, || {
+            // Bootstrap minimal storage so governance helpers work.
+            env.storage().instance().set(
+                &StorageKey::Balances,
+                &soroban_sdk::Map::<Address, i128>::new(&env),
+            );
+            env.storage().instance().set(
+                &StorageKey::Holders,
+                &soroban_sdk::Vec::<Address>::new(&env),
+            );
+        });
         let treasury = Address::generate(&env);
-        (env, treasury)
+        (env, contract_id, treasury)
     }
 
     #[test]
     fn test_deposit_refunded_when_threshold_met() {
-        let (env, treasury) = make_env();
+        let (env, contract_id, treasury) = make_env();
         let proposer = Address::generate(&env);
 
-        // Give proposer enough balance
-        add_balance(&env, &proposer, 10_000).unwrap();
+        env.as_contract(&contract_id, || {
+            // Give proposer enough balance
+            add_balance(&env, &proposer, 10_000).unwrap();
 
-        // Lock deposit
-        lock_proposal_deposit(&env, 1, &proposer).unwrap();
+            // Lock deposit
+            lock_proposal_deposit(&env, 1, &proposer).unwrap();
 
-        // Balance reduced by deposit amount
-        let after_lock = crate::get_balance(&env, &proposer);
-        assert_eq!(after_lock, 10_000 - DEFAULT_DEPOSIT_AMOUNT);
+            // Balance reduced by deposit amount
+            let after_lock = crate::get_balance(&env, &proposer);
+            assert_eq!(after_lock, 10_000 - DEFAULT_DEPOSIT_AMOUNT);
 
-        // Finalize: threshold met (100% participation)
-        settle_proposal_deposit(&env, 1, 500_000, 500_000, &treasury).unwrap();
+            // Finalize: threshold met (100% participation)
+            settle_proposal_deposit(&env, 1, 500_000, 500_000, &treasury).unwrap();
 
-        // Deposit refunded
-        assert_eq!(crate::get_balance(&env, &proposer), 10_000);
-        assert_eq!(crate::get_balance(&env, &treasury), 0);
+            // Deposit refunded
+            assert_eq!(crate::get_balance(&env, &proposer), 10_000);
+            assert_eq!(crate::get_balance(&env, &treasury), 0);
+        });
     }
 
     #[test]
     fn test_deposit_forfeited_when_threshold_not_met() {
-        let (env, treasury) = make_env();
+        let (env, contract_id, treasury) = make_env();
         let proposer = Address::generate(&env);
 
-        add_balance(&env, &proposer, 10_000).unwrap();
-        lock_proposal_deposit(&env, 2, &proposer).unwrap();
+        env.as_contract(&contract_id, || {
+            add_balance(&env, &proposer, 10_000).unwrap();
+            lock_proposal_deposit(&env, 2, &proposer).unwrap();
 
-        // Finalize: low participation (0.1% < 5% threshold)
-        settle_proposal_deposit(&env, 2, 5, 500_000, &treasury).unwrap();
+            // Finalize: low participation (0.1% < 5% threshold)
+            settle_proposal_deposit(&env, 2, 5, 500_000, &treasury).unwrap();
 
-        // Deposit forfeited to treasury
-        assert_eq!(
-            crate::get_balance(&env, &proposer),
-            10_000 - DEFAULT_DEPOSIT_AMOUNT
-        );
-        assert_eq!(crate::get_balance(&env, &treasury), DEFAULT_DEPOSIT_AMOUNT);
+            // Deposit forfeited to treasury
+            assert_eq!(
+                crate::get_balance(&env, &proposer),
+                10_000 - DEFAULT_DEPOSIT_AMOUNT
+            );
+            assert_eq!(crate::get_balance(&env, &treasury), DEFAULT_DEPOSIT_AMOUNT);
+        });
     }
 }

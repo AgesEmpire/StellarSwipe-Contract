@@ -7,6 +7,33 @@ use crate::{checked_mul, GovernanceError, StorageKey};
 
 const PRECISION: i128 = 10_000;
 
+/// Fixed-point scale used by `pow_fixed_point` for decay-ratio exponentiation.
+/// Large enough for negligible rounding error over many squarings, small
+/// enough that squaring a value near this scale (`scale * scale`) stays far
+/// below `i128::MAX`.
+const DECAY_SCALE: i128 = 1_000_000_000_000;
+
+/// Raises `base_scaled` (a value in `0..=scale` representing a ratio in
+/// `[0, 1]`, expressed as `ratio * scale`) to `exponent`, returning the
+/// result in the same fixed-point representation.
+///
+/// Uses binary exponentiation, rescaling by `/ scale` after every
+/// multiplication so intermediate values stay bounded by `scale` instead of
+/// growing with the exponent — unlike computing `base^exponent` directly
+/// (e.g. via `saturating_pow`), which overflows i128 after a small number of
+/// iterations for any base close to 1.
+fn pow_fixed_point(mut base_scaled: i128, mut exponent: u32, scale: i128) -> i128 {
+    let mut result = scale;
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            result = result.saturating_mul(base_scaled) / scale;
+        }
+        base_scaled = base_scaled.saturating_mul(base_scaled) / scale;
+        exponent >>= 1;
+    }
+    result
+}
+
 /// ── Decay rate bounds (basis points, 1000 = 100%) ────────────────────────
 /// A decay rate of 0 would disable conviction decay entirely (unbounded
 /// accumulation), while a rate of 1000 would cause instant full decay
@@ -623,14 +650,19 @@ pub fn calculate_conviction(
     let mut conviction = tokens.saturating_mul(sqrt_days) / 1000;
 
     // ── Apply exponential decay based on decay_rate_bps ──────────────────
-    // decay_factor = (1000 - decay_rate_bps) / 1000
-    // conviction *= decay_factor^days (approximated linearly for efficiency)
+    // conviction *= (decay_factor/1000)^days, compounded daily. Computed in
+    // fixed-point via binary exponentiation (see `pow_fixed_point`) instead
+    // of raising decay_factor and 1000 to `days_elapsed` directly: both
+    // powers blow past i128::MAX after ~13 days for typical decay rates, so
+    // `saturating_pow` on each and then dividing the two saturated i128::MAX
+    // values previously collapsed the result to ~1 regardless of the true
+    // ratio.
     if calibration.decay_rate_bps >= MIN_DECAY_RATE && calibration.decay_rate_bps <= MAX_DECAY_RATE {
         let decay_factor = 1000i128 - calibration.decay_rate_bps as i128;
-        // Apply decay: conviction * (decay_factor/1000) per day, compounded
-        // For efficiency, use linear approximation: conviction * (1 - decay_rate_bps * days / 1000)
-        let decay_multiplier = decay_factor.saturating_pow(days_elapsed as u32);
-        conviction = conviction.saturating_mul(decay_multiplier) / 1000i128.saturating_pow(days_elapsed as u32);
+        let decay_factor_scaled = decay_factor.saturating_mul(DECAY_SCALE) / 1000;
+        let decay_multiplier_scaled =
+            pow_fixed_point(decay_factor_scaled, days_elapsed as u32, DECAY_SCALE);
+        conviction = conviction.saturating_mul(decay_multiplier_scaled) / DECAY_SCALE;
     }
 
     // ── Apply penalty for short-lived (low-conviction) votes ──────────────

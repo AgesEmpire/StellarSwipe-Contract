@@ -789,6 +789,8 @@ fn governance_proposal_vote_finalize_and_execute() {
         &String::from_str(&env, "Adjust reward"),
         &String::from_str(&env, "Increase by 20%"),
         &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
     );
 
     env.ledger().set_timestamp(70);
@@ -838,6 +840,8 @@ fn timelock_queue_execute_and_cancel_flow() {
         &String::from_str(&env, "Enable feature"),
         &String::from_str(&env, "toggle"),
         &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
     );
 
     env.ledger().set_timestamp(70);
@@ -907,6 +911,8 @@ fn queue_underfunded_treasury_spend_action(
         &String::from_str(env, "Fund payout"),
         &String::from_str(env, "treasury spend"),
         &Bytes::new(env),
+        &ProposalCategory::General,
+        &false,
     );
 
     env.ledger().set_timestamp(70);
@@ -1015,6 +1021,8 @@ fn governance_reputation_tracks_activity() {
         &String::from_str(&env, "Signal"),
         &String::from_str(&env, "Record governance sentiment"),
         &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
     );
 
     env.ledger().set_timestamp(70);
@@ -1088,6 +1096,8 @@ fn upgrade_announcement_event_emitted_on_contract_upgrade_proposal_success() {
         &String::from_str(&env, "Upgrade auto_trade contract"),
         &String::from_str(&env, "Deploy new version"),
         &migration_notes_hash,
+        &ProposalCategory::General,
+        &false,
     );
 
     env.ledger().set_timestamp(70);
@@ -1146,6 +1156,8 @@ fn reputation_tier_computed_correctly_from_participation() {
             &String::from_str(&env, "Proposal"),
             &String::from_str(&env, "desc"),
             &Bytes::new(&env),
+            &ProposalCategory::General,
+            &false,
         );
     }
     // After 60 proposals, tier should be Silver (>=50 actions)
@@ -1170,6 +1182,8 @@ fn decay_applied_after_grace_period() {
         &String::from_str(&env, "Test"),
         &String::from_str(&env, "desc"),
         &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
     );
 
     env.ledger().set_timestamp(170);
@@ -1215,6 +1229,8 @@ fn no_decay_within_grace_period() {
         &String::from_str(&env, "Test"),
         &String::from_str(&env, "desc"),
         &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
     );
 
     let rep_before = client.governance_reputation(&user);
@@ -1248,6 +1264,8 @@ fn staleness_level_detected_correctly() {
         &String::from_str(&env, "Test"),
         &String::from_str(&env, "desc"),
         &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
     );
 
     // Still Active within 30 days
@@ -1288,6 +1306,8 @@ fn refresh_stale_reputation_recalculates_score() {
         &String::from_str(&env, "Test"),
         &String::from_str(&env, "desc"),
         &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
     );
 
     // Go 100 days into the future - reputation should be decayed
@@ -2216,16 +2236,19 @@ fn conviction_calibration_reward_long_votes() {
         &recipients.public_sale,
     );
 
+    // A large enough commitment that decay_rate_bps's 5%/day compounding
+    // (see #837 conviction_voting overflow fix) still leaves a meaningful,
+    // non-zero conviction after 15 days for the reward bonus to act on.
     client.vote_conviction(
         &pool_id,
         &proposal_id,
         &recipients.community_rewards,
-        &1_000i128,
+        &100_000i128,
     );
 
     env.ledger().set_timestamp(15 * 86_400);
     let conviction = client.update_proposal_conviction(&pool_id, &proposal_id);
-    assert!(conviction >= 3);
+    assert!(conviction >= 100);
 }
 
 #[test]
@@ -2252,11 +2275,14 @@ fn conviction_calibration_caps_max_conviction() {
         &recipients.public_sale,
     );
 
+    // Large enough that pre-cap conviction (even after 100 days of 5%/day
+    // decay) comfortably exceeds max_conviction_cap, so this actually
+    // exercises the clamp rather than passing vacuously.
     client.vote_conviction(
         &pool_id,
         &proposal_id,
         &recipients.community_rewards,
-        &1_000i128,
+        &1_000_000i128,
     );
 
     env.ledger().set_timestamp(100 * 86_400);
@@ -2288,20 +2314,22 @@ fn conviction_calibration_combination_penalty_and_reward() {
         &recipients.public_sale,
     );
 
+    // Large enough that penalty vs. reward stays distinguishable from
+    // decay_rate_bps's default 5%/day compounding decay over these windows.
     client.vote_conviction(
         &pool_id,
         &proposal_id,
         &recipients.community_rewards,
-        &1_000i128,
+        &100_000i128,
     );
 
     env.ledger().set_timestamp(3 * 86_400);
     let conviction_short = client.update_proposal_conviction(&pool_id, &proposal_id);
-    assert_eq!(conviction_short, 1);
+    assert_eq!(conviction_short, 57);
 
     env.ledger().set_timestamp(14 * 86_400);
     let conviction_long = client.update_proposal_conviction(&pool_id, &proposal_id);
-    assert!(conviction_long >= 3);
+    assert!(conviction_long >= 100);
     assert!(conviction_long > conviction_short);
 }
 
@@ -2333,12 +2361,12 @@ fn conviction_calibration_zero_threshold_disables_penalty() {
         &pool_id,
         &proposal_id,
         &recipients.community_rewards,
-        &1_000i128,
+        &10_000i128,
     );
 
     env.ledger().set_timestamp(86_400);
     let conviction = client.update_proposal_conviction(&pool_id, &proposal_id);
-    assert_eq!(conviction, 1);
+    assert_eq!(conviction, 9);
 }
 
 #[test]
@@ -2361,6 +2389,8 @@ fn voting_power_uses_snapshot_not_live_balance() {
             "Voting power must be snapshotted at proposal creation",
         ),
         &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
     );
 
     // late_staker stakes AFTER proposal creation — should not gain voting power on this proposal
@@ -2568,6 +2598,7 @@ fn withdraw_proposal_emits_event() {
     client.withdraw_proposal(&proposal_id, &recipients.community_rewards);
 
     // Verify that a (gov, propwdr) event was emitted.
+    use soroban_sdk::TryFromVal;
     let events = env.events().all();
     let found = events.iter().any(|e| {
         let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
@@ -2799,6 +2830,51 @@ fn conviction_score_bounded_across_valid_decay_rates() {
             "Conviction {} exceeds max possible {} for decay_rate={}",
             conviction, max_possible, decay_rate);
     }
+}
+
+#[test]
+fn conviction_decay_does_not_collapse_for_large_day_counts() {
+    // Regression test: `decay_factor.saturating_pow(days)` and
+    // `1000.saturating_pow(days)` both blew past i128::MAX after ~13 days
+    // for any decay rate, and dividing the two saturated i128::MAX values
+    // collapsed conviction to ~1 regardless of the true ratio or token
+    // amount. `conviction_score_bounded_across_valid_decay_rates` above
+    // didn't catch this because its bounds were loose enough for the
+    // collapsed value to still pass. A correctly-computed decay must
+    // actually track the configured rate, not converge on a constant.
+    use crate::conviction_voting::{calculate_conviction, ConvictionCalibration};
+
+    let days = 50u64;
+    let time_elapsed = days * 86_400;
+    let light_decay = ConvictionCalibration {
+        penalty_threshold_days: 0,
+        penalty_multiplier: 1,
+        reward_bonus_pct: 0,
+        max_conviction_cap: 0,
+        decay_rate_bps: 1,
+    };
+    let heavy_decay = ConvictionCalibration {
+        decay_rate_bps: 900,
+        ..light_decay.clone()
+    };
+
+    let with_light_decay = calculate_conviction(1_000_000, time_elapsed, &light_decay);
+    let with_heavy_decay = calculate_conviction(1_000_000, time_elapsed, &heavy_decay);
+
+    assert!(
+        with_light_decay > 6_000,
+        "1 bps/day decay over {days} days should barely reduce conviction, got {with_light_decay}"
+    );
+    assert!(
+        with_light_decay > with_heavy_decay,
+        "light decay ({with_light_decay}) should exceed heavy decay ({with_heavy_decay}) after {days} days"
+    );
+
+    // No panic for a far larger day count than the old
+    // `saturating_pow`-based implementation could handle at all.
+    let huge_time_elapsed = 100_000u64 * 86_400;
+    let result = calculate_conviction(1_000_000, huge_time_elapsed, &heavy_decay);
+    assert!(result >= 0);
 }
 
 // ── Issue #796: Treasury spend proposal execution expiry ──────────────────────
