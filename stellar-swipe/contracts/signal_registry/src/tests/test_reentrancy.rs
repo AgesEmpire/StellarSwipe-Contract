@@ -171,10 +171,7 @@ fn guard_blocks_across_entrypoints() {
     env.as_contract(&contract_id, || reentrancy::force_lock(&env));
 
     assert_eq!(
-        client
-            .try_unstake_tokens(&provider)
-            .unwrap_err()
-            .unwrap(),
+        client.try_unstake_tokens(&provider).unwrap_err().unwrap(),
         AdminError::ReentrancyDetected
     );
     assert_eq!(

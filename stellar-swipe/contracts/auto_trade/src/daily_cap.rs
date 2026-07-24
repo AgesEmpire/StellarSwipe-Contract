@@ -119,13 +119,7 @@ mod tests {
         let (env, _cid) = setup();
         let user = Address::generate(&env);
         env.as_contract(&_cid, || {
-            set_daily_cap_config(
-                &env,
-                &user,
-                &DailyCapConfig {
-                    max_executions: 3,
-                },
-            );
+            set_daily_cap_config(&env, &user, &DailyCapConfig { max_executions: 3 });
 
             for _ in 0..3 {
                 assert!(check_daily_execution_cap(&env, &user).is_ok());
@@ -144,13 +138,7 @@ mod tests {
         let (env, _cid) = setup();
         let user = Address::generate(&env);
         env.as_contract(&_cid, || {
-            set_daily_cap_config(
-                &env,
-                &user,
-                &DailyCapConfig {
-                    max_executions: 1,
-                },
-            );
+            set_daily_cap_config(&env, &user, &DailyCapConfig { max_executions: 1 });
 
             assert!(check_daily_execution_cap(&env, &user).is_ok());
             record_execution(&env, &user);
@@ -177,13 +165,7 @@ mod tests {
         let (env, _cid) = setup();
         let user = Address::generate(&env);
         env.as_contract(&_cid, || {
-            set_daily_cap_config(
-                &env,
-                &user,
-                &DailyCapConfig {
-                    max_executions: 2,
-                },
-            );
+            set_daily_cap_config(&env, &user, &DailyCapConfig { max_executions: 2 });
 
             // Use up both slots
             for _ in 0..2 {
@@ -209,13 +191,7 @@ mod tests {
         let (env, _cid) = setup();
         let user = Address::generate(&env);
         env.as_contract(&_cid, || {
-            set_daily_cap_config(
-                &env,
-                &user,
-                &DailyCapConfig {
-                    max_executions: 3,
-                },
-            );
+            set_daily_cap_config(&env, &user, &DailyCapConfig { max_executions: 3 });
 
             // Record 2 executions
             for _ in 0..2 {
@@ -259,13 +235,7 @@ mod tests {
         let (env, _cid) = setup();
         let user = Address::generate(&env);
         env.as_contract(&_cid, || {
-            set_daily_cap_config(
-                &env,
-                &user,
-                &DailyCapConfig {
-                    max_executions: 25,
-                },
-            );
+            set_daily_cap_config(&env, &user, &DailyCapConfig { max_executions: 25 });
             let config = get_daily_cap_config(&env, &user);
             assert_eq!(config.max_executions, 25);
         });

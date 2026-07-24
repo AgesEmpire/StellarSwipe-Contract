@@ -28,4 +28,6 @@ pub enum ContractError {
     PreferredTokenInsufficient = 22,
     PayoutCurrencyUnchanged = 23,
     InvalidMultiplierBounds = 24,
+    SelfReferralNotAllowed = 25,
+    ReferralAlreadyRegistered = 26,
 }

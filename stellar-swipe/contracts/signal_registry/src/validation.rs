@@ -133,13 +133,8 @@ pub fn validate_provider_signal_limit(
         _ => admin::get_bronze_signal_limit(env),
     };
 
-    let key = ProviderCacheKey::ActiveSignalCount(provider.clone());
-    let active_count = if env.storage().persistent().has(&key) {
-        get_provider_active_count(env, provider)
-    } else {
-        sync_provider_active_count(env, storage, provider);
-        get_provider_active_count(env, provider)
-    };
+    let _ = storage;
+    let active_count = get_provider_active_count(env, provider);
 
     if active_count >= limit {
         return Err(AdminError::SignalLimitExceeded);

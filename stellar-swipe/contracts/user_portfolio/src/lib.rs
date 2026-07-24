@@ -6,11 +6,11 @@ mod achievements;
 mod badges;
 mod exposure_cap;
 mod migration;
-mod position_tags;
 mod onboarding;
 #[cfg(test)]
 #[path = "tests/mod.rs"]
 mod portfolio_tests;
+mod position_tags;
 mod preferences;
 mod queries;
 mod storage;
@@ -25,7 +25,9 @@ pub use preferences::{
     TradingStyle,
 };
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+};
 use storage::DataKey;
 
 /// Compute the Herfindahl-Hirschman Index (HHI) concentration score for a user's open
@@ -41,7 +43,7 @@ fn compute_concentration_score(env: &Env, user: &Address) -> u32 {
         .get(&DataKey::UserOpenPositions(user.clone()))
         .unwrap_or_else(|| Vec::new(env));
 
-    if open_ids.len() == 0 {
+    if open_ids.is_empty() {
         return 0;
     }
 
@@ -210,14 +212,8 @@ pub struct Portfolio {
     pub closed_position_ids: Vec<u64>,
 }
 
-soroban_sdk::contractmeta!(
-    key = "SourceHash",
-    val = env!("STELLAR_SOURCE_HASH")
-);
-soroban_sdk::contractmeta!(
-    key = "GitCommit",
-    val = env!("STELLAR_GIT_COMMIT")
-);
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct UserPortfolio;
@@ -226,8 +222,18 @@ pub struct UserPortfolio;
 impl UserPortfolio {
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
-        m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
-        m.set(soroban_sdk::String::from_str(&env, "git_commit"), soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")));
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
+        );
         m
     }
 
@@ -965,11 +971,7 @@ impl UserPortfolio {
     }
 
     /// User: remove the exposure cap for `asset_id`.
-    pub fn remove_asset_exposure_cap(
-        env: Env,
-        user: Address,
-        asset_id: u32,
-    ) {
+    pub fn remove_asset_exposure_cap(env: Env, user: Address, asset_id: u32) {
         user.require_auth();
         exposure_cap::remove_cap(&env, &user, asset_id);
     }
@@ -1091,9 +1093,10 @@ impl UserPortfolio {
         let total_value = pnl.total_pnl;
         let now = env.ledger().timestamp();
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::PortfolioSnapshotEntry(user.clone(), now), &total_value);
+        env.storage().persistent().set(
+            &DataKey::PortfolioSnapshotEntry(user.clone(), now),
+            &total_value,
+        );
 
         let ts_key = DataKey::UserSnapshotTimestamps(user.clone());
         let mut timestamps: Vec<u64> = env
@@ -1113,7 +1116,10 @@ impl UserPortfolio {
             (user, now, total_value),
         );
 
-        PortfolioSnapshot { timestamp: now, total_value }
+        PortfolioSnapshot {
+            timestamp: now,
+            total_value,
+        }
     }
 
     /// Keeper- or admin-triggerable batch snapshot: records the current portfolio
@@ -1128,9 +1134,10 @@ impl UserPortfolio {
             let total_value = pnl.total_pnl;
             let now = env.ledger().timestamp();
 
-            env.storage()
-                .persistent()
-                .set(&DataKey::PortfolioSnapshotEntry(user.clone(), now), &total_value);
+            env.storage().persistent().set(
+                &DataKey::PortfolioSnapshotEntry(user.clone(), now),
+                &total_value,
+            );
 
             let ts_key = DataKey::UserSnapshotTimestamps(user.clone());
             let mut timestamps: Vec<u64> = env
@@ -1170,7 +1177,10 @@ impl UserPortfolio {
                     .persistent()
                     .get(&DataKey::PortfolioSnapshotEntry(user.clone(), ts))
                     .unwrap_or(0);
-                result.push_back(PortfolioSnapshot { timestamp: ts, total_value });
+                result.push_back(PortfolioSnapshot {
+                    timestamp: ts,
+                    total_value,
+                });
             }
         }
         result
@@ -1218,7 +1228,10 @@ impl UserPortfolio {
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
-        lots.push_back(CostLot { entry_price, amount });
+        lots.push_back(CostLot {
+            entry_price,
+            amount,
+        });
         env.storage().persistent().set(&key, &lots);
     }
 
@@ -1248,7 +1261,11 @@ impl UserPortfolio {
                 new_lots.push_back(lot);
                 continue;
             }
-            let consumed = if lot.amount <= remaining { lot.amount } else { remaining };
+            let consumed = if lot.amount <= remaining {
+                lot.amount
+            } else {
+                remaining
+            };
             if lot.entry_price > 0 {
                 // realized = (exit_price - entry_price) * consumed / entry_price
                 let pnl = exit_price
@@ -1261,7 +1278,10 @@ impl UserPortfolio {
             remaining = remaining.saturating_sub(consumed);
             let leftover = lot.amount.saturating_sub(consumed);
             if leftover > 0 {
-                new_lots.push_back(CostLot { entry_price: lot.entry_price, amount: leftover });
+                new_lots.push_back(CostLot {
+                    entry_price: lot.entry_price,
+                    amount: leftover,
+                });
             }
         }
 
@@ -2695,7 +2715,9 @@ mod exposure_cap_tests {
         let user = Address::generate(&env);
 
         // Set cap of 5_000 for asset 1.
-        client.set_asset_exposure_cap(&user, &1u32, &5_000i128).unwrap();
+        client
+            .set_asset_exposure_cap(&user, &1u32, &5_000i128)
+            .unwrap();
 
         // Trade 3_000 — within cap.
         let result = client.try_open_position_with_cap_check(&user, &1u32, &100i128, &3_000i128);
@@ -2712,7 +2734,9 @@ mod exposure_cap_tests {
         let client = UserPortfolioClient::new(&env, &contract_id);
         let user = Address::generate(&env);
 
-        client.set_asset_exposure_cap(&user, &1u32, &2_000i128).unwrap();
+        client
+            .set_asset_exposure_cap(&user, &1u32, &2_000i128)
+            .unwrap();
 
         // 3_000 > 2_000 cap → must be rejected.
         let result = client.try_open_position_with_cap_check(&user, &1u32, &100i128, &3_000i128);
@@ -2728,7 +2752,8 @@ mod exposure_cap_tests {
         let user = Address::generate(&env);
 
         // No cap set for asset 99.
-        let result = client.try_open_position_with_cap_check(&user, &99u32, &100i128, &999_999_999i128);
+        let result =
+            client.try_open_position_with_cap_check(&user, &99u32, &100i128, &999_999_999i128);
         assert!(result.is_ok(), "no cap → any amount should pass");
     }
 
@@ -2740,11 +2765,15 @@ mod exposure_cap_tests {
         let client = UserPortfolioClient::new(&env, &contract_id);
         let user = Address::generate(&env);
 
-        client.set_asset_exposure_cap(&user, &1u32, &1_000i128).unwrap();
+        client
+            .set_asset_exposure_cap(&user, &1u32, &1_000i128)
+            .unwrap();
         assert_eq!(client.get_asset_exposure_cap(&user, &1u32), Some(1_000));
 
         // Raise the cap.
-        client.set_asset_exposure_cap(&user, &1u32, &5_000i128).unwrap();
+        client
+            .set_asset_exposure_cap(&user, &1u32, &5_000i128)
+            .unwrap();
         assert_eq!(client.get_asset_exposure_cap(&user, &1u32), Some(5_000));
 
         // Remove the cap entirely.

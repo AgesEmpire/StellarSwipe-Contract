@@ -97,7 +97,7 @@ fn maybe_top10_leaderboard(env: &Env, user: &Address) {
         .persistent()
         .get(&DataKey::LeaderboardRank(user.clone()))
         .unwrap_or(0);
-    if rank >= 1 && rank <= 10 {
+    if (1..=10).contains(&rank) {
         try_grant(
             env,
             user,

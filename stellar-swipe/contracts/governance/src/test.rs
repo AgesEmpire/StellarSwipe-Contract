@@ -5,7 +5,8 @@ use crate::distribution::{
     TEAM_VESTING_DURATION, YEAR_SECONDS,
 };
 use crate::proposals::{
-    GovernanceConfig, ProposalCategory, ProposalStatus, ProposalType, VoteType as GovernanceVoteType,
+    GovernanceConfig, ProposalCategory, ProposalStatus, ProposalType,
+    VoteType as GovernanceVoteType,
 };
 use crate::{
     Authority, CommitteeAction, CommitteeElectionStatus, CrossCommitteeStatus, DecisionStatus,
@@ -2453,11 +2454,7 @@ fn proposer_can_withdraw_proposal_before_voting_opens() {
 
     let proposal_id = client.create_proposal(
         &recipients.community_rewards,
-        &ProposalType::ParameterChange(
-            String::from_str(&env, "liquidity_reward_bps"),
-            100,
-            120,
-        ),
+        &ProposalType::ParameterChange(String::from_str(&env, "liquidity_reward_bps"), 100, 120),
         &String::from_str(&env, "Adjust reward"),
         &String::from_str(&env, "Increase by 20%"),
         &Bytes::new(&env),
@@ -2492,8 +2489,7 @@ fn non_proposer_cannot_withdraw_others_proposal() {
     );
 
     // public_sale is NOT the proposer — must be rejected.
-    let result =
-        client.try_withdraw_proposal(&proposal_id, &recipients.public_sale);
+    let result = client.try_withdraw_proposal(&proposal_id, &recipients.public_sale);
     assert_eq!(result, Err(Ok(GovernanceError::Unauthorized)));
 
     // Original proposal must remain unchanged.
@@ -2512,11 +2508,7 @@ fn cannot_withdraw_after_voting_has_started() {
 
     let proposal_id = client.create_proposal(
         &recipients.community_rewards,
-        &ProposalType::ParameterChange(
-            String::from_str(&env, "liquidity_reward_bps"),
-            100,
-            120,
-        ),
+        &ProposalType::ParameterChange(String::from_str(&env, "liquidity_reward_bps"), 100, 120),
         &String::from_str(&env, "Adjust reward"),
         &String::from_str(&env, "Increase by 20%"),
         &Bytes::new(&env),
@@ -2533,8 +2525,7 @@ fn cannot_withdraw_after_voting_has_started() {
     );
 
     // Now try to withdraw — must be rejected because status is Active.
-    let result =
-        client.try_withdraw_proposal(&proposal_id, &recipients.community_rewards);
+    let result = client.try_withdraw_proposal(&proposal_id, &recipients.community_rewards);
     assert_eq!(result, Err(Ok(GovernanceError::ProposalNotActive)));
 }
 
@@ -2610,10 +2601,7 @@ fn withdraw_proposal_emits_event() {
             .and_then(|v| Symbol::try_from_val(&env, &v).ok());
         t0 == Some(Symbol::new(&env, "gov")) && t1 == Some(Symbol::new(&env, "propwdr"))
     });
-    assert!(
-        found,
-        "withdraw_proposal must emit (gov, propwdr) event"
-    );
+    assert!(found, "withdraw_proposal must emit (gov, propwdr) event");
 }
 
 #[test]
@@ -2639,8 +2627,7 @@ fn cannot_withdraw_already_withdrawn_proposal() {
     assert_eq!(status, ProposalStatus::Withdrawn);
 
     // Second withdrawal — must be rejected (status is Withdrawn, not Pending).
-    let result =
-        client.try_withdraw_proposal(&proposal_id, &recipients.community_rewards);
+    let result = client.try_withdraw_proposal(&proposal_id, &recipients.community_rewards);
     assert_eq!(result, Err(Ok(GovernanceError::ProposalAlreadyWithdrawn)));
 }
 
@@ -2708,8 +2695,7 @@ fn cancelled_proposal_cannot_be_withdrawn() {
     client.cancel_proposal(&proposal_id, &recipients.community_rewards);
 
     // Now try to withdraw — must be rejected (status is Cancelled, not Pending).
-    let result =
-        client.try_withdraw_proposal(&proposal_id, &recipients.community_rewards);
+    let result = client.try_withdraw_proposal(&proposal_id, &recipients.community_rewards);
     assert_eq!(result, Err(Ok(GovernanceError::ProposalNotActive)));
 }
 
@@ -2803,7 +2789,9 @@ fn conviction_decay_rate_non_admin_cannot_set() {
 fn conviction_score_bounded_across_valid_decay_rates() {
     // Proptest-style verification: for all valid decay rates (1..=999),
     // conviction score should be in (0, max_conviction] after some time.
-    use crate::conviction_voting::{calculate_conviction, ConvictionCalibration, MIN_DECAY_RATE, MAX_DECAY_RATE};
+    use crate::conviction_voting::{
+        calculate_conviction, ConvictionCalibration, MAX_DECAY_RATE, MIN_DECAY_RATE,
+    };
 
     let tokens = 10_000i128;
     let time_elapsed = 30u64 * 86_400; // 30 days
@@ -2820,15 +2808,23 @@ fn conviction_score_bounded_across_valid_decay_rates() {
         let conviction = calculate_conviction(tokens, time_elapsed, &calibration);
 
         // Conviction should be non-negative
-        assert!(conviction >= 0, "Conviction should be non-negative for decay_rate={}", decay_rate);
+        assert!(
+            conviction >= 0,
+            "Conviction should be non-negative for decay_rate={}",
+            decay_rate
+        );
 
         // With 10,000 tokens and 30 days, sqrt(30) ≈ 5.47, so base conviction ≈ 54
         // After decay, it should be less than or equal to the base (no decay case)
         // The maximum possible conviction without decay would be tokens * sqrt(days) / 1000
         let max_possible = tokens * (30i128).checked_mul(1).unwrap_or(1) / 1000;
-        assert!(conviction <= max_possible + 100,
+        assert!(
+            conviction <= max_possible + 100,
             "Conviction {} exceeds max possible {} for decay_rate={}",
-            conviction, max_possible, decay_rate);
+            conviction,
+            max_possible,
+            decay_rate
+        );
     }
 }
 
@@ -3018,4 +3014,3 @@ fn reclaim_expired_proposal_removes_entry_and_is_callable_by_anyone() {
     }
     assert!(!found);
 }
-

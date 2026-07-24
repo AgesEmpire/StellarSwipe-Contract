@@ -34,7 +34,7 @@ fn pow_fixed_point(mut base_scaled: i128, mut exponent: u32, scale: i128) -> i12
     result
 }
 
-/// ── Decay rate bounds (basis points, 1000 = 100%) ────────────────────────
+// ── Decay rate bounds (basis points, 1000 = 100%) ────────────────────────
 /// A decay rate of 0 would disable conviction decay entirely (unbounded
 /// accumulation), while a rate of 1000 would cause instant full decay
 /// (votes always worth zero). The valid range is strictly between these
@@ -42,12 +42,12 @@ fn pow_fixed_point(mut base_scaled: i128, mut exponent: u32, scale: i128) -> i12
 pub const MIN_DECAY_RATE: u64 = 1;
 pub const MAX_DECAY_RATE: u64 = 999;
 
-/// ── Conviction Calibration ────────────────────────────────────────────────
+// ── Conviction Calibration ────────────────────────────────────────────────
 /// Calibration controls let the governance admin tune how conviction is
 /// penalised for short-lived support and rewarded for sustained commitment.
 ///
 /// Fields
-/// ──────
+// ──────
 /// * `penalty_threshold_days`  – Votes younger than this threshold (in days)
 ///   receive a weight penalty. Set to 0 to disable the penalty.
 /// * `penalty_multiplier`      – Denominator (1/N) for the penalty fraction.
@@ -84,7 +84,7 @@ impl Default for ConvictionCalibration {
     }
 }
 
-/// ── Calibration helpers ───────────────────────────────────────────────────
+// ── Calibration helpers ───────────────────────────────────────────────────
 
 pub fn get_conviction_calibration(env: &Env) -> ConvictionCalibration {
     env.storage()
@@ -93,7 +93,10 @@ pub fn get_conviction_calibration(env: &Env) -> ConvictionCalibration {
         .unwrap_or_else(|| ConvictionCalibration::default())
 }
 
-pub fn put_conviction_calibration(env: &Env, config: &ConvictionCalibration) -> Result<(), GovernanceError> {
+pub fn put_conviction_calibration(
+    env: &Env,
+    config: &ConvictionCalibration,
+) -> Result<(), GovernanceError> {
     // Validate decay rate is within acceptable bounds
     if config.decay_rate_bps < MIN_DECAY_RATE || config.decay_rate_bps > MAX_DECAY_RATE {
         return Err(GovernanceError::InvalidDecayRate);
@@ -657,7 +660,8 @@ pub fn calculate_conviction(
     // `saturating_pow` on each and then dividing the two saturated i128::MAX
     // values previously collapsed the result to ~1 regardless of the true
     // ratio.
-    if calibration.decay_rate_bps >= MIN_DECAY_RATE && calibration.decay_rate_bps <= MAX_DECAY_RATE {
+    if calibration.decay_rate_bps >= MIN_DECAY_RATE && calibration.decay_rate_bps <= MAX_DECAY_RATE
+    {
         let decay_factor = 1000i128 - calibration.decay_rate_bps as i128;
         let decay_factor_scaled = decay_factor.saturating_mul(DECAY_SCALE) / 1000;
         let decay_multiplier_scaled =

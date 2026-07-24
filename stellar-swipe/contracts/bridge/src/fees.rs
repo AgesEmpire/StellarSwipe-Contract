@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-use soroban_sdk::{contracttype, Address, Env, Symbol, String, Vec};
-use crate::monitoring::{get_bridge_transfer, TransferStatus, ChainId};
-use crate::governance::{get_bridge_validators};
+use crate::governance::get_bridge_validators;
+use crate::monitoring::{get_bridge_transfer, ChainId, TransferStatus};
+use soroban_sdk::{contracttype, Address, Env, String, Symbol, Vec};
 use stellar_swipe_common::assets::Asset;
 
 #[contracttype]
@@ -36,25 +36,35 @@ pub enum FeeStorageKey {
 }
 
 pub fn set_bridge_treasury(env: &Env, bridge_id: u64, treasury: Address) {
-    env.storage().persistent().set(&FeeStorageKey::TreasuryTarget(bridge_id), &treasury);
+    env.storage()
+        .persistent()
+        .set(&FeeStorageKey::TreasuryTarget(bridge_id), &treasury);
 }
 
 pub fn get_bridge_treasury(env: &Env, bridge_id: u64) -> Result<Address, String> {
-    env.storage().persistent().get(&FeeStorageKey::TreasuryTarget(bridge_id))
+    env.storage()
+        .persistent()
+        .get(&FeeStorageKey::TreasuryTarget(bridge_id))
         .ok_or_else(|| String::from_str(env, "Treasury not set"))
 }
 
 pub fn set_bridge_fee_config(env: &Env, config: &BridgeFeeConfig) {
-    env.storage().persistent().set(&FeeStorageKey::FeeConfig(config.bridge_id), config);
+    env.storage()
+        .persistent()
+        .set(&FeeStorageKey::FeeConfig(config.bridge_id), config);
 }
 
 pub fn get_bridge_fee_config(env: &Env, bridge_id: u64) -> Result<BridgeFeeConfig, String> {
-    env.storage().persistent().get(&FeeStorageKey::FeeConfig(bridge_id))
+    env.storage()
+        .persistent()
+        .get(&FeeStorageKey::FeeConfig(bridge_id))
         .ok_or_else(|| String::from_str(env, "Fee config not found"))
 }
 
 pub fn get_bridge_fee_stats(env: &Env, bridge_id: u64) -> BridgeFeeStats {
-    env.storage().persistent().get(&FeeStorageKey::FeeStats(bridge_id))
+    env.storage()
+        .persistent()
+        .get(&FeeStorageKey::FeeStats(bridge_id))
         .unwrap_or(BridgeFeeStats {
             total_fees_collected: 0,
             fees_distributed_validators: 0,
@@ -65,10 +75,16 @@ pub fn get_bridge_fee_stats(env: &Env, bridge_id: u64) -> BridgeFeeStats {
 }
 
 pub fn save_bridge_fee_stats(env: &Env, bridge_id: u64, stats: &BridgeFeeStats) {
-    env.storage().persistent().set(&FeeStorageKey::FeeStats(bridge_id), stats);
+    env.storage()
+        .persistent()
+        .set(&FeeStorageKey::FeeStats(bridge_id), stats);
 }
 
-pub fn calculate_bridge_fee(env: &Env, bridge_id: u64, transfer_amount: i128) -> Result<i128, String> {
+pub fn calculate_bridge_fee(
+    env: &Env,
+    bridge_id: u64,
+    transfer_amount: i128,
+) -> Result<i128, String> {
     let fee_config = get_bridge_fee_config(env, bridge_id)?;
 
     let fee = (transfer_amount * fee_config.base_fee_bps as i128) / 10000;
@@ -92,7 +108,7 @@ pub fn collect_bridge_fee(
 ) -> Result<i128, String> {
     let transfer = get_bridge_transfer(env, transfer_id)
         .ok_or_else(|| String::from_str(env, "Transfer not found"))?;
-    
+
     let fee = calculate_bridge_fee(env, transfer.bridge_id, amount)?;
     let net_amount = amount - fee;
 
@@ -100,15 +116,22 @@ pub fn collect_bridge_fee(
     let total_fees = stats.total_fees_collected + fee;
     stats.transfers_count += 1;
     stats.total_fees_collected = total_fees;
-    
+
     if stats.transfers_count > 0 {
         stats.avg_fee = total_fees / stats.transfers_count as i128;
     }
-    
+
     save_bridge_fee_stats(env, transfer.bridge_id, &stats);
 
-    let daily_transfers: u64 = env.storage().persistent().get(&FeeStorageKey::DailyTransfers(transfer.bridge_id)).unwrap_or(0);
-    env.storage().persistent().set(&FeeStorageKey::DailyTransfers(transfer.bridge_id), &(daily_transfers + 1));
+    let daily_transfers: u64 = env
+        .storage()
+        .persistent()
+        .get(&FeeStorageKey::DailyTransfers(transfer.bridge_id))
+        .unwrap_or(0);
+    env.storage().persistent().set(
+        &FeeStorageKey::DailyTransfers(transfer.bridge_id),
+        &(daily_transfers + 1),
+    );
 
     env.events().publish(
         (Symbol::new(env, "bridge_fee_collected"), transfer_id),
@@ -122,7 +145,8 @@ pub fn distribute_validator_rewards(env: &Env, bridge_id: u64) -> Result<(), Str
     let fee_config = get_bridge_fee_config(env, bridge_id)?;
     let mut fee_stats = get_bridge_fee_stats(env, bridge_id);
 
-    let target_validator_total = (fee_stats.total_fees_collected * fee_config.validator_reward_pct as i128) / 10000;
+    let target_validator_total =
+        (fee_stats.total_fees_collected * fee_config.validator_reward_pct as i128) / 10000;
     let validator_share = target_validator_total - fee_stats.fees_distributed_validators;
 
     if validator_share <= 0 {
@@ -154,7 +178,8 @@ pub fn allocate_to_treasury(env: &Env, bridge_id: u64) -> Result<(), String> {
     let fee_config = get_bridge_fee_config(env, bridge_id)?;
     let mut fee_stats = get_bridge_fee_stats(env, bridge_id);
 
-    let target_treasury_total = (fee_stats.total_fees_collected * fee_config.treasury_pct as i128) / 10000;
+    let target_treasury_total =
+        (fee_stats.total_fees_collected * fee_config.treasury_pct as i128) / 10000;
     let treasury_share = target_treasury_total - fee_stats.fees_to_treasury;
 
     if treasury_share <= 0 {
@@ -162,7 +187,7 @@ pub fn allocate_to_treasury(env: &Env, bridge_id: u64) -> Result<(), String> {
     }
 
     let _treasury_address = get_bridge_treasury(env, bridge_id)?;
-    
+
     fee_stats.fees_to_treasury += treasury_share;
     save_bridge_fee_stats(env, bridge_id, &fee_stats);
 
@@ -259,8 +284,20 @@ pub fn estimate_bridge_fee(
     Ok(estimated_fee)
 }
 
-fn min(a: u32, b: u32) -> u32 { if a < b { a } else { b } }
-fn max(a: u32, b: u32) -> u32 { if a > b { a } else { b } }
+fn min(a: u32, b: u32) -> u32 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+fn max(a: u32, b: u32) -> u32 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
 
 pub fn adjust_bridge_fees_dynamically(env: &Env, bridge_id: u64) -> Result<(), String> {
     let mut fee_config = get_bridge_fee_config(env, bridge_id)?;
@@ -274,10 +311,10 @@ pub fn adjust_bridge_fees_dynamically(env: &Env, bridge_id: u64) -> Result<(), S
     match utilization {
         0..=3000 => {
             fee_config.base_fee_bps = max(10, fee_config.base_fee_bps.saturating_sub(5));
-        },
+        }
         7000..=10000 => {
             fee_config.base_fee_bps = min(100, fee_config.base_fee_bps + 5);
-        },
+        }
         _ => {}
     }
 
@@ -296,12 +333,20 @@ fn get_bridge_max_capacity(_env: &Env, _bridge_id: u64) -> Result<u64, String> {
 }
 
 pub fn calculate_bridge_utilization(env: &Env, bridge_id: u64) -> Result<u32, String> {
-    let transfers_24h: u64 = env.storage().persistent().get(&FeeStorageKey::DailyTransfers(bridge_id)).unwrap_or(0);
+    let transfers_24h: u64 = env
+        .storage()
+        .persistent()
+        .get(&FeeStorageKey::DailyTransfers(bridge_id))
+        .unwrap_or(0);
     let max_capacity = get_bridge_max_capacity(env, bridge_id)?;
 
     let max_cap = if max_capacity == 0 { 1 } else { max_capacity };
     let utilization_bps = (transfers_24h * 10000) / max_cap;
-    let res = if utilization_bps > 10000 { 10000 } else { utilization_bps as u32 };
+    let res = if utilization_bps > 10000 {
+        10000
+    } else {
+        utilization_bps as u32
+    };
     Ok(res)
 }
 
@@ -311,7 +356,10 @@ pub fn refund_bridge_fee(env: &Env, transfer_id: u64, reason: String) -> Result<
 
     // We assume the caller checked if transfer status is Failed, since TransferStatus does not have Cancelled.
     if transfer.status != TransferStatus::Failed {
-        return Err(String::from_str(env, "Only failed transfers eligible for refund"));
+        return Err(String::from_str(
+            env,
+            "Only failed transfers eligible for refund",
+        ));
     }
 
     let mut fee_stats = get_bridge_fee_stats(env, transfer.bridge_id);
@@ -344,7 +392,10 @@ mod tests {
     }
 
     fn xlm_asset(env: &Env) -> Asset {
-        Asset { code: soroban_sdk::String::from_str(env, "XLM"), issuer: None }
+        Asset {
+            code: soroban_sdk::String::from_str(env, "XLM"),
+            issuer: None,
+        }
     }
 
     #[test]
@@ -387,9 +438,13 @@ mod tests {
         // No chain multiplier set → defaults to 10_000 (identity).
 
         let amount = 1_000_000i128;
-        let estimated = estimate_bridge_fee(&env, ChainId::Ethereum, amount, &xlm_asset(&env)).unwrap();
+        let estimated =
+            estimate_bridge_fee(&env, ChainId::Ethereum, amount, &xlm_asset(&env)).unwrap();
         let actual = calculate_bridge_fee(&env, bridge_id, amount).unwrap();
-        assert_eq!(estimated, actual, "estimate must equal actual when multiplier=10_000");
+        assert_eq!(
+            estimated, actual,
+            "estimate must equal actual when multiplier=10_000"
+        );
     }
 
     #[test]
@@ -403,7 +458,8 @@ mod tests {
 
         let amount = 1_000_000i128;
         let actual_base = calculate_bridge_fee(&env, bridge_id, amount).unwrap(); // 3000
-        let estimated = estimate_bridge_fee(&env, ChainId::Polygon, amount, &xlm_asset(&env)).unwrap();
+        let estimated =
+            estimate_bridge_fee(&env, ChainId::Polygon, amount, &xlm_asset(&env)).unwrap();
 
         assert_eq!(estimated, actual_base * 15_000 / 10_000);
         assert!(estimated > actual_base);
@@ -436,7 +492,8 @@ mod tests {
         // Very small transfer → min_fee kicks in at 100.
         let amount = 100i128;
         let actual = calculate_bridge_fee(&env, bridge_id, amount).unwrap(); // min_fee = 100
-        let estimated = estimate_bridge_fee(&env, ChainId::Bitcoin, amount, &xlm_asset(&env)).unwrap();
+        let estimated =
+            estimate_bridge_fee(&env, ChainId::Bitcoin, amount, &xlm_asset(&env)).unwrap();
         // Identity multiplier: estimated must equal actual.
         assert_eq!(estimated, actual);
     }
@@ -451,7 +508,8 @@ mod tests {
         // Large transfer → max_fee 10_000 caps the base fee.
         let amount = 100_000_000i128;
         let actual = calculate_bridge_fee(&env, bridge_id, amount).unwrap(); // max_fee = 10_000
-        let estimated = estimate_bridge_fee(&env, ChainId::Ethereum, amount, &xlm_asset(&env)).unwrap();
+        let estimated =
+            estimate_bridge_fee(&env, ChainId::Ethereum, amount, &xlm_asset(&env)).unwrap();
         assert_eq!(estimated, actual);
     }
 

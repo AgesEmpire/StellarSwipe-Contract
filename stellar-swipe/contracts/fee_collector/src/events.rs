@@ -282,6 +282,46 @@ pub fn emit_payout_currency_set(env: &Env, provider: &Address, preferred_token: 
     );
 }
 
+// ── Referral events ─────────────────────────────────────────────────────────
+
+pub fn emit_referral_registered(env: &Env, referrer: &Address, referee: &Address) {
+    ReferralRegistered {
+        referrer: referrer.clone(),
+        referee: referee.clone(),
+    }
+    .publish(env);
+}
+
+pub fn emit_referral_fee_share_updated(
+    env: &Env,
+    old_bps: u32,
+    new_bps: u32,
+    updated_by: &Address,
+) {
+    ReferralFeeShareUpdated {
+        old_bps,
+        new_bps,
+        updated_by: updated_by.clone(),
+    }
+    .publish(env);
+}
+
+pub fn emit_referral_fee_paid(
+    env: &Env,
+    referrer: &Address,
+    referee: &Address,
+    token: &Address,
+    amount: i128,
+) {
+    ReferralFeePaid {
+        referrer: referrer.clone(),
+        referee: referee.clone(),
+        token: token.clone(),
+        amount,
+    }
+    .publish(env);
+}
+
 // ── #665: Fee Forecast event ─────────────────────────────────────────────────
 
 /// Emitted when a fee revenue forecast is computed (auto or manual trigger).

@@ -67,7 +67,11 @@ impl Amount {
 
     /// Multiply by a `numerator / denominator` rate (e.g. a basis-points fee
     /// or a price ratio) without an intermediate overflow.
-    pub fn checked_mul_rate(self, numerator: i128, denominator: i128) -> Result<Amount, AmountError> {
+    pub fn checked_mul_rate(
+        self,
+        numerator: i128,
+        denominator: i128,
+    ) -> Result<Amount, AmountError> {
         if denominator == 0 {
             return Err(AmountError::DivisionByZero);
         }
@@ -135,10 +139,10 @@ mod tests {
 
     #[test]
     fn checked_mul_rate_applies_fee_bps() {
-        // 1_000_0000 (100 units at 7dp) * 50 bps / 10_000 = 5_0000 (0.5 units)
+        // 10_000_000 (100 units at 7dp) * 50 bps / 10_000 = 50_000 (0.5 units)
         assert_eq!(
-            Amount::new(1_000_0000).checked_mul_rate(50, 10_000),
-            Ok(Amount::new(5_0000))
+            Amount::new(10_000_000).checked_mul_rate(50, 10_000),
+            Ok(Amount::new(50_000))
         );
     }
 

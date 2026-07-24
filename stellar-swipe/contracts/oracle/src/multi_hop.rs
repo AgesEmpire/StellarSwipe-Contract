@@ -137,7 +137,7 @@ fn find_all_paths(
 }
 
 fn dfs(
-    env: &Env,
+    _env: &Env,
     graph: &Vec<AssetPair>,
     current: &Asset,
     target: &Asset,
@@ -177,7 +177,7 @@ fn dfs(
             } else {
                 visited.set(next_asset.clone(), true);
                 dfs(
-                    env,
+                    _env,
                     graph,
                     &next_asset,
                     target,
@@ -331,10 +331,22 @@ mod tests {
 
         let graph = soroban_sdk::vec![
             &env,
-            AssetPair { base: a.clone(), quote: b.clone() },
-            AssetPair { base: b.clone(), quote: c.clone() },
-            AssetPair { base: c.clone(), quote: d.clone() },
-            AssetPair { base: a.clone(), quote: d.clone() },
+            AssetPair {
+                base: a.clone(),
+                quote: b.clone()
+            },
+            AssetPair {
+                base: b.clone(),
+                quote: c.clone()
+            },
+            AssetPair {
+                base: c.clone(),
+                quote: d.clone()
+            },
+            AssetPair {
+                base: a.clone(),
+                quote: d.clone()
+            },
         ];
         let paths = find_all_paths(&env, &graph, &a, &d, 3);
         assert_eq!(paths.len(), 2);
@@ -378,11 +390,16 @@ mod tests {
             let path1 = find_optimal_path(env, a.clone(), b.clone(), 100 * PRECISION).unwrap();
 
             // Remove pair from available but it should still be in cache
-            let mut pairs = storage::get_available_pairs(env);
-            pairs.remove(pair.clone());
+            let pairs = storage::get_available_pairs(env);
+            let mut remaining = Vec::new(env);
+            for available_pair in pairs.iter() {
+                if available_pair != pair {
+                    remaining.push_back(available_pair);
+                }
+            }
             env.storage()
                 .persistent()
-                .set(&storage::StorageKey::AvailablePairs, &pairs);
+                .set(&storage::StorageKey::PairsList, &remaining);
 
             let path2 = find_optimal_path(env, a.clone(), b.clone(), 100 * PRECISION).unwrap();
             assert_eq!(path1.hops.len(), path2.hops.len());

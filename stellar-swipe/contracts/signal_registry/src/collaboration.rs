@@ -132,12 +132,14 @@ pub fn distribute_collaborative_rewards(
         let (address, fee_share, roi_share) = distributions.get(last_idx).unwrap();
         let fee_rem = total_fees - fee_sum;
         let roi_rem = total_roi - roi_sum;
-        distributions.set(last_idx, (address, fee_share + fee_rem, roi_share + roi_rem));
+        distributions.set(
+            last_idx,
+            (address, fee_share + fee_rem, roi_share + roi_rem),
+        );
     }
 
     distributions
 }
-
 
 fn store_collaborative_signal(env: &Env, signal_id: u64, authors: &Vec<Author>) {
     let mut map: Map<u64, Vec<Author>> = env
@@ -162,4 +164,3 @@ pub fn get_collaborative_signal(env: &Env, signal_id: u64) -> Option<Vec<Author>
 pub fn is_collaborative_signal(env: &Env, signal_id: u64) -> bool {
     get_collaborative_signal(env, signal_id).is_some()
 }
-

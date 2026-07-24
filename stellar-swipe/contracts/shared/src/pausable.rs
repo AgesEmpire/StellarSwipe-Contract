@@ -45,9 +45,7 @@ pub fn is_paused(env: &Env) -> bool {
 /// Event topic  : `("contract_paused",)`  or  `("contract_unpaused",)`
 /// Event data   : `(paused: bool)`
 pub fn set_paused(env: &Env, paused: bool) {
-    env.storage()
-        .instance()
-        .set(&PausableKey::Paused, &paused);
+    env.storage().instance().set(&PausableKey::Paused, &paused);
 
     let topic: Symbol = if paused {
         symbol_short!("paused")

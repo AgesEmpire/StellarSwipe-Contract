@@ -1020,8 +1020,12 @@ impl TradeExecutorContract {
             soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
         );
         m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
             soroban_sdk::String::from_str(&env, "git_commit"),
-            soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
         );
         m
     }
@@ -1338,8 +1342,7 @@ impl TradeExecutorContract {
         tx_hash: Bytes,
         expiry_ts: u64,
     ) -> Result<(), ContractError> {
-        verify_and_commit(&env, &user, nonce, tx_hash, expiry_ts)
-            .map_err(map_replay_error)?;
+        verify_and_commit(&env, &user, nonce, tx_hash, expiry_ts).map_err(map_replay_error)?;
         feature_flags::require_feature_enabled(&env, feature_flags::FEAT_COPY_TRADE)?;
         match order_type {
             OrderType::Market => {

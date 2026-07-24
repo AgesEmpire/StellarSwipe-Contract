@@ -14,6 +14,7 @@ pub const ARCHIVE_THRESHOLD_SECONDS: u64 = SECONDS_PER_30_DAY_MONTH; // 30 days
 pub struct CleanupResult {
     pub signals_processed: u32,
     pub signals_expired: u32,
+    pub expired_signals: Vec<Signal>,
 }
 
 impl Expirable for Signal {
@@ -161,6 +162,7 @@ pub fn cleanup_expired_signals(
     let current_time = env.ledger().timestamp();
     let mut signals_processed = 0u32;
     let mut signals_expired = 0u32;
+    let mut expired_signals = Vec::new(env);
     let mut updated_map = signals_map.clone();
 
     // Collect all keys first
@@ -179,8 +181,9 @@ pub fn cleanup_expired_signals(
 
         let signal_id = keys.get(i).unwrap();
         if let Some(mut signal) = signals_map.get(signal_id) {
-            // Skip already expired or executed signals
-            if signal.status == SignalStatus::Expired || signal.status == SignalStatus::Executed {
+            // Only active signals consume provider capacity and can transition
+            // to Expired in this cleanup path.
+            if signal.status != SignalStatus::Active {
                 continue;
             }
 
@@ -191,6 +194,7 @@ pub fn cleanup_expired_signals(
                 signal.status = SignalStatus::Expired;
                 updated_map.set(signal_id, signal.clone());
                 signals_expired += 1;
+                expired_signals.push_back(signal.clone());
 
                 // Emit expiry event
                 emit_signal_expired(env, signal.id, signal.provider.clone(), signal.expiry);
@@ -208,6 +212,7 @@ pub fn cleanup_expired_signals(
     CleanupResult {
         signals_processed,
         signals_expired,
+        expired_signals,
     }
 }
 

@@ -221,8 +221,7 @@ mod tests {
         let (env, contract_id) = setup();
         let other_id = env.register(TestContract, ());
         // Fetch the real wasm hash via our helper (avoids naming the private Executable type)
-        let real_hash = wasm_hash_from_executable(&env, &other_id)
-            .expect("expected wasm contract");
+        let real_hash = wasm_hash_from_executable(&env, &other_id).expect("expected wasm contract");
         env.as_contract(&contract_id, || {
             set_expected_wasm_hash(&env, &other_id, &real_hash);
             assert!(verify_wasm_hash(&env, &other_id).is_ok());

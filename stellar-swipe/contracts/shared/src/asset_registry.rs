@@ -9,7 +9,7 @@
 //! - `update_asset(admin, asset, symbol, decimals, issuer)` — admin-only, updates existing metadata
 //! - `get_asset_metadata(asset)` — read-only, returns metadata for a given asset contract address
 
-use soroban_sdk::{contracterror, contracttype, contract, contractimpl, Address, Env, String};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
@@ -49,7 +49,6 @@ enum AssetRegistryStorage {
 
 #[contract]
 pub struct AssetRegistryContract;
-
 
 #[contractimpl]
 impl AssetRegistryContract {
@@ -93,7 +92,11 @@ impl AssetRegistryContract {
         if env.storage().instance().has(&key) {
             return Err(AssetRegistryError::AlreadyRegistered);
         }
-        let meta = AssetMetadata { symbol, decimals, issuer };
+        let meta = AssetMetadata {
+            symbol,
+            decimals,
+            issuer,
+        };
         env.storage().instance().set(&key, &meta);
         Ok(meta)
     }
@@ -115,7 +118,11 @@ impl AssetRegistryContract {
         if !env.storage().instance().has(&key) {
             return Err(AssetRegistryError::NotRegistered);
         }
-        let meta = AssetMetadata { symbol, decimals, issuer };
+        let meta = AssetMetadata {
+            symbol,
+            decimals,
+            issuer,
+        };
         env.storage().instance().set(&key, &meta);
         Ok(meta)
     }
@@ -150,11 +157,13 @@ mod tests {
         let asset = Address::generate(&env);
         let client = AssetRegistryContractClient::new(&env, &_contract_id);
         let meta = client.register_asset(
-            &admin, &asset,
-            &String::from_str(&env, "USDC"), &7u32, &None,
+            &admin,
+            &asset,
+            &String::from_str(&env, "USDC"),
+            &7u32,
+            &None,
         );
-        assert!(meta.is_ok());
-        assert_eq!(meta.unwrap().symbol, String::from_str(&env, "USDC"));
+        assert_eq!(meta.symbol, String::from_str(&env, "USDC"));
     }
 
     #[test]
@@ -165,11 +174,13 @@ mod tests {
         let issuer = Address::generate(&env);
 
         let result = client.register_asset(
-            &admin, &asset,
-            &String::from_str(&env, "USDC"), &7u32,
+            &admin,
+            &asset,
+            &String::from_str(&env, "USDC"),
+            &7u32,
             &Some(issuer.clone()),
         );
-        assert!(result.is_ok());
+        assert_eq!(result.symbol, String::from_str(&env, "USDC"));
 
         let meta = client.get_asset_metadata(&asset).unwrap();
         assert_eq!(meta.symbol, String::from_str(&env, "USDC"));
@@ -183,16 +194,11 @@ mod tests {
         let client = AssetRegistryContractClient::new(&env, &_contract_id);
         let asset = Address::generate(&env);
 
-        client.register_asset(
-            &admin, &asset,
-            &String::from_str(&env, "XLM"), &7u32, &None,
-        ).unwrap();
+        client.register_asset(&admin, &asset, &String::from_str(&env, "XLM"), &7u32, &None);
 
-        let result = client.register_asset(
-            &admin, &asset,
-            &String::from_str(&env, "XLM"), &7u32, &None,
-        );
-        assert_eq!(result, Err(AssetRegistryError::AlreadyRegistered));
+        let result =
+            client.try_register_asset(&admin, &asset, &String::from_str(&env, "XLM"), &7u32, &None);
+        assert_eq!(result, Err(Ok(AssetRegistryError::AlreadyRegistered)));
     }
 
     #[test]
@@ -202,17 +208,22 @@ mod tests {
         let asset = Address::generate(&env);
 
         client.register_asset(
-            &admin, &asset,
-            &String::from_str(&env, "USDC"), &7u32, &None,
-        ).unwrap();
+            &admin,
+            &asset,
+            &String::from_str(&env, "USDC"),
+            &7u32,
+            &None,
+        );
 
         let issuer = Address::generate(&env);
         let result = client.update_asset(
-            &admin, &asset,
-            &String::from_str(&env, "USDC"), &6u32,
+            &admin,
+            &asset,
+            &String::from_str(&env, "USDC"),
+            &6u32,
             &Some(issuer.clone()),
         );
-        assert!(result.is_ok());
+        assert_eq!(result.decimals, 6);
 
         let meta = client.get_asset_metadata(&asset).unwrap();
         assert_eq!(meta.decimals, 6);
@@ -225,18 +236,21 @@ mod tests {
         let client = AssetRegistryContractClient::new(&env, &_contract_id);
         let asset = Address::generate(&env);
 
-        let result = client.update_asset(
-            &admin, &asset,
-            &String::from_str(&env, "NONEXISTENT"), &7u32, &None,
+        let result = client.try_update_asset(
+            &admin,
+            &asset,
+            &String::from_str(&env, "NONEXISTENT"),
+            &7u32,
+            &None,
         );
-        assert_eq!(result, Err(AssetRegistryError::NotRegistered));
+        assert_eq!(result, Err(Ok(AssetRegistryError::NotRegistered)));
     }
 
     #[test]
     fn test_lookup_unregistered_returns_none() {
         let (env, contract_id, admin) = setup_env();
         let client = AssetRegistryContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
+        let _ = admin;
 
         let asset = Address::generate(&env);
         let meta = client.get_asset_metadata(&asset);
@@ -250,10 +264,13 @@ mod tests {
         let xlm_asset = Address::generate(&env);
 
         let result = client.register_asset(
-            &admin, &xlm_asset,
-            &String::from_str(&env, "XLM"), &7u32, &None,
+            &admin,
+            &xlm_asset,
+            &String::from_str(&env, "XLM"),
+            &7u32,
+            &None,
         );
-        assert!(result.is_ok());
+        assert_eq!(result.symbol, String::from_str(&env, "XLM"));
 
         let meta = client.get_asset_metadata(&xlm_asset).unwrap();
         assert_eq!(meta.symbol, String::from_str(&env, "XLM"));
@@ -272,8 +289,11 @@ mod tests {
         let impostor = Address::generate(&env);
         let asset = Address::generate(&env);
         let result = client.try_register_asset(
-            &impostor, &asset,
-            &String::from_str(&env, "FAKE"), &7u32, &None,
+            &impostor,
+            &asset,
+            &String::from_str(&env, "FAKE"),
+            &7u32,
+            &None,
         );
         assert!(result.is_err());
     }
@@ -292,27 +312,17 @@ mod tests {
 
         // Register XLM (native) and USDC (with issuer) metadata.
         let xlm = Address::generate(&env);
-        registry
-            .register_asset(
-                &admin,
-                &xlm,
-                &String::from_str(&env, "XLM"),
-                &7u32,
-                &None,
-            )
-            .unwrap();
+        registry.register_asset(&admin, &xlm, &String::from_str(&env, "XLM"), &7u32, &None);
 
         let usdc_issuer = Address::generate(&env);
         let usdc = Address::generate(&env);
-        registry
-            .register_asset(
-                &admin,
-                &usdc,
-                &String::from_str(&env, "USDC"),
-                &7u32,
-                &Some(usdc_issuer.clone()),
-            )
-            .unwrap();
+        registry.register_asset(
+            &admin,
+            &usdc,
+            &String::from_str(&env, "USDC"),
+            &7u32,
+            &Some(usdc_issuer.clone()),
+        );
 
         let xlm_meta = registry.get_asset_metadata(&xlm).unwrap();
         assert_eq!(xlm_meta.symbol, String::from_str(&env, "XLM"));
@@ -326,15 +336,13 @@ mod tests {
 
         // Update USDC decimals (e.g. if USDC changes on Stellar)
         let new_issuer = Address::generate(&env);
-        registry
-            .update_asset(
-                &admin,
-                &usdc,
-                &String::from_str(&env, "USDC"),
-                &6u32,
-                &Some(new_issuer.clone()),
-            )
-            .unwrap();
+        registry.update_asset(
+            &admin,
+            &usdc,
+            &String::from_str(&env, "USDC"),
+            &6u32,
+            &Some(new_issuer.clone()),
+        );
 
         let updated = registry.get_asset_metadata(&usdc).unwrap();
         assert_eq!(updated.decimals, 6);

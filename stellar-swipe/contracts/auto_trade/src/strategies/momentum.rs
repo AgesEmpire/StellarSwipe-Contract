@@ -87,9 +87,9 @@ pub enum MomentumDataKey {
     PriceHistory(AssetPair, u64), // Store price snapshot at timestamp
 }
 
-/// ==========================
-/// Momentum Indicator Calculations
-/// ==========================
+// ==========================
+// Momentum Indicator Calculations
+// ==========================
 
 /// Calculate Rate of Change (ROC) indicator over a period
 ///
@@ -229,9 +229,9 @@ pub fn calculate_momentum_indicators(
     })
 }
 
-/// ==========================
-/// Signal Generation
-/// ==========================
+// ==========================
+// Signal Generation
+// ==========================
 
 /// Calculate confidence score for momentum signal
 ///
@@ -319,9 +319,9 @@ pub fn check_momentum_signals(
     Ok(Some(signal))
 }
 
-/// ==========================
-/// Trade Execution & Position Management
-/// ==========================
+// ==========================
+// Trade Execution & Position Management
+// ==========================
 
 /// Get a momentum strategy by ID
 pub fn get_momentum_strategy(
@@ -421,9 +421,9 @@ pub fn execute_momentum_trade(
     Ok(trade_id)
 }
 
-/// ==========================
-/// Trailing Stop Management
-/// ==========================
+// ==========================
+// Trailing Stop Management
+// ==========================
 
 /// Update trailing stops for all active positions
 ///
@@ -470,9 +470,9 @@ pub fn update_trailing_stops(
     Ok(closed_positions)
 }
 
-/// ==========================
-/// Asset Ranking & Rebalancing
-/// ==========================
+// ==========================
+// Asset Ranking & Rebalancing
+// ==========================
 
 /// Rank assets by momentum indicators
 ///
@@ -572,9 +572,9 @@ pub fn rebalance_by_momentum_rank(
     Ok(())
 }
 
-/// ==========================
-/// Price History Management
-/// ==========================
+// ==========================
+// Price History Management
+// ==========================
 
 /// Store a price snapshot for an asset pair
 pub fn store_price_snapshot(env: &Env, asset_pair: AssetPair, price: i128, timestamp: u64) {
@@ -599,9 +599,9 @@ pub fn get_historical_prices(
     Ok(prices)
 }
 
-/// ==========================
-/// Tests
-/// ==========================
+// ==========================
+// Tests
+// ==========================
 
 #[cfg(test)]
 mod tests {

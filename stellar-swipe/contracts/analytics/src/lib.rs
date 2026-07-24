@@ -137,8 +137,12 @@ impl AnalyticsContract {
             soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
         );
         m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
             soroban_sdk::String::from_str(&env, "git_commit"),
-            soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
         );
         m
     }
@@ -827,7 +831,10 @@ mod tests {
 #[cfg(test)]
 mod tests_cache {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Env,
+    };
 
     fn make_snapshot(volume: i128, active: u64, executions: u64) -> ProtocolSnapshot {
         ProtocolSnapshot {
@@ -932,6 +939,10 @@ mod tests_cache {
         client.invalidate_cache(&QueryType::TotalVolume);
 
         // Next call should return fresh value.
-        assert_eq!(client.get_total_volume_cached(), 6_000_000, "fresh after invalidate");
+        assert_eq!(
+            client.get_total_volume_cached(),
+            6_000_000,
+            "fresh after invalidate"
+        );
     }
 }

@@ -108,7 +108,7 @@ pub fn check_and_trigger_trailing_stop(
     let peak = update_trailing_peak(env, &user, trade_id, current_price);
 
     // Trigger price = peak * (10000 - trail_bps) / 10000
-    let trigger_price = peak.saturating_mul((10_000 - trail_bps as i128)) / 10_000;
+    let trigger_price = peak.saturating_mul(10_000 - trail_bps as i128) / 10_000;
 
     if current_price <= trigger_price {
         close_position_keeper(env, &portfolio, &user, trade_id, asset_pair);

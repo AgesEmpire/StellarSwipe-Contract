@@ -293,8 +293,14 @@ pub fn check_rate_limits(env: &Env, user: &Address, amount: i128) -> Result<(), 
     prune_old_records(env, &mut history, now);
 
     // Hourly count (shared rate limiter)
-    if rate_limiter::check(env, &HOURLY_USE_CASE, user, HOUR_SECS, limits.per_user_hourly_transfers)
-        .is_err()
+    if rate_limiter::check(
+        env,
+        &HOURLY_USE_CASE,
+        user,
+        HOUR_SECS,
+        limits.per_user_hourly_transfers,
+    )
+    .is_err()
     {
         return Err(AutoTradeError::HourlyTransferLimitExceeded);
     }
@@ -311,8 +317,14 @@ pub fn check_rate_limits(env: &Env, user: &Address, amount: i128) -> Result<(), 
     }
 
     // Daily count (shared rate limiter)
-    if rate_limiter::check(env, &DAILY_USE_CASE, user, DAY_SECS, limits.per_user_daily_transfers)
-        .is_err()
+    if rate_limiter::check(
+        env,
+        &DAILY_USE_CASE,
+        user,
+        DAY_SECS,
+        limits.per_user_daily_transfers,
+    )
+    .is_err()
     {
         return Err(AutoTradeError::DailyTransferLimitExceeded);
     }

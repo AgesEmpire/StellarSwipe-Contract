@@ -115,9 +115,9 @@ fn calculate_confidence(_features: &SignalFeatures, _model: &MLModel) -> i128 {
     CONFIDENCE_MULTIPLIER
 }
 
-/// ==========================
-/// Feature Extraction
-/// ==========================
+// ==========================
+// Feature Extraction
+// ==========================
 
 /// Extract features from a signal for ML scoring.
 ///
@@ -135,9 +135,9 @@ pub fn extract_signal_features(
     ))
 }
 
-/// ==========================
-/// ML Model Scoring
-/// ==========================
+// ==========================
+// ML Model Scoring
+// ==========================
 
 /// Score a signal using the ML model
 pub fn score_signal(

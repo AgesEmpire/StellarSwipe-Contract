@@ -90,9 +90,10 @@ pub fn require_admin(env: &Env, caller: &Address) -> Result<(), AutoTradeError> 
 /// Record the current ledger timestamp as the most recent qualifying admin action.
 /// Called automatically from `require_admin` on every successful admin operation.
 pub fn update_last_admin_action(env: &Env) {
-    env.storage()
-        .instance()
-        .set(&AdminStorageKey::LastAdminActionAt, &env.ledger().timestamp());
+    env.storage().instance().set(
+        &AdminStorageKey::LastAdminActionAt,
+        &env.ledger().timestamp(),
+    );
 }
 
 /// Get the timestamp of the last qualifying admin action (0 if never recorded).
@@ -156,10 +157,7 @@ pub fn trigger_inactivity_pause(env: &Env, caller: &Address) -> Result<(), AutoT
     };
 
     let mut states = get_pause_states(env);
-    states.set(
-        soroban_sdk::String::from_str(env, CAT_ALL),
-        pause_state,
-    );
+    states.set(soroban_sdk::String::from_str(env, CAT_ALL), pause_state);
     env.storage()
         .instance()
         .set(&AdminStorageKey::PauseStates, &states);

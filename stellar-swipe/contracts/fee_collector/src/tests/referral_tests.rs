@@ -8,9 +8,7 @@ use soroban_sdk::{
 };
 use stellar_swipe_common::Asset;
 
-use crate::{
-    ContractError, FeeCollector, FeeCollectorClient,
-};
+use crate::{ContractError, FeeCollector, FeeCollectorClient};
 
 #[contract]
 struct MockOracleContract;
@@ -39,7 +37,7 @@ fn mark_trader_has_traded(env: &Env, contract_id: &Address, trader: &Address) {
 
 fn setup(env: &Env) -> (Address, Address, Address, FeeCollectorClient<'_>) {
     let admin = Address::generate(env);
-    
+
     let token_admin = Address::generate(env);
     let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token = token_contract.address();
@@ -120,7 +118,7 @@ fn test_set_referral_fee_share() {
     let (admin, _, _, client) = setup(&env);
 
     client.set_referral_fee_share(&admin, &2000u32); // 20%
-    
+
     // Attempting invalid (> 100%)
     let result = client.try_set_referral_fee_share(&admin, &10001u32);
     assert_eq!(result, Err(Ok(ContractError::InvalidFeeConfiguration)));
@@ -144,7 +142,7 @@ fn test_fee_distribution_with_no_referrer() {
     mark_trader_has_traded(&env, &contract_id, &trader);
 
     let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
-    
+
     // Fee = 1,000,000 * 0.3% = 3,000
     assert_eq!(fee, 3_000);
 
@@ -168,7 +166,7 @@ fn test_fee_distribution_with_referrer() {
     client.set_fee_rate(&30u32); // 0.3%
     client.set_burn_rate(&1_000u32); // 10%
     client.set_revenue_share_rate_bps(&2_000u32); // 20%
-    
+
     client.set_referral_fee_share(&admin, &2_000u32); // 20%
 
     let trader = Address::generate(&env);
@@ -180,16 +178,16 @@ fn test_fee_distribution_with_referrer() {
     mark_trader_has_traded(&env, &contract_id, &trader);
 
     let fee = client.collect_fee(&trader, &token, &trade_amount, &asset);
-    
+
     // Total Fee = 1,000,000 * 0.3% = 3,000
     assert_eq!(fee, 3_000);
 
     // Burn = 3,000 * 10% = 300
     // Distributable = 2,700
-    
+
     // Referral Share = 3,000 * 20% = 600
     // Remaining Distributable = 2,700 - 600 = 2,100
-    
+
     // Revenue Share = 2,700 * 20% = 540
     // Treasury = 2,100 - 540 = 1,560
 

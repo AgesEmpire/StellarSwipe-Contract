@@ -42,6 +42,9 @@ mod storage_monitor;
 mod submission;
 mod template_presets;
 mod templates;
+/// Active signal provider cap tests (Issue #743).
+#[cfg(test)]
+mod test_active_signal_cap;
 mod test_reputation;
 /// Provider submission cooldown tests (Issue #661).
 #[cfg(test)]
@@ -50,6 +53,7 @@ mod types;
 mod validation;
 mod versioning;
 
+pub use admin::{AdminConfig, AdminRole};
 pub use categories::{RiskLevel, SignalCategory};
 /// Re-exported so downstream / integration-test callers (e.g.
 /// `contracts/integration_tests`) can pattern-match on contract errors —
@@ -61,7 +65,7 @@ pub use types::{FeeBreakdown, ProviderPerformance, SignalOutcome, SignalStatus};
 
 use admin::{
     get_admin, get_admin_config, init_admin, is_trading_paused,
-    require_not_paused_legacy as require_not_paused, AdminConfig,
+    require_not_paused_legacy as require_not_paused,
 };
 use shared::version::{set_contract_version, SIGNAL_REGISTRY_VERSION};
 use stellar_swipe_common::emergency::{PauseState, CAT_SIGNALS, CAT_TRADING};
@@ -219,7 +223,7 @@ impl SignalRegistry {
         caller: Address,
         executor: Address,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         env.storage()
             .instance()
@@ -233,7 +237,7 @@ impl SignalRegistry {
         caller: Address,
         portfolio: Address,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         env.storage()
             .instance()
@@ -248,7 +252,7 @@ impl SignalRegistry {
         caller: Address,
         batch_size: u32,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         migration::migrate_signals_v1_to_v2(&env, &caller, batch_size)
     }
@@ -278,7 +282,7 @@ impl SignalRegistry {
         caller: Address,
         batch_size: u32,
     ) -> Result<u32, AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         Ok(storage_monitor::admin_cleanup_storage(&env, batch_size))
     }
@@ -294,7 +298,7 @@ impl SignalRegistry {
         caller: Address,
         cooldown_secs: u64,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         env.storage()
             .instance()
@@ -312,12 +316,8 @@ impl SignalRegistry {
 
     /// Admin: set the maximum number of signals a provider may create per ledger day.
     /// A value of 0 disables the daily cap (issue #778).
-    pub fn set_daily_signal_limit(
-        env: Env,
-        caller: Address,
-        limit: u32,
-    ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+    pub fn set_daily_signal_limit(env: Env, caller: Address, limit: u32) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         env.storage()
             .instance()
@@ -331,6 +331,17 @@ impl SignalRegistry {
             .instance()
             .get(&StorageKey::DailySignalLimit)
             .unwrap_or(0u32)
+    }
+
+    /// Admin: configure the maximum concurrent active-signal count per provider tier.
+    pub fn set_tier_signal_limits(
+        env: Env,
+        caller: Address,
+        bronze: u32,
+        silver: u32,
+        gold: u32,
+    ) -> Result<(), AdminError> {
+        admin::set_tier_signal_limits(&env, &caller, bronze, silver, gold)
     }
 
     /// User stakes tokens. Rate-limited to 5 changes per day.
@@ -420,7 +431,7 @@ impl SignalRegistry {
         window_secs: u64,
         max_actions: u32,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         rl::set_config(
             &env,
@@ -508,6 +519,21 @@ impl SignalRegistry {
         get_admin(&env)
     }
 
+    /// Root admin: assign the scoped admin for configuration, emergency, or treasury operations.
+    pub fn set_admin_role(
+        env: Env,
+        caller: Address,
+        role: AdminRole,
+        account: Address,
+    ) -> Result<(), AdminError> {
+        admin::set_admin_role(&env, &caller, role, account)
+    }
+
+    /// Read the configured scoped admin for a role, if one has been assigned.
+    pub fn get_admin_role(env: Env, role: AdminRole) -> Option<Address> {
+        admin::get_admin_role(&env, role)
+    }
+
     /// Schedule a signal for future publication. `signal_data` must use the
     /// current V2 shape; stored internally as `VersionedSignalData::V2` so
     /// that legacy V1 records coexist transparently (Issue #568).
@@ -545,8 +571,12 @@ impl SignalRegistry {
             soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
         );
         m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
             soroban_sdk::String::from_str(&env, "git_commit"),
-            soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
         );
         m
     }
@@ -632,6 +662,9 @@ impl SignalRegistry {
         if !pruned.is_empty() {
             let mut cat_map = Self::get_category_index_map(&env);
             for signal in pruned.iter() {
+                if signal.status == SignalStatus::Active {
+                    validation::decrement_provider_active_count(&env, &signal.provider);
+                }
                 let old_list = cat_map
                     .get(signal.category.clone())
                     .unwrap_or(Vec::new(&env));
@@ -653,7 +686,7 @@ impl SignalRegistry {
     /// Allowlist a keeper address permitted to call `prune_expired_signals`
     /// (admin only). Adding an already-listed keeper is a no-op.
     pub fn add_prune_keeper(env: Env, caller: Address, keeper: Address) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         let mut keepers = Self::get_prune_keepers(env.clone());
         if !keepers.contains(&keeper) {
@@ -671,7 +704,7 @@ impl SignalRegistry {
         caller: Address,
         keeper: Address,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         let keepers = Self::get_prune_keepers(env.clone());
         let mut remaining = Vec::new(&env);
@@ -824,22 +857,22 @@ impl SignalRegistry {
     }
 
     pub fn claim_pending_rewards(env: Env, caller: Address) -> (i128, i128) {
-    caller.require_auth();
-    let pending = get_pending_rewards(&env, &caller);
-    if pending.fee == 0 && pending.roi == 0 {
-        return (0, 0);
-    }
-    // Clear storage before transfer (reentrancy-safe)
-    store_pending_rewards(&env, &caller, &PendingRewards { fee: 0, roi: 0 });
+        caller.require_auth();
+        let pending = Self::get_pending_rewards(&env, &caller);
+        if pending.fee == 0 && pending.roi == 0 {
+            return (0, 0);
+        }
+        // Clear storage before transfer (reentrancy-safe)
+        Self::store_pending_rewards(&env, &caller, &PendingRewards { fee: 0, roi: 0 });
 
-    // TODO: Transfer tokens from the fee collector to the caller.
-    // Use the token contract address stored in your contract (e.g., fee_collector).
-    // Example:
-    // let token_client = TokenClient::new(&env, &fee_collector_address);
-    // token_client.transfer(&fee_collector_address, &caller, &pending.fee);
-    // Similarly for ROI token.
+        // TODO: Transfer tokens from the fee collector to the caller.
+        // Use the token contract address stored in your contract (e.g., fee_collector).
+        // Example:
+        // let token_client = TokenClient::new(&env, &fee_collector_address);
+        // token_client.transfer(&fee_collector_address, &caller, &pending.fee);
+        // Similarly for ROI token.
 
-    (pending.fee, pending.roi)
+        (pending.fee, pending.roi)
     }
 
     /* =========================
@@ -982,23 +1015,23 @@ impl SignalRegistry {
     }
 
     fn get_pending_rewards(env: &Env, address: &Address) -> PendingRewards {
-    env.storage()
-        .instance()
-        .get(&StorageKey::PendingRewards(address.clone()))
-         .unwrap_or(PendingRewards { fee: 0, roi: 0 })
+        env.storage()
+            .instance()
+            .get(&StorageKey::PendingRewards(address.clone()))
+            .unwrap_or(PendingRewards { fee: 0, roi: 0 })
     }
 
     fn store_pending_rewards(env: &Env, address: &Address, rewards: &PendingRewards) {
-    env.storage()
-        .instance()
-        .set(&StorageKey::PendingRewards(address.clone()), rewards);
-     }
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingRewards(address.clone()), rewards);
+    }
 
     fn add_pending_rewards(env: &Env, address: &Address, fee_add: i128, roi_add: i128) {
-    let mut current = get_pending_rewards(env, address);
-    current.fee += fee_add;
-    current.roi += roi_add;
-    store_pending_rewards(env, address, &current);
+        let mut current = Self::get_pending_rewards(env, address);
+        current.fee += fee_add;
+        current.roi += roi_add;
+        Self::store_pending_rewards(env, address, &current);
     }
 
     /* =========================
@@ -1150,13 +1183,8 @@ impl SignalRegistry {
                 .unwrap_or(0u32);
             if daily_limit > 0 {
                 let day_bucket = env.ledger().timestamp() / 86_400;
-                let count_key =
-                    StorageKey::ProviderDailySignalCount(provider.clone(), day_bucket);
-                let daily_count: u32 = env
-                    .storage()
-                    .persistent()
-                    .get(&count_key)
-                    .unwrap_or(0u32);
+                let count_key = StorageKey::ProviderDailySignalCount(provider.clone(), day_bucket);
+                let daily_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
                 if daily_count >= daily_limit {
                     return Err(AdminError::SignalLimitExceeded);
                 }
@@ -1261,11 +1289,7 @@ impl SignalRegistry {
         {
             let day_bucket = now / 86_400;
             let count_key = StorageKey::ProviderDailySignalCount(provider.clone(), day_bucket);
-            let current: u32 = env
-                .storage()
-                .persistent()
-                .get(&count_key)
-                .unwrap_or(0u32);
+            let current: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
             env.storage()
                 .persistent()
                 .set(&count_key, &current.saturating_add(1));
@@ -1293,6 +1317,7 @@ impl SignalRegistry {
             crate::expiry::check_and_update_expiry(&env, &mut signal);
             signals.set(signal_id, signal.clone());
             Self::save_signals_map(&env, &signals);
+            validation::decrement_provider_active_count(&env, &signal.provider);
         }
 
         let time_to_expiry = signal.expiry.saturating_sub(now);
@@ -1569,39 +1594,33 @@ impl SignalRegistry {
             .ok_or(SignalOutcomeError::SignalNotFound)?;
         if signal.status == SignalStatus::Active {
             return Err(SignalOutcomeError::SignalNotClosed);
-           
         }
-         if collaboration::is_collaborative_signal(&env, signal_id) {
-    let authors = collaboration::get_collaborative_signal(&env, signal_id)
-        .ok_or(SignalOutcomeError::SignalNotFound)?;
+        if collaboration::is_collaborative_signal(&env, signal_id) {
+            let authors = collaboration::get_collaborative_signal(&env, signal_id)
+                .ok_or(SignalOutcomeError::SignalNotFound)?;
 
-    let distributions = collaboration::distribute_collaborative_rewards(
-        &env,
-        &authors,
-        total_fee,
-        total_roi,
-    );
+            let distributions = collaboration::distribute_collaborative_rewards(
+                &env, &authors, total_fee, total_roi,
+            );
 
-    // Emit event
-    let mut event_data = Vec::new(&env);
-    for (addr, fee, roi) in distributions.iter() {
-        event_data.push_back((addr.clone(), fee, roi));
-    }
-    env.events().publish(
-        ("CollaborativeRewardDistributed", signal_id),
-        event_data,
-    );
+            // Emit event
+            let mut event_data = Vec::new(&env);
+            for (addr, fee, roi) in distributions.iter() {
+                event_data.push_back((addr.clone(), fee, roi));
+            }
+            env.events()
+                .publish(("CollaborativeRewardDistributed", signal_id), event_data);
 
-    // Credit pending rewards for each author
-    for (addr, fee_share, roi_share) in distributions.iter() {
-        if *fee_share > 0 || *roi_share > 0 {
-            add_pending_rewards(&env, addr, *fee_share, *roi_share);
+            // Credit pending rewards for each author
+            for (addr, fee_share, roi_share) in distributions.iter() {
+                if fee_share > 0 || roi_share > 0 {
+                    Self::add_pending_rewards(&env, &addr, fee_share, roi_share);
+                }
+            }
+        } else {
+            // Single-author: credit all to the signal provider
+            Self::add_pending_rewards(&env, &signal.provider, total_fee, total_roi);
         }
-    }
-} else {
-    // Single-author: credit all to the signal provider
-    add_pending_rewards(&env, &signal.provider, total_fee, total_roi);
-}
 
         let provider = signal.provider.clone();
         let rep_key = StorageKey::ProviderReputationScore(provider.clone());
@@ -1632,7 +1651,7 @@ impl SignalRegistry {
         caller: Address,
         min_lifetime_secs: u64,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         env.storage()
             .instance()
@@ -2103,13 +2122,14 @@ impl SignalRegistry {
         reason_hash: String,
         stake_vault: Address,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_emergency_admin(&env, &caller)?;
         caller.require_auth();
 
         let (signals_cancelled, stake_slashed) = reentrancy::guarded(&env, || {
             // Effects: persist the ban and cancel signals before the external call.
             let mut signals = Self::get_signals_map(&env);
-            let signals_cancelled = providers::apply_ban(&env, &mut signals, &provider, &reason_hash);
+            let signals_cancelled =
+                providers::apply_ban(&env, &mut signals, &provider, &reason_hash);
             Self::save_signals_map(&env, &signals);
 
             // Interaction: cross-contract call to StakeVault to slash the stake.
@@ -2326,7 +2346,7 @@ impl SignalRegistry {
         caller: Address,
         treasury: Address,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_treasury_admin(&env, &caller)?;
         caller.require_auth();
         fees::set_platform_treasury(&env, treasury);
         Ok(())
@@ -2486,6 +2506,9 @@ impl SignalRegistry {
     pub fn cleanup_expired_signals(env: Env, limit: u32) -> (u32, u32) {
         let signals = Self::get_signals_map(&env);
         let result = expiry::cleanup_expired_signals(&env, &signals, limit);
+        for signal in result.expired_signals.iter() {
+            validation::decrement_provider_active_count(&env, &signal.provider);
+        }
         (result.signals_processed, result.signals_expired)
     }
 
@@ -2580,7 +2603,7 @@ impl SignalRegistry {
         caller: Address,
         threshold: u32,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         if threshold > 100 {
             return Err(AdminError::InvalidParameter);
@@ -3402,7 +3425,7 @@ impl SignalRegistry {
         median_stake: i128,
         median_followers: u64,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
 
         update_median_values(&env, median_stake, median_followers);
@@ -3442,13 +3465,21 @@ impl SignalRegistry {
     // ── Provider specialization tags (Issue #704) ─────────────────────────────
 
     /// Admin: add a specialization tag to the admin-defined set.
-    pub fn add_specialization_tag(env: Env, admin: Address, tag: String) {
-        let _ = providers::add_specialization_tag(&env, &admin, tag);
+    pub fn add_specialization_tag(env: Env, admin: Address, tag: String) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &admin)?;
+        providers::add_specialization_tag(&env, &admin, tag)
+            .map_err(|_| AdminError::InvalidParameter)
     }
 
     /// Admin: remove a specialization tag from the admin-defined set.
-    pub fn remove_specialization_tag(env: Env, admin: Address, tag: String) {
+    pub fn remove_specialization_tag(
+        env: Env,
+        admin: Address,
+        tag: String,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &admin)?;
         providers::remove_specialization_tag(&env, &admin, tag);
+        Ok(())
     }
 
     /// Returns the admin-defined set of specialization tags.
@@ -3525,6 +3556,8 @@ pub struct StorageStats {
 #[cfg(test)]
 mod test;
 #[cfg(test)]
+mod test_admin_roles;
+#[cfg(test)]
 mod test_admin_transfer;
 #[cfg(test)]
 mod test_adoption;
@@ -3542,6 +3575,8 @@ mod test_multisig_approval;
 /// Paginated signal expiry pruning tests (Issue #779).
 #[cfg(test)]
 mod test_prune_expiry;
+#[cfg(test)]
+mod test_reward_stress;
 #[cfg(test)]
 mod test_scheduling;
 #[cfg(test)]

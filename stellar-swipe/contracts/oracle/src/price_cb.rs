@@ -87,9 +87,10 @@ pub fn guard_tripped(env: &Env, pair: &AssetPair) -> Result<(), OracleError> {
 /// Admin: configure the maximum allowed single-update deviation in basis points.
 /// Pass `0` to disable the check.
 pub fn set_threshold(env: &Env, pair: &AssetPair, max_deviation_bps: u32) {
-    env.storage()
-        .instance()
-        .set(&StorageKey::DeviationThreshold(pair.clone()), &max_deviation_bps);
+    env.storage().instance().set(
+        &StorageKey::DeviationThreshold(pair.clone()),
+        &max_deviation_bps,
+    );
 }
 
 /// Admin: reset the circuit breaker after manual review.

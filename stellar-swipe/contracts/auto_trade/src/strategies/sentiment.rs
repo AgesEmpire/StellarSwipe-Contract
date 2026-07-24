@@ -131,9 +131,9 @@ const MAX_SENTIMENT_THRESHOLD: i32 = 9000;
 const SCALE_FACTOR: i32 = 10000;
 const MAX_POSITION_SIZE_PCT: u32 = 5000; // 50%
 
-/// ==========================
-/// Strategy Creation
-/// ==========================
+// ==========================
+// Strategy Creation
+// ==========================
 
 /// Create a new sentiment-based trading strategy
 pub fn create_sentiment_strategy(
@@ -203,9 +203,9 @@ pub fn create_sentiment_strategy(
     Ok(strategy_id)
 }
 
-/// ==========================
-/// Sentiment Aggregation
-/// ==========================
+// ==========================
+// Sentiment Aggregation
+// ==========================
 
 /// Aggregate sentiment from all configured sources
 pub fn aggregate_sentiment(env: &Env, strategy_id: u64) -> Result<SentimentScore, String> {
@@ -299,9 +299,9 @@ fn format_source_name(env: &Env, source: &SentimentSource) -> String {
     }
 }
 
-/// ==========================
-/// Sentiment Collection (Placeholders for Oracle Integration)
-/// ==========================
+// ==========================
+// Sentiment Collection (Placeholders for Oracle Integration)
+// ==========================
 
 /// Collect Twitter sentiment (would integrate with oracle)
 fn collect_twitter_sentiment(env: &Env, _handle: &String) -> Result<(i32, u32), String> {
@@ -481,9 +481,9 @@ fn analyze_rationale_sentiment(env: &Env, rationale: &String) -> Result<i32, Str
     Ok(clamp(net_sentiment, -SCALE_FACTOR, SCALE_FACTOR))
 }
 
-/// ==========================
-/// Sentiment Decay
-/// ==========================
+// ==========================
+// Sentiment Decay
+// ==========================
 
 /// Apply time-based decay to sentiment score
 pub fn apply_sentiment_decay(
@@ -510,9 +510,9 @@ pub fn apply_sentiment_decay(
     Ok(())
 }
 
-/// ==========================
-/// Signal Generation
-/// ==========================
+// ==========================
+// Signal Generation
+// ==========================
 
 /// Check if sentiment generates a trading signal
 pub fn check_sentiment_signal(
@@ -581,9 +581,9 @@ fn check_technical_confirmation(
     }
 }
 
-/// ==========================
-/// Trade Execution
-/// ==========================
+// ==========================
+// Trade Execution
+// ==========================
 
 /// Execute sentiment-based trade
 pub fn execute_sentiment_trade(
@@ -630,9 +630,9 @@ pub fn execute_sentiment_trade(
     Ok(position_id)
 }
 
-/// ==========================
-/// Position Monitoring & Exit
-/// ==========================
+// ==========================
+// Position Monitoring & Exit
+// ==========================
 
 /// Check if position should be exited
 pub fn check_sentiment_exit(env: &Env, strategy_id: u64) -> Result<Option<u64>, String> {
@@ -697,9 +697,9 @@ pub fn check_sentiment_exit(env: &Env, strategy_id: u64) -> Result<Option<u64>, 
     Ok(None)
 }
 
-/// ==========================
-/// Accuracy Tracking
-/// ==========================
+// ==========================
+// Accuracy Tracking
+// ==========================
 
 /// Track sentiment prediction accuracy
 fn track_sentiment_accuracy(
@@ -742,9 +742,9 @@ pub fn get_sentiment_accuracy(env: &Env, strategy_id: u64) -> Result<SentimentAc
     get_accuracy(env, strategy_id)
 }
 
-/// ==========================
-/// Storage Functions
-/// ==========================
+// ==========================
+// Storage Functions
+// ==========================
 
 fn get_next_strategy_id(env: &Env) -> u64 {
     let counter: u64 = env
@@ -810,9 +810,9 @@ pub fn get_last_sentiment(env: &Env, strategy_id: u64) -> Option<SentimentScore>
         .get(&SentimentStorageKey::LastSentiment(strategy_id))
 }
 
-/// ==========================
-/// Utility Functions
-/// ==========================
+// ==========================
+// Utility Functions
+// ==========================
 
 fn clamp(value: i32, min_val: i32, max_val: i32) -> i32 {
     if value < min_val {
@@ -856,9 +856,9 @@ fn sqrt(n: u32) -> u32 {
     x
 }
 
-/// ==========================
-/// Tests
-/// ==========================
+// ==========================
+// Tests
+// ==========================
 
 #[cfg(test)]
 mod tests {

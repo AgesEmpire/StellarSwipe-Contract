@@ -42,10 +42,7 @@ struct ChaosOracle;
 
 #[contractimpl]
 impl ChaosOracle {
-    pub fn get_price(
-        _env: Env,
-        _asset_pair: u32,
-    ) -> stellar_swipe_common::OraclePrice {
+    pub fn get_price(_env: Env, _asset_pair: u32) -> stellar_swipe_common::OraclePrice {
         stellar_swipe_common::OraclePrice {
             price: 1_000_000_000i128,
             decimals: 7,
@@ -161,11 +158,9 @@ fn build_ctx() -> Ctx {
     let oracle_id = env.register_contract(None, ChaosOracle);
     let portfolio_id = env.register_contract(None, UserPortfolio);
 
-    StakeVaultContractClient::new(&env, &vault_id)
-        .initialize(&admin, &token, &sig_stub);
+    StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token, &sig_stub);
 
-    UserPortfolioClient::new(&env, &portfolio_id)
-        .initialize(&admin, &oracle_id);
+    UserPortfolioClient::new(&env, &portfolio_id).initialize(&admin, &oracle_id);
 
     let open_positions = std::vec![std::vec::Vec::new(); USERS];
     let deposited = std::vec![0i128; STAKERS];

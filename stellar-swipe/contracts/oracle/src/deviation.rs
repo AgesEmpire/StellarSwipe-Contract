@@ -77,12 +77,7 @@ pub fn check_deviation(env: &Env, pair: &AssetPair, sources: &Vec<(Address, i128
 
         env.events().publish(
             (Symbol::new(env, "price_deviation_alert"),),
-            (
-                pair.clone(),
-                deviation_bps as u32,
-                threshold_bps,
-                offending,
-            ),
+            (pair.clone(), deviation_bps as u32, threshold_bps, offending),
         );
     }
 }

@@ -29,6 +29,9 @@ pub enum AdminStorageKey {
     Admin,
     PendingAdminTransfer,
     Guardian,
+    ConfigAdmin,
+    EmergencyAdmin,
+    TreasuryAdmin,
     MinStake,
     TradeFee,
     StopLoss,
@@ -46,6 +49,14 @@ pub enum AdminStorageKey {
     SilverSignalLimit,
     GoldSignalLimit,
     PreventSelfDestruct,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminRole {
+    Config,
+    Emergency,
+    Treasury,
 }
 
 #[contracttype]
@@ -145,7 +156,7 @@ pub fn get_admin(env: &Env) -> Result<Address, AdminError> {
 
 /// Set guardian address (admin only)
 pub fn set_guardian(env: &Env, caller: &Address, guardian: Address) -> Result<(), AdminError> {
-    require_direct_admin_or_not_multisig(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
     set_guardian_direct(env, caller, guardian)
 }
@@ -164,7 +175,7 @@ pub fn set_guardian_direct(
 
 /// Revoke guardian (admin only)
 pub fn revoke_guardian(env: &Env, caller: &Address) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
     let guardian: Address = env
         .storage()
@@ -194,6 +205,61 @@ fn require_direct_admin_or_not_multisig(env: &Env, caller: &Address) -> Result<(
         return Err(AdminError::RequiresMultisigApproval);
     }
     require_admin(env, caller)
+}
+
+fn role_key(role: &AdminRole) -> AdminStorageKey {
+    match role {
+        AdminRole::Config => AdminStorageKey::ConfigAdmin,
+        AdminRole::Emergency => AdminStorageKey::EmergencyAdmin,
+        AdminRole::Treasury => AdminStorageKey::TreasuryAdmin,
+    }
+}
+
+pub fn get_admin_role(env: &Env, role: AdminRole) -> Option<Address> {
+    env.storage().instance().get(&role_key(&role))
+}
+
+pub fn set_admin_role(
+    env: &Env,
+    caller: &Address,
+    role: AdminRole,
+    account: Address,
+) -> Result<(), AdminError> {
+    require_direct_admin_or_not_multisig(env, caller)?;
+    caller.require_auth();
+    env.storage().instance().set(&role_key(&role), &account);
+    Ok(())
+}
+
+fn has_scoped_role(env: &Env, caller: &Address, role: &AdminRole) -> bool {
+    env.storage()
+        .instance()
+        .get::<_, Address>(&role_key(role))
+        .map(|role_admin| &role_admin == caller)
+        .unwrap_or(false)
+}
+
+pub fn require_role_or_admin(
+    env: &Env,
+    caller: &Address,
+    role: AdminRole,
+) -> Result<(), AdminError> {
+    if has_scoped_role(env, caller, &role) {
+        return Ok(());
+    }
+    require_admin(env, caller)
+}
+
+pub fn require_config_admin(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_role_or_admin(env, caller, AdminRole::Config)
+}
+
+pub fn require_emergency_admin(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_role_or_admin(env, caller, AdminRole::Emergency)
+}
+
+pub fn require_treasury_admin(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_role_or_admin(env, caller, AdminRole::Treasury)
 }
 
 /// Verify caller is admin
@@ -297,7 +363,7 @@ pub fn cancel_admin_transfer(env: &Env, caller: &Address) -> Result<(), AdminErr
 
 /// Set minimum stake requirement
 pub fn set_min_stake(env: &Env, caller: &Address, new_amount: i128) -> Result<(), AdminError> {
-    require_direct_admin_or_not_multisig(env, caller)?;
+    require_config_admin(env, caller)?;
     caller.require_auth();
     set_min_stake_direct(env, caller, new_amount)
 }
@@ -340,7 +406,7 @@ pub fn get_min_stake(env: &Env) -> i128 {
 
 /// Set trade fee in basis points
 pub fn set_trade_fee(env: &Env, caller: &Address, new_fee_bps: u32) -> Result<(), AdminError> {
-    require_direct_admin_or_not_multisig(env, caller)?;
+    require_config_admin(env, caller)?;
     caller.require_auth();
     set_trade_fee_direct(env, caller, new_fee_bps)
 }
@@ -388,7 +454,7 @@ pub fn set_risk_defaults(
     stop_loss: u32,
     position_limit: u32,
 ) -> Result<(), AdminError> {
-    require_direct_admin_or_not_multisig(env, caller)?;
+    require_config_admin(env, caller)?;
     caller.require_auth();
     set_risk_defaults_direct(env, caller, stop_loss, position_limit)
 }
@@ -465,7 +531,7 @@ pub fn pause_category(
     if is_guardian(env, caller) {
         caller.require_auth();
     } else {
-        require_direct_admin_or_not_multisig(env, caller)?;
+        require_emergency_admin(env, caller)?;
         caller.require_auth();
     }
     pause_category_direct(env, caller, category, duration, reason)
@@ -511,7 +577,7 @@ pub fn pause_trading(env: &Env, caller: &Address) -> Result<(), AdminError> {
 
 /// Unpause a category
 pub fn unpause_category(env: &Env, caller: &Address, category: String) -> Result<(), AdminError> {
-    require_direct_admin_or_not_multisig(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
     unpause_category_direct(env, caller, category)
 }
@@ -630,7 +696,7 @@ pub fn set_tier_signal_limits(
     silver: u32,
     gold: u32,
 ) -> Result<(), AdminError> {
-    require_direct_admin_or_not_multisig(env, caller)?;
+    require_config_admin(env, caller)?;
     caller.require_auth();
     set_tier_signal_limits_direct(env, caller, bronze, silver, gold)
 }
@@ -843,7 +909,7 @@ pub fn remove_multisig_signer(
 
 /// Pause fee collection. Read operations and position closures continue.
 pub fn pause_fee_collection(env: &Env, caller: &Address) -> Result<(), AdminError> {
-    require_direct_admin_or_not_multisig(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
     pause_fee_collection_direct(env, caller)
 }
@@ -859,7 +925,7 @@ pub fn pause_fee_collection_direct(env: &Env, _caller: &Address) -> Result<(), A
 
 /// Resume fee collection.
 pub fn resume_fee_collection(env: &Env, caller: &Address) -> Result<(), AdminError> {
-    require_direct_admin_or_not_multisig(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
     resume_fee_collection_direct(env, caller)
 }
@@ -887,7 +953,7 @@ pub fn set_circuit_breaker_config(
     caller: &Address,
     config: CircuitBreakerConfig,
 ) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
 
     env.storage()

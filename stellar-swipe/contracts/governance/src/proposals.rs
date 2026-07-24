@@ -406,7 +406,9 @@ pub fn get_proposal(env: &Env, proposal_id: u64) -> Result<Proposal, GovernanceE
 /// status) should use this instead of the raw stored value, mirroring the
 /// deadline check `get_active_proposals` already does independently of it.
 pub fn effective_status(env: &Env, proposal: &Proposal) -> ProposalStatus {
-    if proposal.status == ProposalStatus::Succeeded && env.ledger().timestamp() > proposal.execution_deadline {
+    if proposal.status == ProposalStatus::Succeeded
+        && env.ledger().timestamp() > proposal.execution_deadline
+    {
         ProposalStatus::Expired
     } else {
         proposal.status.clone()
@@ -775,25 +777,22 @@ pub fn withdraw_proposal(
     let config = crate::proposal_deposit::get_deposit_config(env);
     if config.amount > 0 {
         // Check if a deposit was locked for this proposal.
-        let locked: Option<Address> = env
-            .storage()
-            .persistent()
-            .get(&crate::proposal_deposit::DepositKey::LockedDeposit(proposal_id));
+        let locked: Option<Address> =
+            env.storage()
+                .persistent()
+                .get(&crate::proposal_deposit::DepositKey::LockedDeposit(
+                    proposal_id,
+                ));
         if let Some(deposit_proposer) = locked {
             if deposit_proposer == proposer {
                 // Refund the full deposit amount to the proposer.
                 let _ = crate::add_balance(env, &proposer, config.amount);
-                env.storage()
-                    .persistent()
-                    .remove(&crate::proposal_deposit::DepositKey::LockedDeposit(
-                        proposal_id,
-                    ));
+                env.storage().persistent().remove(
+                    &crate::proposal_deposit::DepositKey::LockedDeposit(proposal_id),
+                );
                 #[allow(deprecated)]
                 env.events().publish(
-                    (
-                        symbol_short!("deposit"),
-                        symbol_short!("refund"),
-                    ),
+                    (symbol_short!("deposit"), symbol_short!("refund")),
                     (proposal_id, proposer.clone(), config.amount),
                 );
             }
@@ -804,11 +803,7 @@ pub fn withdraw_proposal(
     #[allow(deprecated)]
     env.events().publish(
         (symbol_short!("gov"), symbol_short!("propwdr")),
-        (
-            proposal_id,
-            proposer,
-            env.ledger().timestamp(),
-        ),
+        (proposal_id, proposer, env.ledger().timestamp()),
     );
 
     Ok(ProposalStatus::Withdrawn)

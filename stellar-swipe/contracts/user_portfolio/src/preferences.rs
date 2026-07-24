@@ -195,7 +195,7 @@ fn category_matches_duration(category: &SignalCategory, max_hold_duration: &Hold
 }
 
 fn category_in_preferences(category: &SignalCategory, preferred: &Vec<SignalCategory>) -> bool {
-    if preferred.len() == 0 {
+    if preferred.is_empty() {
         return true;
     }
     for i in 0..preferred.len() {

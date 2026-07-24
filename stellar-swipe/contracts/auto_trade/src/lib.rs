@@ -4,8 +4,6 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Sy
 
 mod admin;
 mod advanced_risk;
-mod drawdown;
-mod loss_streak;
 #[cfg(feature = "testutils")]
 pub mod amm_bridge;
 #[cfg(not(feature = "testutils"))]
@@ -17,13 +15,16 @@ pub mod auth;
 mod conditional;
 mod correlation;
 mod daily_cap;
+mod drawdown;
 mod errors;
 mod escrow;
 mod exit_strategy;
 mod history;
 mod iceberg;
+pub mod keeper;
 mod kyc;
 mod logging;
+mod loss_streak;
 mod multi_asset;
 mod oracle;
 mod portfolio;
@@ -32,11 +33,12 @@ mod portfolio_insurance;
 mod positions;
 #[cfg(feature = "testutils")]
 pub mod positions;
+/// Fee-aware execution priority queue (issue #675).
+pub mod priority_queue;
 #[cfg(not(feature = "testutils"))]
 mod rate_limit;
 #[cfg(feature = "testutils")]
 pub mod rate_limit;
-pub mod keeper;
 mod referral;
 mod risk;
 mod risk_parity;
@@ -51,8 +53,6 @@ mod storage;
 pub mod storage;
 mod strategies;
 mod twap;
-/// Fee-aware execution priority queue (issue #675).
-pub mod priority_queue;
 
 pub use errors::AutoTradeError;
 pub use risk::RiskConfig;
@@ -78,9 +78,9 @@ pub use iceberg::{
 pub use smart_routing::{LiquidityVenue, RouteSegment, RoutingPlan, VenueLiquidity};
 use stellar_swipe_common::amm_bridge::AmmSourceConfig;
 
-/// ==========================
-/// Types
-/// ==========================
+// ==========================
+// Types
+// ==========================
 
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -127,18 +127,12 @@ pub struct TradeSimulation {
     pub failure_reason: Option<String>,
 }
 
-/// ==========================
-/// Contract
-/// ==========================
+// ==========================
+// Contract
+// ==========================
 
-soroban_sdk::contractmeta!(
-    key = "SourceHash",
-    val = env!("STELLAR_SOURCE_HASH")
-);
-soroban_sdk::contractmeta!(
-    key = "GitCommit",
-    val = env!("STELLAR_GIT_COMMIT")
-);
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct AutoTradeContract;
@@ -153,9 +147,9 @@ pub struct AutoTradeStorageStats {
     pub estimated_rent_xlm: i128,
 }
 
-/// ==========================
-/// Implementation
-/// ==========================
+// ==========================
+// Implementation
+// ==========================
 
 #[contractimpl]
 impl AutoTradeContract {
@@ -244,8 +238,18 @@ impl AutoTradeContract {
     /// - `admin`: Address that will hold admin privileges.
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
-        m.set(soroban_sdk::String::from_str(&env, "version"), soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
-        m.set(soroban_sdk::String::from_str(&env, "git_commit"), soroban_sdk::String::from_str(&env, env!("GIT_COMMIT_HASH")));
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
+        );
         m
     }
 
@@ -1182,10 +1186,7 @@ impl AutoTradeContract {
     }
 
     /// Explicitly resume auto-trading after a loss-streak pause (user only).
-    pub fn resume_after_loss_streak(
-        env: Env,
-        user: Address,
-    ) -> Result<(), AutoTradeError> {
+    pub fn resume_after_loss_streak(env: Env, user: Address) -> Result<(), AutoTradeError> {
         loss_streak::resume_after_loss_streak(&env, &user)
     }
 
@@ -1569,11 +1570,7 @@ impl AutoTradeContract {
     }
 
     /// Set the daily execution cap config for a user.
-    pub fn set_daily_cap_config(
-        env: Env,
-        user: Address,
-        config: storage::DailyCapConfig,
-    ) {
+    pub fn set_daily_cap_config(env: Env, user: Address, config: storage::DailyCapConfig) {
         user.require_auth();
         storage::set_daily_cap_config(&env, &user, &config);
         #[allow(deprecated)]
@@ -2044,8 +2041,7 @@ impl AutoTradeContract {
         trade_id: soroban_sdk::BytesN<32>,
     ) -> Result<escrow::EscrowRecord, AutoTradeError> {
         // Either the admin or the originator may cancel.
-        let record =
-            escrow::get_escrow(&env, &trade_id).ok_or(AutoTradeError::EscrowNotFound)?;
+        let record = escrow::get_escrow(&env, &trade_id).ok_or(AutoTradeError::EscrowNotFound)?;
         if record.originator != caller {
             admin::require_admin(&env, &caller)?;
         } else {
@@ -2055,10 +2051,7 @@ impl AutoTradeContract {
     }
 
     /// Read the current escrow record for `trade_id`.
-    pub fn get_escrow(
-        env: Env,
-        trade_id: soroban_sdk::BytesN<32>,
-    ) -> Option<escrow::EscrowRecord> {
+    pub fn get_escrow(env: Env, trade_id: soroban_sdk::BytesN<32>) -> Option<escrow::EscrowRecord> {
         escrow::get_escrow(&env, &trade_id)
     }
 

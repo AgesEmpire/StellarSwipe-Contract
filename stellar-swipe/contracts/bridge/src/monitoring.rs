@@ -5,9 +5,9 @@
 
 #![allow(dead_code)]
 
-use soroban_sdk::{contracttype, String, Symbol, Vec, Env, Address};
-use stellar_swipe_common::assets::Asset;
 use crate::analytics::{update_transfer_analytics, update_validator_analytics};
+use soroban_sdk::{contracttype, Address, Env, String, Symbol, Vec};
+use stellar_swipe_common::assets::Asset;
 
 /// Chain identifiers for multi-chain support
 #[contracttype]
@@ -24,9 +24,9 @@ pub enum ChainId {
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerificationMethod {
-    BlockConfirmations,  // Simple: wait N blocks
-    EpochFinality,       // PoS: wait for epoch finalization
-    Probabilistic,       // Bitcoin: 6+ confirmations
+    BlockConfirmations, // Simple: wait N blocks
+    EpochFinality,      // PoS: wait for epoch finalization
+    Probabilistic,      // Bitcoin: 6+ confirmations
 }
 
 /// Finality configuration per chain
@@ -35,8 +35,8 @@ pub enum VerificationMethod {
 pub struct ChainFinalityConfig {
     pub chain_id: ChainId,
     pub required_confirmations: u32,
-    pub average_block_time: u64,      // seconds
-    pub reorg_depth_limit: u32,       // Max reorg depth
+    pub average_block_time: u64, // seconds
+    pub reorg_depth_limit: u32,  // Max reorg depth
     pub verification_method: VerificationMethod,
 }
 
@@ -44,11 +44,11 @@ pub struct ChainFinalityConfig {
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MonitoringStatus {
-    Pending,      // Initial state, waiting to see on chain
-    Confirming,   // Seen on chain, awaiting confirmations
-    Finalized,    // Sufficient confirmations received
-    Reorged,      // Transaction was reorganized
-    Failed,       // Monitoring timeout or error
+    Pending,    // Initial state, waiting to see on chain
+    Confirming, // Seen on chain, awaiting confirmations
+    Finalized,  // Sufficient confirmations received
+    Reorged,    // Transaction was reorganized
+    Failed,     // Monitoring timeout or error
 }
 
 /// Monitored cross-chain transaction
@@ -99,22 +99,22 @@ pub struct TransferStatusInfo {
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferStatus {
-    Pending,          // Awaiting source finality
-    Finalized,        // Source finalized, awaiting validators
+    Pending,           // Awaiting source finality
+    Finalized,         // Source finalized, awaiting validators
     ValidatorApproved, // Validators approved
-    Minting,          // In progress
-    Complete,         // Successfully minted
-    Failed,           // Transfer failed
+    Minting,           // In progress
+    Complete,          // Successfully minted
+    Failed,            // Transfer failed
 }
 
 /// Storage keys for persistence
 #[contracttype]
 pub enum MonitoringDataKey {
-    MonitoredTx(u64),                      // By transfer_id
-    BridgeTransfer(u64),                   // By transfer_id
-    ChainConfig(u32),                      // By chain discriminant
-    PendingTransactions,                   // List of pending transfer IDs
-    TransactionIndex(u64),                 // Meta index
+    MonitoredTx(u64),      // By transfer_id
+    BridgeTransfer(u64),   // By transfer_id
+    ChainConfig(u32),      // By chain discriminant
+    PendingTransactions,   // List of pending transfer IDs
+    TransactionIndex(u64), // Meta index
     /// Rolling window of recent finality latencies (seconds).
     LatencyWindow,
     /// Whether the automatic latency circuit breaker is tripped.
@@ -139,24 +139,27 @@ const DEFAULT_LATENCY_THRESHOLD_SECS: u64 = 800;
 const DEFAULT_WINDOW_SIZE: u32 = 10;
 
 // Constants for finality configurations
-const ETHEREUM_FINALITY: u32 = 32;  // 32 blocks (~6.4 min)
-const POLYGON_FINALITY: u32 = 128;  // 128 blocks (~4.3 min)
-const BSC_FINALITY: u32 = 15;       // 15 blocks (~45 sec)
-const BITCOIN_FINALITY: u32 = 6;    // 6 blocks (~60 min)
+const ETHEREUM_FINALITY: u32 = 32; // 32 blocks (~6.4 min)
+const POLYGON_FINALITY: u32 = 128; // 128 blocks (~4.3 min)
+const BSC_FINALITY: u32 = 15; // 15 blocks (~45 sec)
+const BITCOIN_FINALITY: u32 = 6; // 6 blocks (~60 min)
 
-const ETHEREUM_BLOCK_TIME: u64 = 12;  // seconds
-const POLYGON_BLOCK_TIME: u64 = 2;    // seconds
-const BSC_BLOCK_TIME: u64 = 3;        // seconds
-const BITCOIN_BLOCK_TIME: u64 = 600;  // seconds
+const ETHEREUM_BLOCK_TIME: u64 = 12; // seconds
+const POLYGON_BLOCK_TIME: u64 = 2; // seconds
+const BSC_BLOCK_TIME: u64 = 3; // seconds
+const BITCOIN_BLOCK_TIME: u64 = 600; // seconds
 
-const MONITORING_TIMEOUT: u64 = 3600;  // 1 hour in seconds
+const MONITORING_TIMEOUT: u64 = 3600; // 1 hour in seconds
 
-/// ==========================
-/// Chain Configuration
-/// ==========================
+// ==========================
+// Chain Configuration
+// ==========================
 
 /// Get finality configuration for a chain
-pub fn get_chain_finality_config(env: &Env, chain_id: ChainId) -> Result<ChainFinalityConfig, String> {
+pub fn get_chain_finality_config(
+    env: &Env,
+    chain_id: ChainId,
+) -> Result<ChainFinalityConfig, String> {
     let chain_key = match chain_id {
         ChainId::Ethereum => 1u32,
         ChainId::Bitcoin => 2,
@@ -168,9 +171,7 @@ pub fn get_chain_finality_config(env: &Env, chain_id: ChainId) -> Result<ChainFi
     if let Some(config) = env
         .storage()
         .persistent()
-        .get::<MonitoringDataKey, ChainFinalityConfig>(&MonitoringDataKey::ChainConfig(
-            chain_key,
-        ))
+        .get::<MonitoringDataKey, ChainFinalityConfig>(&MonitoringDataKey::ChainConfig(chain_key))
     {
         Ok(config)
     } else {
@@ -235,9 +236,9 @@ pub fn set_chain_finality_config(env: &Env, config: &ChainFinalityConfig) {
         .set(&MonitoringDataKey::ChainConfig(chain_key), config);
 }
 
-/// ==========================
-/// Transaction Monitoring
-/// ==========================
+// ==========================
+// Transaction Monitoring
+// ==========================
 
 /// Start monitoring a source chain transaction
 pub fn monitor_source_transaction(
@@ -267,7 +268,10 @@ pub fn monitor_source_transaction(
 
     // Emit event
     env.events().publish(
-        (Symbol::new(env, "transaction_monitoring_started"), transfer_id),
+        (
+            Symbol::new(env, "transaction_monitoring_started"),
+            transfer_id,
+        ),
         (source_chain as u32, tx_hash),
     );
 
@@ -290,16 +294,15 @@ fn store_monitored_tx(env: &Env, transfer_id: u64, monitored: &MonitoredTransact
 
 /// Get all pending monitored transactions (limited query)
 pub fn get_pending_monitored_transactions(env: &Env, limit: u32) -> Vec<MonitoredTransaction> {
-    let mut results = Vec::new(env);
-
     // In real implementation, would iterate through transaction index
     // For now, return empty - would be populated by oracle/monitoring service
-    results
+    let _ = limit;
+    Vec::new(env)
 }
 
-/// ==========================
-/// Confirmation Tracking
-/// ==========================
+// ==========================
+// Confirmation Tracking
+// ==========================
 
 /// Update confirmations for all pending transactions
 ///
@@ -477,16 +480,12 @@ fn trip_circuit_breaker(env: &Env, avg_latency_secs: u64, threshold_secs: u64) {
     );
 }
 
-/// ==========================
-/// Reorganization Handling
-/// ==========================
+// ==========================
+// Reorganization Handling
+// ==========================
 
 /// Check if transaction has been reorganized
-pub fn check_for_reorg(
-    env: &Env,
-    transfer_id: u64,
-    current_block: u64,
-) -> Result<bool, String> {
+pub fn check_for_reorg(env: &Env, transfer_id: u64, current_block: u64) -> Result<bool, String> {
     let monitored = get_monitored_tx(env, transfer_id)
         .ok_or_else(|| String::from_str(env, "Transaction not found"))?;
 
@@ -550,9 +549,9 @@ fn emit_reorg_event(env: &Env, transfer_id: u64, old_block: u64, new_block: u64)
     );
 }
 
-/// ==========================
-/// Timeout Handling
-/// ==========================
+// ==========================
+// Timeout Handling
+// ==========================
 
 /// Check for monitoring timeouts on pending transactions
 pub fn check_monitoring_timeouts(env: &Env, limit: u32) -> Result<Vec<u64>, String> {
@@ -589,9 +588,9 @@ pub fn mark_transaction_failed(env: &Env, transfer_id: u64) -> Result<(), String
     Ok(())
 }
 
-/// ==========================
-/// Bridge Transfer Management
-/// ==========================
+// ==========================
+// Bridge Transfer Management
+// ==========================
 
 /// Get bridge transfer
 pub fn get_bridge_transfer(env: &Env, transfer_id: u64) -> Option<BridgeTransfer> {
@@ -613,9 +612,10 @@ pub fn get_transfer_status(env: &Env, transfer_id: u64) -> Option<TransferStatus
 
 /// Store bridge transfer
 pub fn store_bridge_transfer(env: &Env, transfer: &BridgeTransfer) {
-    env.storage()
-        .persistent()
-        .set(&MonitoringDataKey::BridgeTransfer(transfer.transfer_id), transfer);
+    env.storage().persistent().set(
+        &MonitoringDataKey::BridgeTransfer(transfer.transfer_id),
+        transfer,
+    );
 }
 
 /// Create new bridge transfer.
@@ -679,7 +679,7 @@ pub fn add_validator_signature(
     signature: String,
 ) -> Result<(), String> {
     validator.require_auth();
-    
+
     let mut transfer = get_bridge_transfer(env, transfer_id)
         .ok_or_else(|| String::from_str(env, "Transfer not found"))?;
 
@@ -723,10 +723,7 @@ pub fn approve_transfer_for_minting(env: &Env, transfer_id: u64) -> Result<(), S
         .ok_or_else(|| String::from_str(env, "Transfer not found"))?;
 
     if transfer.status != TransferStatus::ValidatorApproved {
-        return Err(String::from_str(
-            env,
-            "Transfer not approved by validators",
-        ));
+        return Err(String::from_str(env, "Transfer not approved by validators"));
     }
 
     transfer.status = TransferStatus::Minting;
@@ -763,18 +760,18 @@ pub fn complete_transfer(env: &Env, transfer_id: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// ==========================
-/// Utility Functions
-/// ==========================
+// ==========================
+// Utility Functions
+// ==========================
 
 /// Get current time from environment
 fn current_time(env: &Env) -> u64 {
     env.ledger().timestamp()
 }
 
-/// ==========================
-/// Tests
-/// ==========================
+// ==========================
+// Tests
+// ==========================
 
 #[cfg(test)]
 mod tests {
@@ -829,13 +826,7 @@ mod tests {
         let env = setup_env();
         let tx_hash = String::from_str(&env, "0xabcd1234");
 
-        let result = monitor_source_transaction(
-            &env,
-            1,
-            tx_hash,
-            ChainId::Ethereum,
-            100,
-        );
+        let result = monitor_source_transaction(&env, 1, tx_hash, ChainId::Ethereum, 100);
 
         assert!(result.is_ok());
 
@@ -854,13 +845,7 @@ mod tests {
         let tx_hash = String::from_str(&env, "0xabcd1234");
 
         // Create monitored transaction at block 100
-        monitor_source_transaction(
-            &env,
-            1,
-            tx_hash,
-            ChainId::Ethereum,
-            100,
-        ).unwrap();
+        monitor_source_transaction(&env, 1, tx_hash, ChainId::Ethereum, 100).unwrap();
 
         // Update at block 132 (32 confirmations)
         let is_finalized = update_transaction_confirmation_count(&env, 1, 132).unwrap();
@@ -877,13 +862,7 @@ mod tests {
         let tx_hash = String::from_str(&env, "0xabcd1234");
 
         // Polygon requires 128 confirmations
-        monitor_source_transaction(
-            &env,
-            1,
-            tx_hash,
-            ChainId::Polygon,
-            1000,
-        ).unwrap();
+        monitor_source_transaction(&env, 1, tx_hash, ChainId::Polygon, 1000).unwrap();
 
         // Update at 1100 (100 confirmations, not enough)
         let is_finalized = update_transaction_confirmation_count(&env, 1, 1100).unwrap();
@@ -900,13 +879,7 @@ mod tests {
         let tx_hash = String::from_str(&env, "0xabcd1234");
 
         // Bitcoin uses probabilistic finality
-        monitor_source_transaction(
-            &env,
-            1,
-            tx_hash,
-            ChainId::Bitcoin,
-            5000,
-        ).unwrap();
+        monitor_source_transaction(&env, 1, tx_hash, ChainId::Bitcoin, 5000).unwrap();
 
         // Update at 5006 (6 confirmations)
         // Bitcoin requires 6 * 2 = 12 for probabilistic finality
@@ -923,13 +896,7 @@ mod tests {
         let env = setup_env();
         let tx_hash = String::from_str(&env, "0xabcd1234");
 
-        monitor_source_transaction(
-            &env,
-            1,
-            tx_hash,
-            ChainId::Ethereum,
-            9900,
-        ).unwrap();
+        monitor_source_transaction(&env, 1, tx_hash, ChainId::Ethereum, 9900).unwrap();
 
         // Check at current_block = 9920 (within reorg depth of 64)
         let is_reorg = check_for_reorg(&env, 1, 9920).unwrap();
@@ -942,13 +909,7 @@ mod tests {
         let tx_hash = String::from_str(&env, "0xabcd1234");
 
         // Create monitored transaction
-        monitor_source_transaction(
-            &env,
-            1,
-            tx_hash,
-            ChainId::Ethereum,
-            100,
-        ).unwrap();
+        monitor_source_transaction(&env, 1, tx_hash, ChainId::Ethereum, 100).unwrap();
 
         // Mark as finalized first
         let mut monitored = get_monitored_tx(&env, 1).unwrap();
@@ -969,7 +930,10 @@ mod tests {
         let env = setup_env();
         let user = String::from_str(&env, "user123");
 
-        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+        let asset = Asset {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        };
         let result = create_bridge_transfer(
             &env,
             1,
@@ -1134,7 +1098,7 @@ mod tests {
 
         let custom_config = ChainFinalityConfig {
             chain_id: ChainId::Ethereum,
-            required_confirmations: 64,  // Custom: more than default 32
+            required_confirmations: 64, // Custom: more than default 32
             average_block_time: 12,
             reorg_depth_limit: 128,
             verification_method: VerificationMethod::BlockConfirmations,
@@ -1159,9 +1123,23 @@ mod tests {
     fn test_get_transfer_status_pending() {
         let env = setup_env();
         let user = String::from_str(&env, "user123");
-        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+        let asset = Asset {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        };
 
-        create_bridge_transfer(&env, 1, 1, ChainId::Ethereum, ChainId::Polygon, 1_000_000, 100, asset, user).unwrap();
+        create_bridge_transfer(
+            &env,
+            1,
+            1,
+            ChainId::Ethereum,
+            ChainId::Polygon,
+            1_000_000,
+            100,
+            asset,
+            user,
+        )
+        .unwrap();
 
         let info = get_transfer_status(&env, 1).unwrap();
         assert_eq!(info.transfer_id, 1);
@@ -1173,9 +1151,23 @@ mod tests {
     fn test_get_transfer_status_transitions_to_validator_approved() {
         let env = setup_env();
         let user = String::from_str(&env, "user123");
-        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+        let asset = Asset {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        };
 
-        create_bridge_transfer(&env, 1, 1, ChainId::Ethereum, ChainId::Polygon, 1_000_000, 100, asset, user).unwrap();
+        create_bridge_transfer(
+            &env,
+            1,
+            1,
+            ChainId::Ethereum,
+            ChainId::Polygon,
+            1_000_000,
+            100,
+            asset,
+            user,
+        )
+        .unwrap();
 
         let val1 = Address::generate(&env);
         let val2 = Address::generate(&env);
@@ -1191,9 +1183,23 @@ mod tests {
     fn test_get_transfer_status_transitions_to_complete() {
         let env = setup_env();
         let user = String::from_str(&env, "user123");
-        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+        let asset = Asset {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        };
 
-        create_bridge_transfer(&env, 1, 1, ChainId::Ethereum, ChainId::Polygon, 1_000_000, 100, asset, user).unwrap();
+        create_bridge_transfer(
+            &env,
+            1,
+            1,
+            ChainId::Ethereum,
+            ChainId::Polygon,
+            1_000_000,
+            100,
+            asset,
+            user,
+        )
+        .unwrap();
 
         complete_transfer(&env, 1).unwrap();
 
@@ -1206,9 +1212,23 @@ mod tests {
         let env = setup_env();
         let tx_hash = String::from_str(&env, "0xabcd1234");
         let user = String::from_str(&env, "user123");
-        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+        let asset = Asset {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        };
 
-        create_bridge_transfer(&env, 1, 1, ChainId::Ethereum, ChainId::Polygon, 1_000_000, 100, asset, user).unwrap();
+        create_bridge_transfer(
+            &env,
+            1,
+            1,
+            ChainId::Ethereum,
+            ChainId::Polygon,
+            1_000_000,
+            100,
+            asset,
+            user,
+        )
+        .unwrap();
         monitor_source_transaction(&env, 1, tx_hash, ChainId::Ethereum, 100).unwrap();
         mark_transaction_failed(&env, 1).unwrap();
 
@@ -1221,26 +1241,52 @@ mod tests {
         let env = setup_env();
         let user = String::from_str(&env, "user123");
         let tx_hash = String::from_str(&env, "0xabcd1234");
-        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+        let asset = Asset {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        };
 
         // Step 1: Pending
-        create_bridge_transfer(&env, 1, 1, ChainId::Ethereum, ChainId::Polygon, 1_000_000, 100, asset, user).unwrap();
-        assert_eq!(get_transfer_status(&env, 1).unwrap().status, TransferStatus::Pending);
+        create_bridge_transfer(
+            &env,
+            1,
+            1,
+            ChainId::Ethereum,
+            ChainId::Polygon,
+            1_000_000,
+            100,
+            asset,
+            user,
+        )
+        .unwrap();
+        assert_eq!(
+            get_transfer_status(&env, 1).unwrap().status,
+            TransferStatus::Pending
+        );
 
         // Step 2: Source monitoring starts (status stays Pending until validators sign)
         monitor_source_transaction(&env, 1, tx_hash, ChainId::Ethereum, 100).unwrap();
-        assert_eq!(get_transfer_status(&env, 1).unwrap().status, TransferStatus::Pending);
+        assert_eq!(
+            get_transfer_status(&env, 1).unwrap().status,
+            TransferStatus::Pending
+        );
 
         // Step 3: ValidatorApproved
         let val1 = Address::generate(&env);
         let val2 = Address::generate(&env);
         add_validator_signature(&env, 1, val1, String::from_str(&env, "s1")).unwrap();
         add_validator_signature(&env, 1, val2, String::from_str(&env, "s2")).unwrap();
-        assert_eq!(get_transfer_status(&env, 1).unwrap().status, TransferStatus::ValidatorApproved);
+        assert_eq!(
+            get_transfer_status(&env, 1).unwrap().status,
+            TransferStatus::ValidatorApproved
+        );
 
         // Step 4: Minting
         approve_transfer_for_minting(&env, 1).unwrap();
-        assert_eq!(get_transfer_status(&env, 1).unwrap().status, TransferStatus::Minting);
+        assert_eq!(
+            get_transfer_status(&env, 1).unwrap().status,
+            TransferStatus::Minting
+        );
 
         // Step 5: Complete
         complete_transfer(&env, 1).unwrap();
@@ -1254,14 +1300,17 @@ mod tests {
         let env = setup_env();
         let user = String::from_str(&env, "user123");
 
-        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+        let asset = Asset {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        };
         let result = create_bridge_transfer(
             &env,
             1,
             1,
             ChainId::Ethereum,
             ChainId::Polygon,
-            0,  // Invalid amount
+            0, // Invalid amount
             0,
             asset,
             user,
@@ -1326,7 +1375,10 @@ mod tests {
         let user = String::from_str(&env, "user123");
         let tx_hash = String::from_str(&env, "0xabcd1234");
 
-        let asset = Asset { code: String::from_str(&env, "XLM"), issuer: None };
+        let asset = Asset {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        };
         // Step 1: Create transfer
         create_bridge_transfer(
             &env,
@@ -1338,7 +1390,8 @@ mod tests {
             100,
             asset,
             user,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Step 2: Start monitoring
         monitor_source_transaction(&env, 1, tx_hash, ChainId::Ethereum, 100).unwrap();

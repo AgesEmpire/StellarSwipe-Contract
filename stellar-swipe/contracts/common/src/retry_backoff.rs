@@ -114,12 +114,8 @@ pub fn should_retry(state: &RetryState, config: &RetryConfig) -> Option<u32> {
     // After the second failure (attempt=2), delay = base × 2^1 = 2×base.
     // etc.
     let exponent = state.attempt.saturating_sub(1); // 0 on first failure → 2^0 = 1
-    let multiplier = 1u32
-        .checked_shl(exponent)
-        .unwrap_or(u32::MAX);
-    let raw_delay = config
-        .base_delay_ledgers
-        .saturating_mul(multiplier);
+    let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    let raw_delay = config.base_delay_ledgers.saturating_mul(multiplier);
 
     let delay = match config.max_delay_ledgers {
         Some(cap) => core::cmp::min(raw_delay, cap),

@@ -1435,8 +1435,7 @@ fn test_fee_and_burn_amounts_overflow_returns_none() {
 }
 
 #[test]
-fn test_fee_and_burn_conservation()
-{
+fn test_fee_and_burn_conservation() {
     // burn + distributable must always equal fee exactly (no dust)
     let cases: &[(i128, u32, u32)] = &[
         (777_777, 30, 3_333),
@@ -1447,7 +1446,11 @@ fn test_fee_and_burn_conservation()
     for &(amount, fee_bps, burn_bps) in cases {
         if let Some((fee, burn)) = crate::fee_and_burn_amounts(amount, fee_bps, burn_bps) {
             let distributable = fee - burn;
-            assert_eq!(burn + distributable, fee, "conservation failed for amount={amount}");
+            assert_eq!(
+                burn + distributable,
+                fee,
+                "conservation failed for amount={amount}"
+            );
         }
     }
 }

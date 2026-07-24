@@ -9,9 +9,7 @@
 //! - get_tax_events pagination (offset + limit)
 //! - Empty result for user with no events
 
-use crate::{
-    storage::DataKey, TaxEvent, UserPortfolio, UserPortfolioClient,
-};
+use crate::{storage::DataKey, TaxEvent, UserPortfolio, UserPortfolioClient};
 use soroban_sdk::{
     contract, contractimpl,
     testutils::{Address as _, Ledger as _},
@@ -114,7 +112,8 @@ fn multiple_closes_append_events_in_order() {
     for i in 0u64..3 {
         env.ledger().with_mut(|l| l.timestamp = (i + 1) * 1_000);
         let id = client.open_position(&user, &100, &1_000);
-        env.ledger().with_mut(|l| l.timestamp = (i + 1) * 1_000 + 500);
+        env.ledger()
+            .with_mut(|l| l.timestamp = (i + 1) * 1_000 + 500);
         client.close_position(&user, &id, &(i as i128 * 50), &120i128, &1u32, &p, &0u64);
     }
 
