@@ -66,10 +66,11 @@ pub use oracle::{
     MAX_ORACLE_PRICE, MIN_ORACLE_PRICE,
 };
 pub use perf::{
-    mark_operation, op_batch_execute, op_collect_fee, op_create_signal, op_execute_trade,
-    regression_budget_limit, tx_cache_or_compute, BASELINE_AUTO_TRADE_INSTRUCTIONS,
-    BASELINE_COPY_TRADE_INSTRUCTIONS, BASELINE_FEE_COLLECT_INSTRUCTIONS,
-    BASELINE_SIGNAL_SUBMIT_INSTRUCTIONS, DEFAULT_INSTRUCTION_BUDGET, REGRESSION_BUDGET_PCT,
+    invalidate_tx_cache, mark_operation, op_batch_execute, op_collect_fee, op_create_signal,
+    op_execute_trade, regression_budget_limit, tx_cache_or_compute,
+    BASELINE_AUTO_TRADE_INSTRUCTIONS, BASELINE_COPY_TRADE_INSTRUCTIONS,
+    BASELINE_FEE_COLLECT_INSTRUCTIONS, BASELINE_SIGNAL_SUBMIT_INSTRUCTIONS,
+    DEFAULT_INSTRUCTION_BUDGET, REGRESSION_BUDGET_PCT,
 };
 pub use rate_limit::{
     check_rate_limit, record_action, set_config as set_rate_limit_config, ActionType,

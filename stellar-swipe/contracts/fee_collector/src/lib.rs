@@ -439,6 +439,10 @@ impl FeeCollector {
 
         let old_rate = get_fee_rate(&env);
         set_fee_rate_storage(&env, new_rate_bps);
+        // Issue #801: the base rate itself isn't part of `TxFeeConfigCache`,
+        // but we invalidate defensively so any future cache field derived
+        // from the base rate can't be served stale.
+        fee_cache::invalidate_fee_cache(&env);
 
         emit_fee_rate_updated(
             &env,
@@ -472,6 +476,9 @@ impl FeeCollector {
             return Err(ContractError::BurnRateTooHigh);
         }
         set_burn_rate_storage(&env, new_rate_bps);
+        // Issue #801: `burn_rate` is cached in `TxFeeConfigCache` — invalidate
+        // so `collect_fee` picks up the new rate immediately.
+        fee_cache::invalidate_fee_cache(&env);
         Ok(())
     }
 
@@ -571,6 +578,9 @@ impl FeeCollector {
             return Err(ContractError::InvalidFeeConfiguration);
         }
         set_fee_optimization_config(&env, &config);
+        // Issue #801: `optimization_config` is cached in `TxFeeConfigCache` —
+        // invalidate so `collect_fee` picks up the new config immediately.
+        fee_cache::invalidate_fee_cache(&env);
         Ok(())
     }
 
@@ -590,6 +600,9 @@ impl FeeCollector {
         }
 
         set_network_condition_score(&env, score_bps);
+        // Issue #801: `network_score` is cached in `TxFeeConfigCache` —
+        // invalidate so `collect_fee` picks up the new score immediately.
+        fee_cache::invalidate_fee_cache(&env);
         emit_network_condition_updated(
             &env,
             EvtNetworkConditionUpdated {
@@ -1124,6 +1137,9 @@ impl FeeCollector {
             );
             storage::set_protocol_token(&env, &zero);
         }
+        // Issue #801: `protocol_token` is cached in `TxFeeConfigCache` —
+        // invalidate so `collect_fee` picks up the new token immediately.
+        fee_cache::invalidate_fee_cache(&env);
         Ok(())
     }
 
