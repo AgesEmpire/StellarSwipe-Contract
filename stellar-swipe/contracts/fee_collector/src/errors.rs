@@ -30,7 +30,10 @@ pub enum ContractError {
     InvalidMultiplierBounds = 24,
     SelfReferralNotAllowed = 25,
     ReferralAlreadyRegistered = 26,
-    /// The contract is paused (see `shared::pausable`); privileged and
-    /// fund-moving entry points reject calls until an admin resumes it.
-    ContractPaused = 27,
+    /// Issue #811: `upgrade()` was called with a version that is not
+    /// strictly greater than the currently stored contract version.
+    IncompatibleContractVersion = 27,
+    /// Issue #813: caller is neither the admin nor on the authorized-caller
+    /// allowlist for this privileged, non-user-scoped entry point.
+    UnauthorizedCaller = 28,
 }

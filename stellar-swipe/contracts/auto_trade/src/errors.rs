@@ -140,4 +140,14 @@ impl AutoTradeError {
     // ── Daily execution cap ──────────────────────────────────────────────────
     /// Auto-trade blocked by per-user daily execution cap.
     pub const DailyExecutionCapExceeded: AutoTradeError = AutoTradeError::DailyTradeLimitExceeded;
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+    // `AutoTradeError` is already at the 50-variant cap enforced by Soroban's
+    // contract-spec XDR format (`ScSpecUdtErrorEnumV0.cases: VecM<_, 50>`), so
+    // this reuses `SystemError` under a clearer name rather than adding a
+    // 51st discriminant (which fails the `#[contracterror]` macro at
+    // compile time with "LengthExceedsMax").
+    /// `upgrade()` was called with a version that is not strictly greater
+    /// than the currently stored contract version.
+    pub const IncompatibleContractVersion: AutoTradeError = AutoTradeError::SystemError;
 }
