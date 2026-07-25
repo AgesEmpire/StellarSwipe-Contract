@@ -131,6 +131,12 @@ pub enum StorageKey {
     /// trade-settlement keeper contract). See the "Authorized callers"
     /// section below.
     AuthorizedCaller(Address),
+    /// Issue #799: cap on rebate distribution, in basis points of the
+    /// epoch's collected fees.
+    MaxRebateBps,
+    /// Issue #799: pending rebate claims awaiting distribution, per
+    /// (token, epoch). Epoch = unix_timestamp / SECONDS_PER_DAY_FC.
+    PendingRebateClaims(Address, u64),
 }
 
 #[contracttype]
@@ -864,4 +870,67 @@ pub fn set_congestion_signal(env: &Env, signal: &CongestionSignal) {
     env.storage()
         .instance()
         .set(&StorageKey::CongestionSignal, signal);
+}
+
+// ── Issue #799: Rebate Cap ───────────────────────────────────────────────────
+
+/// A single pending rebate claim awaiting settlement in `distribute_rebates`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RebateClaim {
+    pub provider: Address,
+    pub amount: i128,
+}
+
+/// Default cap: at most 80% of an epoch's collected fees may be rebated.
+pub const DEFAULT_MAX_REBATE_BPS: u32 = 8_000;
+
+pub fn get_max_rebate_bps(env: &Env) -> u32 {
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &StorageKey::MaxRebateBps,
+        DEFAULT_MAX_REBATE_BPS,
+    )
+}
+
+pub fn set_max_rebate_bps(env: &Env, bps: u32) {
+    crud_set(env, StorageTier::Instance, &StorageKey::MaxRebateBps, &bps);
+}
+
+pub fn get_pending_rebate_claims(env: &Env, token: &Address, epoch: u64) -> Vec<RebateClaim> {
+    crud_get(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::PendingRebateClaims(token.clone(), epoch),
+    )
+    .unwrap_or_else(|| Vec::new(env))
+}
+
+pub fn add_pending_rebate_claim(
+    env: &Env,
+    token: &Address,
+    epoch: u64,
+    provider: &Address,
+    amount: i128,
+) {
+    let mut claims = get_pending_rebate_claims(env, token, epoch);
+    claims.push_back(RebateClaim {
+        provider: provider.clone(),
+        amount,
+    });
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::PendingRebateClaims(token.clone(), epoch),
+        &claims,
+    );
+}
+
+pub fn clear_pending_rebate_claims(env: &Env, token: &Address, epoch: u64) {
+    crud_remove(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::PendingRebateClaims(token.clone(), epoch),
+    );
 }

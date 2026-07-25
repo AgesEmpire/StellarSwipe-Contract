@@ -191,12 +191,6 @@ impl FeeCollector {
         }
         let admin = get_admin(&env);
         admin.require_auth();
-        pausable::set_paused(&env, true);
-        Ok(())
-    }
-
-    /// Resume fund-moving operations. Admin auth required.
-    pub fn unpause(env: Env) -> Result<(), ContractError> {
 
         let current_version = shared::version::get_contract_version(&env);
         shared::version::guard_upgrade(current_version, new_version)
@@ -206,6 +200,40 @@ impl FeeCollector {
         shared::version::set_contract_version(&env, new_version);
         shared::version::emit_contract_upgraded(&env, current_version, new_version);
         Ok(())
+    }
+
+    // ── Issue #821: shared circuit-breaker pause ─────────────────────────────
+
+    /// Admin-only: halt fund-moving operations (fee collection, claims,
+    /// withdrawals) via the shared circuit breaker.
+    pub fn pause(env: Env) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        pausable::set_paused(&env, true);
+        Ok(())
+    }
+
+    /// Admin-only: resume fund-moving operations.
+    pub fn unpause(env: Env) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        pausable::set_paused(&env, false);
+        Ok(())
+    }
+
+    /// Returns `true` while the shared circuit breaker has the contract paused.
+    pub fn is_paused(env: Env) -> bool {
+        pausable::is_paused(&env)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), ContractError> {
+        pausable::require_not_paused(env).map_err(|_| ContractError::ContractPaused)
     }
 
     // ── Issue #813: cross-contract authentication hardening ─────────────────
@@ -1312,6 +1340,57 @@ impl FeeCollector {
         }
 
         Ok(())
+    }
+
+    // ── Issue #799: Rebate Cap ────────────────────────────────────────────
+
+    /// Returns the current rebate cap, in basis points of an epoch's
+    /// collected fees (default: 8000 = 80%).
+    pub fn get_max_rebate_bps(env: Env) -> u32 {
+        rebates::get_max_rebate_bps(&env)
+    }
+
+    /// Admin: configure the rebate cap, in basis points (max 10000 = 100%).
+    pub fn set_max_rebate_bps(env: Env, caller: Address, bps: u32) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        rebates::set_max_rebate_bps(&env, &caller, bps)
+    }
+
+    /// Record a pending rebate claim for `provider`, settled by the next
+    /// [`Self::distribute_rebates`] call for the current epoch (day).
+    /// Callable by the admin or an authorized caller (Issue #813 allowlist),
+    /// e.g. a trusted rewards/settlement contract.
+    pub fn submit_rebate_claim(
+        env: Env,
+        caller: Address,
+        provider: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        rebates::submit_rebate_claim(&env, &caller, &provider, &token, amount)
+    }
+
+    /// Admin: settle all rebate claims pending for `token` in the current
+    /// epoch. If their sum exceeds `max_rebate_bps` of the epoch's collected
+    /// fees, every claim is scaled down proportionally so the total
+    /// distributed sums to the cap, and a `RebateCapApplied` event is
+    /// emitted. Distributed amounts are credited to each provider's pending
+    /// fees, claimable via [`Self::claim_fees`]. Returns the total amount
+    /// distributed.
+    pub fn distribute_rebates(
+        env: Env,
+        caller: Address,
+        token: Address,
+    ) -> Result<i128, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        rebates::distribute_rebates(&env, &caller, &token)
     }
 
     /// Returns an earnings report for the provider over the requested period.
