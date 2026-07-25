@@ -32,4 +32,7 @@ pub enum OracleError {
     InsufficientSources = 25,
     /// A single-update price deviation exceeded the configured maximum percentage.
     PriceDeviationBreakerTripped = 26,
+    /// Issue #811: `upgrade()` was called with a version that is not
+    /// strictly greater than the currently stored contract version.
+    IncompatibleContractVersion = 27,
 }

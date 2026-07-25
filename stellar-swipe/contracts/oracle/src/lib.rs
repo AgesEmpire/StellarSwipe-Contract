@@ -27,7 +27,7 @@ use reputation::{
     slash_oracle, track_oracle_accuracy, SlashReason,
 };
 use sdex::{calculate_spot_price, OrderBook};
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Map, String, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, BytesN, Env, Map, String, Vec};
 use staleness::{OracleHealth, OracleStatus, StalenessLevel};
 use stellar_swipe_common::emergency::{PauseState, CAT_ALL};
 use stellar_swipe_common::{
@@ -85,6 +85,50 @@ impl OracleContract {
         }
         env.storage().instance().set(&StorageKey::Admin, &admin);
         storage::set_base_currency(&env, base_currency);
+        shared::version::set_contract_version(&env, shared::version::ORACLE_VERSION);
+    }
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+
+    /// Returns this contract's stored version. Cross-contract callers can use
+    /// this to enforce a minimum compatible version before invoking this
+    /// oracle (see `shared::version::validate_callee_version`).
+    pub fn get_contract_version(env: Env) -> u32 {
+        shared::version::get_contract_version(&env)
+    }
+
+    /// Admin-only: replace this contract's executable with `new_wasm_hash`
+    /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
+    /// `new_version` as the contract's version.
+    ///
+    /// `new_version` must be strictly greater than the currently stored
+    /// version, rejecting accidental or malicious downgrades.
+    ///
+    /// # Errors
+    /// - [`OracleError::Unauthorized`] — contract not initialized, or caller
+    ///   is not the admin.
+    /// - [`OracleError::IncompatibleContractVersion`] — `new_version` is not
+    ///   strictly greater than the currently stored version.
+    pub fn upgrade(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), OracleError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(OracleError::Unauthorized)?;
+        admin.require_auth();
+
+        let current_version = shared::version::get_contract_version(&env);
+        shared::version::guard_upgrade(current_version, new_version)
+            .map_err(|_| OracleError::IncompatibleContractVersion)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        shared::version::set_contract_version(&env, new_version);
+        shared::version::emit_contract_upgraded(&env, current_version, new_version);
+        Ok(())
     }
 
     /// Read-only health probe for monitoring and front-ends (no auth).

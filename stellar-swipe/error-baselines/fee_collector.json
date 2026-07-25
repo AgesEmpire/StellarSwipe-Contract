@@ -29,7 +29,9 @@
       "PayoutCurrencyUnchanged": 23,
       "InvalidMultiplierBounds": 24,
       "SelfReferralNotAllowed": 25,
-      "ReferralAlreadyRegistered": 26
+      "ReferralAlreadyRegistered": 26,
+      "IncompatibleContractVersion": 27,
+      "UnauthorizedCaller": 28
     }
   }
 }

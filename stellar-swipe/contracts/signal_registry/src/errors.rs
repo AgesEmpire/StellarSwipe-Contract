@@ -38,6 +38,13 @@ pub enum AdminError {
     TooManyProposals = 33,
     /// Provider has submitted too recently; must wait for the cooldown period to elapse.
     CooldownNotElapsed = 34,
+    /// Issue #811: `upgrade()` was called with a version that is not
+    /// strictly greater than the currently stored contract version.
+    IncompatibleContractVersion = 35,
+    /// Issue #812: the on-chain storage schema version does not match what
+    /// `migrate_signals_v1_to_v2` expects as a precondition. Migration logic
+    /// does not run when this is returned — no state is touched.
+    IncompatibleStorageLayout = 36,
 }
 
 #[contracterror]
