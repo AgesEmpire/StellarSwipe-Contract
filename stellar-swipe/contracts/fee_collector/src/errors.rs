@@ -30,4 +30,7 @@ pub enum ContractError {
     InvalidMultiplierBounds = 24,
     SelfReferralNotAllowed = 25,
     ReferralAlreadyRegistered = 26,
+    /// The contract is paused (see `shared::pausable`); privileged and
+    /// fund-moving entry points reject calls until an admin resumes it.
+    ContractPaused = 27,
 }

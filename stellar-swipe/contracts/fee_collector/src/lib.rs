@@ -55,6 +55,7 @@ use soroban_sdk::{
 };
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
+use shared::pausable;
 use stellar_swipe_common::Asset;
 use stellar_swipe_common::SECONDS_PER_DAY;
 
@@ -153,6 +154,49 @@ impl FeeCollector {
         set_admin(&env, &admin);
         set_initialized(&env);
         Ok(())
+    }
+
+    // ── Emergency pause (shared::pausable, Issue #821) ───────────────────────
+    //
+    // fee_collector moves real funds on `collect_fee`, `batch_collect_fees`,
+    // `claim_fees`, `queue_withdrawal`, `withdraw_treasury_fees` and
+    // `distribute_waterfall`. Before this change none of those entry points
+    // consulted `shared::pausable`, so a protocol-wide emergency pause (as
+    // used by stake_vault, signal_registry, oracle, governance and
+    // auto_trade) left fee_collector fully operational — an inconsistency
+    // with the circuit-breaker guarantee described in issue #821.
+
+    /// Pause fund-moving operations. Admin auth required.
+    pub fn pause(env: Env) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        pausable::set_paused(&env, true);
+        Ok(())
+    }
+
+    /// Resume fund-moving operations. Admin auth required.
+    pub fn unpause(env: Env) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        pausable::set_paused(&env, false);
+        Ok(())
+    }
+
+    /// Returns `true` when the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        pausable::is_paused(&env)
+    }
+
+    /// Guard used by fund-moving entry points; translates the shared
+    /// sentinel error into [`ContractError::ContractPaused`].
+    fn require_not_paused(env: &Env) -> Result<(), ContractError> {
+        pausable::require_not_paused(env).map_err(|_| ContractError::ContractPaused)
     }
 
     /// # Summary
@@ -305,6 +349,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
         if amount <= 0 {
@@ -365,6 +410,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
 
@@ -770,6 +816,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         trader.require_auth();
 
         if trade_amount <= 0 {
@@ -953,6 +1000,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let mut auth_args: Vec<Val> = Vec::new(&env);
         auth_args.push_back(provider.clone().into_val(&env));
         auth_args.push_back(token.clone().into_val(&env));
@@ -1258,6 +1306,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
 
