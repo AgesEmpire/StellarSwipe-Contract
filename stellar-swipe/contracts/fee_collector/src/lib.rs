@@ -1423,6 +1423,24 @@ impl FeeCollector {
         if config.tiers.len() < 3 {
             return Err(ContractError::InvalidFeeConfiguration);
         }
+        // Every tier's eligibility condition and payout must be explicit and
+        // bounded (#819). Without this check a tier with a negative
+        // `volume_threshold_usd` would vacuously match every trader
+        // (`volume_usd >= negative` is always true for `volume_usd >= 0`),
+        // silently overriding the intended tiering, and a `discount_bps`
+        // above `MAX_FEE_RATE_BPS` or equal to zero is not a meaningful,
+        // auditable discount. Rejecting these up front keeps the discount
+        // actually applied at fee-collection time deterministic and
+        // traceable back to an explicit admin-configured tier.
+        for i in 0..config.tiers.len() {
+            let tier = config.tiers.get(i).unwrap();
+            if tier.volume_threshold_usd < 0 {
+                return Err(ContractError::InvalidFeeConfiguration);
+            }
+            if tier.discount_bps == 0 || tier.discount_bps > MAX_FEE_RATE_BPS {
+                return Err(ContractError::InvalidFeeConfiguration);
+            }
+        }
         let tier_count = config.tiers.len();
         set_volume_discount_config_storage(&env, &config);
         emit_volume_discount_config_updated(&env, tier_count);
