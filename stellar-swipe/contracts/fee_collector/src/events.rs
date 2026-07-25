@@ -282,6 +282,28 @@ pub fn emit_payout_currency_set(env: &Env, provider: &Address, preferred_token: 
     );
 }
 
+// ── #813: Authorized-caller allowlist events ────────────────────────────────
+
+pub fn emit_caller_authorized(env: &Env, caller: &Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "caller_authorized"),
+        ),
+        caller.clone(),
+    );
+}
+
+pub fn emit_caller_revoked(env: &Env, caller: &Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "caller_revoked"),
+        ),
+        caller.clone(),
+    );
+}
+
 // ── Referral events ─────────────────────────────────────────────────────────
 
 pub fn emit_referral_registered(env: &Env, referrer: &Address, referee: &Address) {

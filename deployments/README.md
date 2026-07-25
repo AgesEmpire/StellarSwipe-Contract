@@ -24,3 +24,36 @@ Expected fields:
 ```
 
 The e2e runner accepts either plain string IDs or the object form shown above.
+
+## Deployment manifests (Issue #822)
+
+`deployments/<network>.manifest.json` is a **hand-maintained, pre-deploy**
+description of a release: required addresses, each contract's version, and
+its cross-contract dependencies. It is distinct from `<network>.json` above,
+which is generated *during* a deploy and just records contract IDs.
+
+`scripts/deploy_testnet.sh` validates `deployments/$STELLAR_NETWORK.manifest.json`
+(if present) before touching any contract, using
+`scripts/validate_deployment_manifest.py`. The same validator also runs in CI
+against every `deployments/*.manifest.json` in the repo. A manifest is
+invalid — and the release is blocked — if:
+
+- `admin`, or any contract's `address`, is not a syntactically valid Stellar
+  StrKey (wrong length, bad checksum, or wrong address type).
+- Any contract is missing a `package` name or a positive integer `version`.
+- A `depends_on` entry names a contract not present in the manifest, or
+  requires a `min_version` higher than that contract's declared `version`.
+- The `depends_on` graph has a cycle.
+
+See `testnet.manifest.json` for a filled-in example and
+`mainnet.manifest.example.json` for a template — copy the latter to
+`mainnet.manifest.json` and replace the `REPLACE_WITH_*` placeholders before
+a mainnet release. It is named `*.example.json` (not `*.manifest.json`) so
+an unfilled copy is never auto-discovered or auto-validated as if it were
+ready to deploy.
+
+Run it directly with:
+
+```sh
+python3 stellar-swipe/scripts/validate_deployment_manifest.py deployments/testnet.manifest.json
+```

@@ -7,8 +7,8 @@ use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
 use migration::{MigrationKey, StakeInfoV2};
 use shared::{initializable, multisig, pausable};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, Env, IntoVal,
-    String, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
+    IntoVal, String, Symbol, Val, Vec,
 };
 
 // ── Slash severity tiers ──────────────────────────────────────────────────────
@@ -219,8 +219,10 @@ pub enum StakeVaultError {
     RateLimitExceeded = 31,
     InvalidAmount = 32,
     RemainingStakeBelowMinimum = 33,
-    /// Unstake queue is at or above its configured maximum size (issue #786).
-    QueueFull = 34,
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+    /// `upgrade()` was called with a version that is not strictly greater
+    /// than the currently stored contract version.
+    IncompatibleContractVersion = 34,
 }
 
 /// A pending unstake request held in the FIFO queue (issue #663).
@@ -361,6 +363,49 @@ impl StakeVaultContract {
             .instance()
             .set(&pausable::PausableKey::Paused, &false);
         initializable::mark_initialized(&env);
+        shared::version::set_contract_version(&env, shared::version::STAKE_VAULT_VERSION);
+    }
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+
+    /// Returns this contract's stored version. Cross-contract callers can use
+    /// this to enforce a minimum compatible version before invoking this
+    /// contract (see `shared::version::validate_callee_version`).
+    pub fn get_contract_version(env: Env) -> u32 {
+        shared::version::get_contract_version(&env)
+    }
+
+    /// Admin-only: replace this contract's executable with `new_wasm_hash`
+    /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
+    /// `new_version` as the contract's version.
+    ///
+    /// `new_version` must be strictly greater than the currently stored
+    /// version, rejecting accidental or malicious downgrades.
+    ///
+    /// # Errors
+    /// - [`StakeVaultError::NotInitialized`] — contract not initialized.
+    /// - [`StakeVaultError::IncompatibleContractVersion`] — `new_version` is
+    ///   not strictly greater than the currently stored version.
+    pub fn upgrade(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+
+        let current_version = shared::version::get_contract_version(&env);
+        shared::version::guard_upgrade(current_version, new_version)
+            .map_err(|_| StakeVaultError::IncompatibleContractVersion)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        shared::version::set_contract_version(&env, new_version);
+        shared::version::emit_contract_upgraded(&env, current_version, new_version);
+        Ok(())
     }
 
     // ── Emergency pause (shared::pausable) ────────────────────────────────────

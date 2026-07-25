@@ -28,7 +28,9 @@
       "PriceStaleTradeBlocked": 22,
       "PendingAdminNotFound": 23,
       "PendingAdminExpired": 24,
-      "InsufficientSources": 25
+      "InsufficientSources": 25,
+      "PriceDeviationBreakerTripped": 26,
+      "IncompatibleContractVersion": 27
     }
   }
 }
