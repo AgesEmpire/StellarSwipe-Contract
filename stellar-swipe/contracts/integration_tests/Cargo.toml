@@ -49,5 +49,9 @@ path = "tests/integration/test_arithmetic_invariants.rs"
 name = "test_signal_registry_reentrancy"
 path = "tests/integration/test_signal_registry_reentrancy.rs"
 
+[[test]]
+name = "test_fee_distribution_end_to_end"
+path = "tests/integration/test_fee_distribution_end_to_end.rs"
+
 [lints]
 workspace = true
