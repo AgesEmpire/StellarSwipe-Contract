@@ -27,7 +27,8 @@
       "InvalidAppealWindow": 21,
       "RateLimitExceeded": 22,
       "InvalidAmount": 23,
-      "RemainingStakeBelowMinimum": 24
+      "RemainingStakeBelowMinimum": 24,
+      "IncompatibleContractVersion": 34
     }
   }
 }

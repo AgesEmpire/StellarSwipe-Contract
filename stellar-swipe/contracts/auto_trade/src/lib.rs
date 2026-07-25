@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 mod admin;
 mod advanced_risk;
@@ -258,6 +260,45 @@ impl AutoTradeContract {
     /// Nothing. Panics if already initialized.
     pub fn initialize(env: Env, admin: Address) {
         admin::init_admin(&env, admin);
+        shared::version::set_contract_version(&env, shared::version::AUTO_TRADE_VERSION);
+    }
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+
+    /// Returns this contract's stored version. Cross-contract callers can use
+    /// this to enforce a minimum compatible version before invoking this
+    /// contract (see `shared::version::validate_callee_version`).
+    pub fn get_contract_version(env: Env) -> u32 {
+        shared::version::get_contract_version(&env)
+    }
+
+    /// Admin-only: replace this contract's executable with `new_wasm_hash`
+    /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
+    /// `new_version` as the contract's version.
+    ///
+    /// `new_version` must be strictly greater than the currently stored
+    /// version, rejecting accidental or malicious downgrades.
+    ///
+    /// # Errors
+    /// - [`AutoTradeError::Unauthorized`] — caller is not the admin.
+    /// - [`AutoTradeError::IncompatibleContractVersion`] — `new_version` is
+    ///   not strictly greater than the currently stored version.
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), AutoTradeError> {
+        admin::require_admin(&env, &caller)?;
+
+        let current_version = shared::version::get_contract_version(&env);
+        shared::version::guard_upgrade(current_version, new_version)
+            .map_err(|_| AutoTradeError::IncompatibleContractVersion)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        shared::version::set_contract_version(&env, new_version);
+        shared::version::emit_contract_upgraded(&env, current_version, new_version);
+        Ok(())
     }
 
     /// Pause a category (admin or guardian)

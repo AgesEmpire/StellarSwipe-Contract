@@ -30,4 +30,10 @@ pub enum ContractError {
     InvalidMultiplierBounds = 24,
     SelfReferralNotAllowed = 25,
     ReferralAlreadyRegistered = 26,
+    /// Issue #811: `upgrade()` was called with a version that is not
+    /// strictly greater than the currently stored contract version.
+    IncompatibleContractVersion = 27,
+    /// Issue #813: caller is neither the admin nor on the authorized-caller
+    /// allowlist for this privileged, non-user-scoped entry point.
+    UnauthorizedCaller = 28,
 }
