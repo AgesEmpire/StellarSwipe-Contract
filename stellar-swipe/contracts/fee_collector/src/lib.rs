@@ -34,12 +34,13 @@ use storage::{
     get_network_condition_score, get_oracle_contract, get_pending_fees,
     get_provider_payout_currency, get_queued_withdrawal, get_referral_fee_share_bps, get_referrer,
     get_treasury_balance, get_volume_discount_config, get_waterfall_config, has_traded,
-    is_initialized, remove_failed_fee_collection, remove_monthly_trade_volume,
-    remove_provider_payout_currency, remove_queued_withdrawal, set_admin,
-    set_burn_rate as set_burn_rate_storage, set_congestion_config, set_congestion_signal,
-    set_failed_fee_collection, set_fee_optimization_config, set_fee_rate as set_fee_rate_storage,
-    set_forecast_config_storage, set_has_traded, set_initialized, set_last_error_report,
-    set_last_forecast_day, set_monthly_trade_volume, set_network_condition_score,
+    is_authorized_caller, is_initialized, remove_authorized_caller, remove_failed_fee_collection,
+    remove_monthly_trade_volume, remove_provider_payout_currency, remove_queued_withdrawal,
+    set_admin, set_authorized_caller, set_burn_rate as set_burn_rate_storage,
+    set_congestion_config, set_congestion_signal, set_failed_fee_collection,
+    set_fee_optimization_config, set_fee_rate as set_fee_rate_storage, set_forecast_config_storage,
+    set_has_traded, set_initialized, set_last_error_report, set_last_forecast_day,
+    set_monthly_trade_volume, set_network_condition_score,
     set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
     set_provider_payout_currency, set_queued_withdrawal, set_referral_fee_share_bps, set_referrer,
     set_treasury_balance, set_volume_discount_config_storage,
@@ -51,10 +52,12 @@ use storage::{
 };
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, Env, IntoVal, String, Symbol, Val, Vec,
+    contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, String, Symbol,
+    Val, Vec,
 };
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
+use shared::pausable;
 use stellar_swipe_common::Asset;
 use stellar_swipe_common::SECONDS_PER_DAY;
 
@@ -152,7 +155,95 @@ impl FeeCollector {
         }
         set_admin(&env, &admin);
         set_initialized(&env);
+        shared::version::set_contract_version(&env, shared::version::FEE_COLLECTOR_VERSION);
         Ok(())
+    }
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+
+    /// Returns this contract's stored version. Callers that depend on this
+    /// contract cross-contract can use this to enforce a minimum compatible
+    /// version before invoking privileged entry points (see
+    /// `shared::version::validate_callee_version`).
+    pub fn get_contract_version(env: Env) -> u32 {
+        shared::version::get_contract_version(&env)
+    }
+
+    /// Admin-only: replace this contract's executable with `new_wasm_hash`
+    /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
+    /// `new_version` as the contract's version.
+    ///
+    /// `new_version` must be strictly greater than the currently stored
+    /// version — this rejects accidental (or malicious) downgrades that
+    /// could reintroduce a fixed bug or reopen a storage-layout mismatch.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::IncompatibleContractVersion`] — `new_version` is
+    ///   not strictly greater than the currently stored version.
+    pub fn upgrade(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        pausable::set_paused(&env, true);
+        Ok(())
+    }
+
+    /// Resume fund-moving operations. Admin auth required.
+    pub fn unpause(env: Env) -> Result<(), ContractError> {
+
+        let current_version = shared::version::get_contract_version(&env);
+        shared::version::guard_upgrade(current_version, new_version)
+            .map_err(|_| ContractError::IncompatibleContractVersion)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        shared::version::set_contract_version(&env, new_version);
+        shared::version::emit_contract_upgraded(&env, current_version, new_version);
+        Ok(())
+    }
+
+    // ── Issue #813: cross-contract authentication hardening ─────────────────
+    //
+    // A small admin-curated allowlist of non-admin addresses (typically other
+    // contracts, such as a trusted trade-settlement keeper) permitted to
+    // invoke a narrow set of privileged entry points that are not naturally
+    // scoped to a single end-user's own `require_auth()`. The admin is
+    // always implicitly authorized and is never required to be on this list.
+
+    /// Admin-only: add `caller` to the authorized-caller allowlist.
+    pub fn authorize_caller(env: Env, caller: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        set_authorized_caller(&env, &caller);
+        events::emit_caller_authorized(&env, &caller);
+        Ok(())
+    }
+
+    /// Admin-only: remove `caller` from the authorized-caller allowlist.
+    pub fn revoke_caller(env: Env, caller: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        remove_authorized_caller(&env, &caller);
+        events::emit_caller_revoked(&env, &caller);
+        Ok(())
+    }
+
+    /// Returns `true` if `caller` is on the authorized-caller allowlist.
+    /// The admin is always implicitly authorized even if not listed here.
+    pub fn is_caller_authorized(env: Env, caller: Address) -> bool {
+        is_authorized_caller(&env, &caller)
     }
 
     /// # Summary
@@ -305,6 +396,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
         if amount <= 0 {
@@ -365,6 +457,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
 
@@ -495,14 +588,25 @@ impl FeeCollector {
         Ok(())
     }
 
-    /// Admin or Keeper: push the current congestion signal.
-    pub fn set_congestion_signal(env: Env, multiplier_bps: u32) -> Result<(), ContractError> {
+    /// Admin, or an allowlisted keeper (Issue #813 — see [`Self::authorize_caller`]):
+    /// push the current network congestion signal.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::UnauthorizedCaller`] — `caller` is neither the
+    ///   admin nor on the authorized-caller allowlist.
+    pub fn set_congestion_signal(
+        env: Env,
+        caller: Address,
+        multiplier_bps: u32,
+    ) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
-        // Since there is no keeper role yet, we default to admin-only.
-        let admin = get_admin(&env);
-        admin.require_auth();
+        caller.require_auth();
+        if caller != get_admin(&env) && !is_authorized_caller(&env, &caller) {
+            return Err(ContractError::UnauthorizedCaller);
+        }
 
         let config = get_congestion_config(&env);
         if multiplier_bps < config.min_multiplier_bps || multiplier_bps > config.max_multiplier_bps
@@ -770,6 +874,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         trader.require_auth();
 
         if trade_amount <= 0 {
@@ -953,6 +1058,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let mut auth_args: Vec<Val> = Vec::new(&env);
         auth_args.push_back(provider.clone().into_val(&env));
         auth_args.push_back(token.clone().into_val(&env));
@@ -1077,16 +1183,28 @@ impl FeeCollector {
 
     /// Record fee shares distributed to a provider for the current day.
     ///
-    /// Called by the fee distribution system when allocating fee shares to a
-    /// signal provider. Updates the per-day earnings bucket used by
-    /// `get_provider_earnings_report`.
+    /// Called by the fee distribution system (the admin, or an allowlisted
+    /// settlement contract — see [`Self::authorize_caller`]) when allocating
+    /// fee shares to a signal provider. Updates the per-day earnings bucket
+    /// used by `get_provider_earnings_report`.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::UnauthorizedCaller`] — `caller` is neither the
+    ///   admin nor on the authorized-caller allowlist (Issue #813).
+    /// - [`ContractError::InvalidAmount`] — `amount` <= 0.
     pub fn record_provider_fee_share(
         env: Env,
+        caller: Address,
         provider: Address,
         amount: i128,
     ) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
+        }
+        caller.require_auth();
+        if caller != get_admin(&env) && !is_authorized_caller(&env, &caller) {
+            return Err(ContractError::UnauthorizedCaller);
         }
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
@@ -1258,6 +1376,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
 

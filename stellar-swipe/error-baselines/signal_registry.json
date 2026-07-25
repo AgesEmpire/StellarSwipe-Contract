@@ -35,7 +35,10 @@
       "TimelockNotElapsed": 30,
       "ProposalAlreadyExecuted": 31,
       "ProposalCancelled": 32,
-      "TooManyProposals": 33
+      "TooManyProposals": 33,
+      "CooldownNotElapsed": 34,
+      "IncompatibleContractVersion": 35,
+      "IncompatibleStorageLayout": 36
     },
     "AiScoreError": {
       "Unauthorized": 600,

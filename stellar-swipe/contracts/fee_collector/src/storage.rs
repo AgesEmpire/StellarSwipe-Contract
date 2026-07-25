@@ -126,6 +126,11 @@ pub enum StorageKey {
     /// Congestion signal parameters
     CongestionConfig,
     CongestionSignal,
+    /// Issue #813: allowlisted non-admin caller permitted to invoke a narrow
+    /// set of privileged, non-user-scoped entry points (e.g. a trusted
+    /// trade-settlement keeper contract). See the "Authorized callers"
+    /// section below.
+    AuthorizedCaller(Address),
 }
 
 #[contracttype]
@@ -207,6 +212,42 @@ pub fn is_initialized(env: &Env) -> bool {
 
 pub fn set_initialized(env: &Env) {
     initializable::mark_initialized(env);
+}
+
+// --- Authorized callers (Issue #813: cross-contract auth hardening) ---
+//
+// A small admin-curated allowlist of non-admin addresses — typically other
+// contracts, such as a trade-settlement keeper — permitted to invoke a
+// narrow set of privileged entry points that are not naturally scoped to a
+// single end-user's own `require_auth()` (e.g. recording provider fee
+// shares on their behalf, or pushing a network congestion signal). The
+// admin is always implicitly authorized for these entry points and does
+// not need to be added to this list.
+
+pub fn is_authorized_caller(env: &Env, caller: &Address) -> bool {
+    crud_get::<_, bool>(
+        env,
+        StorageTier::Instance,
+        &StorageKey::AuthorizedCaller(caller.clone()),
+    )
+    .unwrap_or(false)
+}
+
+pub fn set_authorized_caller(env: &Env, caller: &Address) {
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::AuthorizedCaller(caller.clone()),
+        &true,
+    );
+}
+
+pub fn remove_authorized_caller(env: &Env, caller: &Address) {
+    crud_remove(
+        env,
+        StorageTier::Instance,
+        &StorageKey::AuthorizedCaller(caller.clone()),
+    );
 }
 
 // --- Oracle Contract ---

@@ -1614,10 +1614,13 @@ mod slash_appeal_tests {
             &Symbol::new(&env, "violation"),
         );
 
-        let events_before = env.events().all().len();
         client.appeal_slash(&provider, &0u64, &String::from_str(&env, "ipfs://evidence"));
+        // `env.events().all()` only reflects the current top-level invocation
+        // (mirrors mainnet per-transaction event scoping), so it's compared
+        // against 0 rather than a "before" count captured from the prior
+        // `slash_stake` call.
         assert!(
-            env.events().all().len() > events_before,
+            !env.events().all().is_empty(),
             "slash_appealed event not emitted"
         );
     }
@@ -1867,10 +1870,12 @@ mod slash_appeal_tests {
         );
         client.appeal_slash(&provider, &0u64, &String::from_str(&env, "ipfs://evidence"));
 
-        let events_before = env.events().all().len();
         client.resolve_appeal(&0u64, &false);
+        // See `appeal_slash_emits_slash_appealed_event` — `env.events().all()`
+        // only reflects the current top-level invocation, so this checks for
+        // non-empty rather than comparing against a stale cross-call count.
         assert!(
-            env.events().all().len() > events_before,
+            !env.events().all().is_empty(),
             "appeal_resolved event not emitted"
         );
     }
@@ -2166,5 +2171,262 @@ mod slash_appeal_tests {
         // Now direct admin call succeeds again (auto-unwraps in mock auth)
         client.set_minimum_stake(&1_000_000i128);
         assert_eq!(client.get_minimum_stake(), 1_000_000);
+    }
+
+    // ── Issue #818: resolve_appeal must go through multi-sig ──────────────────
+    //
+    // Prior to this fix, `resolve_appeal` was the only privileged mutation in
+    // this contract that stayed admin-only even after `set_multisig_config`
+    // was set: it decides whether slashed funds are burned or restored, yet
+    // it skipped the `multisig::get_config(...).is_some()` guard every
+    // sibling entrypoint (pause, unpause, set_minimum_stake,
+    // set_minimum_stake_duration, configure_slash_tiers, set_appeal_window)
+    // enforces, and had no corresponding `action::*` tag wired into
+    // `execute_action`. A single admin key could therefore bypass approval
+    // entirely for a fund-moving decision.
+
+    /// Sets up a slash with a pending appeal, then enables multi-sig.
+    /// Returns (env, vault_id, provider, initial_balance, signers).
+    fn resolve_appeal_multisig_setup() -> (Env, Address, Address, i128, Vec<Address>) {
+        let (env, vault_id, token, admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let initial: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &initial);
+        seed(&env, &vault_id, &provider, initial);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        // Appeal window must be configured while still in single-admin mode.
+        client.set_appeal_window(&86_400u64);
+
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+        client.appeal_slash(
+            &provider,
+            &0u64,
+            &String::from_str(&env, "ipfs://Qm_evidence"),
+        );
+
+        // Now enable multi-sig — resolve_appeal must be gated from here on.
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let signer_c = Address::generate(&env);
+        let signers = soroban_sdk::vec![&env, signer_a, signer_b, signer_c];
+        let cfg = MultisigConfig {
+            signers: signers.clone(),
+            threshold: 2,
+            proposal_timeout_secs: 86_400,
+        };
+        client.set_multisig_config(&admin, &Some(cfg));
+
+        (env, vault_id, provider, initial, signers)
+    }
+
+    fn encode_resolve_appeal_payload(env: &Env, slash_id: u64, uphold: bool) -> Bytes {
+        let mut data = [0u8; 9];
+        data[0..8].copy_from_slice(&slash_id.to_le_bytes());
+        data[8] = if uphold { 1 } else { 0 };
+        encode_action(env, action::RESOLVE_APPEAL, &data)
+    }
+
+    #[test]
+    fn resolve_appeal_returns_requires_multisig_when_configured() {
+        let (env, vault_id, _provider, _initial, _signers) = resolve_appeal_multisig_setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        // Direct admin call must now be rejected — this is the gap being fixed.
+        let result = client.try_resolve_appeal(&0u64, &true);
+        assert_eq!(result, Err(Ok(StakeVaultError::RequiresMultisig)));
+    }
+
+    #[test]
+    fn execute_resolve_appeal_before_threshold_rejected() {
+        let (env, vault_id, _provider, _initial, signers) = resolve_appeal_multisig_setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        let payload = encode_resolve_appeal_payload(&env, 0u64, false);
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+
+        // Only 1 approval (the proposer's); threshold is 2.
+        let result = client.try_execute_action(&signers.get(0).unwrap(), &id);
+        assert_eq!(result, Err(Ok(StakeVaultError::Unauthorized)));
+
+        // Appeal must remain untouched while the proposal is unresolved.
+        let appeal = client.get_slash_appeal(&0u64).unwrap();
+        assert_eq!(appeal.status, AppealStatus::Pending);
+    }
+
+    #[test]
+    fn propose_approve_execute_resolve_appeal_restores_stake_after_threshold() {
+        let (env, vault_id, provider, initial, signers) = resolve_appeal_multisig_setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        // Minor severity slashed 5 % (50_000); reversal must restore it in full.
+        assert_eq!(client.get_stake(&provider), initial - 50_000);
+
+        let payload = encode_resolve_appeal_payload(&env, 0u64, false);
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+        let count = client.approve_action(&signers.get(1).unwrap(), &id);
+        assert_eq!(count, 2);
+
+        client.execute_action(&signers.get(0).unwrap(), &id);
+
+        assert_eq!(
+            client.get_stake(&provider),
+            initial,
+            "stake must be fully restored once the multisig-approved reversal executes"
+        );
+        let appeal = client.get_slash_appeal(&0u64).unwrap();
+        assert_eq!(appeal.status, AppealStatus::Reversed);
+
+        // Re-executing the same proposal must fail (already-executed guard).
+        let result = client.try_execute_action(&signers.get(0).unwrap(), &id);
+        assert_eq!(result, Err(Ok(StakeVaultError::EmergencyRequestNotFound)));
+    }
+
+    #[test]
+    fn propose_approve_execute_resolve_appeal_uphold_burns_funds() {
+        let (env, vault_id, provider, initial, signers) = resolve_appeal_multisig_setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        let payload = encode_resolve_appeal_payload(&env, 0u64, true);
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+        let _ = client.approve_action(&signers.get(1).unwrap(), &id);
+        client.execute_action(&signers.get(0).unwrap(), &id);
+
+        let appeal = client.get_slash_appeal(&0u64).unwrap();
+        assert_eq!(appeal.status, AppealStatus::Upheld);
+        // Provider's stake stays reduced by the slash (funds were burned, not restored).
+        assert_eq!(client.get_stake(&provider), initial - 50_000);
+    }
+}
+
+// ── Issue #786: Unstake queue size cap ──────────────────────────────────────────
+
+mod unstake_queue_cap_tests {
+    use crate::{
+        migration::{MigrationKey, StakeInfoV2},
+        StakeVaultContract, StakeVaultContractClient, StakeVaultError,
+    };
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Address, Env, Map};
+
+    fn sac_token(env: &Env, admin: &Address) -> Address {
+        env.register_stellar_asset_contract_v2(admin.clone())
+            .address()
+    }
+
+    fn seed(env: &Env, contract_id: &Address, staker: &Address, balance: i128) {
+        env.as_contract(contract_id, || {
+            let mut stakes: Map<Address, StakeInfoV2> = env
+                .storage()
+                .persistent()
+                .get(&MigrationKey::StakesV2)
+                .unwrap_or_else(|| Map::new(env));
+            stakes.set(
+                staker.clone(),
+                StakeInfoV2 {
+                    balance,
+                    locked_until: 0,
+                    last_updated: env.ledger().timestamp(),
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&MigrationKey::StakesV2, &stakes);
+        });
+    }
+
+    fn setup() -> (Env, Address, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let signal_registry = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token, &signal_registry);
+        (env, vault_id, token, admin, signal_registry)
+    }
+
+    #[test]
+    fn default_max_queue_size_is_two_hundred() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.get_max_unstake_queue_size(), 200);
+    }
+
+    #[test]
+    fn enqueue_below_cap_succeeds() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_max_unstake_queue_size(&2);
+
+        let staker_a = Address::generate(&env);
+        let staker_b = Address::generate(&env);
+        seed(&env, &vault_id, &staker_a, 1_000_000);
+        seed(&env, &vault_id, &staker_b, 1_000_000);
+
+        assert_eq!(client.queue_unstake(&staker_a), 0);
+        assert_eq!(client.queue_unstake(&staker_b), 1);
+    }
+
+    #[test]
+    fn enqueue_at_cap_is_rejected() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_max_unstake_queue_size(&2);
+
+        let staker_a = Address::generate(&env);
+        let staker_b = Address::generate(&env);
+        let staker_c = Address::generate(&env);
+        seed(&env, &vault_id, &staker_a, 1_000_000);
+        seed(&env, &vault_id, &staker_b, 1_000_000);
+        seed(&env, &vault_id, &staker_c, 1_000_000);
+
+        client.queue_unstake(&staker_a);
+        client.queue_unstake(&staker_b);
+
+        // Queue is now at the cap (2 entries) — the next enqueue must be rejected.
+        let result = client.try_queue_unstake(&staker_c);
+        assert_eq!(result, Err(Ok(StakeVaultError::QueueFull)));
+    }
+
+    #[test]
+    fn lowering_cap_below_current_length_keeps_existing_entries_but_blocks_new_ones() {
+        let (env, vault_id, token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_max_unstake_queue_size(&5);
+
+        let staker_a = Address::generate(&env);
+        let staker_b = Address::generate(&env);
+        let staker_c = Address::generate(&env);
+        seed(&env, &vault_id, &staker_a, 1_000_000);
+        seed(&env, &vault_id, &staker_b, 1_000_000);
+        seed(&env, &vault_id, &staker_c, 1_000_000);
+
+        client.queue_unstake(&staker_a);
+        client.queue_unstake(&staker_b);
+        client.queue_unstake(&staker_c);
+
+        // Lower the cap below the current queue length (3).
+        client.set_max_unstake_queue_size(&2);
+
+        // Existing entries are untouched — positions still resolve correctly.
+        assert_eq!(client.get_queue_position(&staker_a), Some(0));
+        assert_eq!(client.get_queue_position(&staker_b), Some(1));
+        assert_eq!(client.get_queue_position(&staker_c), Some(2));
+
+        // A brand-new enqueue is rejected while the queue sits above the new cap.
+        let staker_d = Address::generate(&env);
+        seed(&env, &vault_id, &staker_d, 1_000_000);
+        let result = client.try_queue_unstake(&staker_d);
+        assert_eq!(result, Err(Ok(StakeVaultError::QueueFull)));
+
+        // The existing entries still process normally despite being over the new cap.
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &3_000_000);
+        assert_eq!(client.process_unstake_queue(&3), 3);
     }
 }

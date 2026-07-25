@@ -1,0 +1,39 @@
+{
+  "_comment": "Deployment manifest for testnet (Issue #822). Validated by stellar-swipe/scripts/validate_deployment_manifest.py before scripts/deploy_testnet.sh runs, and in CI. 'address' is null until a contract has actually been deployed (see deployments/testnet.json, generated at deploy time) — fill it in once known so later re-validations also check it. 'version' tracks the contract's on-chain version constant (see stellar-swipe/contracts/shared/src/version.rs); 'depends_on' declares the minimum compatible version of another contract in this manifest that this contract calls cross-contract, mirroring the runtime shared::version::validate_callee_version check.",
+  "network": "testnet",
+  "admin": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+  "contracts": {
+    "stake_vault": {
+      "package": "stake_vault",
+      "address": null,
+      "version": 2,
+      "depends_on": {}
+    },
+    "signal_registry": {
+      "package": "signal_registry",
+      "address": null,
+      "version": 2,
+      "depends_on": {}
+    },
+    "fee_collector": {
+      "package": "fee_collector",
+      "address": null,
+      "version": 2,
+      "depends_on": {}
+    },
+    "user_portfolio": {
+      "package": "auto_trade",
+      "address": null,
+      "version": 2,
+      "depends_on": {}
+    },
+    "trade_executor": {
+      "package": "bridge",
+      "address": null,
+      "version": 1,
+      "depends_on": {
+        "user_portfolio": { "min_version": 2 }
+      }
+    }
+  }
+}

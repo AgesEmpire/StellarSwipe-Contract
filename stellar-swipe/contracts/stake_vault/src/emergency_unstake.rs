@@ -5,9 +5,10 @@
 //! Approved executions apply a configurable penalty (basis points of stake).
 //! Requests that time out without enough approvals expire and must be resubmitted.
 
-use soroban_sdk::{contracttype, symbol_short, token, Address, Env, Vec};
+use soroban_sdk::{contracttype, token, Address, Env, Vec};
 
 use crate::{
+    events,
     migration::{MigrationKey, StakeInfoV2},
     StakeVaultError, StorageKey,
 };
@@ -100,11 +101,7 @@ pub fn configure(
         .instance()
         .set(&StorageKey::EmergencyMultiSigConfig, &cfg);
 
-    #[allow(deprecated)]
-    env.events().publish(
-        (symbol_short!("stake_v"), symbol_short!("emg_cfg")),
-        (required, penalty_bps, timeout_secs),
-    );
+    events::emit_emergency_configured(env, required, penalty_bps, timeout_secs);
     Ok(())
 }
 
@@ -124,11 +121,7 @@ pub fn request(env: &Env, staker: &Address) -> Result<(), StakeVaultError> {
     };
     save_request(env, &req);
 
-    #[allow(deprecated)]
-    env.events().publish(
-        (symbol_short!("stake_v"), symbol_short!("emg_req")),
-        staker.clone(),
-    );
+    events::emit_emergency_requested(env, staker.clone());
     Ok(())
 }
 
@@ -174,11 +167,7 @@ pub fn approve(
 
     req.approvals.push_back(signer.clone());
 
-    #[allow(deprecated)]
-    env.events().publish(
-        (symbol_short!("stake_v"), symbol_short!("emg_appr")),
-        (staker.clone(), signer.clone(), req.approvals.len()),
-    );
+    events::emit_emergency_approved(env, staker.clone(), signer.clone(), req.approvals.len());
 
     if req.approvals.len() >= cfg.required {
         // Execute the early unstake with penalty.
@@ -203,11 +192,7 @@ pub fn expire_request(env: &Env, staker: &Address) -> Result<(), StakeVaultError
 
     remove_request(env, staker);
 
-    #[allow(deprecated)]
-    env.events().publish(
-        (symbol_short!("stake_v"), symbol_short!("emg_exp")),
-        staker.clone(),
-    );
+    events::emit_emergency_expired(env, staker.clone());
     Ok(())
 }
 
@@ -257,11 +242,7 @@ fn execute_early_unstake(
         .persistent()
         .set(&MigrationKey::StakesV2, &stakes);
 
-    #[allow(deprecated)]
-    env.events().publish(
-        (symbol_short!("stake_v"), symbol_short!("emg_exec")),
-        (staker.clone(), gross, penalty, net),
-    );
+    events::emit_emergency_executed(env, staker.clone(), gross, penalty, net);
 
     // Burn the penalty portion, transfer the net to the staker.
     let token = token::Client::new(env, token_addr);
