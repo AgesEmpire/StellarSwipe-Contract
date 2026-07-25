@@ -1,8 +1,11 @@
 extern crate std;
 
 use crate::distribution::{DistributionRecipients, YEAR_SECONDS};
-use crate::proposals::{ProposalCategory, ProposalType, VoteType as GovernanceVoteType};
-use crate::{GovernanceContract, GovernanceContractClient, GovernanceError};
+use crate::proposals::{
+    GovernanceConfig, ProposalCategory, ProposalStatus, ProposalType,
+    VoteType as GovernanceVoteType,
+};
+use crate::{GovernanceContract, GovernanceContractClient, GovernanceError, ShadowModeResult};
 use soroban_sdk::testutils::{Address as _, Events, Ledger};
 use soroban_sdk::{Address, Bytes, Env, String, Symbol, TryFromVal, Val};
 use stellar_swipe_common::Asset;
@@ -357,6 +360,211 @@ fn shadow_mode_cancel() {
 
     client.cancel_shadow_mode(&admin);
     assert!(!client.is_in_shadow_mode());
+}
+
+// ── Issue #797: Structured events from shadow-mode proposal dry-run ─────────
+
+/// Look for a `shadow/sim_done` event and, if found, decode its payload as a
+/// `ShadowModeResult`.
+///
+/// Note: the test harness's `env.events().all()` only surfaces events from
+/// the most recent top-level contract invocation, so callers must invoke
+/// this immediately after the `simulate_proposal` call, before making any
+/// further client call.
+fn find_shadow_sim_event(env: &Env) -> Option<ShadowModeResult> {
+    env.events().all().iter().find_map(|(_, topics, data)| {
+        let t0 = topics
+            .get(0)
+            .and_then(|v: Val| Symbol::try_from_val(env, &v).ok());
+        let t1 = topics
+            .get(1)
+            .and_then(|v: Val| Symbol::try_from_val(env, &v).ok());
+        if t0 == Some(Symbol::new(env, "shadow")) && t1 == Some(Symbol::new(env, "sim_done")) {
+            ShadowModeResult::try_from_val(env, &data).ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn nonzero_execution_delay_config() -> GovernanceConfig {
+    GovernanceConfig {
+        min_proposal_threshold: 1_000,
+        voting_period: 7 * 86_400,
+        voting_delay: 60,
+        quorum_threshold: 1_000,
+        approval_threshold: 5_000,
+        execution_delay: 60,
+        discussion_duration: 0,
+    }
+}
+
+#[test]
+fn simulate_proposal_success_emits_event_and_writes_no_state() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    // A non-zero execution delay keeps `finalize_proposal` from
+    // auto-executing on success, so the proposal stays `Succeeded` — the
+    // shape the real `execute_proposal` preconditions expect.
+    client.configure_governance(&admin, &nonzero_execution_delay_config());
+
+    client.stake(&r.community_rewards, &120_000_000i128);
+    client.stake(&r.public_sale, &40_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &r.community_rewards,
+        &ProposalType::ParameterChange(String::from_str(&env, "liquidity_reward_bps"), 100, 120),
+        &String::from_str(&env, "Adjust reward"),
+        &String::from_str(&env, "Increase by 20%"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+
+    env.ledger().set_timestamp(70);
+    client.cast_vote(
+        &proposal_id,
+        &r.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    client.cast_vote(&proposal_id, &r.public_sale, &GovernanceVoteType::For);
+
+    env.ledger().set_timestamp(8 * 86_400);
+    assert_eq!(
+        client.finalize_proposal(&proposal_id),
+        ProposalStatus::Succeeded
+    );
+
+    // Past the 60s execution delay, still inside the 7-day execution window.
+    env.ledger().set_timestamp(8 * 86_400 + 61);
+
+    let result = client.simulate_proposal(&proposal_id);
+    assert!(result.success);
+    assert!(result.failure_reason.is_none());
+    assert!(!result.simulated_state_changes.is_empty());
+    assert_eq!(result.proposal_id, proposal_id);
+
+    let evt = find_shadow_sim_event(&env).expect("expected a shadow/sim_done event");
+
+    // No persistent state was written by the dry-run: the proposal must
+    // still read as `Succeeded` — `execute_proposal` would have flipped it
+    // to `Executed` and applied the parameter change.
+    let proposal_after = client.proposal(&proposal_id);
+    assert_eq!(proposal_after.status, ProposalStatus::Succeeded);
+    assert_eq!(evt.proposal_id, proposal_id);
+    assert!(evt.success);
+    assert!(evt.failure_reason.is_none());
+    assert!(!evt.simulated_state_changes.is_empty());
+}
+
+#[test]
+fn simulate_proposal_failure_emits_event_with_reason_and_writes_no_state() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    client.stake(&r.community_rewards, &120_000_000i128);
+    client.stake(&r.public_sale, &40_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &r.community_rewards,
+        &ProposalType::ParameterChange(String::from_str(&env, "liquidity_reward_bps"), 100, 120),
+        &String::from_str(&env, "Adjust reward"),
+        &String::from_str(&env, "Increase by 20%"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+
+    // The proposal is still `Pending` (voting has neither started nor been
+    // finalised) — `execute_proposal` would reject it outright, so the
+    // dry-run must report `success = false` with a populated reason.
+    let result = client.simulate_proposal(&proposal_id);
+    assert!(!result.success);
+    assert!(result.failure_reason.is_some());
+    assert_eq!(result.proposal_id, proposal_id);
+
+    // `env.events().all()` in the test harness only surfaces events from the
+    // most recent top-level contract invocation, so this must be captured
+    // before any further client call is made.
+    let evt = find_shadow_sim_event(&env).expect("expected a shadow/sim_done event");
+    assert_eq!(evt.proposal_id, proposal_id);
+    assert!(!evt.success);
+    assert!(evt.failure_reason.is_some());
+
+    // No persistent state was written: the proposal must still read as
+    // `Pending`, untouched by the dry-run.
+    let proposal_after = client.proposal(&proposal_id);
+    assert_eq!(proposal_after.status, ProposalStatus::Pending);
+}
+
+#[test]
+fn simulate_proposal_treasury_spend_insufficient_balance_reports_failure() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    client.configure_governance(&admin, &nonzero_execution_delay_config());
+    client.stake(&r.community_rewards, &120_000_000i128);
+    client.stake(&r.public_sale, &40_000_000i128);
+
+    // `validate_proposal` requires `amount <= balance / 10` at *creation*
+    // time (a headroom check, separate from the balance check `execute_proposal`
+    // performs at execution time), so the treasury must start well-funded —
+    // mirrors `queue_underfunded_treasury_spend_action` in test.rs.
+    let spend_asset = asset(&env);
+    client.set_treasury_asset(&admin, &spend_asset, &10_000i128);
+
+    let proposal_id = client.create_proposal(
+        &r.community_rewards,
+        &ProposalType::TreasurySpend(
+            r.public_sale.clone(),
+            500i128,
+            spend_asset,
+            String::from_str(&env, "overspend"),
+        ),
+        &String::from_str(&env, "Spend more than the treasury holds"),
+        &String::from_str(&env, "Should fail simulation"),
+        &Bytes::new(&env),
+        &ProposalCategory::TreasuryTransfer,
+        &false,
+    );
+
+    env.ledger().set_timestamp(70);
+    client.cast_vote(
+        &proposal_id,
+        &r.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    client.cast_vote(&proposal_id, &r.public_sale, &GovernanceVoteType::For);
+
+    env.ledger().set_timestamp(8 * 86_400);
+    assert_eq!(
+        client.finalize_proposal(&proposal_id),
+        ProposalStatus::Succeeded
+    );
+    env.ledger().set_timestamp(8 * 86_400 + 61);
+
+    // Drain the treasury after approval — mirrors the real-world scenario
+    // the emergency timelock path is designed for (queue_underfunded_*
+    // helper in test.rs), except here it must surface as a *simulated*
+    // failure instead of a real, storage-mutating one.
+    client.set_treasury_asset(&admin, &asset(&env), &0i128);
+
+    let result = client.simulate_proposal(&proposal_id);
+    assert!(!result.success);
+    assert!(result.failure_reason.is_some());
+
+    let evt = find_shadow_sim_event(&env).expect("expected a shadow/sim_done event");
+    assert!(!evt.success);
+    assert!(evt.failure_reason.is_some());
+
+    // The proposal is still `Succeeded`, not `Executed`, and the treasury
+    // balance the simulation read is unchanged by the call itself.
+    let proposal_after = client.proposal(&proposal_id);
+    assert_eq!(proposal_after.status, ProposalStatus::Succeeded);
 }
 
 // ── Issue #592: Storage tier classification ───────────────────────────────────

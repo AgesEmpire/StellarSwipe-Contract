@@ -79,7 +79,7 @@ use reputation::{
     record_proposal_outcome, record_vote, refresh_stale_reputation, resolve_staleness, Badge,
     GovernanceReputation, ReputationConfig, ReputationTier, StalenessLevel,
 };
-pub use shadow_mode::ShadowModeState;
+pub use shadow_mode::{ShadowModeResult, ShadowModeState};
 use shared::pausable;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Map, String, Symbol,
@@ -1195,6 +1195,24 @@ impl GovernanceContract {
     pub fn cancel_shadow_mode(env: Env, admin: Address) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
         shadow_mode::cancel_shadow_mode(&env, &admin)
+    }
+
+    // ── Issue #797: Structured events from shadow-mode proposal dry-run ────────
+
+    /// Read-only dry-run of a proposal's execution outcome.
+    ///
+    /// Simulates whether `proposal_id` would execute successfully right now
+    /// and what state it would change, without writing anything to
+    /// persistent storage. Always emits a `shadow/sim_done` event carrying a
+    /// `ShadowModeResult` (with `success = false` and a `failure_reason` when
+    /// the proposal would not currently execute), so indexers and dashboards
+    /// can observe simulated outcomes independently of the return value.
+    pub fn simulate_proposal(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ShadowModeResult, GovernanceError> {
+        require_initialized(&env)?;
+        shadow_mode::simulate_proposal(&env, proposal_id)
     }
 
     pub fn stake(env: Env, user: Address, amount: i128) -> Result<(), GovernanceError> {
