@@ -1614,10 +1614,13 @@ mod slash_appeal_tests {
             &Symbol::new(&env, "violation"),
         );
 
-        let events_before = env.events().all().len();
         client.appeal_slash(&provider, &0u64, &String::from_str(&env, "ipfs://evidence"));
+        // `env.events().all()` only reflects the current top-level invocation
+        // (mirrors mainnet per-transaction event scoping), so it's compared
+        // against 0 rather than a "before" count captured from the prior
+        // `slash_stake` call.
         assert!(
-            env.events().all().len() > events_before,
+            !env.events().all().is_empty(),
             "slash_appealed event not emitted"
         );
     }
@@ -1867,10 +1870,12 @@ mod slash_appeal_tests {
         );
         client.appeal_slash(&provider, &0u64, &String::from_str(&env, "ipfs://evidence"));
 
-        let events_before = env.events().all().len();
         client.resolve_appeal(&0u64, &false);
+        // See `appeal_slash_emits_slash_appealed_event` — `env.events().all()`
+        // only reflects the current top-level invocation, so this checks for
+        // non-empty rather than comparing against a stale cross-call count.
         assert!(
-            env.events().all().len() > events_before,
+            !env.events().all().is_empty(),
             "appeal_resolved event not emitted"
         );
     }

@@ -56,6 +56,28 @@ pub const TOPIC_DEPOSIT_FORFEITED: fn() -> Symbol = || symbol_short!("forfeit");
 pub const TOPIC_STAKE_PAUSED: fn() -> Symbol = || symbol_short!("paused");
 pub const TOPIC_STAKE_UNPAUSED: fn() -> Symbol = || symbol_short!("unpaused");
 pub const TOPIC_STAKE_BELOW_MIN: fn() -> Symbol = || symbol_short!("blwmin");
+pub const TOPIC_STAKE_TIER_UP: fn() -> Symbol = || symbol_short!("tier_up");
+pub const TOPIC_STAKE_TIER_DOWN: fn() -> Symbol = || symbol_short!("tier_dn");
+pub const TOPIC_STAKE_MIN_DURATION: fn() -> Symbol = || Symbol::short("mindur");
+pub const TOPIC_STAKE_WITHDRAWAL_REQ: fn() -> Symbol = || Symbol::short("wdreq");
+pub const TOPIC_STAKE_WITHDRAWAL_COOLDOWN: fn() -> Symbol = || Symbol::short("wdcool");
+pub const TOPIC_STAKE_FLASH_LOAN: fn() -> Symbol = || Symbol::short("flashln");
+pub const TOPIC_STAKE_SLASH_TIERS: fn() -> Symbol = || Symbol::short("slashcfg");
+pub const TOPIC_STAKE_SLASHED: fn() -> Symbol = || symbol_short!("slashed");
+pub const TOPIC_STAKE_PARTIAL_UNSTAKE: fn() -> Symbol = || Symbol::short("prtunstk");
+pub const TOPIC_STAKE_APPEAL_WINDOW: fn() -> Symbol = || Symbol::short("apwindow");
+pub const TOPIC_STAKE_APPEALED: fn() -> Symbol = || Symbol::short("appealed");
+pub const TOPIC_STAKE_APPEAL_RESOLVED: fn() -> Symbol = || Symbol::short("apresolv");
+pub const TOPIC_STAKE_DELEGATED: fn() -> Symbol = || Symbol::short("delegate");
+pub const TOPIC_STAKE_UNSTAKE_QUEUED: fn() -> Symbol = || Symbol::short("ustkqueu");
+pub const TOPIC_STAKE_UNSTAKE_PROCESSED: fn() -> Symbol = || Symbol::short("ustkproc");
+pub const TOPIC_STAKE_BATCH_SLASH: fn() -> Symbol = || Symbol::short("batchslh");
+pub const TOPIC_STAKE_BATCH_APPEALS: fn() -> Symbol = || Symbol::short("batchapl");
+pub const TOPIC_STAKE_EMERGENCY_CFG: fn() -> Symbol = || Symbol::short("emgcfg");
+pub const TOPIC_STAKE_EMERGENCY_REQ: fn() -> Symbol = || Symbol::short("emgreq");
+pub const TOPIC_STAKE_EMERGENCY_APPROVED: fn() -> Symbol = || Symbol::short("emgappr");
+pub const TOPIC_STAKE_EMERGENCY_EXPIRED: fn() -> Symbol = || Symbol::short("emgexp");
+pub const TOPIC_STAKE_EMERGENCY_EXECUTED: fn() -> Symbol = || Symbol::short("emgexec");
 
 #[cfg(test)]
 mod tests {
@@ -109,5 +131,27 @@ mod tests {
         let _ = TOPIC_STAKE_PAUSED();
         let _ = TOPIC_STAKE_UNPAUSED();
         let _ = TOPIC_STAKE_BELOW_MIN();
+        let _ = TOPIC_STAKE_TIER_UP();
+        let _ = TOPIC_STAKE_TIER_DOWN();
+        let _ = TOPIC_STAKE_MIN_DURATION();
+        let _ = TOPIC_STAKE_WITHDRAWAL_REQ();
+        let _ = TOPIC_STAKE_WITHDRAWAL_COOLDOWN();
+        let _ = TOPIC_STAKE_FLASH_LOAN();
+        let _ = TOPIC_STAKE_SLASH_TIERS();
+        let _ = TOPIC_STAKE_SLASHED();
+        let _ = TOPIC_STAKE_PARTIAL_UNSTAKE();
+        let _ = TOPIC_STAKE_APPEAL_WINDOW();
+        let _ = TOPIC_STAKE_APPEALED();
+        let _ = TOPIC_STAKE_APPEAL_RESOLVED();
+        let _ = TOPIC_STAKE_DELEGATED();
+        let _ = TOPIC_STAKE_UNSTAKE_QUEUED();
+        let _ = TOPIC_STAKE_UNSTAKE_PROCESSED();
+        let _ = TOPIC_STAKE_BATCH_SLASH();
+        let _ = TOPIC_STAKE_BATCH_APPEALS();
+        let _ = TOPIC_STAKE_EMERGENCY_CFG();
+        let _ = TOPIC_STAKE_EMERGENCY_REQ();
+        let _ = TOPIC_STAKE_EMERGENCY_APPROVED();
+        let _ = TOPIC_STAKE_EMERGENCY_EXPIRED();
+        let _ = TOPIC_STAKE_EMERGENCY_EXECUTED();
     }
 }

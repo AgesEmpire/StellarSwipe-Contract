@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod emergency_unstake;
+pub mod events;
 pub mod migration;
 
 use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
@@ -55,8 +56,12 @@ const EXECUTION_LOCK: &str = "WithdrawLock";
 /// 24 hours in seconds — grace period for providers to top up stake.
 const GRACE_PERIOD_SECS: u64 = 86_400;
 
-/// 1 hour time-lock for large withdrawals (flash loan prevention).
+/// Default time-lock for large withdrawals (flash loan prevention), used until
+/// an admin configures a custom value via `set_withdrawal_cooldown` (issue #816).
 const LARGE_WITHDRAWAL_TIMELOCK_SECS: u64 = 3_600;
+
+/// Upper bound on the configurable withdrawal cooldown (issue #816): 30 days.
+const MAX_WITHDRAWAL_COOLDOWN_SECS: u64 = 2_592_000;
 
 /// Threshold above which a withdrawal is considered "large" and requires time-lock.
 /// Set to SILVER tier (500M = 5 * 10^8 stroops).
@@ -82,6 +87,36 @@ fn stake_tier_for_amount(amount: i128) -> u32 {
     }
 }
 
+/// Validates slash tier basis points (issue #816): each value must be within
+/// `[0, 10_000]` and severity must be non-decreasing (minor <= major <= critical)
+/// so a "worse" violation can never slash a smaller fraction than a lesser one.
+fn validate_slash_tiers(minor_bps: u32, major_bps: u32, critical_bps: u32) -> Result<(), StakeVaultError> {
+    if minor_bps > 10_000 || major_bps > 10_000 || critical_bps > 10_000 {
+        return Err(StakeVaultError::InvalidSlashTier);
+    }
+    if minor_bps > major_bps || major_bps > critical_bps {
+        return Err(StakeVaultError::InvalidSlashTierOrder);
+    }
+    Ok(())
+}
+
+/// Validates a configurable withdrawal cooldown (issue #816): bounded to
+/// `[0, MAX_WITHDRAWAL_COOLDOWN_SECS]`. Zero disables the time-lock delay
+/// entirely (a large withdrawal request becomes immediately actionable).
+fn validate_cooldown(cooldown_secs: u64) -> Result<(), StakeVaultError> {
+    if cooldown_secs > MAX_WITHDRAWAL_COOLDOWN_SECS {
+        return Err(StakeVaultError::InvalidCooldown);
+    }
+    Ok(())
+}
+
+fn get_withdrawal_cooldown_secs(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::WithdrawalCooldownSecs)
+        .unwrap_or(LARGE_WITHDRAWAL_TIMELOCK_SECS)
+}
+
 fn emit_provider_tier_change(
     env: &Env,
     provider: &Address,
@@ -92,18 +127,7 @@ fn emit_provider_tier_change(
     if old_tier == new_tier {
         return;
     }
-
-    let topic = if new_tier > old_tier {
-        "provider_tier_upgraded"
-    } else {
-        "provider_tier_downgraded"
-    };
-
-    #[allow(deprecated)]
-    env.events().publish(
-        (Symbol::new(env, topic),),
-        (provider.clone(), old_tier, new_tier, stake_balance),
-    );
+    events::emit_provider_tier_changed(env, provider.clone(), old_tier, new_tier, stake_balance);
 }
 
 #[contracttype]
@@ -157,6 +181,10 @@ pub enum StorageKey {
     SlashAppeal(u64),
     SlashedFundsHeld(u64),
     AppealWindowSecs,
+    // ── Issue #816: configurable withdrawal cooldown ───────────────────────────
+    /// Admin-configurable large-withdrawal time-lock duration (seconds).
+    /// Falls back to `LARGE_WITHDRAWAL_TIMELOCK_SECS` when unset.
+    WithdrawalCooldownSecs,
 }
 
 #[contracterror]
@@ -296,6 +324,7 @@ mod action {
     pub const SET_MINIMUM_STAKE_DURATION: u8 = 3;
     pub const CONFIGURE_SLASH_TIERS: u8 = 4;
     pub const SET_APPEAL_WINDOW: u8 = 5;
+    pub const SET_WITHDRAWAL_COOLDOWN: u8 = 6;
 }
 
 fn encode_action(env: &Env, tag: u8, data: &[u8]) -> Bytes {
@@ -606,14 +635,7 @@ impl StakeVaultContract {
         env.storage()
             .instance()
             .set(&StorageKey::MinimumStakeDuration, &duration_secs);
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "min_stake_duration_updated"),
-            ),
-            (duration_secs,),
-        );
+        events::emit_min_stake_duration_updated(&env, duration_secs);
         Ok(())
     }
 
@@ -774,9 +796,7 @@ impl StakeVaultContract {
                 let minor = decode_i128_from_bytes(&env, &payload, 1) as u32;
                 let major = decode_i128_from_bytes(&env, &payload, 17) as u32;
                 let critical = decode_i128_from_bytes(&env, &payload, 33) as u32;
-                if minor > 10_000 || major > 10_000 || critical > 10_000 {
-                    return Err(StakeVaultError::InvalidSlashTier);
-                }
+                validate_slash_tiers(minor, major, critical)?;
                 let cfg = SlashTierConfig {
                     minor_bps: minor,
                     major_bps: major,
@@ -800,6 +820,19 @@ impl StakeVaultContract {
                 env.storage()
                     .instance()
                     .set(&StorageKey::AppealWindowSecs, &window);
+            }
+            action::SET_WITHDRAWAL_COOLDOWN => {
+                let mut buf = [0u8; 8];
+                let mut i = 0;
+                while i < 8 {
+                    buf[i] = payload.get(1 + i as u32).unwrap_or(0);
+                    i += 1;
+                }
+                let cooldown = u64::from_le_bytes(buf);
+                validate_cooldown(cooldown)?;
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::WithdrawalCooldownSecs, &cooldown);
             }
             _ => return Err(StakeVaultError::Unauthorized),
         }
@@ -838,14 +871,7 @@ impl StakeVaultContract {
             let now = env.ledger().timestamp();
             env.storage().persistent().set(&key, &now);
 
-            #[allow(deprecated)]
-            env.events().publish(
-                (
-                    Symbol::new(&env, "stake_vault"),
-                    Symbol::new(&env, "stake_below_min"),
-                ),
-                (provider, current_stake, minimum),
-            );
+            events::emit_stake_below_min(&env, provider, current_stake, minimum);
         }
     }
 
@@ -888,12 +914,45 @@ impl StakeVaultContract {
             .get(&StorageKey::StakeBelowMinSince(provider))
     }
 
-    // ── Large-withdrawal time-lock ─────────────────────────────────────────────
+    // ── Large-withdrawal time-lock (issue #816: configurable cooldown) ─────────
+
+    /// Admin: configure the large-withdrawal cooldown duration (seconds).
+    ///
+    /// Bounded to `[0, MAX_WITHDRAWAL_COOLDOWN_SECS]`. `0` disables the delay —
+    /// a large withdrawal becomes actionable immediately after `request_withdrawal`.
+    /// Falls back to the built-in default (1 hour) until this is called.
+    ///
+    /// When multi-sig is configured use `execute_action` with action
+    /// [`action::SET_WITHDRAWAL_COOLDOWN`] instead.
+    pub fn set_withdrawal_cooldown(env: Env, cooldown_secs: u64) -> Result<(), StakeVaultError> {
+        if multisig::get_config(&env).is_some() {
+            return Err(StakeVaultError::RequiresMultisig);
+        }
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        validate_cooldown(cooldown_secs)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::WithdrawalCooldownSecs, &cooldown_secs);
+        events::emit_withdrawal_cooldown_updated(&env, cooldown_secs);
+        Ok(())
+    }
+
+    /// Returns the configured large-withdrawal cooldown in seconds. Defaults to
+    /// the built-in 1-hour timelock until an admin sets a custom value.
+    pub fn get_withdrawal_cooldown(env: Env) -> u64 {
+        get_withdrawal_cooldown_secs(&env)
+    }
 
     /// Initiate a time-locked withdrawal request for a large stake.
     ///
-    /// After calling this, the staker must wait `LARGE_WITHDRAWAL_TIMELOCK_SECS`
-    /// before `withdraw_stake` will succeed for amounts >= `LARGE_WITHDRAWAL_THRESHOLD`.
+    /// After calling this, the staker must wait for the configured withdrawal
+    /// cooldown (see [`Self::get_withdrawal_cooldown`]) before `withdraw_stake`
+    /// will succeed for amounts >= `LARGE_WITHDRAWAL_THRESHOLD`.
     pub fn request_withdrawal(env: Env, staker: Address) -> Result<(), StakeVaultError> {
         staker.require_auth();
         Self::require_not_paused(&env)?;
@@ -910,23 +969,18 @@ impl StakeVaultContract {
             &now,
         );
 
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "withdrawal_requested"),
-            ),
-            (staker, balance, now + LARGE_WITHDRAWAL_TIMELOCK_SECS),
-        );
+        let cooldown = get_withdrawal_cooldown_secs(&env);
+        events::emit_withdrawal_requested(&env, staker, balance, now.saturating_add(cooldown));
 
         Ok(())
     }
 
     pub fn get_withdrawal_unlock_time(env: Env, staker: Address) -> Option<u64> {
+        let cooldown = get_withdrawal_cooldown_secs(&env);
         env.storage()
             .persistent()
             .get::<_, u64>(&StorageKey::LargeWithdrawalRequestedAt(staker))
-            .map(|t| t + LARGE_WITHDRAWAL_TIMELOCK_SECS)
+            .map(|t| t.saturating_add(cooldown))
     }
 
     // ── Withdraw ───────────────────────────────────────────────────────────────
@@ -1029,14 +1083,7 @@ impl StakeVaultContract {
             .unwrap_or(0);
         if last_stake_ledger == current_ledger && current_ledger != 0 {
             // Emit alert event for monitoring system.
-            #[allow(deprecated)]
-            env.events().publish(
-                (
-                    Symbol::new(env, "stake_vault"),
-                    Symbol::new(env, "flash_loan_attempt"),
-                ),
-                (staker.clone(), info.balance, current_ledger),
-            );
+            events::emit_flash_loan_attempt(env, staker.clone(), info.balance, current_ledger);
             return Err(StakeVaultError::FlashLoanDetected);
         }
 
@@ -1048,7 +1095,7 @@ impl StakeVaultContract {
                 .get(&StorageKey::LargeWithdrawalRequestedAt(staker.clone()))
                 .ok_or(StakeVaultError::TimelockRequired)?;
 
-            if now < requested_at.saturating_add(LARGE_WITHDRAWAL_TIMELOCK_SECS) {
+            if now < requested_at.saturating_add(get_withdrawal_cooldown_secs(env)) {
                 return Err(StakeVaultError::TimelockNotElapsed);
             }
 
@@ -1191,14 +1238,7 @@ impl StakeVaultContract {
             .get::<_, u32>(&StorageKey::LastStakeLedger(staker.clone()))
             .unwrap_or(0);
         if last_stake_ledger == current_ledger && current_ledger != 0 {
-            #[allow(deprecated)]
-            env.events().publish(
-                (
-                    Symbol::new(env, "stake_vault"),
-                    Symbol::new(env, "flash_loan_attempt"),
-                ),
-                (staker.clone(), info.balance, current_ledger),
-            );
+            events::emit_flash_loan_attempt(env, staker.clone(), info.balance, current_ledger);
             return Err(StakeVaultError::FlashLoanDetected);
         }
 
@@ -1210,7 +1250,7 @@ impl StakeVaultContract {
                 .get(&StorageKey::LargeWithdrawalRequestedAt(staker.clone()))
                 .ok_or(StakeVaultError::TimelockRequired)?;
 
-            if now < requested_at.saturating_add(LARGE_WITHDRAWAL_TIMELOCK_SECS) {
+            if now < requested_at.saturating_add(get_withdrawal_cooldown_secs(env)) {
                 return Err(StakeVaultError::TimelockNotElapsed);
             }
 
@@ -1251,14 +1291,7 @@ impl StakeVaultContract {
 
         emit_provider_tier_change(env, staker, old_tier, new_tier, remaining);
 
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(env, "stake_vault"),
-                Symbol::new(env, "partial_unstake"),
-            ),
-            (staker.clone(), amount, remaining),
-        );
+        events::emit_partial_unstake(env, staker.clone(), amount, remaining);
 
         // Transfer tokens back to staker (CEI: state updated before cross-contract call).
         token::Client::new(env, &token).transfer(&env.current_contract_address(), staker, &amount);
@@ -1288,9 +1321,7 @@ impl StakeVaultContract {
             .get(&StorageKey::Admin)
             .ok_or(StakeVaultError::NotInitialized)?;
         admin.require_auth();
-        if minor_bps > 10_000 || major_bps > 10_000 || critical_bps > 10_000 {
-            return Err(StakeVaultError::InvalidSlashTier);
-        }
+        validate_slash_tiers(minor_bps, major_bps, critical_bps)?;
         let cfg = SlashTierConfig {
             minor_bps,
             major_bps,
@@ -1299,14 +1330,7 @@ impl StakeVaultContract {
         env.storage()
             .instance()
             .set(&StorageKey::SlashTierConfig, &cfg);
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "slash_tiers_updated"),
-            ),
-            (minor_bps, major_bps, critical_bps),
-        );
+        events::emit_slash_tiers_updated(&env, minor_bps, major_bps, critical_bps);
         Ok(())
     }
 
@@ -1330,15 +1354,84 @@ impl StakeVaultContract {
         reason: Symbol,
     ) -> Result<i128, StakeVaultError> {
         caller.require_auth();
+        Self::require_signal_registry(&env, &caller)?;
+        Self::do_slash(&env, &provider, severity, reason)
+    }
+
+    /// Slash multiple providers in a single call (issue #815).
+    ///
+    /// `providers` and `severities` must have matching length, bounded by
+    /// `MAX_BATCH_SIZE`. `reason` applies uniformly to every slash in the batch.
+    /// Only the signal registry may call this — authorization is checked once
+    /// for the whole batch rather than per item.
+    ///
+    /// Individual providers with no stake are skipped (amount `0` in the
+    /// returned vector) rather than aborting the entire batch, so one bad
+    /// entry cannot block settlement for the rest. Each successful slash still
+    /// emits its own `stake_slashed` event for per-provider audit trails, plus
+    /// one aggregate `batch_slash_completed` event summarizing the run.
+    pub fn batch_slash_stake(
+        env: Env,
+        caller: Address,
+        providers: Vec<Address>,
+        severities: Vec<SlashSeverity>,
+        reason: Symbol,
+    ) -> Result<Vec<i128>, StakeVaultError> {
+        caller.require_auth();
+        Self::require_signal_registry(&env, &caller)?;
+
+        let len = providers.len();
+        if len == 0 || len > MAX_BATCH_SIZE {
+            return Err(StakeVaultError::BatchSizeInvalid);
+        }
+        if len != severities.len() {
+            return Err(StakeVaultError::BatchLengthMismatch);
+        }
+
+        let mut results: Vec<i128> = Vec::new(&env);
+        let mut total_slashed: i128 = 0;
+        let mut processed_count: u32 = 0;
+
+        for i in 0..len {
+            let provider = providers.get(i).unwrap();
+            let severity = severities.get(i).unwrap();
+            match Self::do_slash(&env, &provider, severity, reason.clone()) {
+                Ok(amount) => {
+                    total_slashed = total_slashed.saturating_add(amount);
+                    processed_count = processed_count.saturating_add(1);
+                    results.push_back(amount);
+                }
+                Err(_) => results.push_back(0),
+            }
+        }
+
+        events::emit_batch_slash_completed(&env, processed_count, total_slashed);
+        Ok(results)
+    }
+
+    fn require_signal_registry(env: &Env, caller: &Address) -> Result<(), StakeVaultError> {
         let signal_registry: Address = env
             .storage()
             .instance()
             .get(&StorageKey::SignalRegistry)
             .ok_or(StakeVaultError::NotInitialized)?;
-        if caller != signal_registry {
+        if caller != &signal_registry {
             return Err(StakeVaultError::Unauthorized);
         }
+        Ok(())
+    }
 
+    /// Core slashing logic shared by [`Self::slash_stake`] and
+    /// [`Self::batch_slash_stake`]. Caller authorization/registry checks are
+    /// the responsibility of the entry point — this assumes the caller is
+    /// already validated.
+    fn do_slash(
+        env: &Env,
+        provider: &Address,
+        severity: SlashSeverity,
+        reason: Symbol,
+    ) -> Result<i128, StakeVaultError> {
+        let provider = provider.clone();
         let token: Address = env
             .storage()
             .instance()
@@ -1472,19 +1565,13 @@ impl StakeVaultContract {
         }
 
         // Event records severity tier, slash amount, and slash_id for audit.
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "stake_slashed"),
-            ),
-            (
-                provider.clone(),
-                severity as u32,
-                slash_amount,
-                slash_id,
-                reason,
-            ),
+        events::emit_stake_slashed(
+            &env,
+            provider.clone(),
+            severity as u32,
+            slash_amount,
+            slash_id,
+            reason,
         );
 
         Ok(slash_amount)
@@ -1515,14 +1602,7 @@ impl StakeVaultContract {
         env.storage()
             .instance()
             .set(&StorageKey::AppealWindowSecs, &window_secs);
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "appeal_window_updated"),
-            ),
-            (window_secs,),
-        );
+        events::emit_appeal_window_updated(&env, window_secs);
         Ok(())
     }
 
@@ -1595,14 +1675,7 @@ impl StakeVaultContract {
             .persistent()
             .set(&StorageKey::SlashAppeal(slash_id), &appeal);
 
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "slash_appealed"),
-            ),
-            (appellant, slash_id, evidence_uri),
-        );
+        events::emit_slash_appealed(&env, appellant, slash_id, evidence_uri);
 
         Ok(())
     }
@@ -1622,7 +1695,56 @@ impl StakeVaultContract {
             .get(&StorageKey::Admin)
             .ok_or(StakeVaultError::NotInitialized)?;
         admin.require_auth();
+        Self::do_resolve_appeal(&env, slash_id, uphold)
+    }
 
+    /// Resolve multiple pending slash appeals in a single call (issue #815).
+    ///
+    /// `slash_ids` and `upholds` must have matching length, bounded by
+    /// `MAX_BATCH_SIZE`. Authorization is checked once for the admin rather
+    /// than per item.
+    ///
+    /// Entries that don't exist or are already resolved are skipped rather
+    /// than aborting the whole batch, so one bad entry cannot block settling
+    /// the rest. Returns the number of appeals successfully resolved.
+    pub fn batch_resolve_appeal(
+        env: Env,
+        slash_ids: Vec<u64>,
+        upholds: Vec<bool>,
+    ) -> Result<u32, StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+
+        let len = slash_ids.len();
+        if len == 0 || len > MAX_BATCH_SIZE {
+            return Err(StakeVaultError::BatchSizeInvalid);
+        }
+        if len != upholds.len() {
+            return Err(StakeVaultError::BatchLengthMismatch);
+        }
+
+        let mut processed_count: u32 = 0;
+        for i in 0..len {
+            let slash_id = slash_ids.get(i).unwrap();
+            let uphold = upholds.get(i).unwrap();
+            if Self::do_resolve_appeal(&env, slash_id, uphold).is_ok() {
+                processed_count = processed_count.saturating_add(1);
+            }
+        }
+
+        events::emit_batch_appeals_resolved(&env, processed_count);
+        Ok(processed_count)
+    }
+
+    /// Core appeal-resolution logic shared by [`Self::resolve_appeal`] and
+    /// [`Self::batch_resolve_appeal`]. Admin authorization is the
+    /// responsibility of the entry point — this assumes the caller is
+    /// already validated.
+    fn do_resolve_appeal(env: &Env, slash_id: u64, uphold: bool) -> Result<(), StakeVaultError> {
         // Load slash record.
         let record: SlashRecord = env
             .storage()
@@ -1708,14 +1830,7 @@ impl StakeVaultContract {
             .persistent()
             .set(&StorageKey::SlashAppeal(slash_id), &appeal);
 
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "appeal_resolved"),
-            ),
-            (slash_id, uphold, record.provider),
-        );
+        events::emit_appeal_resolved(&env, slash_id, uphold, record.provider);
 
         Ok(())
     }
@@ -1864,14 +1979,7 @@ impl StakeVaultContract {
             &amount,
         );
 
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "stake_delegated"),
-            ),
-            (delegator, provider, amount),
-        );
+        events::emit_stake_delegated(&env, delegator, provider, amount);
 
         Ok(())
     }
@@ -1971,14 +2079,7 @@ impl StakeVaultContract {
             .instance()
             .set(&StorageKey::UnstakeQueueTail, &tail.saturating_add(1));
 
-        #[allow(deprecated)]
-        env.events().publish(
-            (
-                Symbol::new(&env, "stake_vault"),
-                Symbol::new(&env, "unstake_queued"),
-            ),
-            (staker, ticket, queue_position),
-        );
+        events::emit_unstake_queued(&env, staker, ticket, queue_position);
 
         Ok(ticket)
     }
@@ -2084,14 +2185,7 @@ impl StakeVaultContract {
                         stellar_swipe_common::rate_limit::ActionType::StakeChange,
                     );
 
-                    #[allow(deprecated)]
-                    env.events().publish(
-                        (
-                            Symbol::new(&env, "stake_vault"),
-                            Symbol::new(&env, "unstake_processed"),
-                        ),
-                        (request.user, request.ticket, amount),
-                    );
+                    events::emit_unstake_processed(&env, request.user, request.ticket, amount);
                 }
                 Err(_) => {
                     // Blocked — stop processing to preserve FIFO order.
