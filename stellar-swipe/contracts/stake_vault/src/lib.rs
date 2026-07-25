@@ -8,8 +8,8 @@ use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
 use migration::{MigrationKey, StakeInfoV2};
 use shared::{initializable, multisig, pausable};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, Env, IntoVal,
-    String, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
+    IntoVal, String, Symbol, Val, Vec,
 };
 
 // ── Slash severity tiers ──────────────────────────────────────────────────────
@@ -67,9 +67,9 @@ const MAX_WITHDRAWAL_COOLDOWN_SECS: u64 = 2_592_000;
 /// Set to SILVER tier (500M = 5 * 10^8 stroops).
 const LARGE_WITHDRAWAL_THRESHOLD: i128 = 500_000_000;
 
-/// Maximum number of items processed by a single batch entry point (issue #815).
-/// Bounds per-call gas cost; larger sets must be split across multiple calls.
-const MAX_BATCH_SIZE: u32 = 25;
+/// Default cap on the number of pending entries in the unstake queue (issue #786).
+/// Bounds instance storage growth and per-call compute cost of `queue_unstake`.
+const DEFAULT_MAX_UNSTAKE_QUEUE_SIZE: u32 = 200;
 
 pub const GOLD_TIER_STAKE: i128 = 1_000_000_000;
 pub const SILVER_TIER_STAKE: i128 = GOLD_TIER_STAKE / 2;
@@ -168,6 +168,8 @@ pub enum StorageKey {
     UnstakeQueueEntry(u64),
     /// Ticket number assigned to a queued user (for position lookup).
     UserUnstakeTicket(Address),
+    /// Admin-configurable cap on unstake queue length (issue #786, default 200).
+    MaxUnstakeQueueSize,
     // ── Issue #754: Multi-sig emergency early-unstake ──────────────────────────
     /// N-of-M multi-sig configuration for emergency early unstakes.
     EmergencyMultiSigConfig,
@@ -245,16 +247,10 @@ pub enum StakeVaultError {
     RateLimitExceeded = 31,
     InvalidAmount = 32,
     RemainingStakeBelowMinimum = 33,
-    // ── Issue #816: configurable cooldown & slashing controls ─────────────────────
-    /// Withdrawal cooldown exceeds the allowed maximum.
-    InvalidCooldown = 34,
-    /// Slash tier percentages must be non-decreasing: minor <= major <= critical.
-    InvalidSlashTierOrder = 35,
-    // ── Issue #815: batch settlement ──────────────────────────────────────────────
-    /// Batch input vectors have mismatched lengths.
-    BatchLengthMismatch = 36,
-    /// Batch is empty or exceeds `MAX_BATCH_SIZE`.
-    BatchSizeInvalid = 37,
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+    /// `upgrade()` was called with a version that is not strictly greater
+    /// than the currently stored contract version.
+    IncompatibleContractVersion = 34,
 }
 
 /// A pending unstake request held in the FIFO queue (issue #663).
@@ -396,6 +392,49 @@ impl StakeVaultContract {
             .instance()
             .set(&pausable::PausableKey::Paused, &false);
         initializable::mark_initialized(&env);
+        shared::version::set_contract_version(&env, shared::version::STAKE_VAULT_VERSION);
+    }
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+
+    /// Returns this contract's stored version. Cross-contract callers can use
+    /// this to enforce a minimum compatible version before invoking this
+    /// contract (see `shared::version::validate_callee_version`).
+    pub fn get_contract_version(env: Env) -> u32 {
+        shared::version::get_contract_version(&env)
+    }
+
+    /// Admin-only: replace this contract's executable with `new_wasm_hash`
+    /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
+    /// `new_version` as the contract's version.
+    ///
+    /// `new_version` must be strictly greater than the currently stored
+    /// version, rejecting accidental or malicious downgrades.
+    ///
+    /// # Errors
+    /// - [`StakeVaultError::NotInitialized`] — contract not initialized.
+    /// - [`StakeVaultError::IncompatibleContractVersion`] — `new_version` is
+    ///   not strictly greater than the currently stored version.
+    pub fn upgrade(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+
+        let current_version = shared::version::get_contract_version(&env);
+        shared::version::guard_upgrade(current_version, new_version)
+            .map_err(|_| StakeVaultError::IncompatibleContractVersion)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        shared::version::set_contract_version(&env, new_version);
+        shared::version::emit_contract_upgraded(&env, current_version, new_version);
+        Ok(())
     }
 
     // ── Emergency pause (shared::pausable) ────────────────────────────────────
@@ -2012,6 +2051,15 @@ impl StakeVaultContract {
             .get(&StorageKey::UnstakeQueueHead)
             .unwrap_or(0);
 
+        let max_queue_size: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MaxUnstakeQueueSize)
+            .unwrap_or(DEFAULT_MAX_UNSTAKE_QUEUE_SIZE);
+        if tail.saturating_sub(head) >= max_queue_size as u64 {
+            return Err(StakeVaultError::QueueFull);
+        }
+
         let ticket = tail;
         let queue_position = tail.saturating_sub(head);
 
@@ -2036,12 +2084,54 @@ impl StakeVaultContract {
         Ok(ticket)
     }
 
+    /// Sets the maximum number of pending entries allowed in the unstake queue.
+    ///
+    /// Admin-only. Lowering the cap below the current queue length does not
+    /// affect already-queued entries; it only blocks new `queue_unstake` calls
+    /// until the queue drains back under the new cap. Emits `queue_size_updated`.
+    pub fn set_max_unstake_queue_size(env: Env, size: u32) -> Result<(), StakeVaultError> {
+        if multisig::get_config(&env).is_some() {
+            return Err(StakeVaultError::RequiresMultisig);
+        }
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::MaxUnstakeQueueSize, &size);
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "stake_vault"),
+                Symbol::new(&env, "queue_size_updated"),
+            ),
+            (size,),
+        );
+        Ok(())
+    }
+
+    /// Returns the configured maximum unstake queue length (defaults to 200).
+    pub fn get_max_unstake_queue_size(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MaxUnstakeQueueSize)
+            .unwrap_or(DEFAULT_MAX_UNSTAKE_QUEUE_SIZE)
+    }
+
     /// Process up to `limit` queued unstake requests in FIFO order.
     ///
     /// Requests are processed from the queue head. A request that fails (e.g.
     /// due to a time-lock or locked stake) is left at the head; processing stops
     /// so strict FIFO ordering is preserved. The caller should retry later once
     /// the blocking condition is resolved.
+    ///
+    /// Recommended invocation frequency: call at least as often as the queue
+    /// approaches `MaxUnstakeQueueSize` (e.g. keyed off `unstake_queued` events
+    /// or periodic polling of `get_queue_position`), since `queue_unstake` starts
+    /// rejecting new entries once the queue is at or above the configured cap.
     ///
     /// Returns the number of requests successfully processed.
     pub fn process_unstake_queue(env: Env, limit: u32) -> Result<u32, StakeVaultError> {

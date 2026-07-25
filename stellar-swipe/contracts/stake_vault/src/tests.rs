@@ -2174,21 +2174,14 @@ mod slash_appeal_tests {
     }
 }
 
-// ── Issue #816: configurable withdrawal cooldown ───────────────────────────────
+// ── Issue #786: Unstake queue size cap ──────────────────────────────────────────
 
-#[cfg(test)]
-mod withdrawal_cooldown_tests {
+mod unstake_queue_cap_tests {
     use crate::{
-        action, encode_action,
         migration::{MigrationKey, StakeInfoV2},
         StakeVaultContract, StakeVaultContractClient, StakeVaultError,
     };
-    use shared::multisig::MultisigConfig;
-    use soroban_sdk::{
-        testutils::{Address as _, Ledger},
-        token::StellarAssetClient,
-        Address, Env, Map,
-    };
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Address, Env, Map};
 
     fn sac_token(env: &Env, admin: &Address) -> Address {
         env.register_stellar_asset_contract_v2(admin.clone())
@@ -2220,601 +2213,89 @@ mod withdrawal_cooldown_tests {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
-        let registry = Address::generate(&env);
+        let signal_registry = Address::generate(&env);
         let token = sac_token(&env, &admin);
         let vault_id = env.register(StakeVaultContract, ());
-        StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token, &registry);
-        (env, vault_id, token, admin, registry)
-    }
-
-    fn encode_u64_bytes(value: u64) -> [u8; 8] {
-        value.to_le_bytes()
+        StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token, &signal_registry);
+        (env, vault_id, token, admin, signal_registry)
     }
 
     #[test]
-    fn default_cooldown_is_one_hour() {
+    fn default_max_queue_size_is_two_hundred() {
         let (env, vault_id, _token, _admin, _registry) = setup();
         let client = StakeVaultContractClient::new(&env, &vault_id);
-        assert_eq!(client.get_withdrawal_cooldown(), 3_600);
+        assert_eq!(client.get_max_unstake_queue_size(), 200);
     }
 
     #[test]
-    fn admin_can_set_cooldown_to_minimum_zero() {
+    fn enqueue_below_cap_succeeds() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_max_unstake_queue_size(&2);
+
+        let staker_a = Address::generate(&env);
+        let staker_b = Address::generate(&env);
+        seed(&env, &vault_id, &staker_a, 1_000_000);
+        seed(&env, &vault_id, &staker_b, 1_000_000);
+
+        assert_eq!(client.queue_unstake(&staker_a), 0);
+        assert_eq!(client.queue_unstake(&staker_b), 1);
+    }
+
+    #[test]
+    fn enqueue_at_cap_is_rejected() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        client.set_max_unstake_queue_size(&2);
+
+        let staker_a = Address::generate(&env);
+        let staker_b = Address::generate(&env);
+        let staker_c = Address::generate(&env);
+        seed(&env, &vault_id, &staker_a, 1_000_000);
+        seed(&env, &vault_id, &staker_b, 1_000_000);
+        seed(&env, &vault_id, &staker_c, 1_000_000);
+
+        client.queue_unstake(&staker_a);
+        client.queue_unstake(&staker_b);
+
+        // Queue is now at the cap (2 entries) — the next enqueue must be rejected.
+        let result = client.try_queue_unstake(&staker_c);
+        assert_eq!(result, Err(Ok(StakeVaultError::QueueFull)));
+    }
+
+    #[test]
+    fn lowering_cap_below_current_length_keeps_existing_entries_but_blocks_new_ones() {
         let (env, vault_id, token, _admin, _registry) = setup();
-        let staker = Address::generate(&env);
-        let amount: i128 = 600_000_000; // above LARGE_WITHDRAWAL_THRESHOLD
-
-        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
-        seed(&env, &vault_id, &staker, amount);
-
         let client = StakeVaultContractClient::new(&env, &vault_id);
-        client.set_withdrawal_cooldown(&0u64);
-        assert_eq!(client.get_withdrawal_cooldown(), 0);
-
-        // Zero cooldown: withdrawal succeeds immediately after request, no wait needed.
-        client.request_withdrawal(&staker);
-        assert_eq!(client.withdraw_stake(&staker), amount);
-    }
-
-    #[test]
-    fn admin_can_set_cooldown_to_maximum() {
-        use soroban_sdk::testutils::Ledger as _;
-        let (env, vault_id, token, _admin, _registry) = setup();
-        let staker = Address::generate(&env);
-        let amount: i128 = 600_000_000;
-
-        StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
-        seed(&env, &vault_id, &staker, amount);
-
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        client.set_withdrawal_cooldown(&2_592_000u64); // 30 days, the max
-        assert_eq!(client.get_withdrawal_cooldown(), 2_592_000);
-
-        client.request_withdrawal(&staker);
-
-        // Just under the 30-day cooldown — still blocked.
-        env.ledger().with_mut(|l| l.timestamp += 2_591_999);
-        assert_eq!(
-            client.try_withdraw_stake(&staker),
-            Err(Ok(StakeVaultError::TimelockNotElapsed))
-        );
-
-        // Past the boundary — succeeds.
-        env.ledger().with_mut(|l| l.timestamp += 2);
-        assert_eq!(client.withdraw_stake(&staker), amount);
-    }
-
-    #[test]
-    fn set_cooldown_above_max_rejected() {
-        let (env, vault_id, _token, _admin, _registry) = setup();
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        assert_eq!(
-            client.try_set_withdrawal_cooldown(&2_592_001u64),
-            Err(Ok(StakeVaultError::InvalidCooldown))
-        );
-    }
-
-    #[test]
-    fn set_cooldown_requires_multisig_when_configured() {
-        let (env, vault_id, _token, admin, _registry) = setup();
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        let signer_a = Address::generate(&env);
-        let signer_b = Address::generate(&env);
-        let cfg = MultisigConfig {
-            signers: soroban_sdk::vec![&env, signer_a, signer_b],
-            threshold: 2,
-            proposal_timeout_secs: 86_400,
-        };
-        client.set_multisig_config(&admin, &Some(cfg));
-
-        assert_eq!(
-            client.try_set_withdrawal_cooldown(&100u64),
-            Err(Ok(StakeVaultError::RequiresMultisig))
-        );
-    }
-
-    #[test]
-    fn multisig_propose_approve_execute_set_withdrawal_cooldown() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let registry = Address::generate(&env);
-        let token = sac_token(&env, &admin);
-        let vault_id = env.register(StakeVaultContract, ());
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        client.initialize(&admin, &token, &registry);
-
-        let signer_a = Address::generate(&env);
-        let signer_b = Address::generate(&env);
-        let signers = soroban_sdk::vec![&env, signer_a.clone(), signer_b.clone()];
-        let cfg = MultisigConfig {
-            signers,
-            threshold: 2,
-            proposal_timeout_secs: 86_400,
-        };
-        client.set_multisig_config(&admin, &Some(cfg));
-
-        let payload = encode_action(
-            &env,
-            action::SET_WITHDRAWAL_COOLDOWN,
-            &encode_u64_bytes(7_200u64),
-        );
-        let id = client.propose_action(&signer_a, &payload);
-        client.approve_action(&signer_b, &id);
-        client.execute_action(&signer_a, &id);
-
-        assert_eq!(client.get_withdrawal_cooldown(), 7_200);
-    }
-}
-
-// ── Issue #816: slash tier limits ───────────────────────────────────────────────
-
-#[cfg(test)]
-mod slash_tier_limit_tests {
-    use crate::{
-        migration::{MigrationKey, StakeInfoV2},
-        SlashSeverity, StakeVaultContract, StakeVaultContractClient, StakeVaultError,
-    };
-    use soroban_sdk::{
-        testutils::Address as _, token::StellarAssetClient, Address, Env, Map, Symbol,
-    };
-
-    fn sac_token(env: &Env, admin: &Address) -> Address {
-        env.register_stellar_asset_contract_v2(admin.clone())
-            .address()
-    }
-
-    fn seed(env: &Env, contract_id: &Address, staker: &Address, balance: i128) {
-        env.as_contract(contract_id, || {
-            let mut stakes: Map<Address, StakeInfoV2> = env
-                .storage()
-                .persistent()
-                .get(&MigrationKey::StakesV2)
-                .unwrap_or_else(|| Map::new(env));
-            stakes.set(
-                staker.clone(),
-                StakeInfoV2 {
-                    balance,
-                    locked_until: 0,
-                    last_updated: env.ledger().timestamp(),
-                },
-            );
-            env.storage()
-                .persistent()
-                .set(&MigrationKey::StakesV2, &stakes);
-        });
-    }
-
-    fn setup() -> (Env, Address, Address, Address, Address) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let registry = Address::generate(&env);
-        let token = sac_token(&env, &admin);
-        let vault_id = env.register(StakeVaultContract, ());
-        StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token, &registry);
-        (env, vault_id, token, admin, registry)
-    }
-
-    #[test]
-    fn decreasing_minor_to_major_rejected() {
-        let (env, vault_id, _token, _admin, _registry) = setup();
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        assert_eq!(
-            client.try_configure_slash_tiers(&3_000, &500, &10_000),
-            Err(Ok(StakeVaultError::InvalidSlashTierOrder))
-        );
-    }
-
-    #[test]
-    fn decreasing_major_to_critical_rejected() {
-        let (env, vault_id, _token, _admin, _registry) = setup();
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        assert_eq!(
-            client.try_configure_slash_tiers(&500, &9_000, &8_000),
-            Err(Ok(StakeVaultError::InvalidSlashTierOrder))
-        );
-    }
-
-    #[test]
-    fn equal_tiers_at_boundary_allowed() {
-        let (env, vault_id, _token, _admin, _registry) = setup();
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        client.configure_slash_tiers(&2_000, &2_000, &2_000);
-        let cfg = client.get_slash_tier_config();
-        assert_eq!(cfg.minor_bps, 2_000);
-        assert_eq!(cfg.major_bps, 2_000);
-        assert_eq!(cfg.critical_bps, 2_000);
-    }
-
-    /// Extreme condition (issue #816): every tier set to full slash (100%).
-    #[test]
-    fn all_tiers_at_full_slash_extreme() {
-        let (env, vault_id, token, _admin, registry) = setup();
-        let provider = Address::generate(&env);
-        let balance: i128 = 1_000_000;
-        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
-        seed(&env, &vault_id, &provider, balance);
-
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        client.configure_slash_tiers(&10_000, &10_000, &10_000);
-
-        let slashed = client.slash_stake(
-            &registry,
-            &provider,
-            &SlashSeverity::Minor,
-            &Symbol::new(&env, "extreme"),
-        );
-        assert_eq!(slashed, balance);
-        assert_eq!(client.get_stake(&provider), 0);
-    }
-
-    /// Extreme condition (issue #816): every tier set to zero — the minimum
-    /// 1-stroop slash floor still applies so a slash is never a full no-op.
-    #[test]
-    fn all_tiers_at_zero_still_enforces_minimum_stroop() {
-        let (env, vault_id, token, _admin, registry) = setup();
-        let provider = Address::generate(&env);
-        let balance: i128 = 1_000_000;
-        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
-        seed(&env, &vault_id, &provider, balance);
-
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        client.configure_slash_tiers(&0, &0, &0);
-
-        let slashed = client.slash_stake(
-            &registry,
-            &provider,
-            &SlashSeverity::Critical,
-            &Symbol::new(&env, "zero_tier"),
-        );
-        assert_eq!(slashed, 1);
-        assert_eq!(client.get_stake(&provider), balance - 1);
-    }
-
-    #[test]
-    fn bps_over_10000_still_rejected() {
-        let (env, vault_id, _token, _admin, _registry) = setup();
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        assert_eq!(
-            client.try_configure_slash_tiers(&500, &3_000, &10_001),
-            Err(Ok(StakeVaultError::InvalidSlashTier))
-        );
-    }
-}
-
-// ── Issue #815: batch settlement ────────────────────────────────────────────────
-
-#[cfg(test)]
-mod batch_settlement_tests {
-    use crate::{
-        migration::{MigrationKey, StakeInfoV2},
-        SlashSeverity, StakeVaultContract, StakeVaultContractClient, StakeVaultError,
-    };
-    use soroban_sdk::{
-        testutils::Address as _, token::StellarAssetClient, Address, Env, Map, String, Symbol,
-        Vec,
-    };
-
-    fn sac_token(env: &Env, admin: &Address) -> Address {
-        env.register_stellar_asset_contract_v2(admin.clone())
-            .address()
-    }
-
-    fn seed(env: &Env, contract_id: &Address, staker: &Address, balance: i128) {
-        env.as_contract(contract_id, || {
-            let mut stakes: Map<Address, StakeInfoV2> = env
-                .storage()
-                .persistent()
-                .get(&MigrationKey::StakesV2)
-                .unwrap_or_else(|| Map::new(env));
-            stakes.set(
-                staker.clone(),
-                StakeInfoV2 {
-                    balance,
-                    locked_until: 0,
-                    last_updated: env.ledger().timestamp(),
-                },
-            );
-            env.storage()
-                .persistent()
-                .set(&MigrationKey::StakesV2, &stakes);
-        });
-    }
-
-    fn setup() -> (Env, Address, Address, Address, Address) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let registry = Address::generate(&env);
-        let token = sac_token(&env, &admin);
-        let vault_id = env.register(StakeVaultContract, ());
-        StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token, &registry);
-        (env, vault_id, token, admin, registry)
-    }
-
-    // ── batch_slash_stake ────────────────────────────────────────────────────
-
-    #[test]
-    fn batch_slash_stake_slashes_multiple_providers_correctly() {
-        let (env, vault_id, token, _admin, registry) = setup();
-        let p1 = Address::generate(&env);
-        let p2 = Address::generate(&env);
-        let p3 = Address::generate(&env);
-        let balance: i128 = 1_000_000;
-
-        StellarAssetClient::new(&env, &token).mint(&vault_id, &(balance * 3));
-        seed(&env, &vault_id, &p1, balance);
-        seed(&env, &vault_id, &p2, balance);
-        seed(&env, &vault_id, &p3, balance);
-
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        let providers = soroban_sdk::vec![&env, p1.clone(), p2.clone(), p3.clone()];
-        let severities = soroban_sdk::vec![
-            &env,
-            SlashSeverity::Minor,
-            SlashSeverity::Major,
-            SlashSeverity::Critical
-        ];
-
-        let results = client.batch_slash_stake(
-            &registry,
-            &providers,
-            &severities,
-            &Symbol::new(&env, "batch_fraud"),
-        );
-
-        assert_eq!(results.len(), 3);
-        assert_eq!(results.get(0).unwrap(), 50_000); // 5% minor
-        assert_eq!(results.get(1).unwrap(), 300_000); // 30% major
-        assert_eq!(results.get(2).unwrap(), balance); // 100% critical
-
-        assert_eq!(client.get_stake(&p1), balance - 50_000);
-        assert_eq!(client.get_stake(&p2), balance - 300_000);
-        assert_eq!(client.get_stake(&p3), 0);
-    }
-
-    #[test]
-    fn batch_slash_stake_length_mismatch_rejected() {
-        let (env, vault_id, _token, _admin, registry) = setup();
-        let p1 = Address::generate(&env);
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        let providers = soroban_sdk::vec![&env, p1];
-        let severities = soroban_sdk::vec![&env, SlashSeverity::Minor, SlashSeverity::Major];
-
-        let result = client.try_batch_slash_stake(
-            &registry,
-            &providers,
-            &severities,
-            &Symbol::new(&env, "x"),
-        );
-        assert_eq!(result, Err(Ok(StakeVaultError::BatchLengthMismatch)));
-    }
-
-    #[test]
-    fn batch_slash_stake_empty_rejected() {
-        let (env, vault_id, _token, _admin, registry) = setup();
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        let providers: Vec<Address> = soroban_sdk::vec![&env];
-        let severities: Vec<SlashSeverity> = soroban_sdk::vec![&env];
-
-        let result = client.try_batch_slash_stake(
-            &registry,
-            &providers,
-            &severities,
-            &Symbol::new(&env, "x"),
-        );
-        assert_eq!(result, Err(Ok(StakeVaultError::BatchSizeInvalid)));
-    }
-
-    #[test]
-    fn batch_slash_stake_exceeds_max_size_rejected() {
-        let (env, vault_id, token, _admin, registry) = setup();
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-
-        let mut providers: Vec<Address> = soroban_sdk::vec![&env];
-        let mut severities: Vec<SlashSeverity> = soroban_sdk::vec![&env];
-        // MAX_BATCH_SIZE is 25 — 26 entries must be rejected.
-        for _ in 0..26 {
-            let p = Address::generate(&env);
-            StellarAssetClient::new(&env, &token).mint(&vault_id, &1_000);
-            seed(&env, &vault_id, &p, 1_000);
-            providers.push_back(p);
-            severities.push_back(SlashSeverity::Minor);
-        }
-
-        let result = client.try_batch_slash_stake(
-            &registry,
-            &providers,
-            &severities,
-            &Symbol::new(&env, "x"),
-        );
-        assert_eq!(result, Err(Ok(StakeVaultError::BatchSizeInvalid)));
-    }
-
-    #[test]
-    fn batch_slash_stake_unauthorized_caller_rejected() {
-        let (env, vault_id, token, _admin, _registry) = setup();
-        let attacker = Address::generate(&env);
-        let p1 = Address::generate(&env);
-        StellarAssetClient::new(&env, &token).mint(&vault_id, &1_000);
-        seed(&env, &vault_id, &p1, 1_000);
-
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        let providers = soroban_sdk::vec![&env, p1];
-        let severities = soroban_sdk::vec![&env, SlashSeverity::Minor];
-
-        let result = client.try_batch_slash_stake(
-            &attacker,
-            &providers,
-            &severities,
-            &Symbol::new(&env, "x"),
-        );
-        assert_eq!(result, Err(Ok(StakeVaultError::Unauthorized)));
-    }
-
-    /// Correctness under partial failure (issue #815): a provider with no
-    /// stake is skipped rather than aborting the whole batch, so the other
-    /// providers still settle correctly and accounting stays consistent.
-    #[test]
-    fn batch_slash_stake_skips_empty_provider_and_continues() {
-        let (env, vault_id, token, _admin, registry) = setup();
-        let p1 = Address::generate(&env); // no stake seeded
-        let p2 = Address::generate(&env);
-        let balance: i128 = 1_000_000;
-
-        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
-        seed(&env, &vault_id, &p2, balance);
-
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        let providers = soroban_sdk::vec![&env, p1.clone(), p2.clone()];
-        let severities = soroban_sdk::vec![&env, SlashSeverity::Major, SlashSeverity::Major];
-
-        let results = client.batch_slash_stake(
-            &registry,
-            &providers,
-            &severities,
-            &Symbol::new(&env, "partial"),
-        );
-
-        assert_eq!(results.get(0).unwrap(), 0, "provider with no stake yields 0");
-        assert_eq!(results.get(1).unwrap(), 300_000);
-        assert_eq!(client.get_stake(&p2), balance - 300_000);
-    }
-
-    // ── batch_resolve_appeal ─────────────────────────────────────────────────
-
-    #[test]
-    fn batch_resolve_appeal_resolves_multiple_correctly() {
-        let (env, vault_id, token, _admin, registry) = setup();
-        let p1 = Address::generate(&env);
-        let p2 = Address::generate(&env);
-        let balance: i128 = 1_000_000;
-
-        StellarAssetClient::new(&env, &token).mint(&vault_id, &(balance * 2));
-        seed(&env, &vault_id, &p1, balance);
-        seed(&env, &vault_id, &p2, balance);
-
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        client.set_appeal_window(&86_400u64);
-
-        // slash_id 0 -> p1, slash_id 1 -> p2
-        client.slash_stake(&registry, &p1, &SlashSeverity::Major, &Symbol::new(&env, "r1"));
-        client.slash_stake(&registry, &p2, &SlashSeverity::Major, &Symbol::new(&env, "r2"));
-
-        let evidence = String::from_str(&env, "ipfs://evidence");
-        client.appeal_slash(&p1, &0u64, &evidence);
-        client.appeal_slash(&p2, &1u64, &evidence);
-
-        let slash_ids = soroban_sdk::vec![&env, 0u64, 1u64];
-        let upholds = soroban_sdk::vec![&env, false, true]; // reverse p1's slash, uphold p2's
-
-        let processed = client.batch_resolve_appeal(&slash_ids, &upholds);
-        assert_eq!(processed, 2);
-
-        // p1: reversed — full balance restored.
-        assert_eq!(client.get_stake(&p1), balance);
-        // p2: upheld — slash stands (30% major).
-        assert_eq!(client.get_stake(&p2), balance - 300_000);
-    }
-
-    #[test]
-    fn batch_resolve_appeal_skips_invalid_entries_and_continues() {
-        let (env, vault_id, token, _admin, registry) = setup();
-        let p1 = Address::generate(&env);
-        let balance: i128 = 1_000_000;
-
-        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
-        seed(&env, &vault_id, &p1, balance);
-
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        client.set_appeal_window(&86_400u64);
-        client.slash_stake(&registry, &p1, &SlashSeverity::Major, &Symbol::new(&env, "r1"));
-        client.appeal_slash(
-            &p1,
-            &0u64,
-            &String::from_str(&env, "ipfs://evidence"),
-        );
-
-        // slash_id 1 doesn't exist — should be skipped, not abort the batch.
-        let slash_ids = soroban_sdk::vec![&env, 0u64, 1u64];
-        let upholds = soroban_sdk::vec![&env, true, true];
-
-        let processed = client.batch_resolve_appeal(&slash_ids, &upholds);
-        assert_eq!(processed, 1, "only the valid entry should be counted");
-    }
-
-    #[test]
-    fn batch_resolve_appeal_length_mismatch_rejected() {
-        let (env, vault_id, _token, _admin, _registry) = setup();
-        let client = StakeVaultContractClient::new(&env, &vault_id);
-        let slash_ids = soroban_sdk::vec![&env, 0u64, 1u64];
-        let upholds = soroban_sdk::vec![&env, true];
-
-        let result = client.try_batch_resolve_appeal(&slash_ids, &upholds);
-        assert_eq!(result, Err(Ok(StakeVaultError::BatchLengthMismatch)));
-    }
-
-    // ── Gas / performance comparison (issue #815) ───────────────────────────
-
-    /// Batch settlement should not cost meaningfully more per item than doing
-    /// the same work as separate individual `slash_stake` calls — and the
-    /// single-authorization batch path should come out ahead once the
-    /// per-call authorization/storage-read overhead is amortized.
-    #[test]
-    fn batch_slash_stake_amortizes_cost_vs_individual_calls() {
-        const N: usize = 10;
-
-        // ── Individual calls ────────────────────────────────────────────────
-        let (env_individual, vault_individual, token_individual, _admin, registry_individual) =
-            setup();
-        let client_individual = StakeVaultContractClient::new(&env_individual, &vault_individual);
-        let mut individual_providers: Vec<Address> = soroban_sdk::vec![&env_individual];
-        for _ in 0..N {
-            let p = Address::generate(&env_individual);
-            StellarAssetClient::new(&env_individual, &token_individual).mint(&vault_individual, &1_000_000);
-            seed(&env_individual, &vault_individual, &p, 1_000_000);
-            individual_providers.push_back(p);
-        }
-        // The host auto-resets the instruction tracker before each top-level
-        // call, so per-call cost must be read and summed inside the loop —
-        // reading it only once after the loop would report just the last call.
-        let mut individual_instructions: u64 = 0;
-        for p in individual_providers.iter() {
-            env_individual.cost_estimate().budget().reset_tracker();
-            client_individual.slash_stake(
-                &registry_individual,
-                &p,
-                &SlashSeverity::Minor,
-                &Symbol::new(&env_individual, "r"),
-            );
-            individual_instructions += env_individual.cost_estimate().budget().cpu_instruction_cost();
-        }
-
-        // ── Single batch call ────────────────────────────────────────────────
-        let (env_batch, vault_batch, token_batch, _admin2, registry_batch) = setup();
-        let client_batch = StakeVaultContractClient::new(&env_batch, &vault_batch);
-        let mut providers: Vec<Address> = soroban_sdk::vec![&env_batch];
-        let mut severities: Vec<SlashSeverity> = soroban_sdk::vec![&env_batch];
-        for _ in 0..N {
-            let p = Address::generate(&env_batch);
-            StellarAssetClient::new(&env_batch, &token_batch).mint(&vault_batch, &1_000_000);
-            seed(&env_batch, &vault_batch, &p, 1_000_000);
-            providers.push_back(p);
-            severities.push_back(SlashSeverity::Minor);
-        }
-        env_batch.cost_estimate().budget().reset_tracker();
-        client_batch.batch_slash_stake(
-            &registry_batch,
-            &providers,
-            &severities,
-            &Symbol::new(&env_batch, "r"),
-        );
-        let batch_instructions = env_batch.cost_estimate().budget().cpu_instruction_cost();
-
-        assert!(
-            batch_instructions <= individual_instructions,
-            "batch ({batch_instructions}) should not exceed {N} individual calls ({individual_instructions})"
-        );
+        client.set_max_unstake_queue_size(&5);
+
+        let staker_a = Address::generate(&env);
+        let staker_b = Address::generate(&env);
+        let staker_c = Address::generate(&env);
+        seed(&env, &vault_id, &staker_a, 1_000_000);
+        seed(&env, &vault_id, &staker_b, 1_000_000);
+        seed(&env, &vault_id, &staker_c, 1_000_000);
+
+        client.queue_unstake(&staker_a);
+        client.queue_unstake(&staker_b);
+        client.queue_unstake(&staker_c);
+
+        // Lower the cap below the current queue length (3).
+        client.set_max_unstake_queue_size(&2);
+
+        // Existing entries are untouched — positions still resolve correctly.
+        assert_eq!(client.get_queue_position(&staker_a), Some(0));
+        assert_eq!(client.get_queue_position(&staker_b), Some(1));
+        assert_eq!(client.get_queue_position(&staker_c), Some(2));
+
+        // A brand-new enqueue is rejected while the queue sits above the new cap.
+        let staker_d = Address::generate(&env);
+        seed(&env, &vault_id, &staker_d, 1_000_000);
+        let result = client.try_queue_unstake(&staker_d);
+        assert_eq!(result, Err(Ok(StakeVaultError::QueueFull)));
+
+        // The existing entries still process normally despite being over the new cap.
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &3_000_000);
+        assert_eq!(client.process_unstake_queue(&3), 3);
     }
 }

@@ -28,6 +28,13 @@ jobs:
       # Checkout repository
       - uses: actions/checkout@v4
 
+      # Deployment manifests (deployments/*.manifest.json) describe required
+      # addresses, contract versions, and cross-contract dependencies for a
+      # release. Validate them before anything else so a misconfigured
+      # manifest fails fast, cheaply, and before any build/deploy work.
+      - name: Validate deployment manifests
+        run: python3 stellar-swipe/scripts/validate_deployment_manifest.py
+
       # Setup Rust toolchain with required components and target
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
