@@ -1755,3 +1755,214 @@ fn test_pause_requires_admin_auth() {
     assert!(result.is_err(), "non-admin must not be able to pause");
     assert!(!client.is_paused());
 }
+
+// ---------------------------------------------------------------------------
+// Issue #799: rebate cap
+// ---------------------------------------------------------------------------
+
+/// Seeds `DailyFeeTotal` for the current epoch (day 0 under `Env::default`),
+/// simulating fees already collected via `collect_fee`.
+fn seed_epoch_fees(env: &Env, contract_id: &Address, token: &Address, amount: i128) {
+    env.as_contract(contract_id, || {
+        crate::storage::add_daily_fee_total(env, token, 0u64, amount);
+    });
+}
+
+fn read_pending_fees(env: &Env, contract_id: &Address, provider: &Address, token: &Address) -> i128 {
+    env.as_contract(contract_id, || crate::get_pending_fees(env, provider, token))
+}
+
+#[test]
+fn test_max_rebate_bps_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    assert_eq!(client.get_max_rebate_bps(), 8_000u32);
+}
+
+#[test]
+fn test_set_max_rebate_bps_admin_only() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    client.set_max_rebate_bps(&admin, &5_000u32);
+    assert_eq!(client.get_max_rebate_bps(), 5_000u32);
+
+    let result = client.try_set_max_rebate_bps(&admin, &10_001u32);
+    assert_eq!(result, Err(Ok(ContractError::InvalidAmount)));
+}
+
+#[test]
+fn test_submit_rebate_claim_unauthorized_caller_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let result = client.try_submit_rebate_claim(&stranger, &provider, &token, &1_000i128);
+    assert_eq!(result, Err(Ok(ContractError::UnauthorizedCaller)));
+}
+
+#[test]
+fn test_distribute_rebates_below_cap_full_payout() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Epoch collected 1_000_000; default cap = 80% = 800_000.
+    seed_epoch_fees(&env, &contract_id, &token, 1_000_000);
+
+    client.submit_rebate_claim(&admin, &provider, &token, &300_000i128);
+
+    let distributed = client.distribute_rebates(&admin, &token);
+    assert_eq!(distributed, 300_000i128);
+    assert_eq!(read_pending_fees(&env, &contract_id, &provider, &token), 300_000i128);
+}
+
+#[test]
+fn test_distribute_rebates_above_cap_scales_proportionally() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider_a = Address::generate(&env);
+    let provider_b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Epoch collected 1_000_000; default cap = 80% = 800_000.
+    seed_epoch_fees(&env, &contract_id, &token, 1_000_000);
+
+    // Requested total: 900_000 + 300_000 = 1_200_000, above the 800_000 cap.
+    client.submit_rebate_claim(&admin, &provider_a, &token, &900_000i128);
+    client.submit_rebate_claim(&admin, &provider_b, &token, &300_000i128);
+
+    let distributed = client.distribute_rebates(&admin, &token);
+    assert_eq!(distributed, 800_000i128);
+
+    // Each claim scaled by cap / total_requested = 800_000 / 1_200_000 = 2/3.
+    assert_eq!(read_pending_fees(&env, &contract_id, &provider_a, &token), 600_000i128);
+    assert_eq!(read_pending_fees(&env, &contract_id, &provider_b, &token), 200_000i128);
+}
+
+#[test]
+fn test_distribute_rebates_single_claimant_at_exact_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Epoch collected 500_000; default cap = 80% = 400_000.
+    seed_epoch_fees(&env, &contract_id, &token, 500_000);
+
+    client.submit_rebate_claim(&admin, &provider, &token, &400_000i128);
+
+    let distributed = client.distribute_rebates(&admin, &token);
+    assert_eq!(distributed, 400_000i128);
+    assert_eq!(read_pending_fees(&env, &contract_id, &provider, &token), 400_000i128);
+}
+
+#[test]
+fn test_distribute_rebates_emits_cap_applied_event_only_when_capped() {
+    use soroban_sdk::testutils::Events;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    seed_epoch_fees(&env, &contract_id, &token, 1_000_000);
+
+    // Below cap: no cap-applied event.
+    client.submit_rebate_claim(&admin, &provider, &token, &100_000i128);
+    client.distribute_rebates(&admin, &token);
+    assert!(env.events().all().is_empty());
+
+    // Above cap: cap-applied event emitted.
+    client.submit_rebate_claim(&admin, &provider, &token, &900_000i128);
+    client.distribute_rebates(&admin, &token);
+    assert!(!env.events().all().is_empty());
+}
+
+#[test]
+fn test_distribute_rebates_claimed_via_claim_fees() {
+    use soroban_sdk::token::StellarAssetClient;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    StellarAssetClient::new(&env, &token).mint(&contract_id, &1_000_000);
+    seed_epoch_fees(&env, &contract_id, &token, 1_000_000);
+
+    client.submit_rebate_claim(&admin, &provider, &token, &250_000i128);
+    client.distribute_rebates(&admin, &token);
+
+    let claimed = client.claim_fees(&provider, &token);
+    assert_eq!(claimed, 250_000i128);
+    assert_eq!(read_pending_fees(&env, &contract_id, &provider, &token), 0i128);
+}

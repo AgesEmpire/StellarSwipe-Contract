@@ -236,6 +236,20 @@ pub fn emit_first_trade_fee_waived(env: &Env, user: &Address) {
 
 // ── Issue #442: Revenue Share Distributed event ─────────────────────
 
+// ── Issue #799: Rebate Cap Applied event ─────────────────────────────────────
+
+/// Emitted when `distribute_rebates` scales down pending claims because
+/// their sum exceeded `max_rebate_bps` of the epoch's collected fees.
+pub fn emit_rebate_cap_applied(env: &Env, epoch: u64, requested: i128, distributed: i128) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "rebate_cap_applied"),
+        ),
+        (epoch, requested, distributed),
+    );
+}
+
 /// Emitted when a revenue share snapshot is taken and distributed.
 pub fn emit_revenue_share_distributed(
     env: &Env,

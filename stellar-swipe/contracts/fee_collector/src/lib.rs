@@ -1342,6 +1342,57 @@ impl FeeCollector {
         Ok(())
     }
 
+    // ── Issue #799: Rebate Cap ────────────────────────────────────────────
+
+    /// Returns the current rebate cap, in basis points of an epoch's
+    /// collected fees (default: 8000 = 80%).
+    pub fn get_max_rebate_bps(env: Env) -> u32 {
+        rebates::get_max_rebate_bps(&env)
+    }
+
+    /// Admin: configure the rebate cap, in basis points (max 10000 = 100%).
+    pub fn set_max_rebate_bps(env: Env, caller: Address, bps: u32) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        rebates::set_max_rebate_bps(&env, &caller, bps)
+    }
+
+    /// Record a pending rebate claim for `provider`, settled by the next
+    /// [`Self::distribute_rebates`] call for the current epoch (day).
+    /// Callable by the admin or an authorized caller (Issue #813 allowlist),
+    /// e.g. a trusted rewards/settlement contract.
+    pub fn submit_rebate_claim(
+        env: Env,
+        caller: Address,
+        provider: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        rebates::submit_rebate_claim(&env, &caller, &provider, &token, amount)
+    }
+
+    /// Admin: settle all rebate claims pending for `token` in the current
+    /// epoch. If their sum exceeds `max_rebate_bps` of the epoch's collected
+    /// fees, every claim is scaled down proportionally so the total
+    /// distributed sums to the cap, and a `RebateCapApplied` event is
+    /// emitted. Distributed amounts are credited to each provider's pending
+    /// fees, claimable via [`Self::claim_fees`]. Returns the total amount
+    /// distributed.
+    pub fn distribute_rebates(
+        env: Env,
+        caller: Address,
+        token: Address,
+    ) -> Result<i128, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        rebates::distribute_rebates(&env, &caller, &token)
+    }
+
     /// Returns an earnings report for the provider over the requested period.
     ///
     /// Categories:
