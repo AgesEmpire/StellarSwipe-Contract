@@ -2167,4 +2167,135 @@ mod slash_appeal_tests {
         client.set_minimum_stake(&1_000_000i128);
         assert_eq!(client.get_minimum_stake(), 1_000_000);
     }
+
+    // ── Issue #818: resolve_appeal must go through multi-sig ──────────────────
+    //
+    // Prior to this fix, `resolve_appeal` was the only privileged mutation in
+    // this contract that stayed admin-only even after `set_multisig_config`
+    // was set: it decides whether slashed funds are burned or restored, yet
+    // it skipped the `multisig::get_config(...).is_some()` guard every
+    // sibling entrypoint (pause, unpause, set_minimum_stake,
+    // set_minimum_stake_duration, configure_slash_tiers, set_appeal_window)
+    // enforces, and had no corresponding `action::*` tag wired into
+    // `execute_action`. A single admin key could therefore bypass approval
+    // entirely for a fund-moving decision.
+
+    /// Sets up a slash with a pending appeal, then enables multi-sig.
+    /// Returns (env, vault_id, provider, initial_balance, signers).
+    fn resolve_appeal_multisig_setup() -> (Env, Address, Address, i128, Vec<Address>) {
+        let (env, vault_id, token, admin, signal_registry) = setup();
+        let provider = Address::generate(&env);
+        let initial: i128 = 1_000_000;
+
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &initial);
+        seed(&env, &vault_id, &provider, initial);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        // Appeal window must be configured while still in single-admin mode.
+        client.set_appeal_window(&86_400u64);
+
+        client.slash_stake(
+            &signal_registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "violation"),
+        );
+        client.appeal_slash(
+            &provider,
+            &0u64,
+            &String::from_str(&env, "ipfs://Qm_evidence"),
+        );
+
+        // Now enable multi-sig — resolve_appeal must be gated from here on.
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let signer_c = Address::generate(&env);
+        let signers = soroban_sdk::vec![&env, signer_a, signer_b, signer_c];
+        let cfg = MultisigConfig {
+            signers: signers.clone(),
+            threshold: 2,
+            proposal_timeout_secs: 86_400,
+        };
+        client.set_multisig_config(&admin, &Some(cfg));
+
+        (env, vault_id, provider, initial, signers)
+    }
+
+    fn encode_resolve_appeal_payload(env: &Env, slash_id: u64, uphold: bool) -> Bytes {
+        let mut data = [0u8; 9];
+        data[0..8].copy_from_slice(&slash_id.to_le_bytes());
+        data[8] = if uphold { 1 } else { 0 };
+        encode_action(env, action::RESOLVE_APPEAL, &data)
+    }
+
+    #[test]
+    fn resolve_appeal_returns_requires_multisig_when_configured() {
+        let (env, vault_id, _provider, _initial, _signers) = resolve_appeal_multisig_setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        // Direct admin call must now be rejected — this is the gap being fixed.
+        let result = client.try_resolve_appeal(&0u64, &true);
+        assert_eq!(result, Err(Ok(StakeVaultError::RequiresMultisig)));
+    }
+
+    #[test]
+    fn execute_resolve_appeal_before_threshold_rejected() {
+        let (env, vault_id, _provider, _initial, signers) = resolve_appeal_multisig_setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        let payload = encode_resolve_appeal_payload(&env, 0u64, false);
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+
+        // Only 1 approval (the proposer's); threshold is 2.
+        let result = client.try_execute_action(&signers.get(0).unwrap(), &id);
+        assert_eq!(result, Err(Ok(StakeVaultError::Unauthorized)));
+
+        // Appeal must remain untouched while the proposal is unresolved.
+        let appeal = client.get_slash_appeal(&0u64).unwrap();
+        assert_eq!(appeal.status, AppealStatus::Pending);
+    }
+
+    #[test]
+    fn propose_approve_execute_resolve_appeal_restores_stake_after_threshold() {
+        let (env, vault_id, provider, initial, signers) = resolve_appeal_multisig_setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        // Minor severity slashed 5 % (50_000); reversal must restore it in full.
+        assert_eq!(client.get_stake(&provider), initial - 50_000);
+
+        let payload = encode_resolve_appeal_payload(&env, 0u64, false);
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+        let count = client.approve_action(&signers.get(1).unwrap(), &id);
+        assert_eq!(count, 2);
+
+        client.execute_action(&signers.get(0).unwrap(), &id);
+
+        assert_eq!(
+            client.get_stake(&provider),
+            initial,
+            "stake must be fully restored once the multisig-approved reversal executes"
+        );
+        let appeal = client.get_slash_appeal(&0u64).unwrap();
+        assert_eq!(appeal.status, AppealStatus::Reversed);
+
+        // Re-executing the same proposal must fail (already-executed guard).
+        let result = client.try_execute_action(&signers.get(0).unwrap(), &id);
+        assert_eq!(result, Err(Ok(StakeVaultError::EmergencyRequestNotFound)));
+    }
+
+    #[test]
+    fn propose_approve_execute_resolve_appeal_uphold_burns_funds() {
+        let (env, vault_id, provider, initial, signers) = resolve_appeal_multisig_setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        let payload = encode_resolve_appeal_payload(&env, 0u64, true);
+        let id = client.propose_action(&signers.get(0).unwrap(), &payload);
+        let _ = client.approve_action(&signers.get(1).unwrap(), &id);
+        client.execute_action(&signers.get(0).unwrap(), &id);
+
+        let appeal = client.get_slash_appeal(&0u64).unwrap();
+        assert_eq!(appeal.status, AppealStatus::Upheld);
+        // Provider's stake stays reduced by the slash (funds were burned, not restored).
+        assert_eq!(client.get_stake(&provider), initial - 50_000);
+    }
 }
