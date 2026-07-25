@@ -468,6 +468,112 @@ mod tests {
         });
     }
 
+    // ── Composite / multi-factor scenario ─────────────────────────────────────
+
+    /// Exercises every weighted sub-score in `ChurnRiskScore` at once (signal
+    /// frequency decline, follower loss, and performance decline — the three
+    /// components that make up the 40/30/30 composite formula) and asserts the
+    /// composite and each component against hand-derived expected values.
+    ///
+    /// The issue that motivated this test also names a fourth factor,
+    /// "inactivity window". In the current implementation that case is not a
+    /// separate weighted component: it is a special branch of
+    /// `freq_decline_score` (prior == 0 && recent == 0 → 50) that only fires for
+    /// providers with *no* history at all in either window. That branch is
+    /// covered on its own by `test_churn_risk_no_activity` below, since mixing
+    /// it into this test would zero out the other components (once `prior == 0`
+    /// the decline branch is skipped entirely).
+    #[test]
+    fn test_churn_risk_composite() {
+        let env = make_env();
+        let provider = Address::generate(&env);
+        let now = env.ledger().timestamp();
+        let recent = now.saturating_sub(WINDOW_SECS / 2); // inside recent window
+        let older = now.saturating_sub(WINDOW_SECS + 100); // inside prior window
+
+        with_contract(&env, || {
+            let mut signals: Map<u64, Signal> = Map::new(&env);
+
+            // Recent window: 5 signals (2 Successful, 3 Failed) → recent_count=5,
+            // recent_closed=5, recent_successful=2 → recent_rate = 2*10_000/5 = 4_000 bps.
+            signals.set(0, base_signal(&env, 0, &provider, recent));
+            signals.set(1, base_signal(&env, 1, &provider, recent));
+            for i in 2..5u64 {
+                let mut failed = base_signal(&env, i, &provider, recent);
+                failed.status = SignalStatus::Failed;
+                signals.set(i, failed);
+            }
+
+            // Prior window: 10 signals → prior_count = 10.
+            for i in 5..15u64 {
+                signals.set(i, base_signal(&env, i, &provider, older));
+            }
+
+            // Follower loss: previous snapshot had 200 followers, now only 150.
+            env.storage().persistent().set(
+                &ChurnStorageKey::ProviderSnapshot(provider.clone()),
+                &ProviderChurnSnapshot {
+                    follower_count: 200,
+                    signal_count: 10,
+                    success_rate_bps: 9_000,
+                    snapshot_at: now.saturating_sub(WINDOW_SECS),
+                },
+            );
+            env.storage().instance().set(
+                &crate::social::SocialDataKey::FollowerCount(provider.clone()),
+                &150u32,
+            );
+
+            // Performance decline: all-time rate 9_000 bps vs recent 4_000 bps.
+            let stats = perf(15, 9_000);
+            let score = get_provider_churn_risk(&env, &provider, &signals, Some(&stats));
+
+            // signal_freq_score = (10 - 5) * 100 / 10 = 50
+            assert_eq!(score.signal_freq_score, 50);
+            // follower_unsub_score = (200 - 150) * 100 / 200 = 25
+            assert_eq!(score.follower_unsub_score, 25);
+            // perf_trend_score = (9_000 - 4_000) * 100 / 9_000 = 500_000 / 9_000 = 55 (int div)
+            assert_eq!(score.perf_trend_score, 55);
+
+            // All three components are non-zero, proving each factor contributed.
+            assert!(score.signal_freq_score > 0);
+            assert!(score.follower_unsub_score > 0);
+            assert!(score.perf_trend_score > 0);
+
+            // composite = (50*40 + 25*30 + 55*30) / 100 = (2000 + 750 + 1650) / 100 = 44
+            assert_eq!(score.composite_score, 44);
+            assert_eq!(score.level, ChurnRiskLevel::Medium);
+        });
+    }
+
+    // ── Zero-activity / brand-new provider ────────────────────────────────────
+
+    /// A brand-new provider with no signal history, no churn snapshot, and no
+    /// performance stats must not panic, and must resolve to the composite's
+    /// defined default rather than an arbitrary or uninitialized value.
+    #[test]
+    fn test_churn_risk_no_activity() {
+        let env = make_env();
+        let provider = Address::generate(&env);
+
+        with_contract(&env, || {
+            let signals: Map<u64, Signal> = Map::new(&env);
+            let score = get_provider_churn_risk(&env, &provider, &signals, None);
+
+            // freq_decline_score(0, 0) → prior == 0 && recent == 0 → default 50
+            // (dormancy is undecidable, so it is scored as a mid-point, not 0 or 100).
+            assert_eq!(score.signal_freq_score, 50);
+            // No prior snapshot exists yet → no follower-loss signal.
+            assert_eq!(score.follower_unsub_score, 0);
+            // No stats and no recent closed signals → nothing to compare, no decline.
+            assert_eq!(score.perf_trend_score, 0);
+
+            // composite = (50*40 + 0*30 + 0*30) / 100 = 2000 / 100 = 20
+            assert_eq!(score.composite_score, 20);
+            assert_eq!(score.level, ChurnRiskLevel::Low);
+        });
+    }
+
     // ── Snapshot update ───────────────────────────────────────────────────────
 
     #[test]
