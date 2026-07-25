@@ -57,6 +57,7 @@ use soroban_sdk::{
 };
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
+use shared::pausable;
 use stellar_swipe_common::Asset;
 use stellar_swipe_common::SECONDS_PER_DAY;
 
@@ -190,6 +191,12 @@ impl FeeCollector {
         }
         let admin = get_admin(&env);
         admin.require_auth();
+        pausable::set_paused(&env, true);
+        Ok(())
+    }
+
+    /// Resume fund-moving operations. Admin auth required.
+    pub fn unpause(env: Env) -> Result<(), ContractError> {
 
         let current_version = shared::version::get_contract_version(&env);
         shared::version::guard_upgrade(current_version, new_version)
@@ -389,6 +396,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
         if amount <= 0 {
@@ -449,6 +457,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
 
@@ -865,6 +874,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         trader.require_auth();
 
         if trade_amount <= 0 {
@@ -1048,6 +1058,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let mut auth_args: Vec<Val> = Vec::new(&env);
         auth_args.push_back(provider.clone().into_val(&env));
         auth_args.push_back(token.clone().into_val(&env));
@@ -1365,6 +1376,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
+        Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
 

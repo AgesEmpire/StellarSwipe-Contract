@@ -1586,3 +1586,172 @@ fn test_congestion_bounded() {
     let result = client.try_set_congestion_signal(&admin, &60_000u32);
     assert_eq!(result, Err(Ok(ContractError::InvalidMultiplierBounds)));
 }
+
+// ---------------------------------------------------------------------------
+// Emergency pause / circuit breaker (Issue #821)
+//
+// fee_collector previously had no connection to `shared::pausable` at all,
+// so an admin pausing the protocol during an incident could not stop
+// fee_collector from continuing to move funds via `collect_fee`,
+// `claim_fees` and `withdraw_treasury_fees` while every other contract
+// (stake_vault, signal_registry, oracle, governance, auto_trade) obeyed the
+// shared pause flag. These tests prove the gap is closed for the
+// fund-moving entry points and that normal operation resumes after unpause.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fresh_contract_is_not_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_pause_blocks_withdraw_treasury_fees_then_unpause_allows_it() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (recipient, token, _contract_id, client) = setup(&env, 1000i128);
+
+    env.ledger().set_timestamp(0);
+    client.queue_withdrawal(&recipient, &token, &1000i128);
+    env.ledger().set_timestamp(86400);
+
+    // Admin pauses the contract (shared circuit breaker).
+    client.pause();
+    assert!(client.is_paused());
+
+    // Before the fix this call would have succeeded even while paused.
+    let result = client.try_withdraw_treasury_fees(&recipient, &token, &1000i128);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::ContractPaused)),
+        "paused contract must reject withdraw_treasury_fees with a clear error"
+    );
+    assert_eq!(client.treasury_balance(&token), 1000i128, "no funds should move while paused");
+
+    // Resume: the previously queued withdrawal succeeds again.
+    client.unpause();
+    assert!(!client.is_paused());
+    client.withdraw_treasury_fees(&recipient, &token, &1000i128);
+    assert_eq!(client.treasury_balance(&token), 0i128);
+    assert_eq!(TokenClient::new(&env, &token).balance(&recipient), 1000i128);
+}
+
+#[test]
+fn test_pause_blocks_queue_withdrawal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (recipient, token, _contract_id, client) = setup(&env, 1000i128);
+
+    client.pause();
+    let result = client.try_queue_withdrawal(&recipient, &token, &1000i128);
+    assert_eq!(result, Err(Ok(ContractError::ContractPaused)));
+
+    client.unpause();
+    client.queue_withdrawal(&recipient, &token, &1000i128);
+}
+
+#[test]
+fn test_pause_blocks_collect_fee_then_unpause_allows_it() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+
+    StellarAssetClient::new(&env, &token).mint(&trader, &(2_000 * 10_000_000));
+    mark_trader_has_traded(&env, &contract_id, &trader);
+
+    client.pause();
+    let result = client.try_collect_fee(&trader, &token, &(1_000 * 10_000_000), &asset);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::ContractPaused)),
+        "paused contract must reject collect_fee with a clear error"
+    );
+
+    client.unpause();
+    let fee = client.collect_fee(&trader, &token, &(1_000 * 10_000_000), &asset);
+    assert!(fee > 0, "collect_fee must work normally again after unpause");
+}
+
+#[test]
+fn test_pause_blocks_claim_fees_then_unpause_allows_it() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let amount: i128 = 1_000_000;
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    StellarAssetClient::new(&env, &token_id).mint(&contract_id, &amount);
+    env.as_contract(&contract_id, || {
+        set_pending_fees(&env, &provider, &token_id, amount);
+    });
+
+    client.pause();
+    let result = client.try_claim_fees(&provider, &token_id);
+    assert_eq!(result, Err(Ok(ContractError::ContractPaused)));
+
+    client.unpause();
+    let claimed = client.claim_fees(&provider, &token_id);
+    assert_eq!(claimed, amount);
+}
+
+#[test]
+fn test_pause_requires_admin_auth() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let non_admin = Address::generate(&env);
+    let sub_invokes: &[MockAuthInvoke] = &[];
+    let mock_invoke = MockAuthInvoke {
+        contract: &contract_id,
+        fn_name: "pause",
+        args: ().into_val(&env),
+        sub_invokes,
+    };
+    let mock_auth = MockAuth {
+        address: &non_admin,
+        invoke: &mock_invoke,
+    };
+    let result = client.mock_auths(&[mock_auth]).try_pause();
+    assert!(result.is_err(), "non-admin must not be able to pause");
+    assert!(!client.is_paused());
+}
