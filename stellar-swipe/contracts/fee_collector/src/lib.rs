@@ -191,12 +191,6 @@ impl FeeCollector {
         }
         let admin = get_admin(&env);
         admin.require_auth();
-        pausable::set_paused(&env, true);
-        Ok(())
-    }
-
-    /// Resume fund-moving operations. Admin auth required.
-    pub fn unpause(env: Env) -> Result<(), ContractError> {
 
         let current_version = shared::version::get_contract_version(&env);
         shared::version::guard_upgrade(current_version, new_version)
@@ -206,6 +200,40 @@ impl FeeCollector {
         shared::version::set_contract_version(&env, new_version);
         shared::version::emit_contract_upgraded(&env, current_version, new_version);
         Ok(())
+    }
+
+    // ── Issue #821: shared circuit-breaker pause ─────────────────────────────
+
+    /// Admin-only: halt fund-moving operations (fee collection, claims,
+    /// withdrawals) via the shared circuit breaker.
+    pub fn pause(env: Env) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        pausable::set_paused(&env, true);
+        Ok(())
+    }
+
+    /// Admin-only: resume fund-moving operations.
+    pub fn unpause(env: Env) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        pausable::set_paused(&env, false);
+        Ok(())
+    }
+
+    /// Returns `true` while the shared circuit breaker has the contract paused.
+    pub fn is_paused(env: Env) -> bool {
+        pausable::is_paused(&env)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), ContractError> {
+        pausable::require_not_paused(env).map_err(|_| ContractError::ContractPaused)
     }
 
     // ── Issue #813: cross-contract authentication hardening ─────────────────

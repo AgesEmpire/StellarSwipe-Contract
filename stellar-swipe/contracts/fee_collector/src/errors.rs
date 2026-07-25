@@ -36,4 +36,7 @@ pub enum ContractError {
     /// Issue #813: caller is neither the admin nor on the authorized-caller
     /// allowlist for this privileged, non-user-scoped entry point.
     UnauthorizedCaller = 28,
+    /// Issue #821: a fund-moving entry point was called while the shared
+    /// circuit breaker has the contract paused.
+    ContractPaused = 29,
 }
