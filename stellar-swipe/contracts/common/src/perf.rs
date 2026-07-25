@@ -33,6 +33,15 @@ pub enum PerfStorageKey {
 }
 
 /// Read a value from the transaction-scoped cache, or compute and store it.
+///
+/// Note: despite the "transaction-scoped" naming, this is backed by Soroban
+/// **temporary** storage, which is keyed on `(contract, key)` and survives
+/// until its TTL lapses — it is *not* wiped at the end of a single
+/// transaction. A cached value can therefore be served to many subsequent
+/// transactions. Callers that cache values derived from mutable contract
+/// config MUST call [`invalidate_tx_cache`] for the same `key` whenever that
+/// underlying config changes, or stale values will be served until the TTL
+/// expires (see issue #801).
 pub fn tx_cache_or_compute<T, F>(env: &Env, key: Symbol, mut compute: F) -> T
 where
     T: Clone
@@ -47,6 +56,19 @@ where
     let value = compute();
     env.storage().temporary().set(&cache_key, &value);
     value
+}
+
+/// Evict a transaction-scoped cache entry so the next [`tx_cache_or_compute`]
+/// call for the same `key` recomputes from source-of-truth storage instead of
+/// returning a stale cached value.
+///
+/// Call this immediately after writing any config value that feeds a cached
+/// computation (e.g. a fee rate config field cached by `fee_collector`), so
+/// the change takes effect on the very next read rather than waiting for the
+/// temporary storage entry's TTL to lapse.
+pub fn invalidate_tx_cache(env: &Env, key: Symbol) {
+    let cache_key = PerfStorageKey::TxCache(key);
+    env.storage().temporary().remove(&cache_key);
 }
 
 /// Record that an operation completed (stores timestamp for off-chain latency analysis).
