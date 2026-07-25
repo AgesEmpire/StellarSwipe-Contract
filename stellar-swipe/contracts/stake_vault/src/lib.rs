@@ -853,6 +853,107 @@ impl StakeVaultContract {
         Ok(())
     }
 
+    /// Core slash-appeal resolution logic, shared by the single-admin
+    /// `resolve_appeal` entrypoint (used when no multi-sig config is set)
+    /// and the multi-sig `execute_action` dispatch (used once one is).
+    fn do_resolve_appeal(env: &Env, slash_id: u64, uphold: bool) -> Result<(), StakeVaultError> {
+        // Load slash record.
+        let record: SlashRecord = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::SlashRecord(slash_id))
+            .ok_or(StakeVaultError::SlashNotFound)?;
+
+        // Load appeal record.
+        let mut appeal: SlashAppeal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::SlashAppeal(slash_id))
+            .ok_or(StakeVaultError::SlashNotFound)?;
+
+        if appeal.status != AppealStatus::Pending {
+            return Err(StakeVaultError::AppealAlreadyResolved);
+        }
+
+        // Retrieve held funds (only present when an appeal window is configured
+        // and the slash_stake did not burn immediately).
+        let held: i128 = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::SlashedFundsHeld(slash_id))
+            .unwrap_or(0);
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+
+        if uphold {
+            appeal.status = AppealStatus::Upheld;
+            // Slash confirmed — burn the held funds now.
+            if held > 0 {
+                env.storage()
+                    .persistent()
+                    .remove(&StorageKey::SlashedFundsHeld(slash_id));
+                token::Client::new(env, &token).burn(&env.current_contract_address(), &held);
+            }
+        } else {
+            // Reversed — tokens are still in the vault; credit provider's stake.
+            appeal.status = AppealStatus::Reversed;
+
+            let amount_to_restore = if held > 0 { held } else { record.slash_amount };
+
+            let mut stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+                .storage()
+                .persistent()
+                .get(&MigrationKey::StakesV2)
+                .unwrap_or_else(|| soroban_sdk::Map::new(env));
+
+            let current_info = stakes.get(record.provider.clone()).unwrap_or(StakeInfoV2 {
+                balance: 0,
+                locked_until: 0,
+                last_updated: 0,
+            });
+
+            let restored_balance = current_info.balance.saturating_add(amount_to_restore);
+            let now = env.ledger().timestamp();
+
+            stakes.set(
+                record.provider.clone(),
+                StakeInfoV2 {
+                    balance: restored_balance,
+                    locked_until: current_info.locked_until,
+                    last_updated: now,
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&MigrationKey::StakesV2, &stakes);
+
+            if held > 0 {
+                env.storage()
+                    .persistent()
+                    .remove(&StorageKey::SlashedFundsHeld(slash_id));
+            }
+        }
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::SlashAppeal(slash_id), &appeal);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(env, "stake_vault"),
+                Symbol::new(env, "appeal_resolved"),
+            ),
+            (slash_id, uphold, record.provider),
+        );
+
+        Ok(())
+    }
+
     pub fn notify_stake_below_minimum(env: Env, provider: Address) {
         let minimum: i128 = env
             .storage()
@@ -1688,7 +1789,19 @@ impl StakeVaultContract {
     ///
     /// Resolving an appeal that does not exist or has already been resolved
     /// returns an error.
+    ///
+    /// Resolution determines whether slashed funds are burned or returned to
+    /// the provider, so — like every other privileged mutation in this
+    /// contract — it must be routed through multi-sig approval
+    /// (`propose_action` / `approve_action` / `execute_action` with
+    /// [`action::RESOLVE_APPEAL`]) once a multi-sig config is set. See issue
+    /// #818: this entrypoint previously stayed admin-only even after
+    /// `set_multisig_config` was configured, letting a single admin key
+    /// bypass the approval flow that every sibling admin entrypoint enforces.
     pub fn resolve_appeal(env: Env, slash_id: u64, uphold: bool) -> Result<(), StakeVaultError> {
+        if multisig::get_config(&env).is_some() {
+            return Err(StakeVaultError::RequiresMultisig);
+        }
         let admin: Address = env
             .storage()
             .instance()
