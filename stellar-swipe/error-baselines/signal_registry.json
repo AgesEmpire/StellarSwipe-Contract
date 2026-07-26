@@ -41,10 +41,10 @@
       "IncompatibleStorageLayout": 36
     },
     "AiScoreError": {
-      "Unauthorized": 600,
-      "OracleNotConfigured": 601,
-      "InvalidScore": 602,
-      "SignalNotFound": 603
+      "Unauthorized": 1500,
+      "OracleNotConfigured": 1501,
+      "InvalidScore": 1502,
+      "SignalNotFound": 1503
     },
     "FeeError": {
       "TradeTooSmall": 100,
@@ -170,13 +170,28 @@
       "MissingRationale": 1206,
       "PriceUnreasonable": 1207
     },
+    "SignalCancelError": {
+      "NotFound": 1300,
+      "NotOwner": 1301,
+      "NotActive": 1302,
+      "LifetimeNotElapsed": 1303
+    },
+    "SignalValidationError": {
+      "InvalidAssetPair": 1400,
+      "InvalidPrice": 1401,
+      "EmptyRationale": 1402,
+      "RationaleTooLong": 1403,
+      "InvalidExpiry": 1404,
+      "TooManyTags": 1405,
+      "DailyLimitExceeded": 1406
+    },
     "DisputeError": {
-      "Unauthorized": 1,
-      "DisputeNotFound": 2,
-      "DisputeNotOpen": 3,
-      "AppealAlreadySubmitted": 4,
-      "AppealNotPending": 5,
-      "AppealWindowNotElapsed": 6
+      "Unauthorized": 1600,
+      "DisputeNotFound": 1601,
+      "DisputeNotOpen": 1602,
+      "AppealAlreadySubmitted": 1603,
+      "AppealNotPending": 1604,
+      "AppealWindowNotElapsed": 1605
     }
   }
 }
