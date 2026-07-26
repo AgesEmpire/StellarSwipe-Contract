@@ -382,3 +382,11 @@ appeal also still emits its own `apresolv` event.
 | `emgexp` | `staker: Address` |
 | `emgexec` | `staker: Address`, `gross: i128`, `penalty: i128`, `net: i128` |
 | `amount` | `i128` | Amount released |
+
+### `lockmult` (issue #787)
+Emitted when admin sets or updates a lock-duration voting-power multiplier tier.
+
+| Field | Type | Description |
+|---|---|---|
+| `weeks` | `u32` | Minimum remaining lock duration (in whole weeks) this tier applies to |
+| `bps` | `u32` | Voting-power multiplier in basis points (`10_000` = 1x) |

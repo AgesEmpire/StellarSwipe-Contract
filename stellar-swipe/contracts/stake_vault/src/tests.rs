@@ -1126,6 +1126,150 @@ mod slash_severity_tests {
         assert_eq!(client.withdraw_stake(&staker), amount);
     }
 
+    // ── Issue #787: lock-duration-weighted voting power multiplier ───────────
+
+    fn seed_locked(
+        env: &Env,
+        contract_id: &Address,
+        staker: &Address,
+        balance: i128,
+        locked_until: u64,
+    ) {
+        env.as_contract(contract_id, || {
+            let mut stakes: Map<Address, StakeInfoV2> = env
+                .storage()
+                .persistent()
+                .get(&MigrationKey::StakesV2)
+                .unwrap_or_else(|| Map::new(env));
+            stakes.set(
+                staker.clone(),
+                StakeInfoV2 {
+                    balance,
+                    locked_until,
+                    last_updated: 0,
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&MigrationKey::StakesV2, &stakes);
+        });
+    }
+
+    const SECS_PER_WEEK: u64 = 604_800;
+
+    #[test]
+    fn default_lock_multiplier_tiers_are_returned_when_unset() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let tiers = client.get_lock_multiplier_tiers();
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers.get(0).unwrap().weeks, 1);
+        assert_eq!(tiers.get(0).unwrap().bps, 10_000);
+        assert_eq!(tiers.get(1).unwrap().weeks, 4);
+        assert_eq!(tiers.get(1).unwrap().bps, 12_500);
+        assert_eq!(tiers.get(2).unwrap().weeks, 12);
+        assert_eq!(tiers.get(2).unwrap().bps, 20_000);
+    }
+
+    /// (a) No lock at all — voting power counts at the 1x baseline.
+    #[test]
+    fn voting_power_no_lock_is_baseline_1x() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        seed_locked(&env, &vault_id, &staker, 1_000_000, 0);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.get_voting_power(&staker), 1_000_000);
+    }
+
+    /// (b) Mid-tier lock (4 weeks remaining) applies the 1.25x multiplier.
+    #[test]
+    fn voting_power_mid_tier_multiplier_applied() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let now = env.ledger().timestamp();
+        seed_locked(&env, &vault_id, &staker, 1_000_000, now + 4 * SECS_PER_WEEK);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.get_voting_power(&staker), 1_250_000);
+    }
+
+    /// (c) Max-tier lock (12 weeks remaining) applies the 2x multiplier.
+    #[test]
+    fn voting_power_max_tier_multiplier_applied() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let now = env.ledger().timestamp();
+        seed_locked(
+            &env,
+            &vault_id,
+            &staker,
+            1_000_000,
+            now + 12 * SECS_PER_WEEK,
+        );
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.get_voting_power(&staker), 2_000_000);
+    }
+
+    /// (d) An expired lock (even one that once qualified for a high tier)
+    /// falls back to the 1x baseline rather than retaining its multiplier.
+    #[test]
+    fn voting_power_expired_lock_falls_back_to_1x() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        env.ledger().with_mut(|l| l.timestamp = 20 * SECS_PER_WEEK);
+        let now = env.ledger().timestamp();
+        seed_locked(&env, &vault_id, &staker, 1_000_000, now - 1);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.get_voting_power(&staker), 1_000_000);
+    }
+
+    /// A remaining lock duration below the smallest configured tier keeps the
+    /// pre-#787 zero-voting-power behaviour (still-vesting eligibility lock).
+    #[test]
+    fn voting_power_below_smallest_tier_stays_zero() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let now = env.ledger().timestamp();
+        seed_locked(&env, &vault_id, &staker, 1_000_000, now + 3 * 86_400);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        assert_eq!(client.get_voting_power(&staker), 0);
+    }
+
+    #[test]
+    fn set_lock_multiplier_tier_rejects_invalid_weeks_or_bps() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+
+        assert_eq!(
+            client.try_set_lock_multiplier_tier(&0, &15_000),
+            Err(Ok(StakeVaultError::InvalidLockMultiplierTier))
+        );
+        assert_eq!(
+            client.try_set_lock_multiplier_tier(&4, &9_999),
+            Err(Ok(StakeVaultError::InvalidLockMultiplierTier))
+        );
+    }
+
+    #[test]
+    fn set_lock_multiplier_tier_updates_existing_tier_and_affects_voting_power() {
+        let (env, vault_id, _token, _admin, _registry) = setup();
+        let staker = Address::generate(&env);
+        let now = env.ledger().timestamp();
+        seed_locked(&env, &vault_id, &staker, 1_000_000, now + 4 * SECS_PER_WEEK);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        // Raise the 4-week tier from the default 1.25x to 1.5x in place.
+        client.set_lock_multiplier_tier(&4, &15_000);
+
+        let tiers = client.get_lock_multiplier_tiers();
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(client.get_voting_power(&staker), 1_500_000);
+    }
+
     // ── Issue #563: require_auth_for_args ─────────────────────────────────
 
     /// Auth scoped to (staker, amount=0) is rejected when the staker has a
