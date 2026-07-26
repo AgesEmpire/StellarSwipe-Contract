@@ -50,6 +50,73 @@ impl SlashTierConfig {
 
 const BPS_DENOMINATOR: i128 = 10_000;
 
+// ── Issue #787: stake duration-weighted voting power ──────────────────────────
+
+/// Seconds in a week, used to convert a stake's remaining lock time into the
+/// whole-week buckets that `LockMultiplierTier` thresholds are expressed in.
+const SECS_PER_WEEK: u64 = 604_800;
+
+/// Upper bound on an admin-configured lock-multiplier tier (100x), well above
+/// the default max tier (2x) while still keeping `balance * bps` comfortably
+/// clear of `i128` overflow for realistic stake sizes.
+const MAX_LOCK_MULTIPLIER_BPS: u32 = 1_000_000;
+
+/// Admin-configurable voting-power multiplier tier (issue #787).
+///
+/// While a stake's remaining lock time (`locked_until - now`) is at least
+/// `weeks`, its voting power is multiplied by `bps` basis points
+/// (`10_000` = 1x). The highest-`bps` tier whose `weeks` threshold is met by
+/// the remaining lock time applies.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockMultiplierTier {
+    pub weeks: u32,
+    pub bps: u32,
+}
+
+/// Default lock-multiplier tiers, used until an admin configures custom ones
+/// via `set_lock_multiplier_tier`.
+fn default_lock_multiplier_tiers(env: &Env) -> Vec<LockMultiplierTier> {
+    let mut tiers = Vec::new(env);
+    tiers.push_back(LockMultiplierTier {
+        weeks: 1,
+        bps: 10_000, // 1x
+    });
+    tiers.push_back(LockMultiplierTier {
+        weeks: 4,
+        bps: 12_500, // 1.25x
+    });
+    tiers.push_back(LockMultiplierTier {
+        weeks: 12,
+        bps: 20_000, // 2x
+    });
+    tiers
+}
+
+/// Returns the multiplier (basis points) for a stake with `remaining_secs`
+/// left on its lock. `0` means the remaining duration does not meet even the
+/// smallest configured tier (equivalent to the pre-#787 "still within the
+/// eligibility lock" zero-voting-power behaviour).
+fn lock_multiplier_bps_for_remaining(tiers: &Vec<LockMultiplierTier>, remaining_secs: u64) -> u32 {
+    let remaining_weeks = (remaining_secs / SECS_PER_WEEK) as u32;
+    let mut applicable_bps: u32 = 0;
+    for tier in tiers.iter() {
+        if remaining_weeks >= tier.weeks && tier.bps > applicable_bps {
+            applicable_bps = tier.bps;
+        }
+    }
+    applicable_bps
+}
+
+/// Applies a basis-point multiplier to `balance`, saturating instead of
+/// overflowing for pathologically large inputs.
+fn apply_multiplier_bps(balance: i128, bps: u32) -> i128 {
+    balance
+        .checked_mul(bps as i128)
+        .and_then(|v| v.checked_div(BPS_DENOMINATOR))
+        .unwrap_or(i128::MAX)
+}
+
 /// Temporary-storage key for the reentrancy lock on `withdraw_stake`.
 const EXECUTION_LOCK: &str = "WithdrawLock";
 
@@ -185,6 +252,11 @@ pub enum StorageKey {
     /// Admin-configurable large-withdrawal time-lock duration (seconds).
     /// Falls back to `LARGE_WITHDRAWAL_TIMELOCK_SECS` when unset.
     WithdrawalCooldownSecs,
+    // ── Issue #787: stake duration-weighted voting power ───────────────────────
+    /// Admin-configurable table mapping a remaining-lock-duration threshold
+    /// (in whole weeks) to a voting-power multiplier (basis points).
+    /// Falls back to the built-in default tiers when unset.
+    LockMultiplierTiers,
 }
 
 #[contracterror]
@@ -251,6 +323,10 @@ pub enum StakeVaultError {
     /// `upgrade()` was called with a version that is not strictly greater
     /// than the currently stored contract version.
     IncompatibleContractVersion = 34,
+    // ── Issue #787: stake duration-weighted voting power ─────────────────────
+    /// `set_lock_multiplier_tier` was called with `weeks == 0` or a `bps`
+    /// value outside `[BPS_DENOMINATOR, MAX_LOCK_MULTIPLIER_BPS]`.
+    InvalidLockMultiplierTier = 35,
 }
 
 /// A pending unstake request held in the FIFO queue (issue #663).
@@ -588,6 +664,15 @@ impl StakeVaultContract {
     ///   locked before being eligible to count toward voting power ✓
     /// - Top-up deposits to an existing stake tracked separately so only the new
     ///   portion is subject to the fresh lock ✓
+    ///
+    /// ## Lock-duration-weighted multiplier (Issue #787)
+    /// Once locked, a stake's remaining lock time (`locked_until - now`) is
+    /// looked up against the configured `LockMultiplierTier` table
+    /// (`get_lock_multiplier_tiers`) and the balance is scaled by the
+    /// matching tier's basis points. A remaining duration below the smallest
+    /// configured tier keeps the pre-existing zero-voting-power behaviour; a
+    /// stake with no lock, or whose lock has fully elapsed, always counts at
+    /// the 1x baseline.
     pub fn get_voting_power(env: Env, staker: Address) -> i128 {
         let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
             .storage()
@@ -605,14 +690,68 @@ impl StakeVaultContract {
         }
 
         let now = env.ledger().timestamp();
-        if now < info.locked_until {
-            // Stake is still within the minimum duration lock window.
-            // Voting power is 0 until the lock expires.
-            return 0;
+        if info.locked_until == 0 || now >= info.locked_until {
+            // No lock, or the lock has fully elapsed — baseline 1x.
+            return info.balance;
         }
 
-        // Lock has elapsed — full balance counts as voting power.
-        info.balance
+        // Still locked — apply the tiered multiplier for the remaining duration.
+        let remaining = info.locked_until - now;
+        let tiers = Self::get_lock_multiplier_tiers(env.clone());
+        let bps = lock_multiplier_bps_for_remaining(&tiers, remaining);
+        if bps == 0 {
+            return 0;
+        }
+        apply_multiplier_bps(info.balance, bps)
+    }
+
+    // ── Admin: configure lock-duration voting-power multiplier tiers ───────────
+
+    /// Returns the configured lock-multiplier tiers, or the built-in defaults
+    /// (1 week = 1x, 4 weeks = 1.25x, 12 weeks = 2x) if none have been set.
+    pub fn get_lock_multiplier_tiers(env: Env) -> Vec<LockMultiplierTier> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::LockMultiplierTiers)
+            .unwrap_or_else(|| default_lock_multiplier_tiers(&env))
+    }
+
+    /// Admin-only: set (or update) the voting-power multiplier for stakes
+    /// whose remaining lock time is at least `weeks`, in basis points
+    /// (`10_000` = 1x). `bps` must be in `[10_000, MAX_LOCK_MULTIPLIER_BPS]` —
+    /// a lock can never be worth less than the unlocked baseline.
+    pub fn set_lock_multiplier_tier(env: Env, weeks: u32, bps: u32) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+
+        if weeks == 0 || bps < BPS_DENOMINATOR as u32 || bps > MAX_LOCK_MULTIPLIER_BPS {
+            return Err(StakeVaultError::InvalidLockMultiplierTier);
+        }
+
+        let existing = Self::get_lock_multiplier_tiers(env.clone());
+        let mut updated_tiers: Vec<LockMultiplierTier> = Vec::new(&env);
+        let mut replaced = false;
+        for tier in existing.iter() {
+            if tier.weeks == weeks {
+                updated_tiers.push_back(LockMultiplierTier { weeks, bps });
+                replaced = true;
+            } else {
+                updated_tiers.push_back(tier);
+            }
+        }
+        if !replaced {
+            updated_tiers.push_back(LockMultiplierTier { weeks, bps });
+        }
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::LockMultiplierTiers, &updated_tiers);
+        events::emit_lock_multiplier_tier_updated(&env, weeks, bps);
+        Ok(())
     }
 
     // ── Admin: configure minimum stake duration ────────────────────────────────

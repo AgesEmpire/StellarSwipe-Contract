@@ -185,6 +185,15 @@ pub struct EvtBatchAppealsResolved {
     pub processed_count: u32,
 }
 
+/// Issue #787: lock-duration-weighted voting-power multiplier tiers.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtLockMultiplierTierUpdated {
+    pub schema_version: u32,
+    pub weeks: u32,
+    pub bps: u32,
+}
+
 // ── Emergency multi-sig unstake events (issue #754) ───────────────────────────
 
 #[contracttype]
@@ -448,6 +457,17 @@ pub fn emit_batch_appeals_resolved(env: &Env, processed_count: u32) {
         EvtBatchAppealsResolved {
             schema_version: SCHEMA_VERSION,
             processed_count,
+        },
+    );
+}
+
+pub fn emit_lock_multiplier_tier_updated(env: &Env, weeks: u32, bps: u32) {
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_STAKE_LOCK_MULTIPLIER()),
+        EvtLockMultiplierTierUpdated {
+            schema_version: SCHEMA_VERSION,
+            weeks,
+            bps,
         },
     );
 }

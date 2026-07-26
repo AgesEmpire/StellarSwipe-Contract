@@ -78,6 +78,7 @@ pub const TOPIC_STAKE_EMERGENCY_REQ: fn() -> Symbol = || Symbol::short("emgreq")
 pub const TOPIC_STAKE_EMERGENCY_APPROVED: fn() -> Symbol = || Symbol::short("emgappr");
 pub const TOPIC_STAKE_EMERGENCY_EXPIRED: fn() -> Symbol = || Symbol::short("emgexp");
 pub const TOPIC_STAKE_EMERGENCY_EXECUTED: fn() -> Symbol = || Symbol::short("emgexec");
+pub const TOPIC_STAKE_LOCK_MULTIPLIER: fn() -> Symbol = || Symbol::short("lockmult");
 
 #[cfg(test)]
 mod tests {
@@ -153,5 +154,6 @@ mod tests {
         let _ = TOPIC_STAKE_EMERGENCY_APPROVED();
         let _ = TOPIC_STAKE_EMERGENCY_EXPIRED();
         let _ = TOPIC_STAKE_EMERGENCY_EXECUTED();
+        let _ = TOPIC_STAKE_LOCK_MULTIPLIER();
     }
 }
