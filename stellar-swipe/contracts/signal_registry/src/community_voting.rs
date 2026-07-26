@@ -75,16 +75,19 @@ pub struct DisputeRecord {
     pub appeal_submitted_at: u64,
 }
 
+/// Issue #782: renumbered from 1-6, which collided with `AdminError`
+/// (also 1-36) — two different failure conditions decoded to the same
+/// contract-wide `u32` error code.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum DisputeError {
-    Unauthorized = 1,
-    DisputeNotFound = 2,
-    DisputeNotOpen = 3,
-    AppealAlreadySubmitted = 4,
-    AppealNotPending = 5,
-    AppealWindowNotElapsed = 6,
+    Unauthorized = 1600,
+    DisputeNotFound = 1601,
+    DisputeNotOpen = 1602,
+    AppealAlreadySubmitted = 1603,
+    AppealNotPending = 1604,
+    AppealWindowNotElapsed = 1605,
 }
 
 #[contracttype]
