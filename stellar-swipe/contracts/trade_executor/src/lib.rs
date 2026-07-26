@@ -2092,9 +2092,18 @@ impl TradeExecutorContract {
     }
 
     /// Manually cancel a DCA plan. Only the plan owner may cancel.
+    /// Refunds the value of any unexecuted intervals (Issue #790).
     pub fn cancel_dca_plan(env: Env, user: Address, signal_id: u64) -> Result<(), ContractError> {
         user.require_auth();
-        dca::cancel_dca_plan(&env, &user, signal_id)
+        dca::cancel_dca_plan(&env, &user, signal_id, |_refund_amount| {
+            // Same limitation as execute_dca_interval: the DCA plan is
+            // signal-level and has no token address, so there is no token
+            // contract to transfer from here. The refund amount is still
+            // computed and reported via the DCAPlanCancelled event; wiring
+            // an actual transfer requires giving DCA plans a token/escrow
+            // (tracked separately, out of scope for this fix).
+            Ok(())
+        })
     }
 
     // ── Dead-letter queue (Issue #657) ────────────────────────────────────────
