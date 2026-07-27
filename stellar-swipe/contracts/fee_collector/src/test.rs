@@ -1755,3 +1755,29 @@ fn test_pause_requires_admin_auth() {
     assert!(result.is_err(), "non-admin must not be able to pause");
     assert!(!client.is_paused());
 }
+
+#[test]
+fn error_messages_are_non_empty_and_distinct() {
+    let samples = [
+        ContractError::NotInitialized,
+        ContractError::Unauthorized,
+        ContractError::InsufficientTreasuryBalance,
+        ContractError::TimelockNotElapsed,
+        ContractError::WithdrawalNotQueued,
+        ContractError::UnauthorizedCaller,
+    ];
+    for err in samples.iter() {
+        assert!(!err.message().is_empty());
+    }
+    for i in 0..samples.len() {
+        for j in (i + 1)..samples.len() {
+            assert_ne!(
+                samples[i].message(),
+                samples[j].message(),
+                "expected distinct messages for {:?} and {:?}",
+                samples[i],
+                samples[j]
+            );
+        }
+    }
+}

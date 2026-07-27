@@ -298,10 +298,10 @@ fn test_invalid_price_rejected() {
     client.register_oracle(&admin, &oracle1);
 
     let result = client.try_submit_price(&oracle1, &0);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(OracleError::InvalidPrice)));
 
     let result = client.try_submit_price(&oracle1, &-100);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(OracleError::InvalidPrice)));
 }
 
 #[test]
@@ -314,7 +314,7 @@ fn test_unregistered_oracle_cannot_submit() {
     client.initialize(&admin, &xlm_asset(&env));
 
     let result = client.try_submit_price(&unregistered, &100_000_000);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(OracleError::OracleNotFound)));
 }
 
 // ── Issue #602: minimum independent source count ─────────────────────────────
@@ -558,4 +558,29 @@ fn test_get_normalized_price_no_decimals_configured_returns_error() {
 
     let result = client.try_get_normalized_price(&pair, &6u32);
     assert!(result.is_err());
+}
+
+#[test]
+fn error_messages_are_non_empty_and_distinct() {
+    let samples = [
+        OracleError::PriceNotFound,
+        OracleError::Unauthorized,
+        OracleError::StalePrice,
+        OracleError::InsufficientSources,
+        OracleError::PriceDeviationBreakerTripped,
+    ];
+    for err in samples.iter() {
+        assert!(!err.message().is_empty());
+    }
+    for i in 0..samples.len() {
+        for j in (i + 1)..samples.len() {
+            assert_ne!(
+                samples[i].message(),
+                samples[j].message(),
+                "expected distinct messages for {:?} and {:?}",
+                samples[i],
+                samples[j]
+            );
+        }
+    }
 }
