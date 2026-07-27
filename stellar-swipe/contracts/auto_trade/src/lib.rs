@@ -5,6 +5,7 @@ use soroban_sdk::{
 };
 
 mod auth;
+pub mod budget_guard;
 mod errors;
 pub mod governance;
 mod history;
