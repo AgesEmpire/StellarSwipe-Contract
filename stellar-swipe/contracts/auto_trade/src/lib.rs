@@ -11,6 +11,7 @@ mod history;
 mod multi_asset;
 mod portfolio;
 mod risk;
+pub mod rollback;
 mod sdex;
 mod storage;
 
