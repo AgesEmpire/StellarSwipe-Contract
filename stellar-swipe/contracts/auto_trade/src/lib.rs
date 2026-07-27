@@ -12,6 +12,7 @@ mod multi_asset;
 mod portfolio;
 mod risk;
 mod sdex;
+pub mod signal_ordering;
 mod storage;
 
 use crate::storage::DataKey;
