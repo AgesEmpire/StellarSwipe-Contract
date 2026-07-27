@@ -29,6 +29,8 @@ pub mod replay_protection;
 pub mod retry_backoff;
 /// Generic CRUD helpers to replace per-contract storage boilerplate (Issue #579).
 pub mod storage_crud;
+/// Token metadata and decimal validation shared by deposit/withdraw paths (Issue #880).
+pub mod token_metadata;
 pub mod ttl_manager;
 
 pub use amm_bridge::{

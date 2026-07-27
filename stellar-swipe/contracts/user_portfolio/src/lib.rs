@@ -13,6 +13,7 @@ mod portfolio_tests;
 mod position_tags;
 mod preferences;
 mod queries;
+mod risk_metrics;
 mod storage;
 mod subscriptions;
 mod watchlist;
@@ -2715,9 +2716,7 @@ mod exposure_cap_tests {
         let user = Address::generate(&env);
 
         // Set cap of 5_000 for asset 1.
-        client
-            .set_asset_exposure_cap(&user, &1u32, &5_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &5_000i128);
 
         // Trade 3_000 — within cap.
         let result = client.try_open_position_with_cap_check(&user, &1u32, &100i128, &3_000i128);
@@ -2734,9 +2733,7 @@ mod exposure_cap_tests {
         let client = UserPortfolioClient::new(&env, &contract_id);
         let user = Address::generate(&env);
 
-        client
-            .set_asset_exposure_cap(&user, &1u32, &2_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &2_000i128);
 
         // 3_000 > 2_000 cap → must be rejected.
         let result = client.try_open_position_with_cap_check(&user, &1u32, &100i128, &3_000i128);
@@ -2765,15 +2762,11 @@ mod exposure_cap_tests {
         let client = UserPortfolioClient::new(&env, &contract_id);
         let user = Address::generate(&env);
 
-        client
-            .set_asset_exposure_cap(&user, &1u32, &1_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &1_000i128);
         assert_eq!(client.get_asset_exposure_cap(&user, &1u32), Some(1_000));
 
         // Raise the cap.
-        client
-            .set_asset_exposure_cap(&user, &1u32, &5_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &5_000i128);
         assert_eq!(client.get_asset_exposure_cap(&user, &1u32), Some(5_000));
 
         // Remove the cap entirely.
