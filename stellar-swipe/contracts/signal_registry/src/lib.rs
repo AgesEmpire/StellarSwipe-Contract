@@ -26,6 +26,7 @@ mod ml_scoring;
 mod multisig_approvals;
 mod performance;
 mod providers;
+mod provider_onboarding;
 mod query;
 /// Contract-wide cross-contract reentrancy guard (Issue #781).
 mod reentrancy;
