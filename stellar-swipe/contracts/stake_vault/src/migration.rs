@@ -88,15 +88,38 @@ pub struct MigrationRecoveryResult {
 
 #[derive(Debug, PartialEq)]
 pub enum MigrationError {
+    /// Caller is not the admin authorized to run or recover the migration.
     Unauthorized,
+    /// Checksum readback after writing a V2 entry did not match the V1 balance.
     BalanceMismatch {
         provider: Address,
         old: i128,
         new: i128,
     },
+    /// Migration is already complete; no further batches can be run.
     AlreadyComplete,
     /// Provider is not in `pending_recovery`; nothing to recover.
     NotInRecovery,
+}
+
+impl MigrationError {
+    /// Short, human-readable description of when this error is returned.
+    pub fn message(&self) -> &'static str {
+        match self {
+            MigrationError::Unauthorized => {
+                "caller is not the admin authorized to run or recover the migration"
+            }
+            MigrationError::BalanceMismatch { .. } => {
+                "checksum readback after writing a V2 entry did not match the V1 balance"
+            }
+            MigrationError::AlreadyComplete => {
+                "migration is already complete; no further batches can be run"
+            }
+            MigrationError::NotInRecovery => {
+                "provider is not in pending_recovery; nothing to recover"
+            }
+        }
+    }
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -496,5 +519,50 @@ mod tests {
         // Second call should return AlreadyComplete
         let err = run_migrate(&env, &contract_addr, &admin, 10).unwrap_err();
         assert_eq!(err, MigrationError::AlreadyComplete);
+    }
+
+    #[test]
+    fn test_recover_migration_entry_without_pending_recovery_is_not_in_recovery() {
+        let env = setup();
+        let contract_addr = env.register(TestContract, ());
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+
+        let err = env
+            .as_contract(&contract_addr, || {
+                recover_migration_entry(&env, &admin, provider, 100)
+            })
+            .unwrap_err();
+        assert_eq!(err, MigrationError::NotInRecovery);
+    }
+
+    #[test]
+    fn error_messages_are_non_empty_and_distinct() {
+        let env = setup();
+        let provider = Address::generate(&env);
+        let samples = [
+            MigrationError::Unauthorized,
+            MigrationError::BalanceMismatch {
+                provider,
+                old: 1,
+                new: 2,
+            },
+            MigrationError::AlreadyComplete,
+            MigrationError::NotInRecovery,
+        ];
+        for err in samples.iter() {
+            assert!(!err.message().is_empty());
+        }
+        for i in 0..samples.len() {
+            for j in (i + 1)..samples.len() {
+                assert_ne!(
+                    samples[i].message(),
+                    samples[j].message(),
+                    "expected distinct messages for {:?} and {:?}",
+                    samples[i],
+                    samples[j]
+                );
+            }
+        }
     }
 }

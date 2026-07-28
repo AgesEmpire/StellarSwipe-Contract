@@ -1,0 +1,94 @@
+name: Security Release Gate
+
+# Named, auditable release-safety gate (Issue #886). Deliberately overlaps
+# with the `Format check` / `Clippy` / `Tests` steps in ci.yml — the point of
+# this workflow is to be a distinct, clearly-labeled check that blocks merges
+# into main and blocks release tags on unsafe changes, independent of
+# whatever else ci.yml happens to run. See docs/security/release_security_checklist.md
+# for the human-review half of this gate that this workflow enforces the
+# presence of.
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  STELLAR_NETWORK: testnet
+
+jobs:
+  security-release-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Safety: ensure mainnet config is never loaded in CI
+      - name: Guard — reject mainnet in CI
+        run: |
+          if [ "${STELLAR_NETWORK}" = "mainnet" ]; then
+            echo "ERROR: STELLAR_NETWORK=mainnet is not allowed in CI" && exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      # The human-review half of this gate lives in
+      # docs/security/release_security_checklist.md. Fail loudly if it is
+      # ever deleted so the automated and human halves of the gate stay
+      # connected — see .github/pull_request_template.md, which links
+      # reviewers to this file on every contract-touching PR.
+      - name: Verify release security checklist exists
+        run: test -f docs/security/release_security_checklist.md
+
+      # Deployment manifests (deployments/*.manifest.json) describe required
+      # addresses, contract versions, and cross-contract dependencies for a
+      # release. Validate them before anything else so a misconfigured
+      # manifest fails fast, cheaply, and before any build/test work.
+      - name: Validate deployment manifests
+        run: python3 stellar-swipe/scripts/validate_deployment_manifest.py
+
+      # Setup Rust toolchain with required components and target
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      # Cache dependencies for faster builds
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stellar-swipe
+
+      # Format check for entire workspace
+      - name: Format check
+        run: cd stellar-swipe && cargo fmt --all -- --check
+
+      # Clippy: any warning blocks the release gate.
+      - name: Clippy
+        run: cd stellar-swipe && cargo clippy --workspace --all-targets -- -D warnings
+
+      # Run tests for all workspace crates
+      - name: Tests
+        run: cd stellar-swipe && cargo test --workspace --all-targets
+
+      # Guard against renumbering or reusing #[contracterror] discriminants.
+      # Exit 0 = clean; exit 2 = new codes added (baseline auto-updated, not
+      # a gate failure — see the script's own docstring); exit 1 =
+      # renumbering/reuse detected -> fail the build.
+      - name: Check error code baselines
+        run: |
+          python3 stellar-swipe/scripts/check_error_codes.py
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: error code violation detected — see output above." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: new error codes added; baseline updated locally."
+            echo "This is not a gate failure — commit the updated stellar-swipe/error-baselines/*.json files."
+          fi

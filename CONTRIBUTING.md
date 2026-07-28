@@ -77,3 +77,24 @@ build (see `contracts/fee_collector/src/rebates.rs::record_trade_volume` and
 This is scoped per-function rather than per-crate because the workspace sets
 `clippy::all = "allow"` broadly (issue #599) — a crate-wide deny would also
 flag unrelated, already-safe loop/index arithmetic across these large crates.
+
+## Security review
+
+Any PR that touches `contracts/` (or a shared crate consumed by contracts,
+e.g. `contracts/common`) must be reviewed against
+[`docs/security/release_security_checklist.md`](docs/security/release_security_checklist.md)
+before merge — see the checklist in the PR template
+(`.github/pull_request_template.md`). It covers four categories: logic,
+access control, upgrades, and arithmetic, each with pointers to the relevant
+background analysis under `docs/security/`.
+
+The automated portion of that gate (formatting, clippy, tests, deployment
+manifest validation, error-code discriminant checks) runs in
+[`.github/workflows/security-release-gate.yml`](.github/workflows/security-release-gate.yml)
+on every PR to `main` and on every `v*` release tag. It is in addition to,
+not a replacement for, the human checklist review.
+
+Once a change has passed review, see
+[`deployments/README.md`](deployments/README.md) for how it flows into an
+actual release: deployment manifests, versioning, and the validators that
+run before a contract is deployed or upgraded.

@@ -263,10 +263,15 @@ pub enum StorageKey {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum StakeVaultError {
+    /// Contract function was called before `initialize()` set up the admin/config.
     NotInitialized = 1,
+    /// Caller is not authorized to perform this action (not the admin/owner/staker).
     Unauthorized = 2,
+    /// Caller has no active stake recorded in the vault.
     NoStake = 3,
+    /// Stake is still within its lock period and cannot be unstaked yet.
     StakeLocked = 4,
+    /// Re-entrant call into a state-mutating function was detected and rejected.
     ReentrancyDetected = 5,
     /// Provider stake is below minimum and grace period has expired.
     StakeBelowMinimum = 6,
@@ -310,14 +315,22 @@ pub enum StakeVaultError {
     /// The privileged action requires multi-sig approval; use propose/approve/execute.
     RequiresMultisig = 25,
     // ── Issue #689: Slash appeal ─────────────────────────────────────────────────
+    /// Appeal window duration configured is zero or otherwise invalid.
     InvalidAppealWindow = 26,
+    /// Appeal window for this slash has already elapsed; appeal can no longer be filed.
     AppealWindowClosed = 27,
+    /// No slash record exists for the given id.
     SlashNotFound = 28,
+    /// An appeal has already been filed for this slash.
     AppealAlreadyExists = 29,
+    /// This appeal has already been resolved (approved or rejected).
     AppealAlreadyResolved = 30,
     // ── Rate limiting & validation ───────────────────────────────────────────────
+    /// Caller has exceeded the allowed rate of stake/unstake operations.
     RateLimitExceeded = 31,
+    /// Amount is zero, negative, or otherwise outside allowed bounds.
     InvalidAmount = 32,
+    /// Partial unstake would leave a remaining stake below the minimum threshold.
     RemainingStakeBelowMinimum = 33,
     // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
     /// `upgrade()` was called with a version that is not strictly greater
@@ -327,6 +340,103 @@ pub enum StakeVaultError {
     /// `set_lock_multiplier_tier` was called with `weeks == 0` or a `bps`
     /// value outside `[BPS_DENOMINATOR, MAX_LOCK_MULTIPLIER_BPS]`.
     InvalidLockMultiplierTier = 35,
+    // ── Issue #883: error taxonomy consolidation ──────────────────────────────
+    /// `queue_unstake` was called while the unstake queue is already at
+    /// `MaxUnstakeQueueSize`; distinct from `QueueEmpty` (processing an empty
+    /// queue). Previously referenced without a backing variant — added here.
+    QueueFull = 36,
+}
+
+impl StakeVaultError {
+    /// Short, human-readable description of when this error is returned.
+    pub fn message(&self) -> &'static str {
+        match self {
+            StakeVaultError::NotInitialized => {
+                "vault has not been initialized yet; call initialize() first"
+            }
+            StakeVaultError::Unauthorized => "caller is not authorized to perform this action",
+            StakeVaultError::NoStake => "caller has no active stake in the vault",
+            StakeVaultError::StakeLocked => "stake is still within its lock period",
+            StakeVaultError::ReentrancyDetected => "re-entrant call was detected and rejected",
+            StakeVaultError::StakeBelowMinimum => {
+                "stake is below the minimum and its grace period has expired"
+            }
+            StakeVaultError::ContractPaused => {
+                "contract is paused due to suspicious activity or admin action"
+            }
+            StakeVaultError::TimelockRequired => {
+                "large withdrawal requires a pending time-lock request first"
+            }
+            StakeVaultError::TimelockNotElapsed => "time-lock period has not yet elapsed",
+            StakeVaultError::FlashLoanDetected => {
+                "stake and unstake in the same ledger is not allowed (flash-loan pattern)"
+            }
+            StakeVaultError::InvalidSlashTier => {
+                "slash tier percentage would exceed 100% of stake"
+            }
+            StakeVaultError::StakeDurationNotElapsed => {
+                "voting power is locked until the minimum stake duration elapses"
+            }
+            StakeVaultError::NoDelegatedStake => {
+                "no delegated stake found for this delegator/provider pair"
+            }
+            StakeVaultError::UnstakeAlreadyQueued => {
+                "caller already has a pending unstake request in the queue"
+            }
+            StakeVaultError::NoUnstakeQueued => "no unstake request found for this user",
+            StakeVaultError::QueueEmpty => "unstake queue is empty",
+            StakeVaultError::EmergencyNotConfigured => {
+                "emergency unstake is not configured (no multi-sig config set)"
+            }
+            StakeVaultError::EmergencyRequestAlreadyExists => {
+                "a pending emergency request already exists for this staker"
+            }
+            StakeVaultError::EmergencyRequestNotFound => {
+                "no emergency request found for this staker"
+            }
+            StakeVaultError::EmergencyRequestExpired => {
+                "emergency request expired without sufficient approvals"
+            }
+            StakeVaultError::EmergencyRequestNotExpired => {
+                "request has not yet expired and cannot be discarded"
+            }
+            StakeVaultError::AlreadyApproved => "this signer has already approved this request",
+            StakeVaultError::InvalidEmergencyPenalty => "penalty basis points exceed 100%",
+            StakeVaultError::InvalidMultiSigConfig => {
+                "multi-sig required count is 0 or exceeds the number of admins"
+            }
+            StakeVaultError::RequiresMultisig => {
+                "this privileged action requires multi-sig approval (propose/approve/execute)"
+            }
+            StakeVaultError::InvalidAppealWindow => {
+                "appeal window duration is zero or otherwise invalid"
+            }
+            StakeVaultError::AppealWindowClosed => {
+                "appeal window for this slash has already elapsed"
+            }
+            StakeVaultError::SlashNotFound => "no slash record exists for the given id",
+            StakeVaultError::AppealAlreadyExists => "an appeal has already been filed for this slash",
+            StakeVaultError::AppealAlreadyResolved => {
+                "this appeal has already been resolved"
+            }
+            StakeVaultError::RateLimitExceeded => {
+                "caller has exceeded the allowed rate of stake/unstake operations"
+            }
+            StakeVaultError::InvalidAmount => "amount is zero, negative, or otherwise out of range",
+            StakeVaultError::RemainingStakeBelowMinimum => {
+                "partial unstake would leave a remaining stake below the minimum threshold"
+            }
+            StakeVaultError::IncompatibleContractVersion => {
+                "upgrade() version is not strictly greater than the currently stored version"
+            }
+            StakeVaultError::InvalidLockMultiplierTier => {
+                "lock multiplier tier has weeks == 0 or a bps value out of allowed range"
+            }
+            StakeVaultError::QueueFull => {
+                "unstake queue is at MaxUnstakeQueueSize; wait for entries to process"
+            }
+        }
+    }
 }
 
 /// A pending unstake request held in the FIFO queue (issue #663).

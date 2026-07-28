@@ -157,7 +157,8 @@ fn withdraw_stake_limit_resets_after_window_elapses() {
         client.withdraw_stake(&staker);
     }
     seed_v2_stake(&env, &vault_id, &staker, per_withdrawal, 0);
-    assert!(client.try_withdraw_stake(&staker).is_err());
+    let err = client.try_withdraw_stake(&staker);
+    assert_eq!(err, Err(Ok(StakeVaultError::RateLimitExceeded)));
 
     // Advance past the 24h window — the limit resets.
     env.ledger()
@@ -2572,5 +2573,31 @@ mod unstake_queue_cap_tests {
         // The existing entries still process normally despite being over the new cap.
         StellarAssetClient::new(&env, &token).mint(&vault_id, &3_000_000);
         assert_eq!(client.process_unstake_queue(&3), 3);
+    }
+
+    #[test]
+    fn error_messages_are_non_empty_and_distinct() {
+        let samples = [
+            StakeVaultError::NotInitialized,
+            StakeVaultError::Unauthorized,
+            StakeVaultError::StakeLocked,
+            StakeVaultError::QueueEmpty,
+            StakeVaultError::QueueFull,
+            StakeVaultError::RateLimitExceeded,
+        ];
+        for err in samples.iter() {
+            assert!(!err.message().is_empty());
+        }
+        for i in 0..samples.len() {
+            for j in (i + 1)..samples.len() {
+                assert_ne!(
+                    samples[i].message(),
+                    samples[j].message(),
+                    "expected distinct messages for {:?} and {:?}",
+                    samples[i],
+                    samples[j]
+                );
+            }
+        }
     }
 }

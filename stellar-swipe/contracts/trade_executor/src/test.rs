@@ -1977,3 +1977,29 @@ fn count_never_goes_negative_on_close() {
     );
     assert_eq!(exec.get_user_position_count(&user), 0);
 }
+
+#[test]
+fn error_messages_are_non_empty_and_distinct() {
+    let samples = [
+        ContractError::NotInitialized,
+        ContractError::InsufficientBalance,
+        ContractError::SlippageExceeded,
+        ContractError::PositionLimitReached,
+        ContractError::TooManyOpenPositions,
+        ContractError::ReplayDetected,
+    ];
+    for err in samples.iter() {
+        assert!(!err.message().is_empty());
+    }
+    for i in 0..samples.len() {
+        for j in (i + 1)..samples.len() {
+            assert_ne!(
+                samples[i].message(),
+                samples[j].message(),
+                "expected distinct messages for {:?} and {:?}",
+                samples[i],
+                samples[j]
+            );
+        }
+    }
+}

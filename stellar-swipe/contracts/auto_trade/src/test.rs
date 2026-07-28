@@ -1377,6 +1377,50 @@ fn test_simulation_failure_emits_simulation_log() {
     });
 }
 
+#[test]
+fn error_messages_are_non_empty_and_distinct() {
+    // A representative sample of raw variants plus at least one alias const
+    // (Issue #883). Aliases resolve to their target variant's value, so
+    // `EscrowNotFound` and `StrategyNotFound` intentionally share a message
+    // below — see `AutoTradeError::message()`'s doc comment for why.
+    let samples = [
+        AutoTradeError::InvalidAmount,
+        AutoTradeError::Unauthorized,
+        AutoTradeError::SignalExpired,
+        AutoTradeError::PositionAlreadyExists,
+        AutoTradeError::SystemError,
+        AutoTradeError::AtomicExecutionFailed, // alias const → SystemError
+    ];
+    for err in samples.iter() {
+        assert!(!err.message().is_empty());
+    }
+    assert_eq!(
+        AutoTradeError::SystemError.message(),
+        AutoTradeError::AtomicExecutionFailed.message(),
+        "alias consts share their target variant's runtime value and message"
+    );
+
+    // Distinct underlying variants must have distinct messages.
+    let distinct = [
+        AutoTradeError::InvalidAmount,
+        AutoTradeError::Unauthorized,
+        AutoTradeError::SignalExpired,
+        AutoTradeError::PositionAlreadyExists,
+        AutoTradeError::SystemError,
+    ];
+    for i in 0..distinct.len() {
+        for j in (i + 1)..distinct.len() {
+            assert_ne!(
+                distinct[i].message(),
+                distinct[j].message(),
+                "expected distinct messages for {:?} and {:?}",
+                distinct[i],
+                distinct[j]
+            );
+        }
+    }
+}
+
 // ========================================
 // DCA Strategy Tests
 // ========================================

@@ -13,23 +13,38 @@ pub use validators::{ValidatorApproval, ValidatorApprovalKind, ValidatorSet};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum BridgeError {
+    /// `initialize()` was called on a bridge contract that already has an admin set.
     AlreadyInitialized = 1,
+    /// Transfer, fee, or threshold amount is zero, negative, or otherwise out of range.
     InvalidAmount = 2,
+    /// Validator set passed to `initialize`/updates is empty or fails threshold checks.
     InvalidValidatorSet = 3,
+    /// Caller is not a member of the active validator set for this bridge.
     UnauthorizedValidator = 4,
+    /// No transfer exists for the given transfer id.
     TransferNotFound = 5,
+    /// Transfer has already been executed; cannot be executed a second time.
     TransferAlreadyExecuted = 6,
+    /// Source-chain transaction hash has already been used for a lock/burn (replay attempt).
     ReplayDetected = 7,
+    /// This validator has already submitted a signature for this transfer.
     SignatureAlreadyUsed = 8,
+    /// Fewer validator approvals have been collected than the required threshold.
     NotEnoughValidatorApprovals = 9,
+    /// Transfer would push the rolling 24h volume past the configured daily limit.
     DailyLimitExceeded = 10,
+    /// Single transfer amount exceeds the configured per-transfer maximum.
     MaxTransferExceeded = 11,
+    /// Caller's wrapped-asset balance is lower than the amount requested to burn/withdraw.
     InsufficientWrappedBalance = 12,
+    /// Burn/unlock withdrawal was requested before its mandatory delay window elapsed.
     WithdrawalNotReady = 13,
+    /// Requested operation is not valid for the transfer's current status.
     InvalidOperation = 14,
     /// Withdrawal exceeds the dynamic limit derived from available liquidity buffer.
     /// Distinct from DailyLimitExceeded (static anti-spam) so callers can differentiate.
     DynamicLiquidityLimitExceeded = 15,
+    /// Validator approval threshold is zero, exceeds validator count, or otherwise invalid.
     InvalidThreshold = 16,
     /// Destination chain is not on the admin-managed allowlist (Issue #669).
     UnsupportedDestinationChain = 17,
@@ -37,6 +52,69 @@ pub enum BridgeError {
     OutOfOrderNonce = 18,
     /// Message nonce was already confirmed; duplicate delivery rejected (Issue #668).
     DuplicateNonce = 19,
+}
+
+impl BridgeError {
+    /// Short, human-readable description of when this error is returned.
+    ///
+    /// Intended for logs/operator tooling; not part of the on-chain XDR spec.
+    pub fn message(&self) -> &'static str {
+        match self {
+            BridgeError::AlreadyInitialized => {
+                "bridge contract has already been initialized with an admin"
+            }
+            BridgeError::InvalidAmount => "amount must be a positive value within allowed bounds",
+            BridgeError::InvalidValidatorSet => {
+                "validator set is empty or fails minimum threshold requirements"
+            }
+            BridgeError::UnauthorizedValidator => {
+                "caller is not a member of the active validator set"
+            }
+            BridgeError::TransferNotFound => "no transfer exists for the given transfer id",
+            BridgeError::TransferAlreadyExecuted => {
+                "transfer has already been executed and cannot run again"
+            }
+            BridgeError::ReplayDetected => {
+                "source-chain transaction hash was already used for a transfer"
+            }
+            BridgeError::SignatureAlreadyUsed => {
+                "this validator has already signed off on this transfer"
+            }
+            BridgeError::NotEnoughValidatorApprovals => {
+                "not enough validator approvals collected yet to meet the threshold"
+            }
+            BridgeError::DailyLimitExceeded => {
+                "transfer would exceed the configured rolling daily volume limit"
+            }
+            BridgeError::MaxTransferExceeded => {
+                "transfer amount exceeds the configured per-transfer maximum"
+            }
+            BridgeError::InsufficientWrappedBalance => {
+                "caller's wrapped-asset balance is too low for this burn/withdrawal"
+            }
+            BridgeError::WithdrawalNotReady => {
+                "withdrawal was requested before its mandatory delay window elapsed"
+            }
+            BridgeError::InvalidOperation => {
+                "requested operation is not valid for the transfer's current status"
+            }
+            BridgeError::DynamicLiquidityLimitExceeded => {
+                "withdrawal exceeds the dynamic limit derived from the liquidity buffer"
+            }
+            BridgeError::InvalidThreshold => {
+                "validator approval threshold is zero, too high, or otherwise invalid"
+            }
+            BridgeError::UnsupportedDestinationChain => {
+                "destination chain is not on the admin-managed allowlist"
+            }
+            BridgeError::OutOfOrderNonce => {
+                "message nonce is out of order; earlier messages must be confirmed first"
+            }
+            BridgeError::DuplicateNonce => {
+                "message nonce was already confirmed; duplicate delivery rejected"
+            }
+        }
+    }
 }
 
 #[contracttype]
@@ -1284,6 +1362,32 @@ mod test {
             );
             assert_eq!(result, Err(BridgeError::DynamicLiquidityLimitExceeded));
         });
+    }
+
+    #[test]
+    fn error_messages_are_non_empty_and_distinct() {
+        let samples = [
+            BridgeError::AlreadyInitialized,
+            BridgeError::InvalidAmount,
+            BridgeError::TransferNotFound,
+            BridgeError::ReplayDetected,
+            BridgeError::DynamicLiquidityLimitExceeded,
+            BridgeError::UnsupportedDestinationChain,
+        ];
+        for err in samples.iter() {
+            assert!(!err.message().is_empty());
+        }
+        for i in 0..samples.len() {
+            for j in (i + 1)..samples.len() {
+                assert_ne!(
+                    samples[i].message(),
+                    samples[j].message(),
+                    "expected distinct messages for {:?} and {:?}",
+                    samples[i],
+                    samples[j]
+                );
+            }
+        }
     }
 
     #[test]

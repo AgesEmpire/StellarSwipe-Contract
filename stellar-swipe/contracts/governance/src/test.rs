@@ -3014,3 +3014,46 @@ fn reclaim_expired_proposal_removes_entry_and_is_callable_by_anyone() {
     }
     assert!(!found);
 }
+
+#[test]
+fn error_messages_are_non_empty_and_distinct() {
+    // A representative sample of raw variants plus at least one alias const
+    // (Issue #883). Aliases resolve to their target variant's value, so
+    // `ContractPaused` and `Unauthorized` intentionally share a message —
+    // see `GovernanceError::message()`'s doc comment for why.
+    let samples = [
+        GovernanceError::NotInitialized,
+        GovernanceError::Unauthorized,
+        GovernanceError::ProposalNotFound,
+        GovernanceError::VotingEnded,
+        GovernanceError::BudgetExceeded,
+        GovernanceError::ContractPaused, // alias const → Unauthorized
+    ];
+    for err in samples.iter() {
+        assert!(!err.message().is_empty());
+    }
+    assert_eq!(
+        GovernanceError::Unauthorized.message(),
+        GovernanceError::ContractPaused.message(),
+        "alias consts share their target variant's runtime value and message"
+    );
+
+    let distinct = [
+        GovernanceError::NotInitialized,
+        GovernanceError::Unauthorized,
+        GovernanceError::ProposalNotFound,
+        GovernanceError::VotingEnded,
+        GovernanceError::BudgetExceeded,
+    ];
+    for i in 0..distinct.len() {
+        for j in (i + 1)..distinct.len() {
+            assert_ne!(
+                distinct[i].message(),
+                distinct[j].message(),
+                "expected distinct messages for {:?} and {:?}",
+                distinct[i],
+                distinct[j]
+            );
+        }
+    }
+}
