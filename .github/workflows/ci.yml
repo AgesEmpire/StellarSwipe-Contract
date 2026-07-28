@@ -101,6 +101,11 @@ jobs:
             echo "Please commit the updated stellar-swipe/error-baselines/*.json files."
           fi
 
+      # Validate the baseline JSON files themselves: uniqueness, code-0 guard,
+      # naming conventions, and coverage across all known contract crates.
+      - name: Validate error baseline integrity
+        run: python3 stellar-swipe/scripts/test_error_baselines.py
+
       # Release WASM (workspace [profile.release]) + stellar contract optimize
       # Prebuilt release binary — avoids compiling libdbus-sys from source via cargo install
       - name: Install Stellar CLI
@@ -149,6 +154,27 @@ jobs:
           if [ $rc -eq 2 ]; then
             echo "INFO: New exports found; abi-baselines/*.json updated."
             echo "Please commit the updated stellar-swipe/abi-baselines/*.json files."
+          fi
+
+      # Guard against WASM size regressions.  Any contract that grows more than
+      # 10% above its committed baseline fails the build with a clear diagnostic.
+      # Exit 0 = within budget; exit 1 = regression; exit 2 = new contract
+      # (baseline updated automatically — commit the JSON file).
+      - name: Check WASM size regression baseline
+        run: |
+          python3 stellar-swipe/scripts/check_wasm_size.py \
+            --wasm-dir stellar-swipe/target/wasm-optimized
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: WASM size regression detected — see output above." >&2
+            echo "To accept after review:" >&2
+            echo "  python3 stellar-swipe/scripts/check_wasm_size.py --update" >&2
+            echo "  git add stellar-swipe/baselines/wasm_size_baseline.json" >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: New contracts added to WASM size baseline."
+            echo "Please commit the updated stellar-swipe/baselines/wasm_size_baseline.json."
           fi
 
       - name: Upload optimized WASM artifacts
