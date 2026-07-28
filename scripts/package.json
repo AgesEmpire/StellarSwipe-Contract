@@ -6,6 +6,9 @@
   "scripts": {
     "test:events": "npx tsx test_event_parsing.ts",
     "replay-events": "npx tsx replay_events.ts",
+    "replay-state": "npx tsx replay_state.ts",
+    "test:replay": "npx tsx --test replay_state.test.ts",
+    "registry": "npx tsx deployment_registry.ts",
     "fund": "npx tsx testnet_utils.ts fund",
     "monitor": "npx tsx monitor.ts",
     "test:regression": "cd .. && npx tsx --test tests/regression/index.test.ts"
