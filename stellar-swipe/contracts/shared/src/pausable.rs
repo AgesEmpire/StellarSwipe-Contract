@@ -21,7 +21,7 @@
 ///
 /// After migration the old key is no longer consulted; only
 /// [`PausableKey::Paused`] is read.
-use soroban_sdk::{contracttype, symbol_short, Env, Symbol};
+use soroban_sdk::{contractclient, contracttype, symbol_short, Env, Symbol};
 
 /// Storage key for the pause flag.  Defined as a distinct enum so it cannot
 /// collide with contract-local key enums whose variants have different
@@ -71,6 +71,20 @@ pub fn require_not_paused(env: &Env) -> Result<(), bool> {
     } else {
         Ok(())
     }
+}
+
+/// Cross-contract client for governance-driven pause propagation (Issue #865).
+///
+/// Downstream contracts implement `apply_governance_pause` so a central
+/// governance contract can push a pause/unpause to every registered
+/// downstream contract with a single, uniform call regardless of that
+/// contract's own internal pause representation. Implementations are
+/// expected to authorize the call by requiring their configured governance
+/// address (stored locally) rather than requiring the transaction signer,
+/// since this is a contract-to-contract call.
+#[contractclient(name = "PausableClient")]
+pub trait PausableTrait {
+    fn apply_governance_pause(env: Env, paused: bool);
 }
 
 #[cfg(test)]

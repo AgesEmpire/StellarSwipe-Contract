@@ -35,4 +35,8 @@ pub enum OracleError {
     /// Issue #811: `upgrade()` was called with a version that is not
     /// strictly greater than the currently stored contract version.
     IncompatibleContractVersion = 27,
+    /// Issue #864: a submitted quote's confidence is below the configured minimum.
+    LowConfidence = 28,
+    /// Issue #864: cross-source deviation exceeded the configured hard reject threshold.
+    DeviationRejected = 29,
 }

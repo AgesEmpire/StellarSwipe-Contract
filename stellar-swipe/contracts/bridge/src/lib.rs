@@ -37,6 +37,8 @@ pub enum BridgeError {
     OutOfOrderNonce = 18,
     /// Message nonce was already confirmed; duplicate delivery rejected (Issue #668).
     DuplicateNonce = 19,
+    /// The bridge is paused (governance-driven emergency pause). See Issue #865.
+    ContractPaused = 20,
 }
 
 #[contracttype]
@@ -133,6 +135,11 @@ pub enum DataKey {
     ReserveThreshold,
     /// Admin-managed set of supported destination chain IDs (Issue #669).
     SupportedChains,
+    /// Issue #865: global pause flag set via governance-driven propagation.
+    Paused,
+    /// Issue #865: central governance contract address authorized to call
+    /// `apply_governance_pause`.
+    GovernanceAddress,
 }
 
 const DAY_SECONDS: u64 = 86_400;
@@ -253,6 +260,9 @@ impl BridgeContract {
         source_nonce: u64,
         destination_recipient: String,
     ) -> Result<u64, BridgeError> {
+        if is_paused(&env) {
+            return Err(BridgeError::ContractPaused);
+        }
         if !cfg!(test) {
             user.require_auth();
         }
@@ -351,6 +361,9 @@ impl BridgeContract {
         admin: Address,
         transfer_id: u64,
     ) -> Result<(), BridgeError> {
+        if is_paused(&env) {
+            return Err(BridgeError::ContractPaused);
+        }
         require_admin(&env, &admin)?;
         if !cfg!(test) {
             admin.require_auth();
@@ -406,6 +419,9 @@ impl BridgeContract {
         amount: i128,
         destination_recipient: String,
     ) -> Result<u64, BridgeError> {
+        if is_paused(&env) {
+            return Err(BridgeError::ContractPaused);
+        }
         if !cfg!(test) {
             user.require_auth();
         }
@@ -508,6 +524,9 @@ impl BridgeContract {
         admin: Address,
         transfer_id: u64,
     ) -> Result<(), BridgeError> {
+        if is_paused(&env) {
+            return Err(BridgeError::ContractPaused);
+        }
         let config = require_admin(&env, &admin)?;
         if !cfg!(test) {
             admin.require_auth();
@@ -722,7 +741,55 @@ impl BridgeContract {
 
     /// Read-only health for ops / frontends.
     pub fn health_check(env: Env) -> stellar_swipe_common::HealthStatus {
-        crate::governance::bridge_health_check(&env)
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        let config: Option<BridgeConfig> = env.storage().instance().get(&DataKey::Config);
+        match config {
+            Some(cfg) => stellar_swipe_common::HealthStatus {
+                is_initialized: true,
+                is_paused: is_paused(&env),
+                version,
+                admin: cfg.admin,
+            },
+            None => crate::governance::bridge_health_check(&env),
+        }
+    }
+
+    // ── Issue #865: governance-driven pause propagation ────────────────────────
+
+    /// Set the central governance contract address authorized to call
+    /// `apply_governance_pause`. Admin only.
+    pub fn set_governance(env: Env, admin: Address, governance: Address) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceAddress, &governance);
+        Ok(())
+    }
+
+    /// Read-only: the configured governance contract address, if any.
+    pub fn get_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::GovernanceAddress)
+    }
+
+    /// Called by the configured governance contract to propagate a pause/unpause.
+    /// Rejects new lock-mint/burn-unlock transfers and their execution while paused.
+    pub fn apply_governance_pause(env: Env, paused: bool) -> Result<(), BridgeError> {
+        let governance: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceAddress)
+            .ok_or(BridgeError::UnauthorizedValidator)?;
+        governance.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        Ok(())
+    }
+
+    /// Read-only: true when a governance-driven emergency pause is active.
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
     }
 
     // ── #613 Dynamic liquidity rate-limit ──────────────────────────────────────
@@ -849,6 +916,14 @@ fn require_admin(env: &Env, admin: &Address) -> Result<BridgeConfig, BridgeError
         return Err(BridgeError::UnauthorizedValidator);
     }
     Ok(config)
+}
+
+/// Issue #865: true when a governance-driven emergency pause is active.
+fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
 }
 
 fn get_transfer(env: &Env, transfer_id: u64) -> Result<BridgeTransfer, BridgeError> {

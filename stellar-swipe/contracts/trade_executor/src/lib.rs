@@ -108,6 +108,11 @@ pub enum StorageKey {
     /// Next trade receipt ID counter.
     NextTradeReceiptId,
     ConfirmationDepth,
+    /// Issue #865: global pause flag set via governance-driven propagation.
+    Paused,
+    /// Issue #865: central governance contract address authorized to call
+    /// `apply_governance_pause`.
+    GovernanceAddress,
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -316,6 +321,14 @@ fn require_admin(env: &Env) -> Result<Address, ContractError> {
     oracle::require_admin(env)
 }
 
+/// Issue #865: true when a governance-driven emergency pause is active.
+fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&StorageKey::Paused)
+        .unwrap_or(false)
+}
+
 /// Map a low-level [`ReplayError`] onto the contract's public error surface so
 /// callers can distinguish "already used" from "expired" (Issue: nonce replay
 /// attack prevention audit).
@@ -419,6 +432,28 @@ fn market_circuit_breaker_active(env: &Env) -> bool {
     }
 
     true
+}
+
+/// Read-only counterpart of [`market_circuit_breaker_active`]: reports whether the
+/// breaker is currently tripped without performing the auto-reset write when its
+/// duration has elapsed. Used by the simulation entrypoint (Issue #863) so a
+/// dry-run never mutates storage.
+fn market_circuit_breaker_active_readonly(env: &Env) -> bool {
+    let active = env
+        .storage()
+        .instance()
+        .get(&StorageKey::CircuitBreakerActive)
+        .unwrap_or(false);
+    if !active {
+        return false;
+    }
+
+    let activated_ledger = env
+        .storage()
+        .instance()
+        .get(&StorageKey::CircuitBreakerLedger)
+        .unwrap_or(env.ledger().sequence());
+    env.ledger().sequence().saturating_sub(activated_ledger) < CIRCUIT_BREAKER_DURATION_LEDGERS
 }
 
 fn open_interest_for_pair(env: &Env, pair: &Address) -> i128 {
@@ -577,6 +612,173 @@ fn record_trade_receipt(env: &Env, user: &Address, token: &Address, amount: i128
     );
 
     receipt_id
+}
+
+// ── Issue #863: read-only trade simulation ───────────────────────────────────
+
+/// Per-check validation outcomes surfaced by [`simulate_market_copy_trade`].
+/// Evaluated in the same order the corresponding gates run in
+/// `execute_market_copy_trade`, so a caller can tell exactly which check(s)
+/// would reject the trade.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulationValidations {
+    pub min_trade_size_ok: bool,
+    pub circuit_breaker_ok: bool,
+    pub open_interest_ok: bool,
+    pub daily_volume_ok: bool,
+    pub position_cap_ok: bool,
+    pub position_pct_ok: bool,
+    pub balance_ok: bool,
+}
+
+/// Result of a dry-run trade simulation. Read-only: computing it never writes
+/// storage, requires no auth, and performs no cross-contract mutation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulationResult {
+    /// True only if every check in `validations` passed.
+    pub would_succeed: bool,
+    /// Effective trade amount after resolving `portfolio_pct_bps` (or the explicit amount
+    /// unchanged when no percentage was requested).
+    pub effective_amount: i128,
+    /// Fee that would be charged in `token` for this trade.
+    pub estimated_fee: i128,
+    /// True when the user has enough balance for `effective_amount` alone but not for
+    /// `effective_amount + estimated_fee`, mirroring the fee-fallback path taken by
+    /// `execute_market_copy_trade` (the fee would be deducted from trade proceeds instead).
+    pub fee_paid_from_received: bool,
+    /// The user's current balance of `token`.
+    pub available_balance: i128,
+    /// The balance that would be required for the trade to succeed without the fallback.
+    pub required_balance: i128,
+    pub validations: SimulationValidations,
+    /// The first failing check, in the same evaluation order as `execute_market_copy_trade`.
+    /// `None` when `would_succeed` is true.
+    pub failure_reason: Option<ContractError>,
+}
+
+/// Dry-run a market copy trade. Mirrors the validation gate order in
+/// `execute_market_copy_trade` using only reads, so simulation and execution stay
+/// in lock-step.
+///
+/// Not replayed here: the final per-user position-limit check against the
+/// configured `UserPortfolio` contract (`validate_and_record`) is inherently
+/// mutating on that contract (it atomically records the position alongside
+/// validating it), so it cannot be dry-run from this contract. It is still
+/// enforced for real at execution time.
+fn simulate_market_copy_trade(
+    env: &Env,
+    user: Address,
+    token: Address,
+    amount: i128,
+    portfolio_pct_bps: Option<u32>,
+) -> SimulationResult {
+    let mut failure_reason: Option<ContractError> = None;
+    let fail = |reason: ContractError, failure_reason: &mut Option<ContractError>| {
+        if failure_reason.is_none() {
+            *failure_reason = Some(reason);
+        }
+    };
+
+    if amount <= 0 {
+        fail(ContractError::InvalidAmount, &mut failure_reason);
+    }
+
+    let min_trade_size_ok = amount >= effective_min_trade_size(env, &token);
+    if !min_trade_size_ok {
+        fail(ContractError::BelowMinimumTradeSize, &mut failure_reason);
+    }
+
+    let circuit_breaker_ok = !market_circuit_breaker_active_readonly(env);
+    if !circuit_breaker_ok {
+        fail(ContractError::CircuitBreakerActive, &mut failure_reason);
+    }
+
+    let open_interest_ok = check_open_interest_limit(env, &token, amount).is_ok();
+    if !open_interest_ok {
+        fail(ContractError::OpenInterestLimitReached, &mut failure_reason);
+    }
+
+    let daily_limit: i128 = env
+        .storage()
+        .instance()
+        .get(&StorageKey::DailyVolumeLimit)
+        .unwrap_or(0i128);
+    let daily_volume_ok = if daily_limit > 0 {
+        let today: u64 = env.ledger().timestamp() / 86_400;
+        let day_key = StorageKey::DailyVolumeDay(user.clone());
+        let vol_key = StorageKey::DailyVolume(user.clone());
+        let stored_day: u64 = env.storage().persistent().get(&day_key).unwrap_or(0u64);
+        let current_vol: i128 = if stored_day == today {
+            env.storage().persistent().get(&vol_key).unwrap_or(0i128)
+        } else {
+            0i128
+        };
+        current_vol.checked_add(amount).unwrap_or(i128::MAX) <= daily_limit
+    } else {
+        true
+    };
+    if !daily_volume_ok {
+        fail(ContractError::DailyVolumeLimitExceeded, &mut failure_reason);
+    }
+
+    let exempt = {
+        let key = StorageKey::PositionLimitExempt(user.clone());
+        env.storage().instance().get(&key).unwrap_or(false)
+    };
+    let position_cap_ok = check_position_cap(env, &user, exempt).is_ok();
+    if !position_cap_ok {
+        fail(ContractError::TooManyOpenPositions, &mut failure_reason);
+    }
+
+    let position_pct_ok = portfolio_pct_bps
+        .map(|pct| pct <= risk_gates::MAX_POSITION_PCT_BPS)
+        .unwrap_or(true);
+    if !position_pct_ok {
+        fail(ContractError::PositionPctTooHigh, &mut failure_reason);
+    }
+
+    let oracle: Option<Address> = env.storage().instance().get(&Symbol::new(env, ORACLE_KEY));
+    let effective_amount = if position_pct_ok {
+        resolve_trade_amount(env, &user, &token, amount, portfolio_pct_bps, oracle)
+            .unwrap_or(amount)
+    } else {
+        amount
+    };
+
+    let available_balance = soroban_sdk::token::Client::new(env, &token).balance(&user);
+    let fee = effective_estimated_fee(env);
+    let (balance_ok, fee_paid_from_received, required_balance) =
+        match check_user_balance(env, &user, &token, effective_amount, fee) {
+            Ok(()) => (true, false, effective_amount.saturating_add(fee)),
+            Err(_) => match check_user_balance(env, &user, &token, effective_amount, 0) {
+                Ok(()) => (true, true, effective_amount),
+                Err(detail) => (false, false, detail.required),
+            },
+        };
+    if !balance_ok {
+        fail(ContractError::InsufficientBalance, &mut failure_reason);
+    }
+
+    SimulationResult {
+        would_succeed: failure_reason.is_none(),
+        effective_amount,
+        estimated_fee: fee,
+        fee_paid_from_received,
+        available_balance,
+        required_balance,
+        validations: SimulationValidations {
+            min_trade_size_ok,
+            circuit_breaker_ok,
+            open_interest_ok,
+            daily_volume_ok,
+            position_cap_ok,
+            position_pct_ok,
+            balance_ok,
+        },
+        failure_reason,
+    }
 }
 
 fn execute_market_copy_trade(
@@ -1042,6 +1244,55 @@ impl TradeExecutorContract {
         env.storage().instance().set(&StorageKey::Admin, &admin);
     }
 
+    // ── Issue #865: governance-driven pause propagation ────────────────────────
+
+    /// Set the central governance contract address authorized to call
+    /// `apply_governance_pause`. Admin only.
+    pub fn set_governance(env: Env, governance: Address) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::GovernanceAddress, &governance);
+        Ok(())
+    }
+
+    /// Read-only: the configured governance contract address, if any.
+    pub fn get_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::GovernanceAddress)
+    }
+
+    /// Called by the configured governance contract to propagate a pause/unpause.
+    pub fn apply_governance_pause(env: Env, paused: bool) -> Result<(), ContractError> {
+        let governance: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GovernanceAddress)
+            .ok_or(ContractError::Unauthorized)?;
+        governance.require_auth();
+        env.storage().instance().set(&StorageKey::Paused, &paused);
+        Ok(())
+    }
+
+    /// Read-only: true when a governance-driven emergency pause is active.
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
+    }
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> stellar_swipe_common::HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        let admin: Option<Address> = env.storage().instance().get(&StorageKey::Admin);
+        let Some(admin) = admin else {
+            return stellar_swipe_common::health_uninitialized(&env, version);
+        };
+        stellar_swipe_common::HealthStatus {
+            is_initialized: true,
+            is_paused: is_paused(&env),
+            version,
+            admin,
+        }
+    }
+
     /// # Summary
     /// Configure the portfolio contract used for position validation and
     /// copy-trade recording. Admin auth required.
@@ -1342,6 +1593,9 @@ impl TradeExecutorContract {
         tx_hash: Bytes,
         expiry_ts: u64,
     ) -> Result<(), ContractError> {
+        if is_paused(&env) {
+            return Err(ContractError::ContractPaused);
+        }
         verify_and_commit(&env, &user, nonce, tx_hash, expiry_ts).map_err(map_replay_error)?;
         feature_flags::require_feature_enabled(&env, feature_flags::FEAT_COPY_TRADE)?;
         match order_type {
@@ -1389,6 +1643,25 @@ impl TradeExecutorContract {
                 Ok(())
             }
         }
+    }
+
+    /// Dry-run a market copy trade without submitting it. Returns the expected
+    /// effective amount, fee, and a breakdown of which validation gates would
+    /// pass or fail — without requiring auth, writing any storage, or mutating
+    /// any cross-contract state. Issue #863.
+    ///
+    /// Runs the same checks, in the same order, as the `OrderType::Market` path
+    /// of [`Self::execute_copy_trade`] (excluding the final mutating position-limit
+    /// call to the `UserPortfolio` contract, which cannot be dry-run — see
+    /// [`SimulationResult`]).
+    pub fn simulate_copy_trade(
+        env: Env,
+        user: Address,
+        token: Address,
+        amount: i128,
+        portfolio_pct_bps: Option<u32>,
+    ) -> SimulationResult {
+        simulate_market_copy_trade(&env, user, token, amount, portfolio_pct_bps)
     }
 
     /// Admin/keeper maintenance call: reclaim persistent storage held by
