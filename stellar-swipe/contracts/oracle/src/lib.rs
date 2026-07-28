@@ -301,6 +301,37 @@ impl OracleContract {
         admin::unpause_category(&env, &caller, category)
     }
 
+    // ── Issue #865: governance-driven pause propagation ────────────────────────
+
+    /// Set the central governance contract address authorized to call
+    /// `apply_governance_pause`. Admin only.
+    pub fn set_governance(env: Env, admin: Address, governance: Address) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::GovernanceAddress, &governance);
+        Ok(())
+    }
+
+    /// Read-only: the configured governance contract address, if any.
+    pub fn get_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::GovernanceAddress)
+    }
+
+    /// Called by the configured governance contract to propagate a pause/unpause
+    /// to this oracle by setting (or clearing) the global `CAT_ALL` pause category.
+    pub fn apply_governance_pause(env: Env, paused: bool) -> Result<(), OracleError> {
+        let governance: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GovernanceAddress)
+            .ok_or(OracleError::Unauthorized)?;
+        governance.require_auth();
+        admin::set_all_paused(&env, paused);
+        Ok(())
+    }
+
     /// Set guardian address (admin only)
     pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), OracleError> {
         admin::set_guardian(&env, &caller, guardian)
@@ -751,11 +782,12 @@ impl OracleContract {
             .ok_or(OracleError::PriceNotFound)?;
 
         let current_time = env.ledger().timestamp();
+        let window = staleness::get_staleness_window(&env, &pair);
         let mut fresh_prices: Vec<PriceData> = Vec::new(&env);
 
-        // 1. Filter stale prices (TTL: 300s / 5 mins)
+        // 1. Filter stale prices using the configured freshness window (Issue #864).
         for p in prices.iter() {
-            if current_time.saturating_sub(p.timestamp) < 300 {
+            if current_time.saturating_sub(p.timestamp) < window {
                 fresh_prices.push_back(p);
             }
         }
@@ -831,6 +863,76 @@ impl OracleContract {
             .unwrap_or(0)
     }
 
+    /// Set the minimum confidence (0-100) required for a submitted quote to be
+    /// accepted by `submit_pair_price`. Admin only. Emits `min_confidence_updated`.
+    /// Issue #864.
+    pub fn set_min_confidence(
+        env: Env,
+        admin: Address,
+        min_confidence: u32,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let old: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinConfidence, &min_confidence);
+        events::emit_min_confidence_updated(&env, old, min_confidence);
+        Ok(())
+    }
+
+    /// Return the current minimum confidence requirement (0 = no requirement).
+    pub fn get_min_confidence(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0)
+    }
+
+    /// Admin: set the freshness window (seconds) for a pair. Quotes older than
+    /// this are rejected by `submit_pair_price`/`get_price_with_confidence`.
+    /// Issue #864.
+    pub fn set_staleness_window(
+        env: Env,
+        admin: Address,
+        pair: AssetPair,
+        window_secs: u64,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        staleness::set_staleness_window(&env, &pair, window_secs);
+        Ok(())
+    }
+
+    /// Read-only: return the configured freshness window in seconds for a pair.
+    pub fn get_staleness_window(env: Env, pair: AssetPair) -> u64 {
+        staleness::get_staleness_window(&env, &pair)
+    }
+
+    /// Admin: set the hard deviation reject threshold (basis points) for a pair.
+    /// Unlike `set_deviation_threshold` (alert-only), exceeding this threshold
+    /// causes `submit_pair_price` to reject the quote. Issue #864.
+    pub fn set_deviation_reject_threshold(
+        env: Env,
+        admin: Address,
+        pair: AssetPair,
+        threshold_bps: u32,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        deviation::set_deviation_reject_threshold(&env, &pair, threshold_bps);
+        Ok(())
+    }
+
+    /// Read-only: return current deviation hard reject threshold in bps (0 = disabled).
+    pub fn get_deviation_reject_threshold(env: Env, pair: AssetPair) -> u32 {
+        deviation::get_deviation_reject_threshold(&env, &pair)
+    }
+
     pub fn add_price_source(
         env: Env,
         admin: Address,
@@ -847,6 +949,12 @@ impl OracleContract {
     }
 
     /// Submit a price observation for aggregation (`PriceMap` path).
+    ///
+    /// Issue #864: rejects the quote before it is accepted if its confidence
+    /// is below the configured minimum, or if it deviates from other
+    /// currently-fresh sources by more than the configured hard reject
+    /// threshold. Existing entries older than the configured staleness
+    /// window are dropped before this comparison is made.
     pub fn submit_pair_price(
         env: Env,
         source: Address,
@@ -860,6 +968,15 @@ impl OracleContract {
 
         source.require_auth();
 
+        if price <= 0 {
+            return Err(OracleError::InvalidPrice);
+        }
+
+        let min_confidence = Self::get_min_confidence(env.clone());
+        if confidence < min_confidence {
+            return Err(OracleError::LowConfidence);
+        }
+
         // Ensure source is a registered oracle
         let weight: u32 = env
             .storage()
@@ -871,33 +988,45 @@ impl OracleContract {
         }
 
         let key = StorageKey::PriceMap(pair.clone());
-        let mut prices: Vec<PriceData> = env
+        let prices: Vec<PriceData> = env
             .storage()
             .temporary()
             .get(&key)
             .unwrap_or(Vec::new(&env));
 
+        let now = env.ledger().timestamp();
+        let window = staleness::get_staleness_window(&env, &pair);
+
+        // Drop existing entries outside the freshness window before comparing.
+        let mut fresh: Vec<PriceData> = Vec::new(&env);
+        for p in prices.iter() {
+            if now.saturating_sub(p.timestamp) < window {
+                fresh.push_back(p);
+            }
+        }
+
+        // #864: compute cross-source deviation (including the new quote) and
+        // reject before persisting if it exceeds the hard reject threshold.
+        let mut source_prices: Vec<(Address, i128)> = Vec::new(&env);
+        for i in 0..fresh.len() {
+            let p = fresh.get(i).unwrap();
+            source_prices.push_back((p.source, p.price));
+        }
+        source_prices.push_back((source.clone(), price));
+        deviation::check_deviation(&env, &pair, &source_prices)?;
+
         let new_entry = PriceData {
             asset_pair: pair.clone(),
             price,
-            timestamp: env.ledger().timestamp(),
+            timestamp: now,
             source,
             confidence,
         };
+        fresh.push_back(new_entry);
 
-        prices.push_back(new_entry);
-
-        // Cache management: Keep prices for 5 mins
-        env.storage().temporary().set(&key, &prices);
+        // Cache management: Keep prices for the configured freshness window.
+        env.storage().temporary().set(&key, &fresh);
         env.storage().temporary().extend_ttl(&key, 60, 60);
-
-        // #671: compute cross-source deviation and emit alert if threshold exceeded
-        let mut source_prices: Vec<(Address, i128)> = Vec::new(&env);
-        for i in 0..prices.len() {
-            let p = prices.get(i).unwrap();
-            source_prices.push_back((p.source, p.price));
-        }
-        deviation::check_deviation(&env, &pair, &source_prices);
 
         Ok(())
     }

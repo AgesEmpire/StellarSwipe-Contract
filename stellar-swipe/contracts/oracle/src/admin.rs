@@ -83,6 +83,34 @@ pub fn unpause_category(env: &Env, caller: &Address, category: String) -> Result
     Ok(())
 }
 
+/// Directly set (or clear) the global `CAT_ALL` pause category, bypassing the
+/// normal admin/guardian authorization performed by [`pause_category`] /
+/// [`unpause_category`]. Callers are responsible for authorizing the request
+/// themselves; this is used by the governance-driven pause propagation
+/// entrypoint (Issue #865), which authorizes via the configured governance
+/// contract address instead of the local admin/guardian.
+pub fn set_all_paused(env: &Env, paused: bool) {
+    let category = String::from_str(env, CAT_ALL);
+    let mut states = get_pause_states(env);
+    if paused {
+        let now = env.ledger().timestamp();
+        states.set(
+            category,
+            PauseState {
+                paused: true,
+                paused_at: now,
+                auto_unpause_at: None,
+                reason: String::from_str(env, "governance_pause"),
+            },
+        );
+    } else {
+        states.remove(category);
+    }
+    env.storage()
+        .instance()
+        .set(&StorageKey::PauseStates, &states);
+}
+
 pub fn get_pause_states(env: &Env) -> Map<String, PauseState> {
     env.storage()
         .instance()

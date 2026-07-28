@@ -98,6 +98,8 @@ pub enum ContractError {
     /// nonce/tx_hash has closed. See the replay-protection audit
     /// (Issue: nonce replay attack prevention).
     TradeExpired = 33,
+    /// The contract is paused (governance-driven emergency pause). See Issue #865.
+    ContractPaused = 34,
 }
 
 impl ContractError {

@@ -45,10 +45,15 @@ pub enum StorageKey {
     PendingAdmin,
     PendingAdminExpiry,
     MinSourceCount,
+    /// Issue #864: minimum confidence (0-100) required for a submitted quote to be accepted.
+    MinConfidence,
     /// Max percentage deviation allowed between consecutive price updates for an asset pair (basis points, 10000 = 100%).
     DeviationThreshold(AssetPair),
     /// Set to true when the single-update deviation breaker has tripped for an asset pair.
     DeviationBreakerTripped(AssetPair),
+    /// Issue #865: central governance contract address authorized to call
+    /// `apply_governance_pause`.
+    GovernanceAddress,
 }
 
 #[contracttype]

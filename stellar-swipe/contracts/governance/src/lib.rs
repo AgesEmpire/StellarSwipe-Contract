@@ -166,6 +166,8 @@ pub enum StorageKey {
     ShadowMode,
     /// #693: Per-category quorum and supermajority thresholds (Map<u32, CategoryThreshold>).
     CategoryThresholds,
+    /// Issue #865: downstream contract addresses that receive governance pause propagation.
+    PausePropagationTargets,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -353,7 +355,8 @@ impl GovernanceContract {
         }
     }
 
-    /// Sets the global pause flag (admin only).
+    /// Sets the global pause flag (admin only) and propagates the change to
+    /// every registered downstream contract (Issue #865).
     ///
     /// Uses the shared [`pausable`] module so pause behavior and event shape
     /// are consistent across all contracts that adopt it (Issue #561).
@@ -364,7 +367,53 @@ impl GovernanceContract {
     ) -> Result<(), GovernanceError> {
         require_admin(&env, &admin)?;
         pausable::set_paused(&env, paused);
+        propagate_pause_to_downstream(&env, paused);
         Ok(())
+    }
+
+    // ── Issue #865: governance pause propagation ───────────────────────────────
+
+    /// Register a downstream contract to receive pause/unpause propagation the
+    /// next time `set_contract_paused` is called. Admin only. Idempotent.
+    pub fn register_pause_target(
+        env: Env,
+        admin: Address,
+        target: Address,
+    ) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        let mut targets = pause_targets(&env);
+        if !targets.contains(&target) {
+            targets.push_back(target);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PausePropagationTargets, &targets);
+        }
+        Ok(())
+    }
+
+    /// Unregister a downstream contract from pause propagation. Admin only.
+    pub fn unregister_pause_target(
+        env: Env,
+        admin: Address,
+        target: Address,
+    ) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        let targets = pause_targets(&env);
+        let mut filtered = Vec::new(&env);
+        for t in targets.iter() {
+            if t != target {
+                filtered.push_back(t);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::PausePropagationTargets, &filtered);
+        Ok(())
+    }
+
+    /// Read-only: the downstream contracts currently registered for pause propagation.
+    pub fn get_pause_targets(env: Env) -> Vec<Address> {
+        pause_targets(&env)
     }
 
     pub fn get_metadata(env: Env) -> Result<TokenMetadata, GovernanceError> {
@@ -1854,6 +1903,32 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
 /// Crate-visible alias used by sub-modules (e.g. proposal_deposit).
 pub(crate) fn require_admin_pub(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
     require_admin(env, caller)
+}
+
+/// Issue #865: downstream contracts registered for pause propagation.
+fn pause_targets(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::PausePropagationTargets)
+        .unwrap_or(Vec::new(env))
+}
+
+/// Best-effort propagation of a governance pause/unpause to every registered
+/// downstream contract (Issue #865). A single unreachable or incompatible
+/// downstream contract does not block the local pause or propagation to the
+/// remaining targets; failures are surfaced via a `pause_propagation_failed`
+/// event so operators can reconcile drift manually.
+fn propagate_pause_to_downstream(env: &Env, paused: bool) {
+    let targets = pause_targets(env);
+    for target in targets.iter() {
+        let client = pausable::PausableClient::new(env, &target);
+        if client.try_apply_governance_pause(&paused).is_err() {
+            env.events().publish(
+                (Symbol::new(env, "pause_propagation_failed"),),
+                (target, paused),
+            );
+        }
+    }
 }
 
 fn balances(env: &Env) -> Map<Address, i128> {

@@ -257,6 +257,9 @@ pub enum StorageKey {
     /// (in whole weeks) to a voting-power multiplier (basis points).
     /// Falls back to the built-in default tiers when unset.
     LockMultiplierTiers,
+    /// Issue #865: central governance contract address authorized to call
+    /// `apply_governance_pause`.
+    GovernanceAddress,
 }
 
 #[contracterror]
@@ -661,6 +664,60 @@ impl StakeVaultContract {
 
     pub fn is_paused(env: Env) -> bool {
         pausable::is_paused(&env)
+    }
+
+    // ── Issue #865: governance-driven pause propagation ────────────────────────
+
+    /// Set the central governance contract address authorized to call
+    /// `apply_governance_pause`. Admin only.
+    pub fn set_governance(env: Env, admin: Address, governance: Address) -> Result<(), StakeVaultError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(StakeVaultError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::GovernanceAddress, &governance);
+        Ok(())
+    }
+
+    /// Read-only: the configured governance contract address, if any.
+    pub fn get_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::GovernanceAddress)
+    }
+
+    /// Called by the configured governance contract to propagate a pause/unpause
+    /// (Issue #865). Bypasses the multi-sig requirement enforced on `pause`/`unpause`
+    /// since this is a trusted, governance-initiated emergency action.
+    pub fn apply_governance_pause(env: Env, paused: bool) -> Result<(), StakeVaultError> {
+        let governance: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GovernanceAddress)
+            .ok_or(StakeVaultError::Unauthorized)?;
+        governance.require_auth();
+        pausable::set_paused(&env, paused);
+        Ok(())
+    }
+
+    /// Read-only health probe for monitoring and front-ends (no auth). Issue #865.
+    pub fn health_check(env: Env) -> stellar_swipe_common::HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        let admin: Option<Address> = env.storage().instance().get(&StorageKey::Admin);
+        let Some(admin) = admin else {
+            return stellar_swipe_common::health_uninitialized(&env, version);
+        };
+        stellar_swipe_common::HealthStatus {
+            is_initialized: true,
+            is_paused: pausable::is_paused(&env),
+            version,
+            admin,
+        }
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
