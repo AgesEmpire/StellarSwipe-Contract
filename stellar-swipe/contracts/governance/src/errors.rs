@@ -109,6 +109,10 @@ pub enum GovernanceError {
     InvalidTimelockConfig = 49,
     /// No conviction-voting pool exists for the given id.
     ConvictionPoolNotFound = 50,
+    /// No pending admin rotation has been proposed.
+    PendingAdminNotFound = 51,
+    /// Guardian address has not been configured.
+    GuardianNotSet = 52,
 }
 
 impl GovernanceError {
@@ -224,6 +228,12 @@ impl GovernanceError {
             GovernanceError::InvalidTimelockConfig => "timelock configuration is invalid",
             GovernanceError::ConvictionPoolNotFound => {
                 "no conviction-voting pool exists for the given id"
+            }
+            GovernanceError::PendingAdminNotFound => {
+                "no pending admin rotation has been proposed"
+            }
+            GovernanceError::GuardianNotSet => {
+                "guardian address has not been configured"
             }
         }
     }
