@@ -62,6 +62,8 @@ pub enum ContractError {
     /// Issue #813: caller is neither the admin nor on the authorized-caller
     /// allowlist for this privileged, non-user-scoped entry point.
     UnauthorizedCaller = 28,
+    /// Token metadata (decimals, symbol, or name) is invalid or mismatches registered data.
+    InvalidTokenMetadata = 29,
 }
 
 impl ContractError {
@@ -133,6 +135,9 @@ impl ContractError {
             }
             ContractError::UnauthorizedCaller => {
                 "caller is neither the admin nor on the authorized-caller allowlist"
+            }
+            ContractError::InvalidTokenMetadata => {
+                "token metadata (decimals, symbol, or name) is invalid or mismatches registered data"
             }
         }
     }

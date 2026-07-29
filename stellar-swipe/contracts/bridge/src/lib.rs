@@ -4,6 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
 use stellar_swipe_common::SECONDS_PER_DAY;
+use stellar_swipe_common::token_metadata::{TokenMetadata, TokenMetadataError, validate as validate_token_metadata};
 
 mod validators;
 
@@ -54,6 +55,8 @@ pub enum BridgeError {
     DuplicateNonce = 19,
     /// The bridge is paused (governance-driven emergency pause). See Issue #865.
     ContractPaused = 20,
+    /// Token metadata (decimals, symbol, or name) is invalid or missing.
+    InvalidTokenMetadata = 21,
 }
 
 impl BridgeError {
@@ -114,6 +117,9 @@ impl BridgeError {
             }
             BridgeError::DuplicateNonce => {
                 "message nonce was already confirmed; duplicate delivery rejected"
+            }
+            BridgeError::InvalidTokenMetadata => {
+                "token metadata (decimals, symbol, or name) is invalid or missing"
             }
         }
     }
@@ -304,6 +310,21 @@ impl BridgeContract {
         if !cfg!(test) {
             admin.require_auth();
         }
+
+        // Validate token metadata before accepting registration.
+        let metadata = TokenMetadata {
+            symbol: source_asset.clone(),
+            name: source_asset.clone(),
+            decimals,
+        };
+        validate_token_metadata(&metadata).map_err(|_| BridgeError::InvalidTokenMetadata)?;
+
+        let wrapped_metadata = TokenMetadata {
+            symbol: wrapped_asset.clone(),
+            name: wrapped_asset.clone(),
+            decimals,
+        };
+        validate_token_metadata(&wrapped_metadata).map_err(|_| BridgeError::InvalidTokenMetadata)?;
 
         let asset = WrappedAsset {
             source_chain,
