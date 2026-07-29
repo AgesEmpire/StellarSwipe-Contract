@@ -2601,3 +2601,36 @@ mod unstake_queue_cap_tests {
         }
     }
 }
+
+// ── Instruction-budget regression snapshots (Issue #budget) ───────────────────
+
+use stellar_swipe_common::budget_regression::measure_and_emit;
+
+#[test]
+fn deposit_stake_budget_regression() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 1_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+
+    env.budget().reset_tracker();
+    StakeVaultContractClient::new(&env, &vault_id).deposit_stake(&staker, &amount);
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("stake_vault.deposit_stake", 6_000_000, instructions);
+}
+
+#[test]
+fn withdraw_stake_budget_regression() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 1_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+
+    env.budget().reset_tracker();
+    StakeVaultContractClient::new(&env, &vault_id).withdraw_stake(&staker);
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("stake_vault.withdraw_stake", 6_000_000, instructions);
+}
