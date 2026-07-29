@@ -959,6 +959,42 @@ mod slash_severity_tests {
     }
 
     #[test]
+    fn governance_can_reconfigure_tiers() {
+        let (env, vault_id, token, admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let balance: i128 = 1_000_000;
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
+        seed(&env, &vault_id, &provider, balance);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let governance = Address::generate(&env);
+        client.set_governance(&admin, &governance);
+
+        client.governance_configure_slash_tiers(&governance, &100, &2_000, &10_000);
+        let slashed = client.slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "test"),
+        );
+        assert_eq!(slashed, 10_000); // 1%
+    }
+
+    #[test]
+    fn unauthorized_governance_reconfigure_rejected() {
+        let (env, vault_id, token, admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let governance = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        client.set_governance(&admin, &governance);
+
+        assert_eq!(
+            client.try_governance_configure_slash_tiers(&attacker, &100, &2_000, &10_000),
+            Err(Ok(StakeVaultError::Unauthorized))
+        );
+    }
+
+    #[test]
     fn invalid_tier_bps_rejected() {
         let (env, vault_id, _token, _admin, _registry) = setup();
         let client = StakeVaultContractClient::new(&env, &vault_id);
