@@ -3,6 +3,14 @@ use shared::errors::{ErrorCategory, RecoveryStrategy};
 use soroban_sdk::{contractevent, Address, Env, String, Symbol, Vec};
 
 #[contractevent]
+pub struct SnapshotRecorded {
+    pub ledger: u64,
+    pub timestamp: u64,
+    pub total_amount: i128,
+    pub entry_count: u32,
+}
+
+#[contractevent]
 pub struct WithdrawalQueued {
     pub recipient: Address,
     pub token: Address,
@@ -423,5 +431,24 @@ pub fn emit_effective_multiplier_changed(env: &Env, evt: EvtEffectiveMultiplierC
             Symbol::new(env, "multiplier_changed"),
         ),
         (evt.old_multiplier_bps, evt.new_multiplier_bps),
+    );
+}
+
+// ── Issue #814: Snapshot Recorded event ──────────────────────────────
+
+pub struct EvtSnapshotRecorded {
+    pub ledger: u64,
+    pub timestamp: u64,
+    pub total_amount: i128,
+    pub entry_count: u32,
+}
+
+pub fn emit_snapshot_recorded(env: &Env, evt: EvtSnapshotRecorded) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "snapshot_recorded"),
+        ),
+        (evt.ledger, evt.timestamp, evt.total_amount, evt.entry_count),
     );
 }

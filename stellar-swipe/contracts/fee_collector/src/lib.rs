@@ -10,14 +10,15 @@ use events::{
     emit_fee_rate_updated, emit_fees_claimed, emit_fees_claimed_converted,
     emit_first_trade_fee_waived, emit_network_condition_updated, emit_payout_currency_set,
     emit_referral_fee_paid, emit_referral_fee_share_updated, emit_referral_registered,
-    emit_retry_attempted, emit_treasury_withdrawal, emit_volume_discount_config_updated,
-    emit_waterfall_distribution, emit_withdrawal_queued, EvtEffectiveMultiplierChanged,
-    EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed,
-    EvtNetworkConditionUpdated, EvtRetryAttempted, EvtTreasuryWithdrawal, EvtWithdrawalQueued,
+    emit_retry_attempted, emit_snapshot_recorded, emit_treasury_withdrawal,
+    emit_volume_discount_config_updated, emit_waterfall_distribution, emit_withdrawal_queued,
+    EvtEffectiveMultiplierChanged, EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated,
+    EvtFeesClaimed, EvtNetworkConditionUpdated, EvtRetryAttempted, EvtSnapshotRecorded,
+    EvtTreasuryWithdrawal, EvtWithdrawalQueued,
 };
 pub use events::{
     EffectiveMultiplierChanged, FeeRateUpdated, FeesBurned, FeesClaimed, FirstTradeFeeWaived,
-    TreasuryWithdrawal, WithdrawalQueued,
+    SnapshotRecorded, TreasuryWithdrawal, WithdrawalQueued,
 };
 
 mod rebates;
@@ -28,27 +29,29 @@ pub use reports::{EarningsLeaderboardEntry, EarningsReport, ReportPeriod};
 mod storage;
 pub use storage::BalanceMismatch;
 use storage::{
-    add_daily_fee_total, get_admin, get_burn_rate, get_congestion_config, get_congestion_signal,
-    get_daily_fee_total, get_failed_fee_collection, get_fee_optimization_config, get_fee_rate,
-    get_forecast_config, get_last_error_report, get_last_forecast_day, get_monthly_trade_volume,
+    add_daily_fee_total, add_to_revenue_share_pool_index, get_admin, get_burn_rate,
+    get_congestion_config, get_congestion_signal, get_daily_fee_total,
+    get_failed_fee_collection, get_fee_optimization_config, get_fee_rate, get_forecast_config,
+    get_fee_snapshot, get_last_error_report, get_last_forecast_day, get_monthly_trade_volume,
     get_network_condition_score, get_oracle_contract, get_pending_fees,
     get_provider_payout_currency, get_queued_withdrawal, get_referral_fee_share_bps, get_referrer,
-    get_treasury_balance, get_volume_discount_config, get_waterfall_config, has_traded,
-    is_authorized_caller, is_initialized, remove_authorized_caller, remove_failed_fee_collection,
+    get_revenue_share_pool_index, get_treasury_balance, get_volume_discount_config,
+    get_waterfall_config, has_traded, is_authorized_caller, is_initialized,
+    remove_authorized_caller, remove_failed_fee_collection, remove_from_revenue_share_pool_index,
     remove_monthly_trade_volume, remove_provider_payout_currency, remove_queued_withdrawal,
     set_admin, set_authorized_caller, set_burn_rate as set_burn_rate_storage,
     set_congestion_config, set_congestion_signal, set_failed_fee_collection,
     set_fee_optimization_config, set_fee_rate as set_fee_rate_storage, set_forecast_config_storage,
-    set_has_traded, set_initialized, set_last_error_report, set_last_forecast_day,
-    set_monthly_trade_volume, set_network_condition_score,
+    set_fee_snapshot, set_has_traded, set_initialized, set_last_error_report,
+    set_last_forecast_day, set_monthly_trade_volume, set_network_condition_score,
     set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
     set_provider_payout_currency, set_queued_withdrawal, set_referral_fee_share_bps, set_referrer,
     set_treasury_balance, set_volume_discount_config_storage,
     set_waterfall_config as set_waterfall_config_storage, CongestionConfig, CongestionSignal,
-    ErrorReport, FailedFeeCollection, FeeOptimizationConfig, ForecastConfigData,
-    MonthlyTradeVolume, QueuedWithdrawal, StorageKey, VolumeDiscountConfig, VolumeTier,
-    WaterfallConfig, WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS,
-    MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
+    ErrorReport, FailedFeeCollection, FeeOptimizationConfig, FeeSnapshot, ForecastConfigData,
+    MonthlyTradeVolume, QueuedWithdrawal, SnapshotEntry, StorageKey, VolumeDiscountConfig,
+    VolumeTier, WaterfallConfig, WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS,
+    MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
 };
 
 use soroban_sdk::{
@@ -1718,5 +1721,112 @@ impl FeeCollector {
         set_referral_fee_share_bps(&env, share_bps);
         emit_referral_fee_share_updated(&env, old_bps, share_bps, &admin);
         Ok(())
+    }
+
+    // ── Issue #814: Deterministic fee distribution snapshots ──────────
+
+    /// Admin-only: record a deterministic snapshot of all revenue share
+    /// pools.  Tokens are sorted by address before snapshotting so that
+    /// the result is deterministic regardless of insertion order.
+    ///
+    /// After recording, all revenue share pools are cleared for the
+    /// next cycle.  Emits a [`SnapshotRecorded`] event.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::SnapshotNotFound`] — no pools have accumulated
+    ///   since the last snapshot.
+    pub fn record_snapshot(env: Env, caller: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        caller.require_auth();
+
+        let index = get_revenue_share_pool_index(&env);
+        if index.len() == 0 {
+            return Err(ContractError::SnapshotNotFound);
+        }
+
+        // Sort tokens deterministically by address (bubble sort — small
+        // token count expected).
+        let mut sorted = index;
+        let n = sorted.len();
+        let mut i = 0u32;
+        while i < n {
+            let mut j = 0u32;
+            while j + 1 < n {
+                let a = sorted.get(j).unwrap();
+                let b = sorted.get(j + 1).unwrap();
+                if a > b {
+                    sorted.set(j, b.clone());
+                    sorted.set(j + 1, a.clone());
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+
+        let ledger = env.ledger().sequence() as u64;
+        let timestamp = env.ledger().timestamp();
+
+        let mut entries: Vec<SnapshotEntry> = Vec::new(&env);
+        let mut total_amount: i128 = 0;
+
+        for token in sorted.iter() {
+            let amount = get_revenue_share_pool(&env, token);
+            if amount > 0 {
+                entries.push_back(SnapshotEntry {
+                    token: token.clone(),
+                    amount,
+                });
+                total_amount = total_amount.saturating_add(amount);
+            }
+        }
+
+        if entries.len() == 0 {
+            return Err(ContractError::SnapshotNotFound);
+        }
+
+        let snapshot = FeeSnapshot {
+            ledger,
+            timestamp,
+            total_amount,
+            entries: entries.clone(),
+        };
+
+        set_fee_snapshot(&env, ledger, &snapshot);
+
+        // Clear all pools after snapshotting.
+        for token in sorted.iter() {
+            clear_revenue_share_pool(&env, token);
+        }
+
+        emit_snapshot_recorded(
+            &env,
+            EvtSnapshotRecorded {
+                ledger,
+                timestamp,
+                total_amount,
+                entry_count: entries.len() as u32,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve a previously recorded deterministic snapshot by ledger
+    /// sequence.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::SnapshotNotFound`] — no snapshot exists for
+    ///   the given ledger sequence.
+    pub fn get_snapshot(env: Env, ledger: u64) -> Result<FeeSnapshot, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        get_fee_snapshot(&env, ledger).ok_or(ContractError::SnapshotNotFound)
     }
 }
