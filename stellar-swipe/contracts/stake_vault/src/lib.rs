@@ -712,15 +712,18 @@ impl StakeVaultContract {
         let Some(admin) = admin else {
             return stellar_swipe_common::health_uninitialized(&env, version);
         };
-        stellar_swipe_common::HealthStatus {
+        let status = stellar_swipe_common::HealthStatus {
             is_initialized: true,
             is_paused: pausable::is_paused(&env),
             version,
             admin,
-        }
+            initialized_at: env.ledger().timestamp(),
+        };
+        stellar_swipe_common::emit_health_event(&env, &status);
+        status
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────────
+    // ── Helpers ────────────────────────────────────────────────────────
 
     fn require_not_paused(env: &Env) -> Result<(), StakeVaultError> {
         pausable::require_not_paused(env).map_err(|_| StakeVaultError::ContractPaused)

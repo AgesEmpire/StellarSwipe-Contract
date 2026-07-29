@@ -822,12 +822,17 @@ impl BridgeContract {
         let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
         let config: Option<BridgeConfig> = env.storage().instance().get(&DataKey::Config);
         match config {
-            Some(cfg) => stellar_swipe_common::HealthStatus {
-                is_initialized: true,
-                is_paused: is_paused(&env),
-                version,
-                admin: cfg.admin,
-            },
+            Some(cfg) => {
+                let status = stellar_swipe_common::HealthStatus {
+                    is_initialized: true,
+                    is_paused: is_paused(&env),
+                    version,
+                    admin: cfg.admin,
+                    initialized_at: env.ledger().timestamp(),
+                };
+                stellar_swipe_common::emit_health_event(&env, &status);
+                status
+            }
             None => crate::governance::bridge_health_check(&env),
         }
     }

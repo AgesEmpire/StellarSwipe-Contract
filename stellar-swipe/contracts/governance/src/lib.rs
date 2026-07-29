@@ -347,12 +347,15 @@ impl GovernanceContract {
             .get(&StorageKey::Admin)
             .unwrap_or_else(|| stellar_swipe_common::placeholder_admin(&env));
         let is_paused = pausable::is_paused(&env);
-        stellar_swipe_common::HealthStatus {
+        let status = stellar_swipe_common::HealthStatus {
             is_initialized: true,
             is_paused,
             version,
             admin,
-        }
+            initialized_at: env.ledger().timestamp(),
+        };
+        stellar_swipe_common::emit_health_event(&env, &status);
+        status
     }
 
     /// Sets the global pause flag (admin only) and propagates the change to

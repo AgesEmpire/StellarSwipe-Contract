@@ -143,16 +143,16 @@ impl OracleContract {
             .get(&StorageKey::Admin)
             .unwrap_or_else(|| placeholder_admin(&env));
         let is_paused = admin::is_paused(&env, String::from_str(&env, CAT_ALL));
-        HealthStatus {
+        let status = HealthStatus {
             is_initialized: true,
             is_paused,
             version,
             admin,
-        }
+            initialized_at: env.ledger().timestamp(),
+        };
+        stellar_swipe_common::emit_health_event(&env, &status);
+        status
     }
-
-    /// # Summary
-    /// Set price for an asset pair. Stores the price, updates history,
     /// and triggers staleness metadata update.
     ///
     /// # Parameters
