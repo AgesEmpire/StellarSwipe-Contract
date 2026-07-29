@@ -78,65 +78,6 @@ This is scoped per-function rather than per-crate because the workspace sets
 `clippy::all = "allow"` broadly (issue #599) — a crate-wide deny would also
 flag unrelated, already-safe loop/index arithmetic across these large crates.
 
-## Fuzz / property-based testing (signal_registry)
-
-`signal_registry` validates untrusted signal input (price, expiry, rationale
-length, tag count — see `validation::validate_signal_input` and the
-`MAX_EXPIRY_SECONDS` / `MAX_RATIONALE_LEN` checks in `create_signal`). Two
-layers of testing back that up beyond the fixed-input unit tests in `test.rs`:
-
-### Property tests (run on every `cargo test`)
-
-`contracts/signal_registry/src/tests/property_tests.rs` uses
-[`proptest`](https://docs.rs/proptest) to assert `get_signal_quality_score` /
-`calculate_quality_score` stay within `[0, 100]` across randomized execution
-counts, adoption counts, stake amounts, and AI scores. No separate feature
-flag or invocation is needed — it's a normal `[dev-dependencies]` crate, so
-it runs as part of the existing `cargo test --workspace --all-targets` step
-in CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) like every
-other test in the crate.
-
-### Fuzzing (local, not run in CI)
-
-`contracts/signal_registry/fuzz/` is a [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
-target (`fuzz_create_signal`) that generates arbitrary `(price, expiry_offset,
-rationale bytes, tag count)` combinations and calls `create_signal` through
-the generated `SignalRegistryClient::try_create_signal`, asserting the call
-only ever completes as `Ok` or a typed `AdminError` — never an unwind panic
-(a panic inside the contract call is caught by the Soroban host at the
-invocation boundary and surfaced as an `Err`, so a crash here would indicate
-either an issue outside that boundary or a genuine host regression).
-
-To run it locally:
-
-```bash
-cargo install cargo-fuzz   # one-time
-cd stellar-swipe/contracts/signal_registry/fuzz
-cargo +nightly fuzz run fuzz_create_signal -- -max_total_time=60
-```
-
-The fuzz crate is a **detached workspace** (its own `[workspace]` /
-`Cargo.lock`, separate from `stellar-swipe/Cargo.toml`) so `libfuzzer-sys`,
-`arbitrary`, and the nightly sanitizer build it needs never become
-dependencies of the deployed contract workspace or its `cargo-deny` /
-reproducible-build checks. Its `Cargo.toml` pins every `soroban-*` crate (and
-`ed25519-dalek`) to the exact versions in `stellar-swipe/Cargo.lock` — left
-unpinned, a fresh resolve of `soroban-env-host`'s `ed25519-dalek = ">=2.0.0"`
-requirement picks up `ed25519-dalek` 3.x, which breaks
-`soroban-env-host`'s own `testutils` build (its `with_test_prng` helper
-predates ed25519-dalek 3's `CryptoRng` bound). If `cargo fuzz build` ever
-fails with a `ChaCha20Rng: CryptoRng` trait error, re-sync those pinned
-versions with the current `stellar-swipe/Cargo.lock` and run
-`cargo update -p ed25519-dalek@<new-version> --precise 2.2.0` (or whatever
-version the parent lockfile carries) inside `fuzz/` to force the two
-`ed25519-dalek` copies back into one.
-
-Because fuzzing needs the nightly toolchain and cargo-fuzz's coverage
-instrumentation, it is **not** part of CI — run it locally before merging
-changes to `validation.rs` or `create_signal`'s input handling, and seed
-`fuzz/corpus/fuzz_create_signal/` with any crash-reproducing input you find
-so it's covered by future runs.
-
 ## Security review
 
 Any PR that touches `contracts/` (or a shared crate consumed by contracts,

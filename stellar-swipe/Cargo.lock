@@ -806,7 +806,6 @@ version = "0.0.0"
 dependencies = [
  "fee_collector",
  "proptest",
- "shared",
  "signal_registry",
  "soroban-sdk",
  "stake_vault",
@@ -1344,7 +1343,6 @@ name = "signal_registry"
 version = "0.0.0"
 dependencies = [
  "dlmalloc",
- "proptest",
  "shared",
  "soroban-sdk",
  "stellar_swipe_common",
