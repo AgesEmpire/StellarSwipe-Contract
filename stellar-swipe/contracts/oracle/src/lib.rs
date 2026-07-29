@@ -37,7 +37,7 @@ use types::{
     ConsensusPriceData, ExternalPrice, OracleReputation, PriceData, PriceSubmission, StorageKey,
 };
 
-pub use conversion::{convert_to_base, ConversionPath};
+pub use conversion::{convert_to_base, normalize_price, ConversionPath};
 pub use deviation::{check_deviation, get_deviation_threshold, set_deviation_threshold};
 pub use history::{calculate_twap, get_historical_price, get_twap_deviation, store_price};
 pub use multi_hop::{calculate_multi_hop_price, find_optimal_path, LiquidityPath};
@@ -590,9 +590,11 @@ impl OracleContract {
     /// downstream consumers always work with a consistent decimal precision
     /// regardless of how each asset's feed is originally stored.
     ///
+    /// Falls back to 7 decimals when no feed decimals have been configured,
+    /// preserving backward compatibility with existing feeds.
+    ///
     /// # Errors
-    /// - [`OracleError::PriceNotFound`] — no price set for `pair`, or no decimals
-    ///   configured (call `set_feed_decimals` first).
+    /// - [`OracleError::PriceNotFound`] — no price set for `pair`.
     /// - [`OracleError::ConversionOverflow`] — rescaling would overflow `i128`.
     pub fn get_normalized_price(
         env: Env,
@@ -600,8 +602,7 @@ impl OracleContract {
         target_decimals: u32,
     ) -> Result<i128, OracleError> {
         let raw_price = storage::get_price(&env, &pair)?;
-        let from_decimals =
-            storage::get_feed_decimals(&env, &pair).ok_or(OracleError::PriceNotFound)?;
+        let from_decimals = storage::get_feed_decimals(&env, &pair).unwrap_or(7);
         storage::rescale_price(raw_price, from_decimals, target_decimals)
             .ok_or(OracleError::ConversionOverflow)
     }
@@ -1037,10 +1038,10 @@ impl OracleContract {
         // For this issue, we assume we fetch the orderbook.
         let orderbook = fetch_sdex_orderbook(&env, &pair)?;
 
-        // 2. Calculate price
+        // 2. Calculate price and normalize to canonical 7-decimal precision.
         let price = calculate_spot_price(&env, orderbook)?;
-
-        Ok(price)
+        let normalized = storage::rescale_price(price, 7, 7).unwrap_or(price);
+        Ok(normalized)
     }
 
     pub fn update_with_external_data(
