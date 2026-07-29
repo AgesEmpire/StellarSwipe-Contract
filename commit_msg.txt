@@ -1,0 +1,32 @@
+feat: cross-contract allowlist, migration replay tests, batch settlement, storage layout diff
+
+Issue 1 - Cross-contract call allowlist:
+- Add shared/src/allowlist.rs with AllowlistStorageKey, AllowlistError,
+  add/remove/require/get/is helpers and full unit test coverage
+- Enforce allowlist in shared/src/cross_contract.rs via require_sensitive_caller()
+  which maps AllowlistError to CrossContractError::CallerNotAllowed (new variant 11)
+- Export allowlist API and require_sensitive_caller from shared/src/lib.rs
+- Add docs/cross_contract_allowlist.md documenting the model, admin ops,
+  deployment checklist, and error reference
+
+Issue 2 - Replay-oriented storage migration tests:
+- Append replay_tests module to stake_vault/src/migration.rs with 8 tests:
+  single Gold-tier provider, mixed-tier providers, 100 providers across 4 batches,
+  zero-balance edge case, state consistency at every batch boundary,
+  recovery path simulation, non-pending recovery rejection, and 200-provider
+  single-entry-batch total consistency
+
+Issue 3 - Batch settlement and partial-fill accounting:
+- Add trade_executor/src/batch_settlement.rs with SettlementOrder, FillRecord,
+  BatchSettlementResult types, full lifecycle (create/settle_batch/fail) and
+  storage (SettlementKey enum) with deterministic event emission
+- Wire batch_settlement module into trade_executor/src/lib.rs
+- Test suite covers: sequential IDs, full fill, multi-partial fill, fill exceeds
+  remaining, fill on closed order, fail after partial, mixed success/failure paths
+
+Issue 4 - Storage layout diff tooling:
+- Add scripts/storage_layout_diff.py: scans contracttype Key enums, generates
+  JSON snapshots, diffs against baselines, exits 0/1/2 for clean/breaking/new
+- Seed storage-baselines/ for trade_executor, auto_trade, stake_vault, shared
+- Wire new 'Check storage layout diff' CI step into .github/workflows/ci.yml
+  after error-baseline check with clear remediation instructions on failure

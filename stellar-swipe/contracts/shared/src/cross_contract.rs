@@ -1,3 +1,4 @@
+use crate::allowlist::{require_allowed_contract, AllowlistError};
 use crate::auth::{check_call_depth, verify_wasm_hash};
 use crate::version::check_compatible;
 use soroban_sdk::{
@@ -21,6 +22,8 @@ pub enum CrossContractError {
     ContractHashMismatch = 8,
     AlreadyDelivered = 9,
     CallerNotRegistered = 10,
+    /// The caller contract is not in the cross-contract allowlist.
+    CallerNotAllowed = 11,
 }
 
 #[contracttype]
@@ -136,6 +139,33 @@ pub fn verify_expected_contract_hash(
     verify_wasm_hash(env, contract_id).map_err(|_| CrossContractError::ContractHashMismatch)
 }
 
+/// Enforce the cross-contract allowlist for a sensitive entrypoint.
+///
+/// `entrypoint` identifies which logical entrypoint is being protected — it
+/// is typically `env.current_contract_address()` or a stable identifier for
+/// the specific guarded function. `caller` is the contract invoking this
+/// entrypoint.
+///
+/// Returns `Ok(())` when the caller is on the allowlist.  Returns
+/// `Err(CrossContractError::CallerNotAllowed)` for any other contract,
+/// ensuring unauthorized contracts are rejected before any state is mutated.
+///
+/// # Usage
+/// ```ignore
+/// require_sensitive_caller(&env, &env.current_contract_address(), &caller)?;
+/// // … proceed with privileged logic …
+/// ```
+pub fn require_sensitive_caller(
+    env: &Env,
+    entrypoint: &Address,
+    caller: &Address,
+) -> Result<(), CrossContractError> {
+    require_allowed_contract(env, entrypoint, caller)
+        .map_err(|e| match e {
+            AllowlistError::ContractNotAllowed => CrossContractError::CallerNotAllowed,
+            _ => CrossContractError::UnauthorizedCaller,
+        })
+}
 pub fn validate_callee_version(
     env: &Env,
     contract_id: &Address,
