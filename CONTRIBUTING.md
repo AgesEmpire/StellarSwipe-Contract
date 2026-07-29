@@ -98,3 +98,34 @@ Once a change has passed review, see
 [`deployments/README.md`](deployments/README.md) for how it flows into an
 actual release: deployment manifests, versioning, and the validators that
 run before a contract is deployed or upgraded.
+
+## Contract interface (ABI) changes
+
+Every Soroban contract's exported function names and `contractspecv0` hash are
+snapshotted in [`stellar-swipe/abi-baselines/`](stellar-swipe/abi-baselines/).
+CI detects and reports any ABI difference automatically, posting a
+[**WASM ABI Export Diff Report**](#) as a PR comment.
+
+### Adding new exports (non-breaking)
+
+Add the new function, build, and run CI. The script detects the new exports,
+updates the baseline, and exits with code 2 (non-failing). Commit the updated
+`abi-baselines/<contract>.json` file alongside your change.
+
+### Changing or removing exports (breaking)
+
+A function removal or a parameter-name/type/order change is a **breaking ABI
+change** — CI fails with exit code 1 unless you explicitly acknowledge it:
+
+1. Verify that the migration path covers all existing stored data and
+   cross-contract callers.
+2. Create `abi-baselines/<contract>.breaking.txt` with a short reason
+   (one line is fine).
+3. Re-run CI — the script updates the baseline and succeeds.
+4. Commit both the updated `abi-baselines/<contract>.json` and the
+   `.breaking.txt` file together.
+5. Remove `.breaking.txt` in the very next PR so accidental future breaks
+   are still caught.
+
+> The PR comment makes it easy for reviewers to see exactly which exports
+> changed and whether the change was intentional.
