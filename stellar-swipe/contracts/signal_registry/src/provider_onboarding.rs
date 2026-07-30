@@ -151,7 +151,7 @@ pub fn request_reverification(env: &Env, provider: &Address) {
     set_record(env, &record);
     emit(
         env,
-        symbol_short!("ob_reverif"),
+        symbol_short!("ob_rverf"),
         provider,
         &OnboardingStatus::Pending,
     );

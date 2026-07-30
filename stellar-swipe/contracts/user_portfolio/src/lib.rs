@@ -214,6 +214,30 @@ pub struct Portfolio {
     pub closed_position_ids: Vec<u64>,
 }
 
+/// Complete portfolio state export for off-chain analytics, dashboards, and indexers.
+/// All fields are read-only snapshots derived from existing on-chain state.
+/// Consumers can rely on this stable format without reverse-engineering storage keys.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortfolioExport {
+    /// Sum of all realized P&L from closed positions.
+    pub realized_pnl: i128,
+    /// Unrealized P&L from open positions (`None` when oracle is unavailable).
+    pub unrealized_pnl: Option<i128>,
+    /// Total P&L (realized + unrealized, when available).
+    pub total_pnl: i128,
+    /// Return on investment in basis points (total_pnl * 10_000 / total_invested).
+    pub roi_bps: i32,
+    /// Number of currently open positions.
+    pub open_position_count: u32,
+    /// Number of closed positions.
+    pub closed_position_count: u32,
+    /// Number of portfolio snapshots recorded for this user.
+    pub snapshot_count: u32,
+    /// Current open positions with full state.
+    pub open_positions: Vec<PortfolioPosition>,
+}
+
 soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
 soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
@@ -1186,6 +1210,69 @@ impl UserPortfolio {
             }
         }
         result
+    }
+
+    // ── Portfolio export for off-chain analytics ───────────────────────────────
+
+    /// Read-only export of the user's full portfolio state for off-chain analytics,
+    /// dashboards, and indexers. Returns a stable `PortfolioExport` struct that
+    /// bundles P&L, position counts, open positions, and metadata in one call.
+    ///
+    /// This is a compose query — it calls `get_pnl`, reads position indexes, and
+    /// counts snapshots — but performs no writes. The returned format is documented
+    /// and guaranteed stable within the same major contract version.
+    pub fn export_portfolio(env: Env, user: Address) -> PortfolioExport {
+        let pnl = queries::compute_get_pnl(&env, user.clone());
+
+        let open_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserOpenPositions(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut open_positions = Vec::new(&env);
+        for i in 0..open_ids.len() {
+            let Some(position_id) = open_ids.get(i) else {
+                continue;
+            };
+            let Some(position) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Position>(&DataKey::Position(position_id))
+            else {
+                continue;
+            };
+            if position.status == PositionStatus::Open {
+                open_positions.push_back(PortfolioPosition {
+                    position_id,
+                    position,
+                });
+            }
+        }
+
+        let closed_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserClosedPositions(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let snapshot_count: u32 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::UserSnapshotTimestamps(user))
+            .map(|v| v.len() as u32)
+            .unwrap_or(0);
+
+        PortfolioExport {
+            realized_pnl: pnl.realized_pnl,
+            unrealized_pnl: pnl.unrealized_pnl,
+            total_pnl: pnl.total_pnl,
+            roi_bps: pnl.roi_bps,
+            open_position_count: open_positions.len() as u32,
+            closed_position_count: closed_ids.len() as u32,
+            snapshot_count,
+            open_positions,
+        }
     }
 
     // ── Portfolio concentration risk (Issue #684) ──────────────────────────────
