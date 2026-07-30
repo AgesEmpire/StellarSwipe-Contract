@@ -607,7 +607,26 @@ pub fn set_protocol_token(env: &Env, token: &Address) {
     );
 }
 
-// ── Issue #442: Revenue Share ────────────────────────────────────────
+// ── Issue #880: Token Metadata Validation ────────────────────────────────────────
+
+pub fn get_registered_token_metadata(env: &Env, token: &Address) -> Option<TokenMetadata> {
+    crud_get(env, StorageTier::Instance, &StorageKey::RegisteredTokenMetadata(token.clone()))
+}
+
+pub fn set_registered_token_metadata(env: &Env, token: &Address, metadata: &TokenMetadata) {
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RegisteredTokenMetadata(token.clone()),
+        metadata,
+    );
+}
+
+pub fn remove_registered_token_metadata(env: &Env, token: &Address) {
+    crud_remove(env, StorageTier::Instance, &StorageKey::RegisteredTokenMetadata(token.clone()));
+}
+
+// ── Issue #442: Revenue Share ────────────────────────────────────────────────────────
 
 pub const DEFAULT_REVENUE_SHARE_RATE_BPS: u32 = 2000; // 20%
 pub const SECONDS_PER_WEEK: u64 = 604_800;

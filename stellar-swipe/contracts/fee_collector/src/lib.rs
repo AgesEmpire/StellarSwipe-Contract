@@ -65,6 +65,9 @@ use shared::reentrancy::{self, ReentrancyError};
 use stellar_swipe_common::health::{health_uninitialized, HealthStatus};
 use stellar_swipe_common::Asset;
 use stellar_swipe_common::SECONDS_PER_DAY;
+use stellar_swipe_common::token_metadata::{
+    TokenMetadata, validate as validate_token_metadata,
+};
 
 #[cfg(test)]
 mod tests;
@@ -407,6 +410,8 @@ impl FeeCollector {
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
+        // Validate token metadata before allowing withdrawal.
+        validate_token_metadata_for_token(&env, &token)?;
         if amount > get_treasury_balance(&env, &token) {
             return Err(ContractError::InsufficientTreasuryBalance);
         }
@@ -467,6 +472,9 @@ impl FeeCollector {
         Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
+
+        // Validate registered token metadata before allowing withdrawal.
+        validate_token_metadata_for_token(&env, &token)?;
 
         let queued = match get_queued_withdrawal(&env) {
             Some(q) if q.recipient == recipient && q.token == token && q.amount == amount => q,
@@ -1068,6 +1076,8 @@ impl FeeCollector {
             return Err(ContractError::NotInitialized);
         }
         Self::require_not_paused(&env)?;
+        // Validate registered token metadata before allowing fee claims.
+        validate_token_metadata_for_token(&env, &token)?;
         let mut auth_args: Vec<Val> = Vec::new(&env);
         auth_args.push_back(provider.clone().into_val(&env));
         auth_args.push_back(token.clone().into_val(&env));
@@ -1254,6 +1264,32 @@ impl FeeCollector {
         Ok(())
     }
 
+    /// Admin: register a token's metadata for validation in bridge and
+    /// fee flows. Rejects tokens with invalid or ambiguous metadata.
+    pub fn register_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        symbol: String,
+        name: String,
+        decimals: u32,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        admin.require_auth();
+
+        let metadata = TokenMetadata {
+            symbol: symbol.clone(),
+            name: name.clone(),
+            decimals,
+        };
+        validate_token_metadata(&metadata).map_err(|_| ContractError::InvalidTokenMetadata)?;
+
+        storage::set_registered_token_metadata(&env, &token, &metadata);
+        Ok(())
+    }
+
     /// Calculate fee with optional protocol token discount.
     /// If the token being used matches the configured protocol token,
     /// a 50% discount is applied (fee_rate is halved).
@@ -1265,6 +1301,19 @@ impl FeeCollector {
             }
         }
         base_rate
+    }
+
+    /// Validate that a token has registered metadata and that it passes
+    /// the protocol's metadata sanity checks (decimals ≤ 18, non-empty
+    /// symbol ≤ 12 chars, non-empty name ≤ 64 chars).
+    fn validate_token_metadata_for_token(
+        env: &Env,
+        token: &Address,
+    ) -> Result<(), ContractError> {
+        let metadata = storage::get_registered_token_metadata(env, token)
+            .ok_or(ContractError::InvalidTokenMetadata)?;
+        validate_token_metadata(&metadata).map_err(|_| ContractError::InvalidTokenMetadata)?;
+        Ok(())
     }
 
     // ── Issue #442: Revenue Sharing with Token Holders ──────────────

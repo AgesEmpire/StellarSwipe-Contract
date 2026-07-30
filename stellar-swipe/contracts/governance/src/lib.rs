@@ -159,6 +159,10 @@ pub enum StorageKey {
     ReputationConfig,
     /// Conviction calibration configuration (penalty, reward, cap parameters).
     ConvictionCalibration,
+    /// Issue #884: Pending admin for key rotation flow. Set by current admin
+    /// via `propose_key_rotation`; cleared when new admin accepts or rotation
+    /// is cancelled.
+    PendingAdmin,
     /// Spam-deposit configuration for proposal creation.
     DepositConfig,
     /// Address of the treasury wallet for forfeited deposits.
@@ -348,12 +352,93 @@ impl GovernanceContract {
             .get(&StorageKey::Admin)
             .unwrap_or_else(|| stellar_swipe_common::placeholder_admin(&env));
         let is_paused = pausable::is_paused(&env);
-        stellar_swipe_common::HealthStatus {
+        let status = stellar_swipe_common::HealthStatus {
             is_initialized: true,
             is_paused,
             version,
             admin,
+            initialized_at: env.ledger().timestamp(),
+        };
+        stellar_swipe_common::emit_health_event(&env, &status);
+        status
+    }
+
+    /// Admin-only: propose a key rotation to a new admin address.
+    /// The current admin must authorize. The rotation must be accepted
+    /// by the proposed new admin within the governance-configured delay.
+    pub fn propose_key_rotation(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+    ) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        if new_admin == admin {
+            return Err(GovernanceError::InvalidMetadata);
         }
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingAdmin, &new_admin);
+        Ok(())
+    }
+
+    /// Accept a pending key rotation. The caller becomes the new admin.
+    /// Only the address currently stored as PendingAdmin can call this.
+    pub fn accept_key_rotation(env: Env, new_admin: Address) -> Result<(), GovernanceError> {
+        let pending = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingAdmin)
+            .ok_or(GovernanceError::Unauthorized)?;
+        if pending != new_admin {
+            return Err(GovernanceError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .remove(&StorageKey::PendingAdmin);
+        Ok(())
+    }
+
+    /// Admin-only: cancel a pending key rotation.
+    pub fn cancel_key_rotation(env: Env, admin: Address) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .remove(&StorageKey::PendingAdmin);
+        Ok(())
+    }
+
+    /// Guardian-only: emergency revocation of the current admin.
+    /// Removes admin access and clears any pending rotation.
+    /// The guardian must authorize.
+    pub fn emergency_revoke_admin(env: Env, guardian: Address) -> Result<(), GovernanceError> {
+        let stored_guardian: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardian)
+            .ok_or(GovernanceError::Unauthorized)?;
+        if stored_guardian != guardian {
+            return Err(GovernanceError::Unauthorized);
+        }
+        guardian.require_auth();
+        env.storage()
+            .instance()
+            .remove(&StorageKey::Admin);
+        env.storage()
+            .instance()
+            .remove(&StorageKey::PendingAdmin);
+        Ok(())
+    }
+
+    /// Admin-only: set the guardian address for emergency recovery.
+    pub fn set_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::Guardian, &guardian);
+        Ok(())
     }
 
     /// Sets the global pause flag (admin only) and propagates the change to

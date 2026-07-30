@@ -51,7 +51,7 @@ pub use constants::{
     STELLAR_AMOUNT_SCALE,
 };
 pub use emergency::PauseState;
-pub use health::{health_uninitialized, placeholder_admin, HealthStatus};
+pub use health::{emit_health_event, health_uninitialized, placeholder_admin, HealthStatus};
 pub use multisig::{
     approve, cancel, emit_approval_recorded, emit_proposal_approved, emit_proposal_cancelled,
     emit_proposal_created, emit_proposal_executed, emit_timelock_config_updated,
