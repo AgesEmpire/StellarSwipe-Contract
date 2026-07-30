@@ -5,6 +5,12 @@ pub mod expiry;
 pub use expiry::Expirable;
 
 pub mod access_control;
+/// Cross-contract call allowlist (Issue: cross-contract allowlist security).
+pub mod allowlist;
+pub use allowlist::{
+    add_allowed_contract, get_allowlist, is_contract_allowed, remove_allowed_contract,
+    require_allowed_contract, AllowlistError, MAX_ALLOWLIST_SIZE,
+};
 /// Asset metadata registry (Issue #700).
 #[cfg(any(test, feature = "testutils"))]
 pub mod asset_registry;
@@ -42,6 +48,7 @@ pub mod version;
 pub use cross_contract::{
     CrossContractError, CrossContractMessage, CrossContractMessageReceiverClient,
     CrossContractVersionClient, MessageStatus, MAX_MESSAGE_SIZE,
+    require_sensitive_caller,
 };
 pub use errors::{ErrorCategory, RecoveryStrategy};
 pub use pausable::{is_paused, require_not_paused, set_paused, PausableKey};
