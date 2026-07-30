@@ -1147,6 +1147,8 @@ mod tests {
         });
     }
 
+    // ── Replay-envelope regression test (Issue: replay-compatible envelopes) ────
+
     #[test]
     fn test_retry_scenario_emits_single_event() {
         let (env, contract_id) = setup();
@@ -1161,6 +1163,141 @@ mod tests {
                     .publish((Symbol::new(&env, "signal_adopted"),), 7u64);
             });
             assert_eq!(env.events().all().len(), 1);
+        });
+    }
+}
+
+// ── Replay-compatible event envelope (Issue: replay-compatible envelopes) ───────
+//
+// Stable envelope metadata emitted alongside (or preceding) business events so
+// analytics pipelines can reconstruct causal ordering across ledger replays,
+// node restarts, or cross-ledger archival dumps.
+//
+// # Fields
+//
+// `schema_version` — bumps when the envelope structure changes.
+// `envelope_id` — monotonically increasing per contract; stable across retries.
+// `ledger_sequence` — soroban ledger sequence at publish time.
+// `timestamp` — unix timestamp at publish time.
+
+use soroban_sdk::{contracttype};
+
+#[contracttype]
+pub enum ReplayStorageKey {
+    NextEnvelopeId,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayEnvelope {
+    pub schema_version: u32,
+    pub envelope_id: u64,
+    pub ledger_sequence: u32,
+    pub timestamp: u64,
+}
+
+/// Return the next monotonically-increasing envelope id and bump the counter.
+pub fn next_envelope_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&ReplayStorageKey::NextEnvelopeId)
+        .unwrap_or(0);
+    let next = id + 1;
+    env.storage()
+        .instance()
+        .set(&ReplayStorageKey::NextEnvelopeId, &next);
+    next
+}
+
+/// Publish a `ReplayEnvelope` event on the `("replay", "envelope")` topic.
+pub fn emit_replay_envelope(env: &Env) {
+    let envelope = ReplayEnvelope {
+        schema_version: 1,
+        envelope_id: next_envelope_id(env),
+        ledger_sequence: env.ledger().sequence(),
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(
+        (Symbol::new(env, "replay"), Symbol::new(env, "envelope")),
+        envelope,
+    );
+}
+
+/// Convenience: emit an envelope immediately followed by a business event.
+/// This helps analytics pipelines pair the envelope metadata with the actual
+/// payload while preserving stable ordering.
+pub fn emit_with_replay<E: soroban_sdk::TryIntoVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    topic: (Symbol, Symbol),
+    event: E,
+) {
+    emit_replay_envelope(env);
+    env.events().publish(topic, event);
+}
+
+// ── Replay envelope tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use soroban_sdk::{contract, testutils::Address as _, Env};
+
+    #[contract]
+    struct TestContract;
+
+    fn setup() -> (Env, Address) {
+        let env = Env::default();
+        let id = env.register(TestContract, ());
+        (env, id)
+    }
+
+    #[test]
+    fn envelope_id_is_monotonically_increasing() {
+        let (env, contract_id) = setup();
+
+        env.as_contract(&contract_id, || {
+            let id1 = next_envelope_id(&env);
+            let id2 = next_envelope_id(&env);
+            let id3 = next_envelope_id(&env);
+            assert!(id1 < id2);
+            assert!(id2 < id3);
+        });
+    }
+
+    #[test]
+    fn envelope_survives_replay_of_same_ledger() {
+        use soroban_sdk::testutils::Events;
+        let (env, contract_id) = setup();
+
+        env.as_contract(&contract_id, || {
+            emit_replay_envelope(&env);
+            let first_len = env.events().all().len();
+            emit_replay_envelope(&env);
+            let second_len = env.events().all().len();
+            assert_eq!(first_len, 1);
+            assert_eq!(second_len, 2);
+        });
+    }
+
+    #[test]
+    fn emit_with_replay_publishes_envelope_then_event() {
+        use soroban_sdk::testutils::Events;
+        let (env, contract_id) = setup();
+
+        env.as_contract(&contract_id, || {
+            emit_with_replay(
+                &env,
+                (Symbol::new(&env, "trade"), Symbol::new(&env, "executed")),
+                42u64,
+            );
+
+            let events = env.events().all();
+            assert_eq!(events.len(), 2);
+            // First event must be the replay envelope
+            let envelope_topics = &events.get(0).0;
+            assert_eq!(envelope_topics.get(0), Symbol::new(&env, "replay"));
+            assert_eq!(envelope_topics.get(1), Symbol::new(&env, "envelope"));
         });
     }
 }

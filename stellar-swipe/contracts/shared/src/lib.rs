@@ -32,6 +32,7 @@ pub mod reentrancy;
 pub mod auth;
 #[allow(deprecated)]
 pub mod cross_contract;
+pub mod capability;
 pub mod errors;
 /// Canonical event-topic constants (issue #585).
 pub mod event_topics;
@@ -60,3 +61,16 @@ pub use cross_contract::{
 pub use errors::{ErrorCategory, RecoveryStrategy};
 pub use pausable::{is_paused, require_not_paused, set_paused, PausableKey};
 pub use version::{ContractKind, VersionError};
+
+pub use capability::{
+    delegate_capability, delegation_count, empty_capability_state,
+    get_capability_state, put_capability_state, require_capability,
+    revoke_capability, CapabilityDelegation, CapabilityError, CapabilityScope,
+    CapabilityState, CapabilityStorageKey, MAX_DELEGATIONS_PER_DELEGATOR,
+};
+pub use events::{
+    emit_with_replay, emit_replay_envelope, next_envelope_id, ReplayEnvelope,
+};
+pub use errors::{
+    emit_error_metadata, make_error_metadata, ErrorMetadata, ERROR_METADATA_SCHEMA_VERSION,
+};
