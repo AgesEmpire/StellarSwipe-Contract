@@ -29,6 +29,7 @@ pub use preferences::{
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
+use stellar_swipe_common::health::{health_uninitialized, HealthStatus};
 use storage::DataKey;
 
 /// Compute the Herfindahl-Hirschman Index (HHI) concentration score for a user's open
@@ -1343,6 +1344,27 @@ impl UserPortfolio {
             count += 1;
         }
         result
+    }
+
+    // ── Issue #862: Health / Readiness ───────────────────────────────────────
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        if !env.storage().instance().has(&DataKey::Initialized) {
+            return health_uninitialized(&env, version);
+        }
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| stellar_swipe_common::health::placeholder_admin(&env));
+        HealthStatus {
+            is_initialized: true,
+            is_paused: false,
+            version,
+            admin,
+        }
     }
 
     fn require_admin(env: &Env) {

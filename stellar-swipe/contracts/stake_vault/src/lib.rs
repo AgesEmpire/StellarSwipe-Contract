@@ -6,7 +6,7 @@ pub mod migration;
 
 use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
 use migration::{MigrationKey, StakeInfoV2};
-use shared::{initializable, multisig, pausable};
+use shared::{initializable, multisig, pausable, reentrancy};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
     IntoVal, String, Symbol, Val, Vec,
@@ -733,6 +733,8 @@ impl StakeVaultContract {
     /// Records the current ledger sequence to detect same-ledger withdraw
     /// attempts (flash loan pattern).
     pub fn deposit_stake(env: Env, staker: Address, amount: i128) -> Result<(), StakeVaultError> {
+        // Issue #859: Reentrancy guard for cross-contract token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| StakeVaultError::ReentrancyDetected)?;
         staker.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -1760,6 +1762,8 @@ impl StakeVaultContract {
         severity: SlashSeverity,
         reason: Symbol,
     ) -> Result<i128, StakeVaultError> {
+        // Issue #859: Reentrancy guard for cross-contract token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| StakeVaultError::ReentrancyDetected)?;
         caller.require_auth();
         Self::require_signal_registry(&env, &caller)?;
         Self::do_slash(&env, &provider, severity, reason)

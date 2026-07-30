@@ -58,6 +58,8 @@ use soroban_sdk::{
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use shared::pausable;
+use shared::reentrancy::{self, ReentrancyError};
+use stellar_swipe_common::health::{health_uninitialized, HealthStatus};
 use stellar_swipe_common::Asset;
 use stellar_swipe_common::SECONDS_PER_DAY;
 
@@ -454,6 +456,8 @@ impl FeeCollector {
         token: Address,
         amount: i128,
     ) -> Result<(), ContractError> {
+        // Issue #859: reentrancy guard for token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
@@ -1055,6 +1059,8 @@ impl FeeCollector {
     /// so a valid signature cannot be replayed against a different token or
     /// redirected to a different provider (Issue #563).
     pub fn claim_fees(env: Env, provider: Address, token: Address) -> Result<i128, ContractError> {
+        // Issue #859: reentrancy guard for token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
@@ -1718,5 +1724,22 @@ impl FeeCollector {
         set_referral_fee_share_bps(&env, share_bps);
         emit_referral_fee_share_updated(&env, old_bps, share_bps, &admin);
         Ok(())
+    }
+
+    // ── Issue #862: Health / Readiness ─────────────────────────────────────────
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        if !is_initialized(&env) {
+            return health_uninitialized(&env, version);
+        }
+        let admin = get_admin(&env);
+        HealthStatus {
+            is_initialized: true,
+            is_paused: pausable::is_paused(&env),
+            version,
+            admin,
+        }
     }
 }

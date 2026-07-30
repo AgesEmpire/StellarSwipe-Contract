@@ -14,6 +14,8 @@ pub use allowlist::{
 /// Asset metadata registry (Issue #700).
 #[cfg(any(test, feature = "testutils"))]
 pub mod asset_registry;
+/// Capability-based authorization model (Issue #860).
+pub mod capabilities;
 pub mod multisig;
 pub use multisig::{
     approve as multisig_approve, get_config as multisig_get_config,
@@ -23,6 +25,9 @@ pub use multisig::{
     set_config as multisig_set_config, validate_config as multisig_validate_config, MultisigConfig,
     MultisigError, MultisigStorageKey, Proposal, ProposalStatus,
 };
+
+/// Cross-contract reentrancy guard (Issue #859).
+pub mod reentrancy;
 
 pub mod auth;
 #[allow(deprecated)]
@@ -42,6 +47,8 @@ pub mod math;
 pub mod pausable;
 /// Generic fixed-window rate limiter (Issue #595).
 pub mod rate_limiter;
+/// Safe arithmetic helpers for deterministic rounding and overflow safeguards (Issue #861).
+pub mod safe_math;
 #[allow(deprecated)]
 pub mod version;
 
