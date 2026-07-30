@@ -61,6 +61,8 @@ use soroban_sdk::{
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use shared::pausable;
+use shared::reentrancy::{self, ReentrancyError};
+use stellar_swipe_common::health::{health_uninitialized, HealthStatus};
 use stellar_swipe_common::Asset;
 use stellar_swipe_common::SECONDS_PER_DAY;
 
@@ -457,6 +459,8 @@ impl FeeCollector {
         token: Address,
         amount: i128,
     ) -> Result<(), ContractError> {
+        // Issue #859: reentrancy guard for token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
@@ -1058,6 +1062,8 @@ impl FeeCollector {
     /// so a valid signature cannot be replayed against a different token or
     /// redirected to a different provider (Issue #563).
     pub fn claim_fees(env: Env, provider: Address, token: Address) -> Result<i128, ContractError> {
+        // Issue #859: reentrancy guard for token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
@@ -1723,110 +1729,20 @@ impl FeeCollector {
         Ok(())
     }
 
-    // ── Issue #814: Deterministic fee distribution snapshots ──────────
+    // ── Issue #862: Health / Readiness ─────────────────────────────────────────
 
-    /// Admin-only: record a deterministic snapshot of all revenue share
-    /// pools.  Tokens are sorted by address before snapshotting so that
-    /// the result is deterministic regardless of insertion order.
-    ///
-    /// After recording, all revenue share pools are cleared for the
-    /// next cycle.  Emits a [`SnapshotRecorded`] event.
-    ///
-    /// # Errors
-    /// - [`ContractError::NotInitialized`] — contract not initialized.
-    /// - [`ContractError::SnapshotNotFound`] — no pools have accumulated
-    ///   since the last snapshot.
-    pub fn record_snapshot(env: Env, caller: Address) -> Result<(), ContractError> {
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
         if !is_initialized(&env) {
-            return Err(ContractError::NotInitialized);
+            return health_uninitialized(&env, version);
         }
         let admin = get_admin(&env);
-        admin.require_auth();
-        caller.require_auth();
-
-        let index = get_revenue_share_pool_index(&env);
-        if index.len() == 0 {
-            return Err(ContractError::SnapshotNotFound);
+        HealthStatus {
+            is_initialized: true,
+            is_paused: pausable::is_paused(&env),
+            version,
+            admin,
         }
-
-        // Sort tokens deterministically by address (bubble sort — small
-        // token count expected).
-        let mut sorted = index;
-        let n = sorted.len();
-        let mut i = 0u32;
-        while i < n {
-            let mut j = 0u32;
-            while j + 1 < n {
-                let a = sorted.get(j).unwrap();
-                let b = sorted.get(j + 1).unwrap();
-                if a > b {
-                    sorted.set(j, b.clone());
-                    sorted.set(j + 1, a.clone());
-                }
-                j += 1;
-            }
-            i += 1;
-        }
-
-        let ledger = env.ledger().sequence() as u64;
-        let timestamp = env.ledger().timestamp();
-
-        let mut entries: Vec<SnapshotEntry> = Vec::new(&env);
-        let mut total_amount: i128 = 0;
-
-        for token in sorted.iter() {
-            let amount = get_revenue_share_pool(&env, token);
-            if amount > 0 {
-                entries.push_back(SnapshotEntry {
-                    token: token.clone(),
-                    amount,
-                });
-                total_amount = total_amount.saturating_add(amount);
-            }
-        }
-
-        if entries.len() == 0 {
-            return Err(ContractError::SnapshotNotFound);
-        }
-
-        let snapshot = FeeSnapshot {
-            ledger,
-            timestamp,
-            total_amount,
-            entries: entries.clone(),
-        };
-
-        set_fee_snapshot(&env, ledger, &snapshot);
-
-        // Clear all pools after snapshotting.
-        for token in sorted.iter() {
-            clear_revenue_share_pool(&env, token);
-        }
-
-        emit_snapshot_recorded(
-            &env,
-            EvtSnapshotRecorded {
-                ledger,
-                timestamp,
-                total_amount,
-                entry_count: entries.len() as u32,
-            },
-        );
-
-        Ok(())
-    }
-
-    /// Retrieve a previously recorded deterministic snapshot by ledger
-    /// sequence.
-    ///
-    /// # Errors
-    /// - [`ContractError::NotInitialized`] — contract not initialized.
-    /// - [`ContractError::SnapshotNotFound`] — no snapshot exists for
-    ///   the given ledger sequence.
-    pub fn get_snapshot(env: Env, ledger: u64) -> Result<FeeSnapshot, ContractError> {
-        if !is_initialized(&env) {
-            return Err(ContractError::NotInitialized);
-        }
-        get_fee_snapshot(&env, ledger).ok_or(ContractError::SnapshotNotFound)
     }
 }
