@@ -1781,3 +1781,22 @@ fn error_messages_are_non_empty_and_distinct() {
         }
     }
 }
+
+// ── Instruction-budget regression snapshots (Issue #budget) ───────────────────
+
+use stellar_swipe_common::budget_regression::measure_and_emit;
+
+#[test]
+fn collect_fee_budget_regression() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_recipient, _token, contract_id, client) = setup(&env, 1_000_000);
+    let trader = Address::generate(&env);
+    let asset = trade_asset(&env);
+    let amount: i128 = 100_000;
+
+    env.budget().reset_tracker();
+    let _ = client.collect_fee(&trader, &_token, &amount, &asset);
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("fee_collector.collect_fee", 5_000_000, instructions);
+}

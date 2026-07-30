@@ -584,3 +584,107 @@ fn error_messages_are_non_empty_and_distinct() {
         }
     }
 }
+
+// ── Instruction-budget regression snapshots (Issue #budget) ───────────────────
+
+use stellar_swipe_common::budget_regression::measure_and_emit;
+
+#[test]
+fn set_price_budget_regression() {
+    let (env, admin, oracle1, _, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &xlm_asset(&env));
+    client.register_oracle(&admin, &oracle1);
+
+    env.budget().reset_tracker();
+    client.set_price(
+        AssetPair {
+            base: xlm_asset(&env),
+            quote: Asset {
+                code: String::from_str(&env, "USDC"),
+                issuer: Some(Address::generate(&env)),
+            },
+        },
+        100_000_000,
+    );
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("oracle.set_price", 3_000_000, instructions);
+}
+
+#[test]
+fn get_price_budget_regression() {
+    let (env, admin, oracle1, _, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &xlm_asset(&env));
+    client.register_oracle(&admin, &oracle1);
+
+    let pair = AssetPair {
+        base: xlm_asset(&env),
+        quote: Asset {
+            code: String::from_str(&env, "USDC"),
+            issuer: Some(Address::generate(&env)),
+        },
+    };
+    client.set_price(pair.clone(), 100_000_000);
+    client.submit_price(&oracle1, &100_000_000);
+
+    env.budget().reset_tracker();
+    let _ = client.get_price(pair);
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("oracle.get_price", 2_000_000, instructions);
+}
+
+// ── Normalization tests (Issue #normalization) ───────────────────────────────
+
+#[test]
+fn get_normalized_price_falls_back_to_7_decimals_when_unconfigured() {
+    let (env, admin, _, _, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &xlm_asset(&env));
+
+    let pair = AssetPair {
+        base: xlm_asset(&env),
+        quote: Asset {
+            code: String::from_str(&env, "USDC"),
+            issuer: Some(Address::generate(&env)),
+        },
+    };
+
+    // Store a 7-decimal price without configuring feed decimals
+    client.set_price(pair.clone(), 100_000_000);
+    let normalized = client.get_normalized_price(pair, 7);
+    assert_eq!(normalized, Ok(100_000_000));
+}
+
+#[test]
+fn get_normalized_price_rescales_configured_decimals() {
+    let (env, admin, _, _, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &xlm_asset(&env));
+
+    let pair = AssetPair {
+        base: xlm_asset(&env),
+        quote: Asset {
+            code: String::from_str(&env, "USDC"),
+            issuer: Some(Address::generate(&env)),
+        },
+    };
+
+    // Configure 6-decimal feed and store $50,000 as 50_000_000
+    client.set_feed_decimals(&admin, &pair, &6);
+    client.set_price(pair.clone(), 50_000_000);
+
+    // Normalized to 7 decimals: 50_000_000 * 10 = 500_000_000
+    let normalized = client.get_normalized_price(pair, 7);
+    assert_eq!(normalized, Ok(500_000_000));
+}
+
+#[test]
+fn normalize_price_helper_converts_to_canonical_7_decimals() {
+    let result = crate::conversion::normalize_price(50_000_000, 6);
+    assert_eq!(result, Some(500_000_000));
+}

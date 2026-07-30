@@ -362,3 +362,18 @@ fn close_position_emits_position_closed_event_on_loss() {
     assert_eq!(evt.realized_pnl, -20);
     assert!(!evt.action_required);
 }
+
+// ── Instruction-budget regression snapshots (Issue #budget) ───────────────────
+
+use stellar_swipe_common::budget_regression::measure_and_emit;
+
+#[test]
+fn record_trade_budget_regression() {
+    let (env, user, client) = setup(100);
+    let provider = dummy_provider(&env);
+
+    env.budget().reset_tracker();
+    client.open_position(&user, &100, &10);
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("user_portfolio.record_trade", 5_000_000, instructions);
+}

@@ -1733,6 +1733,38 @@ impl StakeVaultContract {
             .get(&StorageKey::Admin)
             .ok_or(StakeVaultError::NotInitialized)?;
         admin.require_auth();
+        Self::set_slash_tiers(&env, minor_bps, major_bps, critical_bps)
+    }
+
+    /// Governance-driven slash-tier configuration (Issue #governance_slash).
+    ///
+    /// Allows the configured governance contract (`set_governance`) to update
+    /// slash severity percentages without requiring the admin/multi-sig path.
+    pub fn governance_configure_slash_tiers(
+        env: Env,
+        governance: Address,
+        minor_bps: u32,
+        major_bps: u32,
+        critical_bps: u32,
+    ) -> Result<(), StakeVaultError> {
+        let stored_governance: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GovernanceAddress)
+            .ok_or(StakeVaultError::Unauthorized)?;
+        if governance != stored_governance {
+            return Err(StakeVaultError::Unauthorized);
+        }
+        governance.require_auth();
+        Self::set_slash_tiers(&env, minor_bps, major_bps, critical_bps)
+    }
+
+    fn set_slash_tiers(
+        env: &Env,
+        minor_bps: u32,
+        major_bps: u32,
+        critical_bps: u32,
+    ) -> Result<(), StakeVaultError> {
         validate_slash_tiers(minor_bps, major_bps, critical_bps)?;
         let cfg = SlashTierConfig {
             minor_bps,
@@ -1742,7 +1774,7 @@ impl StakeVaultContract {
         env.storage()
             .instance()
             .set(&StorageKey::SlashTierConfig, &cfg);
-        events::emit_slash_tiers_updated(&env, minor_bps, major_bps, critical_bps);
+        events::emit_slash_tiers_updated(env, minor_bps, major_bps, critical_bps);
         Ok(())
     }
 

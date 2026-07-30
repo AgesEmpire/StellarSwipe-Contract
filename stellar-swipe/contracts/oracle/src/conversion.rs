@@ -1,7 +1,7 @@
 //! Price conversion system for multi-asset portfolio aggregation
 
 use crate::errors::OracleError;
-use crate::storage::{get_base_currency, get_price};
+use crate::storage::get_base_currency;
 use shared::math::normalize_amount;
 use soroban_sdk::{contracttype, vec, Env, Map, Vec};
 use stellar_swipe_common::{Asset, AssetPair};
@@ -32,25 +32,29 @@ pub fn convert_to_base(env: &Env, amount: i128, asset: Asset) -> Result<i128, Or
     convert_via_path(env, amount, asset, base)
 }
 
+/// Normalize a raw `price` from `from_decimals` to canonical 7-decimal precision.
+///
+/// Returns `None` if the rescaling overflows `i128`.
+pub fn normalize_price(price: i128, from_decimals: u32) -> Option<i128> {
+    shared::math::normalize_amount(price, from_decimals, 7)
+}
+
 /// Direct conversion: asset → base
 ///
-/// `price` is expressed in 7-decimal fixed-point (Stellar standard), so the
-/// product `amount × price` carries 14 implicit decimals.  We use
-/// `shared::math::normalize_amount` to scale it back down to 7 decimals
-/// (truncating toward zero) instead of a bare division by a magic constant.
+/// Prices are normalized to canonical 7-decimal precision before scaling so
+/// that feeds stored with different native precisions produce deterministic
+/// results.
 fn convert_direct(env: &Env, amount: i128, from: &Asset, to: &Asset) -> Result<i128, OracleError> {
     let pair = AssetPair {
         base: from.clone(),
         quote: to.clone(),
     };
-    let price = get_price(env, &pair)?;
+    let price = crate::get_normalized_price(env.clone(), pair, 7)?;
 
     let product = amount
         .checked_mul(price)
         .ok_or(OracleError::ConversionOverflow)?;
 
-    // Product has 14 implicit decimals (7 from amount + 7 from price).
-    // Rescale to 7 decimals using the shared utility.
     normalize_amount(product, 14, 7).ok_or(OracleError::ConversionOverflow)
 }
 
