@@ -3,6 +3,7 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
+use shared::reentrancy;
 use stellar_swipe_common::SECONDS_PER_DAY;
 use stellar_swipe_common::token_metadata::{TokenMetadata, TokenMetadataError, validate as validate_token_metadata};
 
@@ -460,6 +461,8 @@ impl BridgeContract {
         admin: Address,
         transfer_id: u64,
     ) -> Result<(), BridgeError> {
+        // Issue #859: Reentrancy guard for cross-contract state transitions.
+        reentrancy::require_not_locked(&env).map_err(|_| BridgeError::InvalidOperation)?;
         if is_paused(&env) {
             return Err(BridgeError::ContractPaused);
         }

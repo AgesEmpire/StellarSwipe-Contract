@@ -66,6 +66,7 @@ use proposals::{
     VoteType as GovernanceVoteType,
 };
 pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
+use shared::capabilities::{self, Capability, CapabilityError};
 use quadratic_voting::{
     allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
     get_quadratic_vote, get_quadratic_voting_config, get_vote_credits, reallocate_quadratic_votes,
@@ -450,7 +451,8 @@ impl GovernanceContract {
         admin: Address,
         paused: bool,
     ) -> Result<(), GovernanceError> {
-        require_admin(&env, &admin)?;
+        // Issue #860: Capability-based authorization for pause actions.
+        require_capability(&env, &admin, Capability::Pause)?;
         pausable::set_paused(&env, paused);
         propagate_pause_to_downstream(&env, paused);
         Ok(())
@@ -465,7 +467,8 @@ impl GovernanceContract {
         admin: Address,
         target: Address,
     ) -> Result<(), GovernanceError> {
-        require_admin(&env, &admin)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::Pause)?;
         let mut targets = pause_targets(&env);
         if !targets.contains(&target) {
             targets.push_back(target);
@@ -482,7 +485,8 @@ impl GovernanceContract {
         admin: Address,
         target: Address,
     ) -> Result<(), GovernanceError> {
-        require_admin(&env, &admin)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::Pause)?;
         let targets = pause_targets(&env);
         let mut filtered = Vec::new(&env);
         for t in targets.iter() {
@@ -541,6 +545,8 @@ impl GovernanceContract {
         config: GovernanceConfig,
     ) -> Result<GovernanceConfig, GovernanceError> {
         require_initialized(&env)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
         proposals::configure_governance(&env, &admin, config)
     }
 
@@ -557,6 +563,8 @@ impl GovernanceContract {
         threshold: CategoryThreshold,
     ) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
         set_category_thresholds(&env, &admin, category, threshold)
     }
 
@@ -580,6 +588,8 @@ impl GovernanceContract {
         config: proposal_deposit::DepositConfig,
     ) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
         proposal_deposit::set_deposit_config(&env, &admin, config)
     }
 
@@ -911,7 +921,8 @@ impl GovernanceContract {
         max_delay: u64,
         guardian: Address,
     ) -> Result<Timelock, GovernanceError> {
-        require_admin(&env, &admin)?;
+        // Issue #860: Capability-based authorization for parameter changes.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
         initialize_timelock(&env, min_delay, max_delay, guardian)
     }
 
@@ -1932,6 +1943,53 @@ impl GovernanceContract {
         );
         Ok(actions)
     }
+
+    // ── Issue #860: Capability management ──────────────────────────────────────
+
+    /// Grant `capability` to `target` address. Only SuperAdmin may call this.
+    pub fn grant_capability(
+        env: Env,
+        caller: Address,
+        target: Address,
+        capability: Capability,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        require_capability(&env, &caller, Capability::SuperAdmin)?;
+        capabilities::grant_capability(&env, &caller, &target, capability);
+        Ok(())
+    }
+
+    /// Revoke `capability` from `target` address. Only SuperAdmin may call this.
+    pub fn revoke_capability(
+        env: Env,
+        caller: Address,
+        target: Address,
+        capability: Capability,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        require_capability(&env, &caller, Capability::SuperAdmin)?;
+        capabilities::revoke_capability(&env, &caller, &target, capability);
+        Ok(())
+    }
+
+    /// Check whether `target` holds `capability`.
+    pub fn has_capability(
+        env: Env,
+        target: Address,
+        capability: Capability,
+    ) -> Result<bool, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(capabilities::has_capability(&env, &target, capability))
+    }
+
+    /// List all capabilities granted to `target`.
+    pub fn list_capabilities(
+        env: Env,
+        target: Address,
+    ) -> Result<Vec<Capability>, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(capabilities::list_capabilities(&env, &target))
+    }
 }
 
 fn is_initialized(env: &Env) -> bool {
@@ -1983,6 +2041,31 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
         return Err(GovernanceError::Unauthorized);
     }
     Ok(())
+}
+
+/// Issue #860: Require that `caller` has a specific capability.
+/// Falls back to legacy admin check for backward compatibility.
+fn require_capability(
+    env: &Env,
+    caller: &Address,
+    capability: Capability,
+) -> Result<(), GovernanceError> {
+    require_initialized(env)?;
+    caller.require_auth();
+    // Check capability system first; fall back to legacy admin check.
+    if capabilities::has_capability(env, caller, capability) {
+        return Ok(());
+    }
+    // Legacy fallback: caller must be the stored admin address.
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&StorageKey::Admin)
+        .ok_or(GovernanceError::NotInitialized)?;
+    if admin == *caller {
+        return Ok(());
+    }
+    Err(GovernanceError::Unauthorized)
 }
 
 /// Crate-visible alias used by sub-modules (e.g. proposal_deposit).

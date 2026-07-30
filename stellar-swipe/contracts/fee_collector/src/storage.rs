@@ -131,8 +131,11 @@ pub enum StorageKey {
     /// trade-settlement keeper contract). See the "Authorized callers"
     /// section below.
     AuthorizedCaller(Address),
-    /// #880: Registered token metadata for validation in bridge and fee flows.
-    RegisteredTokenMetadata(Address),
+    /// Index of all tokens that have non-zero revenue share pools,
+    /// used for deterministic snapshot iteration (Issue #814).
+    RevenueSharePoolIndex,
+    /// Deterministic fee distribution snapshot keyed by ledger sequence.
+    Snapshot(u64),
 }
 
 #[contracttype]
@@ -194,6 +197,29 @@ pub struct BalanceMismatch {
     pub actual: i128,
     /// Difference: `actual - expected`. Positive means surplus, negative means deficit.
     pub delta: i128,
+}
+
+// ── Issue #814: Deterministic fee distribution snapshots ──────────
+
+/// A single entry in a fee distribution snapshot, recording the token
+/// and its accumulated revenue share pool amount at snapshot time.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SnapshotEntry {
+    pub token: Address,
+    pub amount: i128,
+}
+
+/// A deterministic snapshot of all revenue share pools at a point in
+/// time.  Snapshots are keyed by ledger sequence and recorded in
+/// insertion order sorted by token address for determinism.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeeSnapshot {
+    pub ledger: u64,
+    pub timestamp: u64,
+    pub total_amount: i128,
+    pub entries: Vec<SnapshotEntry>,
 }
 
 // --- Admin ---
@@ -657,6 +683,9 @@ pub fn add_revenue_share_pool(env: &Env, token: &Address, amount: i128) {
         &StorageKey::RevenueSharePool(token.clone()),
         &current.saturating_add(amount),
     );
+    if amount > 0 {
+        add_to_revenue_share_pool_index(env, token);
+    }
 }
 
 pub fn clear_revenue_share_pool(env: &Env, token: &Address) {
@@ -664,6 +693,70 @@ pub fn clear_revenue_share_pool(env: &Env, token: &Address) {
         env,
         StorageTier::Persistent,
         &StorageKey::RevenueSharePool(token.clone()),
+    );
+    remove_from_revenue_share_pool_index(env, token);
+}
+
+// ── Revenue Share Pool Index (Issue #814) ──────────────────────────
+
+/// Returns the list of tokens that have non-zero revenue share pools.
+/// Used for deterministic snapshot iteration.
+pub fn get_revenue_share_pool_index(env: &Env) -> Vec<Address> {
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RevenueSharePoolIndex,
+        Vec::new(env),
+    )
+}
+
+/// Adds `token` to the pool index if not already present.
+pub fn add_to_revenue_share_pool_index(env: &Env, token: &Address) {
+    let mut index = get_revenue_share_pool_index(env);
+    for i in 0..index.len() {
+        if index.get(i).unwrap() == *token {
+            return;
+        }
+    }
+    index.push_back(token.clone());
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RevenueSharePoolIndex,
+        &index,
+    );
+}
+
+/// Removes `token` from the pool index.
+pub fn remove_from_revenue_share_pool_index(env: &Env, token: &Address) {
+    let index = get_revenue_share_pool_index(env);
+    let mut new_index = Vec::new(env);
+    for i in 0..index.len() {
+        let t = index.get(i).unwrap();
+        if t != *token {
+            new_index.push_back(t);
+        }
+    }
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RevenueSharePoolIndex,
+        &new_index,
+    );
+}
+
+// ── Snapshot storage (Issue #814) ───────────────────────────────────
+
+pub fn get_fee_snapshot(env: &Env, ledger: u64) -> Option<FeeSnapshot> {
+    crud_get(env, StorageTier::Instance, &StorageKey::Snapshot(ledger))
+}
+
+pub fn set_fee_snapshot(env: &Env, ledger: u64, snapshot: &FeeSnapshot) {
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::Snapshot(ledger),
+        snapshot,
     );
 }
 
