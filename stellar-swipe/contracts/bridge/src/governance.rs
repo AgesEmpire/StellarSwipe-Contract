@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use soroban_sdk::{contracttype, Address, Env, Map, String, Symbol, Vec};
-use stellar_swipe_common::{health_uninitialized, placeholder_admin, HealthStatus};
+use stellar_swipe_common::{emit_health_event, health_uninitialized, placeholder_admin, HealthStatus};
 
 /// Governance proposal statuses
 #[contracttype]
@@ -815,12 +815,15 @@ pub fn bridge_health_check(env: &Env) -> HealthStatus {
                     .and_then(|g: BridgeGovernance| vec_first_address(&g.signers, env))
                     .unwrap_or_else(|| placeholder_admin(env))
             });
-            return HealthStatus {
+            let status = HealthStatus {
                 is_initialized: true,
                 is_paused,
                 version,
                 admin,
+                initialized_at: env.ledger().timestamp(),
             };
+            emit_health_event(env, &status);
+            return status;
         }
     }
     health_uninitialized(env, version)

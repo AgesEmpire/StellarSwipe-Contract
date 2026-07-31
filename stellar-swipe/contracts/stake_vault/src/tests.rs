@@ -959,6 +959,42 @@ mod slash_severity_tests {
     }
 
     #[test]
+    fn governance_can_reconfigure_tiers() {
+        let (env, vault_id, token, admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let balance: i128 = 1_000_000;
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
+        seed(&env, &vault_id, &provider, balance);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let governance = Address::generate(&env);
+        client.set_governance(&admin, &governance);
+
+        client.governance_configure_slash_tiers(&governance, &100, &2_000, &10_000);
+        let slashed = client.slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "test"),
+        );
+        assert_eq!(slashed, 10_000); // 1%
+    }
+
+    #[test]
+    fn unauthorized_governance_reconfigure_rejected() {
+        let (env, vault_id, token, admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let governance = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        client.set_governance(&admin, &governance);
+
+        assert_eq!(
+            client.try_governance_configure_slash_tiers(&attacker, &100, &2_000, &10_000),
+            Err(Ok(StakeVaultError::Unauthorized))
+        );
+    }
+
+    #[test]
     fn invalid_tier_bps_rejected() {
         let (env, vault_id, _token, _admin, _registry) = setup();
         let client = StakeVaultContractClient::new(&env, &vault_id);
@@ -2600,4 +2636,37 @@ mod unstake_queue_cap_tests {
             }
         }
     }
+}
+
+// ── Instruction-budget regression snapshots (Issue #budget) ───────────────────
+
+use stellar_swipe_common::budget_regression::measure_and_emit;
+
+#[test]
+fn deposit_stake_budget_regression() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 1_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+
+    env.budget().reset_tracker();
+    StakeVaultContractClient::new(&env, &vault_id).deposit_stake(&staker, &amount);
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("stake_vault.deposit_stake", 6_000_000, instructions);
+}
+
+#[test]
+fn withdraw_stake_budget_regression() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 1_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+
+    env.budget().reset_tracker();
+    StakeVaultContractClient::new(&env, &vault_id).withdraw_stake(&staker);
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("stake_vault.withdraw_stake", 6_000_000, instructions);
 }

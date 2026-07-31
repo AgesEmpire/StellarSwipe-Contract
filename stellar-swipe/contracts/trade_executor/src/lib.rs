@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod batch_settlement;
 pub mod dca;
 mod errors;
 pub mod feature_flags;
@@ -1285,12 +1286,15 @@ impl TradeExecutorContract {
         let Some(admin) = admin else {
             return stellar_swipe_common::health_uninitialized(&env, version);
         };
-        stellar_swipe_common::HealthStatus {
+        let status = stellar_swipe_common::HealthStatus {
             is_initialized: true,
             is_paused: is_paused(&env),
             version,
             admin,
-        }
+            initialized_at: env.ledger().timestamp(),
+        };
+        stellar_swipe_common::emit_health_event(&env, &status);
+        status
     }
 
     /// # Summary

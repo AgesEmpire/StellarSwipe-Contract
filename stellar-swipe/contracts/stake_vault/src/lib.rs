@@ -6,7 +6,7 @@ pub mod migration;
 
 use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
 use migration::{MigrationKey, StakeInfoV2};
-use shared::{initializable, multisig, pausable};
+use shared::{initializable, multisig, pausable, reentrancy};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
     IntoVal, String, Symbol, Val, Vec,
@@ -712,15 +712,18 @@ impl StakeVaultContract {
         let Some(admin) = admin else {
             return stellar_swipe_common::health_uninitialized(&env, version);
         };
-        stellar_swipe_common::HealthStatus {
+        let status = stellar_swipe_common::HealthStatus {
             is_initialized: true,
             is_paused: pausable::is_paused(&env),
             version,
             admin,
-        }
+            initialized_at: env.ledger().timestamp(),
+        };
+        stellar_swipe_common::emit_health_event(&env, &status);
+        status
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────────
+    // ── Helpers ────────────────────────────────────────────────────────
 
     fn require_not_paused(env: &Env) -> Result<(), StakeVaultError> {
         pausable::require_not_paused(env).map_err(|_| StakeVaultError::ContractPaused)
@@ -733,6 +736,8 @@ impl StakeVaultContract {
     /// Records the current ledger sequence to detect same-ledger withdraw
     /// attempts (flash loan pattern).
     pub fn deposit_stake(env: Env, staker: Address, amount: i128) -> Result<(), StakeVaultError> {
+        // Issue #859: Reentrancy guard for cross-contract token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| StakeVaultError::ReentrancyDetected)?;
         staker.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -1728,6 +1733,38 @@ impl StakeVaultContract {
             .get(&StorageKey::Admin)
             .ok_or(StakeVaultError::NotInitialized)?;
         admin.require_auth();
+        Self::set_slash_tiers(&env, minor_bps, major_bps, critical_bps)
+    }
+
+    /// Governance-driven slash-tier configuration (Issue #governance_slash).
+    ///
+    /// Allows the configured governance contract (`set_governance`) to update
+    /// slash severity percentages without requiring the admin/multi-sig path.
+    pub fn governance_configure_slash_tiers(
+        env: Env,
+        governance: Address,
+        minor_bps: u32,
+        major_bps: u32,
+        critical_bps: u32,
+    ) -> Result<(), StakeVaultError> {
+        let stored_governance: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GovernanceAddress)
+            .ok_or(StakeVaultError::Unauthorized)?;
+        if governance != stored_governance {
+            return Err(StakeVaultError::Unauthorized);
+        }
+        governance.require_auth();
+        Self::set_slash_tiers(&env, minor_bps, major_bps, critical_bps)
+    }
+
+    fn set_slash_tiers(
+        env: &Env,
+        minor_bps: u32,
+        major_bps: u32,
+        critical_bps: u32,
+    ) -> Result<(), StakeVaultError> {
         validate_slash_tiers(minor_bps, major_bps, critical_bps)?;
         let cfg = SlashTierConfig {
             minor_bps,
@@ -1737,7 +1774,7 @@ impl StakeVaultContract {
         env.storage()
             .instance()
             .set(&StorageKey::SlashTierConfig, &cfg);
-        events::emit_slash_tiers_updated(&env, minor_bps, major_bps, critical_bps);
+        events::emit_slash_tiers_updated(env, minor_bps, major_bps, critical_bps);
         Ok(())
     }
 
@@ -1760,6 +1797,8 @@ impl StakeVaultContract {
         severity: SlashSeverity,
         reason: Symbol,
     ) -> Result<i128, StakeVaultError> {
+        // Issue #859: Reentrancy guard for cross-contract token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| StakeVaultError::ReentrancyDetected)?;
         caller.require_auth();
         Self::require_signal_registry(&env, &caller)?;
         Self::do_slash(&env, &provider, severity, reason)

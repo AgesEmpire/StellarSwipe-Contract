@@ -14,6 +14,9 @@ pub struct RegistryHealthStatus {
     /// Signals past their expiry timestamp still occupying instance storage —
     /// what `prune_expired_signals` would remove given a large enough budget.
     pub expired_signal_count: u32,
+    /// Ledger timestamp (seconds) when the contract was initialized,
+    /// used by off-chain monitoring to compute uptime.
+    pub initialized_at: u64,
 }
 
 #[contracttype]

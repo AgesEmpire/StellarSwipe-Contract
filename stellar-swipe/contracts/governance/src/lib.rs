@@ -68,9 +68,8 @@ use proposals::{
     SimulationEffect, SimulationResult, Vote, VoteDelegation,
     VoteType as GovernanceVoteType,
 };
-pub use proposals::{
-    CategoryThreshold, GovernanceConfig, ProposalCategory, SimulationEffect, SimulationResult,
-};
+pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
+use shared::capabilities::{self, Capability, CapabilityError};
 use quadratic_voting::{
     allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
     get_quadratic_vote, get_quadratic_voting_config, get_vote_credits, reallocate_quadratic_votes,
@@ -163,6 +162,10 @@ pub enum StorageKey {
     ReputationConfig,
     /// Conviction calibration configuration (penalty, reward, cap parameters).
     ConvictionCalibration,
+    /// Issue #884: Pending admin for key rotation flow. Set by current admin
+    /// via `propose_key_rotation`; cleared when new admin accepts or rotation
+    /// is cancelled.
+    PendingAdmin,
     /// Spam-deposit configuration for proposal creation.
     DepositConfig,
     /// Address of the treasury wallet for forfeited deposits.
@@ -352,12 +355,93 @@ impl GovernanceContract {
             .get(&StorageKey::Admin)
             .unwrap_or_else(|| stellar_swipe_common::placeholder_admin(&env));
         let is_paused = pausable::is_paused(&env);
-        stellar_swipe_common::HealthStatus {
+        let status = stellar_swipe_common::HealthStatus {
             is_initialized: true,
             is_paused,
             version,
             admin,
+            initialized_at: env.ledger().timestamp(),
+        };
+        stellar_swipe_common::emit_health_event(&env, &status);
+        status
+    }
+
+    /// Admin-only: propose a key rotation to a new admin address.
+    /// The current admin must authorize. The rotation must be accepted
+    /// by the proposed new admin within the governance-configured delay.
+    pub fn propose_key_rotation(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+    ) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        if new_admin == admin {
+            return Err(GovernanceError::InvalidMetadata);
         }
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingAdmin, &new_admin);
+        Ok(())
+    }
+
+    /// Accept a pending key rotation. The caller becomes the new admin.
+    /// Only the address currently stored as PendingAdmin can call this.
+    pub fn accept_key_rotation(env: Env, new_admin: Address) -> Result<(), GovernanceError> {
+        let pending = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingAdmin)
+            .ok_or(GovernanceError::Unauthorized)?;
+        if pending != new_admin {
+            return Err(GovernanceError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .remove(&StorageKey::PendingAdmin);
+        Ok(())
+    }
+
+    /// Admin-only: cancel a pending key rotation.
+    pub fn cancel_key_rotation(env: Env, admin: Address) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .remove(&StorageKey::PendingAdmin);
+        Ok(())
+    }
+
+    /// Guardian-only: emergency revocation of the current admin.
+    /// Removes admin access and clears any pending rotation.
+    /// The guardian must authorize.
+    pub fn emergency_revoke_admin(env: Env, guardian: Address) -> Result<(), GovernanceError> {
+        let stored_guardian: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardian)
+            .ok_or(GovernanceError::Unauthorized)?;
+        if stored_guardian != guardian {
+            return Err(GovernanceError::Unauthorized);
+        }
+        guardian.require_auth();
+        env.storage()
+            .instance()
+            .remove(&StorageKey::Admin);
+        env.storage()
+            .instance()
+            .remove(&StorageKey::PendingAdmin);
+        Ok(())
+    }
+
+    /// Admin-only: set the guardian address for emergency recovery.
+    pub fn set_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::Guardian, &guardian);
+        Ok(())
     }
 
     /// Sets the global pause flag (admin only) and propagates the change to
@@ -370,7 +454,8 @@ impl GovernanceContract {
         admin: Address,
         paused: bool,
     ) -> Result<(), GovernanceError> {
-        require_admin(&env, &admin)?;
+        // Issue #860: Capability-based authorization for pause actions.
+        require_capability(&env, &admin, Capability::Pause)?;
         pausable::set_paused(&env, paused);
         propagate_pause_to_downstream(&env, paused);
         Ok(())
@@ -385,7 +470,8 @@ impl GovernanceContract {
         admin: Address,
         target: Address,
     ) -> Result<(), GovernanceError> {
-        require_admin(&env, &admin)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::Pause)?;
         let mut targets = pause_targets(&env);
         if !targets.contains(&target) {
             targets.push_back(target);
@@ -402,7 +488,8 @@ impl GovernanceContract {
         admin: Address,
         target: Address,
     ) -> Result<(), GovernanceError> {
-        require_admin(&env, &admin)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::Pause)?;
         let targets = pause_targets(&env);
         let mut filtered = Vec::new(&env);
         for t in targets.iter() {
@@ -461,6 +548,8 @@ impl GovernanceContract {
         config: GovernanceConfig,
     ) -> Result<GovernanceConfig, GovernanceError> {
         require_initialized(&env)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
         proposals::configure_governance(&env, &admin, config)
     }
 
@@ -477,6 +566,8 @@ impl GovernanceContract {
         threshold: CategoryThreshold,
     ) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
         set_category_thresholds(&env, &admin, category, threshold)
     }
 
@@ -500,6 +591,8 @@ impl GovernanceContract {
         config: proposal_deposit::DepositConfig,
     ) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
         proposal_deposit::set_deposit_config(&env, &admin, config)
     }
 
@@ -860,7 +953,8 @@ impl GovernanceContract {
         max_delay: u64,
         guardian: Address,
     ) -> Result<Timelock, GovernanceError> {
-        require_admin(&env, &admin)?;
+        // Issue #860: Capability-based authorization for parameter changes.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
         initialize_timelock(&env, min_delay, max_delay, guardian)
     }
 
@@ -1881,6 +1975,53 @@ impl GovernanceContract {
         );
         Ok(actions)
     }
+
+    // ── Issue #860: Capability management ──────────────────────────────────────
+
+    /// Grant `capability` to `target` address. Only SuperAdmin may call this.
+    pub fn grant_capability(
+        env: Env,
+        caller: Address,
+        target: Address,
+        capability: Capability,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        require_capability(&env, &caller, Capability::SuperAdmin)?;
+        capabilities::grant_capability(&env, &caller, &target, capability);
+        Ok(())
+    }
+
+    /// Revoke `capability` from `target` address. Only SuperAdmin may call this.
+    pub fn revoke_capability(
+        env: Env,
+        caller: Address,
+        target: Address,
+        capability: Capability,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        require_capability(&env, &caller, Capability::SuperAdmin)?;
+        capabilities::revoke_capability(&env, &caller, &target, capability);
+        Ok(())
+    }
+
+    /// Check whether `target` holds `capability`.
+    pub fn has_capability(
+        env: Env,
+        target: Address,
+        capability: Capability,
+    ) -> Result<bool, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(capabilities::has_capability(&env, &target, capability))
+    }
+
+    /// List all capabilities granted to `target`.
+    pub fn list_capabilities(
+        env: Env,
+        target: Address,
+    ) -> Result<Vec<Capability>, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(capabilities::list_capabilities(&env, &target))
+    }
 }
 
 fn is_initialized(env: &Env) -> bool {
@@ -1932,6 +2073,31 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
         return Err(GovernanceError::Unauthorized);
     }
     Ok(())
+}
+
+/// Issue #860: Require that `caller` has a specific capability.
+/// Falls back to legacy admin check for backward compatibility.
+fn require_capability(
+    env: &Env,
+    caller: &Address,
+    capability: Capability,
+) -> Result<(), GovernanceError> {
+    require_initialized(env)?;
+    caller.require_auth();
+    // Check capability system first; fall back to legacy admin check.
+    if capabilities::has_capability(env, caller, capability) {
+        return Ok(());
+    }
+    // Legacy fallback: caller must be the stored admin address.
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&StorageKey::Admin)
+        .ok_or(GovernanceError::NotInitialized)?;
+    if admin == *caller {
+        return Ok(());
+    }
+    Err(GovernanceError::Unauthorized)
 }
 
 /// Crate-visible alias used by sub-modules (e.g. proposal_deposit).

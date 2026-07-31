@@ -10,14 +10,15 @@ use events::{
     emit_fee_rate_updated, emit_fees_claimed, emit_fees_claimed_converted,
     emit_first_trade_fee_waived, emit_network_condition_updated, emit_payout_currency_set,
     emit_referral_fee_paid, emit_referral_fee_share_updated, emit_referral_registered,
-    emit_retry_attempted, emit_treasury_withdrawal, emit_volume_discount_config_updated,
-    emit_waterfall_distribution, emit_withdrawal_queued, EvtEffectiveMultiplierChanged,
-    EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed,
-    EvtNetworkConditionUpdated, EvtRetryAttempted, EvtTreasuryWithdrawal, EvtWithdrawalQueued,
+    emit_retry_attempted, emit_snapshot_recorded, emit_treasury_withdrawal,
+    emit_volume_discount_config_updated, emit_waterfall_distribution, emit_withdrawal_queued,
+    EvtEffectiveMultiplierChanged, EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated,
+    EvtFeesClaimed, EvtNetworkConditionUpdated, EvtRetryAttempted, EvtSnapshotRecorded,
+    EvtTreasuryWithdrawal, EvtWithdrawalQueued,
 };
 pub use events::{
     EffectiveMultiplierChanged, FeeRateUpdated, FeesBurned, FeesClaimed, FirstTradeFeeWaived,
-    TreasuryWithdrawal, WithdrawalQueued,
+    SnapshotRecorded, TreasuryWithdrawal, WithdrawalQueued,
 };
 
 mod rebates;
@@ -28,27 +29,29 @@ pub use reports::{EarningsLeaderboardEntry, EarningsReport, ReportPeriod};
 mod storage;
 pub use storage::BalanceMismatch;
 use storage::{
-    add_daily_fee_total, get_admin, get_burn_rate, get_congestion_config, get_congestion_signal,
-    get_daily_fee_total, get_failed_fee_collection, get_fee_optimization_config, get_fee_rate,
-    get_forecast_config, get_last_error_report, get_last_forecast_day, get_monthly_trade_volume,
+    add_daily_fee_total, add_to_revenue_share_pool_index, get_admin, get_burn_rate,
+    get_congestion_config, get_congestion_signal, get_daily_fee_total,
+    get_failed_fee_collection, get_fee_optimization_config, get_fee_rate, get_forecast_config,
+    get_fee_snapshot, get_last_error_report, get_last_forecast_day, get_monthly_trade_volume,
     get_network_condition_score, get_oracle_contract, get_pending_fees,
     get_provider_payout_currency, get_queued_withdrawal, get_referral_fee_share_bps, get_referrer,
-    get_treasury_balance, get_volume_discount_config, get_waterfall_config, has_traded,
-    is_authorized_caller, is_initialized, remove_authorized_caller, remove_failed_fee_collection,
+    get_revenue_share_pool_index, get_treasury_balance, get_volume_discount_config,
+    get_waterfall_config, has_traded, is_authorized_caller, is_initialized,
+    remove_authorized_caller, remove_failed_fee_collection, remove_from_revenue_share_pool_index,
     remove_monthly_trade_volume, remove_provider_payout_currency, remove_queued_withdrawal,
     set_admin, set_authorized_caller, set_burn_rate as set_burn_rate_storage,
     set_congestion_config, set_congestion_signal, set_failed_fee_collection,
     set_fee_optimization_config, set_fee_rate as set_fee_rate_storage, set_forecast_config_storage,
-    set_has_traded, set_initialized, set_last_error_report, set_last_forecast_day,
-    set_monthly_trade_volume, set_network_condition_score,
+    set_fee_snapshot, set_has_traded, set_initialized, set_last_error_report,
+    set_last_forecast_day, set_monthly_trade_volume, set_network_condition_score,
     set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
     set_provider_payout_currency, set_queued_withdrawal, set_referral_fee_share_bps, set_referrer,
     set_treasury_balance, set_volume_discount_config_storage,
     set_waterfall_config as set_waterfall_config_storage, CongestionConfig, CongestionSignal,
-    ErrorReport, FailedFeeCollection, FeeOptimizationConfig, ForecastConfigData,
-    MonthlyTradeVolume, QueuedWithdrawal, StorageKey, VolumeDiscountConfig, VolumeTier,
-    WaterfallConfig, WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS,
-    MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
+    ErrorReport, FailedFeeCollection, FeeOptimizationConfig, FeeSnapshot, ForecastConfigData,
+    MonthlyTradeVolume, QueuedWithdrawal, SnapshotEntry, StorageKey, VolumeDiscountConfig,
+    VolumeTier, WaterfallConfig, WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS,
+    MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
 };
 
 use soroban_sdk::{
@@ -58,8 +61,13 @@ use soroban_sdk::{
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use shared::pausable;
+use shared::reentrancy::{self, ReentrancyError};
+use stellar_swipe_common::health::{health_uninitialized, HealthStatus};
 use stellar_swipe_common::Asset;
 use stellar_swipe_common::SECONDS_PER_DAY;
+use stellar_swipe_common::token_metadata::{
+    TokenMetadata, validate as validate_token_metadata,
+};
 
 #[cfg(test)]
 mod tests;
@@ -402,6 +410,8 @@ impl FeeCollector {
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
+        // Validate token metadata before allowing withdrawal.
+        validate_token_metadata_for_token(&env, &token)?;
         if amount > get_treasury_balance(&env, &token) {
             return Err(ContractError::InsufficientTreasuryBalance);
         }
@@ -454,12 +464,17 @@ impl FeeCollector {
         token: Address,
         amount: i128,
     ) -> Result<(), ContractError> {
+        // Issue #859: reentrancy guard for token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
         Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
+
+        // Validate registered token metadata before allowing withdrawal.
+        validate_token_metadata_for_token(&env, &token)?;
 
         let queued = match get_queued_withdrawal(&env) {
             Some(q) if q.recipient == recipient && q.token == token && q.amount == amount => q,
@@ -1055,10 +1070,14 @@ impl FeeCollector {
     /// so a valid signature cannot be replayed against a different token or
     /// redirected to a different provider (Issue #563).
     pub fn claim_fees(env: Env, provider: Address, token: Address) -> Result<i128, ContractError> {
+        // Issue #859: reentrancy guard for token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
         Self::require_not_paused(&env)?;
+        // Validate registered token metadata before allowing fee claims.
+        validate_token_metadata_for_token(&env, &token)?;
         let mut auth_args: Vec<Val> = Vec::new(&env);
         auth_args.push_back(provider.clone().into_val(&env));
         auth_args.push_back(token.clone().into_val(&env));
@@ -1245,6 +1264,32 @@ impl FeeCollector {
         Ok(())
     }
 
+    /// Admin: register a token's metadata for validation in bridge and
+    /// fee flows. Rejects tokens with invalid or ambiguous metadata.
+    pub fn register_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        symbol: String,
+        name: String,
+        decimals: u32,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        admin.require_auth();
+
+        let metadata = TokenMetadata {
+            symbol: symbol.clone(),
+            name: name.clone(),
+            decimals,
+        };
+        validate_token_metadata(&metadata).map_err(|_| ContractError::InvalidTokenMetadata)?;
+
+        storage::set_registered_token_metadata(&env, &token, &metadata);
+        Ok(())
+    }
+
     /// Calculate fee with optional protocol token discount.
     /// If the token being used matches the configured protocol token,
     /// a 50% discount is applied (fee_rate is halved).
@@ -1256,6 +1301,19 @@ impl FeeCollector {
             }
         }
         base_rate
+    }
+
+    /// Validate that a token has registered metadata and that it passes
+    /// the protocol's metadata sanity checks (decimals ≤ 18, non-empty
+    /// symbol ≤ 12 chars, non-empty name ≤ 64 chars).
+    fn validate_token_metadata_for_token(
+        env: &Env,
+        token: &Address,
+    ) -> Result<(), ContractError> {
+        let metadata = storage::get_registered_token_metadata(env, token)
+            .ok_or(ContractError::InvalidTokenMetadata)?;
+        validate_token_metadata(&metadata).map_err(|_| ContractError::InvalidTokenMetadata)?;
+        Ok(())
     }
 
     // ── Issue #442: Revenue Sharing with Token Holders ──────────────
@@ -1718,5 +1776,22 @@ impl FeeCollector {
         set_referral_fee_share_bps(&env, share_bps);
         emit_referral_fee_share_updated(&env, old_bps, share_bps, &admin);
         Ok(())
+    }
+
+    // ── Issue #862: Health / Readiness ─────────────────────────────────────────
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        if !is_initialized(&env) {
+            return health_uninitialized(&env, version);
+        }
+        let admin = get_admin(&env);
+        HealthStatus {
+            is_initialized: true,
+            is_paused: pausable::is_paused(&env),
+            version,
+            admin,
+        }
     }
 }

@@ -75,6 +75,7 @@ use shared::version::{
 use stellar_swipe_common::emergency::{PauseState, CAT_SIGNALS, CAT_TRADING};
 use stellar_swipe_common::rate_limit::{self as rl, ActionType as RLAction, RateLimitConfig};
 use stellar_swipe_common::SECONDS_PER_30_DAY_MONTH;
+use stellar_swipe_common::emit_health_event;
 
 use combos::{
     cancel_combo, create_combo_signal, execute_combo_signal, get_combo, get_combo_executions_pub,
@@ -665,25 +666,31 @@ impl SignalRegistry {
         let signals = Self::get_signals_map(&env);
         let expired_signal_count = expiry::count_prunable_signals(&env, &signals);
         if !admin::has_admin(&env) {
-            return RegistryHealthStatus {
+            let status = RegistryHealthStatus {
                 is_initialized: false,
                 is_paused: false,
                 version,
                 admin: placeholder_admin(&env),
                 expired_signal_count,
+                initialized_at: 0,
             };
+            emit_health_event(&env, &status);
+            return status;
         }
         let admin_addr = match get_admin(&env) {
             Ok(a) => a,
             Err(_) => placeholder_admin(&env),
         };
-        RegistryHealthStatus {
+        let status = RegistryHealthStatus {
             is_initialized: true,
             is_paused: is_trading_paused(&env),
             version,
             admin: admin_addr,
             expired_signal_count,
-        }
+            initialized_at: env.ledger().timestamp(),
+        };
+        emit_health_event(&env, &status);
+        status
     }
 
     /// Permanently remove up to `max_entries` expired signals from instance

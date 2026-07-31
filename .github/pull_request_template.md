@@ -24,6 +24,13 @@ The automated portion of the release gate runs in
 (fmt/clippy/tests/deployment-manifest/error-code checks). This checkbox
 covers the human-judgement half that automation can't verify.
 
+## WASM ABI diff
+
+CI posts a **WASM ABI Export Diff Report** as a PR comment. Check it for:
+- [ ] All export changes are intentional.
+- [ ] Removed or modified exports have a documented migration path.
+- [ ] Any `.breaking.txt` file is removed in the follow-up PR.
+
 ## Related issue
 
 <!-- e.g. Closes #123 -->

@@ -3,11 +3,16 @@ use soroban_sdk::Vec;
 
 use crate::errors::OracleError;
 use crate::staleness;
+use crate::storage::rescale_price;
 use crate::types::ExternalPrice;
 
-/// Aggregate external oracle reports (simplified average; signature verification is out of scope here).
+const CANONICAL_DECIMALS: u32 = 7;
+
+/// Aggregate external oracle reports, normalizing each price to canonical
+/// 7-decimal precision before averaging so feeds with different native
+/// precisions are consumed deterministically.
 ///
-/// Issue #864: reports older than the configured staleness window for their
+/// Issue #normalization: reports older than the configured staleness window for their
 /// asset pair are dropped before aggregation; if every report is stale the
 /// call is rejected with `OracleError::StalePrice` rather than silently
 /// falling back to insufficient-sources.
@@ -29,8 +34,10 @@ pub fn process_external_prices(
             any_stale = true;
             continue;
         }
-        if p.price > 0 {
-            sum = sum.checked_add(p.price).ok_or(OracleError::Overflow)?;
+        let normalized = rescale_price(p.price, p.decimals, CANONICAL_DECIMALS)
+            .ok_or(OracleError::ConversionOverflow)?;
+        if normalized > 0 {
+            sum = sum.checked_add(normalized).ok_or(OracleError::Overflow)?;
             count += 1;
         }
     }

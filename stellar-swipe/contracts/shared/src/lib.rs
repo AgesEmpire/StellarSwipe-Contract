@@ -5,9 +5,17 @@ pub mod expiry;
 pub use expiry::Expirable;
 
 pub mod access_control;
+/// Cross-contract call allowlist (Issue: cross-contract allowlist security).
+pub mod allowlist;
+pub use allowlist::{
+    add_allowed_contract, get_allowlist, is_contract_allowed, remove_allowed_contract,
+    require_allowed_contract, AllowlistError, MAX_ALLOWLIST_SIZE,
+};
 /// Asset metadata registry (Issue #700).
 #[cfg(any(test, feature = "testutils"))]
 pub mod asset_registry;
+/// Capability-based authorization model (Issue #860).
+pub mod capabilities;
 pub mod multisig;
 pub use multisig::{
     approve as multisig_approve, get_config as multisig_get_config,
@@ -18,9 +26,13 @@ pub use multisig::{
     MultisigError, MultisigStorageKey, Proposal, ProposalStatus,
 };
 
+/// Cross-contract reentrancy guard (Issue #859).
+pub mod reentrancy;
+
 pub mod auth;
 #[allow(deprecated)]
 pub mod cross_contract;
+pub mod capability;
 pub mod errors;
 /// Canonical event-topic constants (issue #585).
 pub mod event_topics;
@@ -36,13 +48,29 @@ pub mod math;
 pub mod pausable;
 /// Generic fixed-window rate limiter (Issue #595).
 pub mod rate_limiter;
+/// Safe arithmetic helpers for deterministic rounding and overflow safeguards (Issue #861).
+pub mod safe_math;
 #[allow(deprecated)]
 pub mod version;
 
 pub use cross_contract::{
     CrossContractError, CrossContractMessage, CrossContractMessageReceiverClient,
     CrossContractVersionClient, MessageStatus, MAX_MESSAGE_SIZE,
+    require_sensitive_caller,
 };
 pub use errors::{ErrorCategory, RecoveryStrategy};
 pub use pausable::{is_paused, require_not_paused, set_paused, PausableKey};
 pub use version::{ContractKind, VersionError};
+
+pub use capability::{
+    delegate_capability, delegation_count, empty_capability_state,
+    get_capability_state, put_capability_state, require_capability,
+    revoke_capability, CapabilityDelegation, CapabilityError, CapabilityScope,
+    CapabilityState, CapabilityStorageKey, MAX_DELEGATIONS_PER_DELEGATOR,
+};
+pub use events::{
+    emit_with_replay, emit_replay_envelope, next_envelope_id, ReplayEnvelope,
+};
+pub use errors::{
+    emit_error_metadata, make_error_metadata, ErrorMetadata, ERROR_METADATA_SCHEMA_VERSION,
+};
