@@ -29,6 +29,8 @@ mod test_pause_propagation;
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod test_portableDD;
+#[cfg(test)]
+mod test_simulation;
 
 use committees::{
     list_committees as list_registered_committees, CommitteeAction, CommitteeElection,
@@ -61,8 +63,9 @@ use proposals::{
     calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
     default_governance_config, effective_status, execute_proposal, finalize_proposal,
     get_active_proposals, get_all_proposals, get_category_threshold, get_governance_config,
-    get_proposal, reclaim_expired_proposal, set_category_thresholds, withdraw_proposal, Proposal,
-    ProposalStatistics, ProposalStatus, ProposalType, Vote, VoteDelegation,
+    get_proposal, reclaim_expired_proposal, set_category_thresholds, simulate_proposal,
+    withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalType,
+    SimulationEffect, SimulationResult, Vote, VoteDelegation,
     VoteType as GovernanceVoteType,
 };
 pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
@@ -740,6 +743,35 @@ impl GovernanceContract {
         require_initialized(&env)?;
         require_not_paused(&env)?;
         proposals::execute_proposal(&env, proposal_id, executor)
+    }
+
+    /// # Summary
+    /// Simulate execution of a governance proposal **without mutating state**.
+    ///
+    /// Runs the same logic as `execute_proposal` but returns a [`SimulationResult`]
+    /// describing every storage effect the proposal would cause, allowing
+    /// maintainers to validate proposal effects before executing on-chain.
+    ///
+    /// No authentication is required - the simulation is read-only and safe
+    /// to call via `simulateTransaction` RPC.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `proposal_id`: ID of the proposal to simulate.
+    ///
+    /// # Returns
+    /// `Ok(SimulationResult)` describing whether the execution would succeed,
+    /// an error message if it would fail, and the list of effects.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::NotInitialized`] - contract not initialized.
+    /// - [`GovernanceError::ProposalNotFound`] - `proposal_id` does not exist.
+    pub fn simulate_proposal(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<SimulationResult, GovernanceError> {
+        require_initialized(&env)?;
+        proposals::simulate_proposal(&env, proposal_id)
     }
 
     pub fn cancel_proposal(
