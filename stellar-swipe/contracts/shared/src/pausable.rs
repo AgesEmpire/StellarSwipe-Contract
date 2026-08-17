@@ -133,10 +133,8 @@ pub fn set_paused_scope(env: &Env, paused: bool, scope: PauseScope) {
                 .set(&ScopedPausableStorageKey::Paused(scope), &paused);
 
             #[allow(deprecated)]
-            env.events().publish(
-                (Symbol::new(env, "pause_scope"),),
-                ((scope as u32), paused),
-            );
+            env.events()
+                .publish((Symbol::new(env, "pause_scope"),), ((scope as u32), paused));
         }
     }
 }
@@ -150,10 +148,7 @@ pub fn set_paused_scope(env: &Env, paused: bool, scope: PauseScope) {
 /// shared::pausable::require_not_paused_scope(&env, PauseScope::Treasury)
 ///     .map_err(|_| MyError::TreasuryPaused)?;
 /// ```
-pub fn require_not_paused_scope(
-    env: &Env,
-    scope: PauseScope,
-) -> Result<(), PauseScope> {
+pub fn require_not_paused_scope(env: &Env, scope: PauseScope) -> Result<(), PauseScope> {
     if is_paused_for_scope(env, scope) {
         Err(scope)
     } else {

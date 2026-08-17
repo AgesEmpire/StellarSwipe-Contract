@@ -25,8 +25,8 @@ mod migration;
 mod ml_scoring;
 mod multisig_approvals;
 mod performance;
-mod providers;
 mod provider_onboarding;
+mod providers;
 mod query;
 /// Contract-wide cross-contract reentrancy guard (Issue #781).
 mod reentrancy;
@@ -73,9 +73,9 @@ use shared::version::{
     set_contract_version, SIGNAL_REGISTRY_VERSION,
 };
 use stellar_swipe_common::emergency::{PauseState, CAT_SIGNALS, CAT_TRADING};
+use stellar_swipe_common::emit_health_event;
 use stellar_swipe_common::rate_limit::{self as rl, ActionType as RLAction, RateLimitConfig};
 use stellar_swipe_common::SECONDS_PER_30_DAY_MONTH;
-use stellar_swipe_common::emit_health_event;
 
 use combos::{
     cancel_combo, create_combo_signal, execute_combo_signal, get_combo, get_combo_executions_pub,

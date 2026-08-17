@@ -775,7 +775,11 @@ mod replay_tests {
         assert!(result.complete);
 
         let balance = env.as_contract(&cid, || get_v2_balance(&env, &provider));
-        assert_eq!(balance, Some(0i128), "zero V1 balance must produce zero V2 balance");
+        assert_eq!(
+            balance,
+            Some(0i128),
+            "zero V1 balance must produce zero V2 balance"
+        );
     }
 
     // ── Fixture: migration state consistency across batch boundaries ─────────

@@ -74,9 +74,7 @@ impl OracleError {
             OracleError::NoConversionPath => {
                 "no route of intermediate assets connects the source and target asset"
             }
-            OracleError::InvalidPath => {
-                "conversion path is empty or references an unknown asset"
-            }
+            OracleError::InvalidPath => "conversion path is empty or references an unknown asset",
             OracleError::ConversionOverflow => {
                 "multiplying/chaining prices along the conversion path overflowed"
             }
@@ -107,7 +105,9 @@ impl OracleError {
                 "executed price deviates from the reference price by more than allowed slippage"
             }
             OracleError::EmptyOrderBook => "order book for this asset pair has no resting orders",
-            OracleError::WideSpreadDetected => "bid/ask spread is wider than the configured maximum",
+            OracleError::WideSpreadDetected => {
+                "bid/ask spread is wider than the configured maximum"
+            }
             OracleError::InsufficientLiquidity => {
                 "available liquidity is insufficient to fill the requested amount"
             }

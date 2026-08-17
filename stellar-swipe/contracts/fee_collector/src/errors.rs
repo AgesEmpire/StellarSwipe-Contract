@@ -108,9 +108,7 @@ impl ContractError {
             }
             ContractError::FeeRoundedToZero => "computed fee rounded down to zero and was skipped",
             ContractError::BurnRateTooHigh => "requested burn rate exceeds the configured maximum",
-            ContractError::DivisionByZero => {
-                "attempted division by zero in a fee/rate calculation"
-            }
+            ContractError::DivisionByZero => "attempted division by zero in a fee/rate calculation",
             ContractError::InvalidFeeConfiguration => {
                 "fee configuration is invalid (rates don't sum correctly or are out of range)"
             }
@@ -158,12 +156,8 @@ impl ContractError {
             ContractError::InsufficientInsuranceBalance => {
                 "insurance balance is insufficient for requested payout"
             }
-            ContractError::ClaimAlreadyProcessed => {
-                "claim ID has already been paid out"
-            }
-            ContractError::ContractPaused => {
-                "contract is currently paused"
-            }
+            ContractError::ClaimAlreadyProcessed => "claim ID has already been paid out",
+            ContractError::ContractPaused => "contract is currently paused",
         }
     }
 }

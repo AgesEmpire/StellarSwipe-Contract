@@ -1634,7 +1634,11 @@ fn test_pause_blocks_withdraw_treasury_fees_then_unpause_allows_it() {
         Err(Ok(ContractError::ContractPaused)),
         "paused contract must reject withdraw_treasury_fees with a clear error"
     );
-    assert_eq!(client.treasury_balance(&token), 1000i128, "no funds should move while paused");
+    assert_eq!(
+        client.treasury_balance(&token),
+        1000i128,
+        "no funds should move while paused"
+    );
 
     // Resume: the previously queued withdrawal succeeds again.
     client.unpause();
@@ -1691,7 +1695,10 @@ fn test_pause_blocks_collect_fee_then_unpause_allows_it() {
 
     client.unpause();
     let fee = client.collect_fee(&trader, &token, &(1_000 * 10_000_000), &asset);
-    assert!(fee > 0, "collect_fee must work normally again after unpause");
+    assert!(
+        fee > 0,
+        "collect_fee must work normally again after unpause"
+    );
 }
 
 #[test]

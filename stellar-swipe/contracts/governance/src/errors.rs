@@ -144,7 +144,9 @@ impl GovernanceError {
                 "no vesting schedule exists for the given recipient"
             }
             GovernanceError::CliffNotReached => "vesting cliff period has not yet been reached",
-            GovernanceError::NothingToRelease => "no vested tokens are currently available to release",
+            GovernanceError::NothingToRelease => {
+                "no vested tokens are currently available to release"
+            }
             GovernanceError::InsufficientBalance => {
                 "caller's balance is lower than the amount required for this action"
             }
@@ -218,7 +220,9 @@ impl GovernanceError {
             GovernanceError::ProposalNotApproved => {
                 "proposal has not been approved and cannot be executed"
             }
-            GovernanceError::VotingNotStarted => "voting period for this proposal has not started yet",
+            GovernanceError::VotingNotStarted => {
+                "voting period for this proposal has not started yet"
+            }
             GovernanceError::VotingEnded => "voting period for this proposal has already ended",
             GovernanceError::NoVotingPower => "caller has zero voting power and cannot cast a vote",
             GovernanceError::TimelockNotInitialized => {
@@ -229,12 +233,8 @@ impl GovernanceError {
             GovernanceError::ConvictionPoolNotFound => {
                 "no conviction-voting pool exists for the given id"
             }
-            GovernanceError::PendingAdminNotFound => {
-                "no pending admin rotation has been proposed"
-            }
-            GovernanceError::GuardianNotSet => {
-                "guardian address has not been configured"
-            }
+            GovernanceError::PendingAdminNotFound => "no pending admin rotation has been proposed",
+            GovernanceError::GuardianNotSet => "guardian address has not been configured",
         }
     }
 }

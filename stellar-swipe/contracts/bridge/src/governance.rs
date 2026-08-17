@@ -6,7 +6,9 @@
 #![allow(dead_code)]
 
 use soroban_sdk::{contracttype, Address, Env, Map, String, Symbol, Vec};
-use stellar_swipe_common::{emit_health_event, health_uninitialized, placeholder_admin, HealthStatus};
+use stellar_swipe_common::{
+    emit_health_event, health_uninitialized, placeholder_admin, HealthStatus,
+};
 
 /// Governance proposal statuses
 #[contracttype]

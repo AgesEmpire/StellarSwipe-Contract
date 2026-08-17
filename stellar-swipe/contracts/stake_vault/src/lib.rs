@@ -157,7 +157,11 @@ fn stake_tier_for_amount(amount: i128) -> u32 {
 /// Validates slash tier basis points (issue #816): each value must be within
 /// `[0, 10_000]` and severity must be non-decreasing (minor <= major <= critical)
 /// so a "worse" violation can never slash a smaller fraction than a lesser one.
-fn validate_slash_tiers(minor_bps: u32, major_bps: u32, critical_bps: u32) -> Result<(), StakeVaultError> {
+fn validate_slash_tiers(
+    minor_bps: u32,
+    major_bps: u32,
+    critical_bps: u32,
+) -> Result<(), StakeVaultError> {
     if minor_bps > 10_000 || major_bps > 10_000 || critical_bps > 10_000 {
         return Err(StakeVaultError::InvalidSlashTier);
     }
@@ -374,9 +378,7 @@ impl StakeVaultError {
             StakeVaultError::FlashLoanDetected => {
                 "stake and unstake in the same ledger is not allowed (flash-loan pattern)"
             }
-            StakeVaultError::InvalidSlashTier => {
-                "slash tier percentage would exceed 100% of stake"
-            }
+            StakeVaultError::InvalidSlashTier => "slash tier percentage would exceed 100% of stake",
             StakeVaultError::StakeDurationNotElapsed => {
                 "voting power is locked until the minimum stake duration elapses"
             }
@@ -418,10 +420,10 @@ impl StakeVaultError {
                 "appeal window for this slash has already elapsed"
             }
             StakeVaultError::SlashNotFound => "no slash record exists for the given id",
-            StakeVaultError::AppealAlreadyExists => "an appeal has already been filed for this slash",
-            StakeVaultError::AppealAlreadyResolved => {
-                "this appeal has already been resolved"
+            StakeVaultError::AppealAlreadyExists => {
+                "an appeal has already been filed for this slash"
             }
+            StakeVaultError::AppealAlreadyResolved => "this appeal has already been resolved",
             StakeVaultError::RateLimitExceeded => {
                 "caller has exceeded the allowed rate of stake/unstake operations"
             }
@@ -670,7 +672,11 @@ impl StakeVaultContract {
 
     /// Set the central governance contract address authorized to call
     /// `apply_governance_pause`. Admin only.
-    pub fn set_governance(env: Env, admin: Address, governance: Address) -> Result<(), StakeVaultError> {
+    pub fn set_governance(
+        env: Env,
+        admin: Address,
+        governance: Address,
+    ) -> Result<(), StakeVaultError> {
         let stored_admin: Address = env
             .storage()
             .instance()

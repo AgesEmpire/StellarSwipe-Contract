@@ -160,11 +160,10 @@ pub fn require_sensitive_caller(
     entrypoint: &Address,
     caller: &Address,
 ) -> Result<(), CrossContractError> {
-    require_allowed_contract(env, entrypoint, caller)
-        .map_err(|e| match e {
-            AllowlistError::ContractNotAllowed => CrossContractError::CallerNotAllowed,
-            _ => CrossContractError::UnauthorizedCaller,
-        })
+    require_allowed_contract(env, entrypoint, caller).map_err(|e| match e {
+        AllowlistError::ContractNotAllowed => CrossContractError::CallerNotAllowed,
+        _ => CrossContractError::UnauthorizedCaller,
+    })
 }
 pub fn validate_callee_version(
     env: &Env,

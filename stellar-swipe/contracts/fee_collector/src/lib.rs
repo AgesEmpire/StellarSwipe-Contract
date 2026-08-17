@@ -30,15 +30,11 @@ pub use reports::{EarningsLeaderboardEntry, EarningsReport, ReportPeriod};
 
 mod storage;
 pub use storage::BalanceMismatch;
-pub use storage::{
-    get_insurance_balance, get_insurance_payout_cap, is_insurance_claim_processed,
-    set_insurance_balance, set_insurance_claim_processed, set_insurance_payout_cap,
-};
 use storage::{
     add_daily_fee_total, add_to_revenue_share_pool_index, get_admin, get_burn_rate,
-    get_congestion_config, get_congestion_signal, get_daily_fee_total,
-    get_failed_fee_collection, get_fee_optimization_config, get_fee_rate, get_forecast_config,
-    get_fee_snapshot, get_last_error_report, get_last_forecast_day, get_monthly_trade_volume,
+    get_congestion_config, get_congestion_signal, get_daily_fee_total, get_failed_fee_collection,
+    get_fee_optimization_config, get_fee_rate, get_fee_snapshot, get_forecast_config,
+    get_last_error_report, get_last_forecast_day, get_monthly_trade_volume,
     get_network_condition_score, get_oracle_contract, get_pending_fees,
     get_provider_payout_currency, get_queued_withdrawal, get_referral_fee_share_bps, get_referrer,
     get_revenue_share_pool_index, get_treasury_balance, get_volume_discount_config,
@@ -47,8 +43,8 @@ use storage::{
     remove_monthly_trade_volume, remove_provider_payout_currency, remove_queued_withdrawal,
     set_admin, set_authorized_caller, set_burn_rate as set_burn_rate_storage,
     set_congestion_config, set_congestion_signal, set_failed_fee_collection,
-    set_fee_optimization_config, set_fee_rate as set_fee_rate_storage, set_forecast_config_storage,
-    set_fee_snapshot, set_has_traded, set_initialized, set_last_error_report,
+    set_fee_optimization_config, set_fee_rate as set_fee_rate_storage, set_fee_snapshot,
+    set_forecast_config_storage, set_has_traded, set_initialized, set_last_error_report,
     set_last_forecast_day, set_monthly_trade_volume, set_network_condition_score,
     set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
     set_provider_payout_currency, set_queued_withdrawal, set_referral_fee_share_bps, set_referrer,
@@ -58,6 +54,10 @@ use storage::{
     MonthlyTradeVolume, QueuedWithdrawal, SnapshotEntry, StorageKey, VolumeDiscountConfig,
     VolumeTier, WaterfallConfig, WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS,
     MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
+};
+pub use storage::{
+    get_insurance_balance, get_insurance_payout_cap, is_insurance_claim_processed,
+    set_insurance_balance, set_insurance_claim_processed, set_insurance_payout_cap,
 };
 
 use soroban_sdk::{
@@ -69,11 +69,9 @@ use shared::errors::{ErrorCategory, RecoveryStrategy};
 use shared::pausable;
 use shared::reentrancy::{self, ReentrancyError};
 use stellar_swipe_common::health::{health_uninitialized, HealthStatus};
+use stellar_swipe_common::token_metadata::{validate as validate_token_metadata, TokenMetadata};
 use stellar_swipe_common::Asset;
 use stellar_swipe_common::SECONDS_PER_DAY;
-use stellar_swipe_common::token_metadata::{
-    TokenMetadata, validate as validate_token_metadata,
-};
 
 #[cfg(test)]
 mod tests;
@@ -620,11 +618,7 @@ impl FeeCollector {
             return Err(ContractError::InvalidAmount);
         }
 
-        token::Client::new(&env, &token).transfer(
-            &from,
-            &env.current_contract_address(),
-            &amount,
-        );
+        token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
 
         let current_bal = get_insurance_balance(&env, &token);
         let new_bal = current_bal
@@ -1508,10 +1502,7 @@ impl FeeCollector {
     /// Validate that a token has registered metadata and that it passes
     /// the protocol's metadata sanity checks (decimals ≤ 18, non-empty
     /// symbol ≤ 12 chars, non-empty name ≤ 64 chars).
-    fn validate_token_metadata_for_token(
-        env: &Env,
-        token: &Address,
-    ) -> Result<(), ContractError> {
+    fn validate_token_metadata_for_token(env: &Env, token: &Address) -> Result<(), ContractError> {
         if let Some(metadata) = storage::get_registered_token_metadata(env, token) {
             validate_token_metadata(&metadata).map_err(|_| ContractError::InvalidTokenMetadata)?;
         }

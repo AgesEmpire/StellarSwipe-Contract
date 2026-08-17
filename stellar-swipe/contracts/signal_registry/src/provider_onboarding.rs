@@ -69,7 +69,8 @@ fn set_record(env: &Env, record: &OnboardingRecord) {
 // ── Events ────────────────────────────────────────────────────────────────────
 
 fn emit(env: &Env, topic: Symbol, provider: &Address, status: &OnboardingStatus) {
-    env.events().publish((topic, provider.clone()), status.clone());
+    env.events()
+        .publish((topic, provider.clone()), status.clone());
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

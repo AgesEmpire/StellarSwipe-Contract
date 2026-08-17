@@ -269,7 +269,11 @@ fn regression_slash_critical_equals_full_balance() {
     // Critical slash (10_000 bps = 100%) must wipe the whole balance.
     for balance in [1, 999, 1_000_000, MAX_STAKE] {
         let slashed = slash_amount(balance, 10_000);
-        assert_eq!(slashed, balance, "critical slash should equal full balance for {}", balance);
+        assert_eq!(
+            slashed, balance,
+            "critical slash should equal full balance for {}",
+            balance
+        );
     }
 }
 
@@ -289,8 +293,12 @@ fn regression_normalize_round_trip_7_to_6_decimals() {
     let down = normalize_amount(amount, 7, 6).expect("7→6 should not overflow");
     let up = normalize_amount(down, 6, 7).expect("6→7 should not overflow");
     // Sub-unit loss must be < 10 (one 7-decimal unit).
-    assert!(amount - up < 10 && amount >= up,
-        "round-trip 7→6→7 for {} should lose < 10 units, got {}", amount, up);
+    assert!(
+        amount - up < 10 && amount >= up,
+        "round-trip 7→6→7 for {} should lose < 10 units, got {}",
+        amount,
+        up
+    );
 }
 
 #[test]

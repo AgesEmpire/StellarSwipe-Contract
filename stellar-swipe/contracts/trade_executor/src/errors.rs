@@ -145,7 +145,9 @@ impl ContractError {
             ContractError::DCAPlanAlreadyExists => {
                 "a DCA plan with this id/configuration already exists"
             }
-            ContractError::SignalExpired => "the trade signal referenced by this action has expired",
+            ContractError::SignalExpired => {
+                "the trade signal referenced by this action has expired"
+            }
             ContractError::IntervalNotDue => {
                 "the next scheduled interval for this recurring action has not been reached yet"
             }

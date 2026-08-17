@@ -1,11 +1,13 @@
 #![no_std]
 
+use shared::reentrancy;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
-use shared::reentrancy;
+use stellar_swipe_common::token_metadata::{
+    validate as validate_token_metadata, TokenMetadata, TokenMetadataError,
+};
 use stellar_swipe_common::SECONDS_PER_DAY;
-use stellar_swipe_common::token_metadata::{TokenMetadata, TokenMetadataError, validate as validate_token_metadata};
 
 mod validators;
 
@@ -325,7 +327,8 @@ impl BridgeContract {
             name: wrapped_asset.clone(),
             decimals,
         };
-        validate_token_metadata(&wrapped_metadata).map_err(|_| BridgeError::InvalidTokenMetadata)?;
+        validate_token_metadata(&wrapped_metadata)
+            .map_err(|_| BridgeError::InvalidTokenMetadata)?;
 
         let asset = WrappedAsset {
             source_chain,
@@ -865,7 +868,11 @@ impl BridgeContract {
 
     /// Set the central governance contract address authorized to call
     /// `apply_governance_pause`. Admin only.
-    pub fn set_governance(env: Env, admin: Address, governance: Address) -> Result<(), BridgeError> {
+    pub fn set_governance(
+        env: Env,
+        admin: Address,
+        governance: Address,
+    ) -> Result<(), BridgeError> {
         require_admin(&env, &admin)?;
         if !cfg!(test) {
             admin.require_auth();

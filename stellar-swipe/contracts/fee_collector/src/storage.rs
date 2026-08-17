@@ -619,7 +619,11 @@ pub fn set_protocol_token(env: &Env, token: &Address) {
 // ── Issue #880: Token Metadata Validation ────────────────────────────────────────
 
 pub fn get_registered_token_metadata(env: &Env, token: &Address) -> Option<TokenMetadata> {
-    crud_get(env, StorageTier::Instance, &StorageKey::RegisteredTokenMetadata(token.clone()))
+    crud_get(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RegisteredTokenMetadata(token.clone()),
+    )
 }
 
 pub fn set_registered_token_metadata(env: &Env, token: &Address, metadata: &TokenMetadata) {
@@ -632,7 +636,11 @@ pub fn set_registered_token_metadata(env: &Env, token: &Address, metadata: &Toke
 }
 
 pub fn remove_registered_token_metadata(env: &Env, token: &Address) {
-    crud_remove(env, StorageTier::Instance, &StorageKey::RegisteredTokenMetadata(token.clone()));
+    crud_remove(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RegisteredTokenMetadata(token.clone()),
+    );
 }
 
 // ── Issue #442: Revenue Share ────────────────────────────────────────────────────────

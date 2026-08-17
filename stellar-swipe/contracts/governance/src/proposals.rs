@@ -599,7 +599,10 @@ pub fn simulate_proposal_action(
             let cur = upgrades.get(contract_name.clone());
             effects.push_back(SimulationEffect {
                 key: String::from_str(env, &(String::from_str(env, "upgrade:") + contract_name)),
-                current: match cur { Some(h) => h.to_string(), None => String::from_str(env, "(none)") },
+                current: match cur {
+                    Some(h) => h.to_string(),
+                    None => String::from_str(env, "(none)"),
+                },
                 proposed: new_hash.to_string(),
             });
             Ok(())
@@ -623,20 +626,16 @@ pub fn simulate_proposal_action(
     };
 
     Ok(SimulationResult {
-            success: true,
-            error: String::new(env),
-            effects,
-        })
+        success: true,
+        error: String::from_str(env, ""),
+        effects,
+    })
 }
 
-pub fn simulate_proposal(
-    env: &Env,
-    proposal_id: u64,
-) -> Result<SimulationResult, GovernanceError> {
+pub fn simulate_proposal(env: &Env, proposal_id: u64) -> Result<SimulationResult, GovernanceError> {
     let proposal = get_proposal(env, proposal_id)?;
     simulate_proposal_action(env, &proposal)
 }
-
 
 pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
     let mut proposal = get_proposal(env, proposal_id)?;
