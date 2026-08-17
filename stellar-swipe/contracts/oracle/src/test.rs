@@ -654,9 +654,9 @@ fn get_normalized_price_falls_back_to_7_decimals_when_unconfigured() {
     };
 
     // Store a 7-decimal price without configuring feed decimals
-    client.set_price(pair.clone(), 100_000_000);
-    let normalized = client.get_normalized_price(pair, 7);
-    assert_eq!(normalized, Ok(100_000_000));
+    client.set_price(&pair, &100_000_000);
+    let normalized = client.get_normalized_price(&pair, &7);
+    assert_eq!(normalized, 100_000_000);
 }
 
 #[test]
@@ -676,11 +676,11 @@ fn get_normalized_price_rescales_configured_decimals() {
 
     // Configure 6-decimal feed and store $50,000 as 50_000_000
     client.set_feed_decimals(&admin, &pair, &6);
-    client.set_price(pair.clone(), 50_000_000);
+    client.set_price(&pair, &50_000_000);
 
     // Normalized to 7 decimals: 50_000_000 * 10 = 500_000_000
-    let normalized = client.get_normalized_price(pair, 7);
-    assert_eq!(normalized, Ok(500_000_000));
+    let normalized = client.get_normalized_price(&pair, &7);
+    assert_eq!(normalized, 500_000_000);
 }
 
 #[test]

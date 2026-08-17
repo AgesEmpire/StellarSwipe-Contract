@@ -131,6 +131,12 @@ impl OracleError {
             OracleError::IncompatibleContractVersion => {
                 "upgrade() version is not strictly greater than the currently stored version"
             }
+            OracleError::LowConfidence => {
+                "submitted quote confidence is below the configured minimum"
+            }
+            OracleError::DeviationRejected => {
+                "cross-source price deviation exceeded the configured hard reject threshold"
+            }
         }
     }
 }

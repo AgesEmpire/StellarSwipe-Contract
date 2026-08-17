@@ -121,6 +121,7 @@ impl BridgeError {
             BridgeError::DuplicateNonce => {
                 "message nonce was already confirmed; duplicate delivery rejected"
             }
+            BridgeError::ContractPaused => "bridge is paused (governance-driven emergency pause)",
             BridgeError::InvalidTokenMetadata => {
                 "token metadata (decimals, symbol, or name) is invalid or missing"
             }
