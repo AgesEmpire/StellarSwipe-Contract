@@ -1800,3 +1800,265 @@ fn collect_fee_budget_regression() {
     let instructions = env.budget().cpu_instruction_cost();
     measure_and_emit("fee_collector.collect_fee", 5_000_000, instructions);
 }
+
+// ── Issue #960: Insurance Payout & Cap Tests ─────────────────────────────────
+
+#[test]
+fn test_insurance_payout_successful() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let funder = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Mint tokens to funder and deposit into insurance fund
+    let deposit_amount = 10_000i128;
+    StellarAssetClient::new(&env, &token).mint(&funder, &deposit_amount);
+    client.deposit_insurance_fund(&funder, &token, &deposit_amount);
+
+    assert_eq!(client.get_insurance_balance(&token), deposit_amount);
+
+    // Set max payout cap to 5,000 per claim
+    let max_cap = 5_000i128;
+    client.set_insurance_payout_cap(&admin, &token, &max_cap);
+    assert_eq!(client.get_insurance_payout_cap(&token), max_cap);
+
+    // Execute successful payout of 3,000 to provider
+    let claim_id = String::from_str(&env, "claim_12345");
+    let payout_amount = 3_000i128;
+    client.payout_insurance(&admin, &provider, &token, &payout_amount, &claim_id);
+
+    // Verify balances
+    assert_eq!(
+        client.get_insurance_balance(&token),
+        deposit_amount - payout_amount
+    );
+    assert_eq!(
+        TokenClient::new(&env, &token).balance(&provider),
+        payout_amount
+    );
+    assert!(client.is_insurance_claim_processed(&claim_id));
+}
+
+#[test]
+fn test_insurance_payout_exceeds_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let funder = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let deposit_amount = 10_000i128;
+    StellarAssetClient::new(&env, &token).mint(&funder, &deposit_amount);
+    client.deposit_insurance_fund(&funder, &token, &deposit_amount);
+
+    // Set max payout cap to 2,000
+    client.set_insurance_payout_cap(&admin, &token, &2_000i128);
+
+    // Attempt payout of 2,001 (exceeds cap)
+    let claim_id = String::from_str(&env, "claim_excess");
+    let res = client.try_payout_insurance(&admin, &provider, &token, &2_001i128, &claim_id);
+    assert_eq!(res, Err(Ok(ContractError::PayoutExceedsCap)));
+}
+
+#[test]
+fn test_insurance_payout_unauthorized() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let unauthorized_caller = Address::generate(&env);
+    let provider = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+    client.set_insurance_payout_cap(&admin, &token, &5_000i128);
+
+    // Set insurance balance
+    env.as_contract(&contract_id, || {
+        crate::storage::set_insurance_balance(&env, &token, 5_000i128);
+    });
+
+    // Unauthorized non-admin attempt
+    let claim_id = String::from_str(&env, "claim_unauth");
+    let res = client.try_payout_insurance(
+        &unauthorized_caller,
+        &provider,
+        &token,
+        &1_000i128,
+        &claim_id,
+    );
+    assert_eq!(res, Err(Ok(ContractError::UnauthorizedCaller)));
+}
+
+#[test]
+fn test_insurance_payout_double_claim_prevention() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let funder = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    StellarAssetClient::new(&env, &token).mint(&funder, &10_000i128);
+    client.deposit_insurance_fund(&funder, &token, &10_000i128);
+    client.set_insurance_payout_cap(&admin, &token, &5_000i128);
+
+    let claim_id = String::from_str(&env, "claim_double");
+    client.payout_insurance(&admin, &provider, &token, &1_000i128, &claim_id);
+
+    // Second payout with same claim ID must fail
+    let res2 = client.try_payout_insurance(&admin, &provider, &token, &1_000i128, &claim_id);
+    assert_eq!(res2, Err(Ok(ContractError::ClaimAlreadyProcessed)));
+}
+
+#[test]
+fn test_insurance_payout_insufficient_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let funder = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Deposit only 500
+    StellarAssetClient::new(&env, &token).mint(&funder, &500i128);
+    client.deposit_insurance_fund(&funder, &token, &500i128);
+    client.set_insurance_payout_cap(&admin, &token, &5_000i128);
+
+    // Request payout of 1,000 (exceeds balance)
+    let claim_id = String::from_str(&env, "claim_insuff");
+    let res = client.try_payout_insurance(&admin, &provider, &token, &1_000i128, &claim_id);
+    assert_eq!(res, Err(Ok(ContractError::InsufficientInsuranceBalance)));
+}
+
+#[test]
+fn test_insurance_payout_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let funder = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    StellarAssetClient::new(&env, &token).mint(&funder, &5_000i128);
+    client.deposit_insurance_fund(&funder, &token, &5_000i128);
+    client.set_insurance_payout_cap(&admin, &token, &5_000i128);
+
+    client.pause();
+
+    let claim_id = String::from_str(&env, "claim_paused");
+    let res = client.try_payout_insurance(&admin, &provider, &token, &1_000i128, &claim_id);
+    assert_eq!(res, Err(Ok(ContractError::ContractPaused)));
+}
+
+#[test]
+fn test_insurance_payout_authorized_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let keeper = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let funder = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    StellarAssetClient::new(&env, &token).mint(&funder, &5_000i128);
+    client.deposit_insurance_fund(&funder, &token, &5_000i128);
+    client.set_insurance_payout_cap(&admin, &token, &5_000i128);
+
+    // Authorize keeper
+    client.authorize_caller(&keeper);
+    assert!(client.is_caller_authorized(&keeper));
+
+    // Keeper executes insurance payout
+    let claim_id = String::from_str(&env, "claim_keeper");
+    client.payout_insurance(&keeper, &provider, &token, &1_500i128, &claim_id);
+
+    assert_eq!(TokenClient::new(&env, &token).balance(&provider), 1_500i128);
+    assert_eq!(client.get_insurance_balance(&token), 3_500i128);
+}
+
+#[test]
+fn test_insurance_payout_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Negative cap rejection
+    let res_cap = client.try_set_insurance_payout_cap(&admin, &token, &-100i128);
+    assert_eq!(res_cap, Err(Ok(ContractError::InvalidAmount)));
+
+    // Zero / negative payout rejection
+    let claim_zero = String::from_str(&env, "claim_zero");
+    let res_zero = client.try_payout_insurance(&admin, &provider, &token, &0i128, &claim_zero);
+    assert_eq!(res_zero, Err(Ok(ContractError::InvalidAmount)));
+
+    let claim_neg = String::from_str(&env, "claim_neg");
+    let res_neg = client.try_payout_insurance(&admin, &provider, &token, &-50i128, &claim_neg);
+    assert_eq!(res_neg, Err(Ok(ContractError::InvalidAmount)));
+}

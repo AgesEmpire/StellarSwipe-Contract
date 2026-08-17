@@ -134,7 +134,7 @@ pub fn set_paused_scope(env: &Env, paused: bool, scope: PauseScope) {
 
             #[allow(deprecated)]
             env.events().publish(
-                (symbol_short!("pause_scope"),),
+                (Symbol::new(env, "pause_scope"),),
                 ((scope as u32), paused),
             );
         }
@@ -299,11 +299,11 @@ mod tests {
         let (env, id) = setup();
         let c = TestPausableClient::new(&env, &id);
 
-        c.pause_scope(PauseScope::Treasury);
+        c.pause_scope(&PauseScope::Treasury);
 
         assert!(!c.paused());
-        assert!(c.paused_scope(PauseScope::Treasury));
-        assert!(!c.paused_scope(PauseScope::Trading));
+        assert!(c.paused_scope(&PauseScope::Treasury));
+        assert!(!c.paused_scope(&PauseScope::Trading));
     }
 
     #[test]
@@ -311,11 +311,11 @@ mod tests {
         let (env, id) = setup();
         let c = TestPausableClient::new(&env, &id);
 
-        c.pause_scope(PauseScope::Treasury);
-        assert!(c.paused_scope(PauseScope::Treasury));
+        c.pause_scope(&PauseScope::Treasury);
+        assert!(c.paused_scope(&PauseScope::Treasury));
 
-        c.unpause_scope(PauseScope::Treasury);
-        assert!(!c.paused_scope(PauseScope::Treasury));
+        c.unpause_scope(&PauseScope::Treasury);
+        assert!(!c.paused_scope(&PauseScope::Treasury));
     }
 
     #[test]
@@ -323,9 +323,9 @@ mod tests {
         let (env, id) = setup();
         let c = TestPausableClient::new(&env, &id);
 
-        c.pause_scope(PauseScope::Treasury);
-        assert!(c.guard_scope(PauseScope::Treasury));
-        assert!(!c.guard_scope(PauseScope::Staking));
+        c.pause_scope(&PauseScope::Treasury);
+        assert!(c.guard_scope(&PauseScope::Treasury));
+        assert!(!c.guard_scope(&PauseScope::Staking));
     }
 
     #[test]
@@ -333,14 +333,14 @@ mod tests {
         let (env, id) = setup();
         let c = TestPausableClient::new(&env, &id);
 
-        c.pause_scope(PauseScope::Treasury);
-        c.pause_scope(PauseScope::Trading);
+        c.pause_scope(&PauseScope::Treasury);
+        c.pause_scope(&PauseScope::Trading);
 
-        assert!(c.paused_scope(PauseScope::Treasury));
-        assert!(c.paused_scope(PauseScope::Trading));
-        assert!(c.guard_scope(PauseScope::Treasury));
-        assert!(c.guard_scope(PauseScope::Trading));
-        assert!(!c.guard_scope(PauseScope::Upgrades));
+        assert!(c.paused_scope(&PauseScope::Treasury));
+        assert!(c.paused_scope(&PauseScope::Trading));
+        assert!(c.guard_scope(&PauseScope::Treasury));
+        assert!(c.guard_scope(&PauseScope::Trading));
+        assert!(!c.guard_scope(&PauseScope::Upgrades));
     }
 
     #[test]
@@ -349,7 +349,7 @@ mod tests {
         let (env, id) = setup();
         let c = TestPausableClient::new(&env, &id);
 
-        c.pause_scope(PauseScope::Staking);
+        c.pause_scope(&PauseScope::Staking);
         let events = env.events().all();
         assert!(!events.is_empty(), "scoped pause must emit an event");
     }

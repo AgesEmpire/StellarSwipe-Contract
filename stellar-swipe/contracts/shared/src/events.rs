@@ -1175,13 +1175,6 @@ mod tests {
 //
 // # Fields
 //
-// `schema_version` — bumps when the envelope structure changes.
-// `envelope_id` — monotonically increasing per contract; stable across retries.
-// `ledger_sequence` — soroban ledger sequence at publish time.
-// `timestamp` — unix timestamp at publish time.
-
-use soroban_sdk::{contracttype};
-
 #[contracttype]
 pub enum ReplayStorageKey {
     NextEnvelopeId,
@@ -1210,7 +1203,6 @@ pub fn next_envelope_id(env: &Env) -> u64 {
     next
 }
 
-/// Publish a `ReplayEnvelope` event on the `("replay", "envelope")` topic.
 pub fn emit_replay_envelope(env: &Env) {
     let envelope = ReplayEnvelope {
         schema_version: 1,
@@ -1227,7 +1219,7 @@ pub fn emit_replay_envelope(env: &Env) {
 /// Convenience: emit an envelope immediately followed by a business event.
 /// This helps analytics pipelines pair the envelope metadata with the actual
 /// payload while preserving stable ordering.
-pub fn emit_with_replay<E: soroban_sdk::TryIntoVal<Env, soroban_sdk::Val>>(
+pub fn emit_with_replay<E: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
     env: &Env,
     topic: (Symbol, Symbol),
     event: E,
@@ -1241,7 +1233,7 @@ pub fn emit_with_replay<E: soroban_sdk::TryIntoVal<Env, soroban_sdk::Val>>(
 #[cfg(test)]
 mod replay_tests {
     use super::*;
-    use soroban_sdk::{contract, testutils::Address as _, Env};
+    use soroban_sdk::{contract, testutils::Address as _, Env, FromVal};
 
     #[contract]
     struct TestContract;
@@ -1295,9 +1287,15 @@ mod replay_tests {
             let events = env.events().all();
             assert_eq!(events.len(), 2);
             // First event must be the replay envelope
-            let envelope_topics = &events.get(0).0;
-            assert_eq!(envelope_topics.get(0), Symbol::new(&env, "replay"));
-            assert_eq!(envelope_topics.get(1), Symbol::new(&env, "envelope"));
+            let envelope_topics = &events.get(0).unwrap().1;
+            assert_eq!(
+                Symbol::from_val(&env, &envelope_topics.get(0).unwrap()),
+                Symbol::new(&env, "replay")
+            );
+            assert_eq!(
+                Symbol::from_val(&env, &envelope_topics.get(1).unwrap()),
+                Symbol::new(&env, "envelope")
+            );
         });
     }
 }

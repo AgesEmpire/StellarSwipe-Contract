@@ -8,17 +8,19 @@ mod fee_cache;
 use events::{
     emit_effective_multiplier_changed, emit_error_reported, emit_fee_collected, emit_fee_forecast,
     emit_fee_rate_updated, emit_fees_claimed, emit_fees_claimed_converted,
-    emit_first_trade_fee_waived, emit_network_condition_updated, emit_payout_currency_set,
-    emit_referral_fee_paid, emit_referral_fee_share_updated, emit_referral_registered,
-    emit_retry_attempted, emit_snapshot_recorded, emit_treasury_withdrawal,
-    emit_volume_discount_config_updated, emit_waterfall_distribution, emit_withdrawal_queued,
-    EvtEffectiveMultiplierChanged, EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated,
-    EvtFeesClaimed, EvtNetworkConditionUpdated, EvtRetryAttempted, EvtSnapshotRecorded,
-    EvtTreasuryWithdrawal, EvtWithdrawalQueued,
+    emit_first_trade_fee_waived, emit_insurance_payout, emit_insurance_payout_cap_updated,
+    emit_network_condition_updated, emit_payout_currency_set, emit_referral_fee_paid,
+    emit_referral_fee_share_updated, emit_referral_registered, emit_retry_attempted,
+    emit_snapshot_recorded, emit_treasury_withdrawal, emit_volume_discount_config_updated,
+    emit_waterfall_distribution, emit_withdrawal_queued, EvtEffectiveMultiplierChanged,
+    EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed, EvtInsurancePayout,
+    EvtNetworkConditionUpdated, EvtRetryAttempted, EvtSnapshotRecorded, EvtTreasuryWithdrawal,
+    EvtWithdrawalQueued,
 };
 pub use events::{
     EffectiveMultiplierChanged, FeeRateUpdated, FeesBurned, FeesClaimed, FirstTradeFeeWaived,
-    SnapshotRecorded, TreasuryWithdrawal, WithdrawalQueued,
+    InsurancePayout, InsurancePayoutCapUpdated, SnapshotRecorded, TreasuryWithdrawal,
+    WithdrawalQueued,
 };
 
 mod rebates;
@@ -28,6 +30,10 @@ pub use reports::{EarningsLeaderboardEntry, EarningsReport, ReportPeriod};
 
 mod storage;
 pub use storage::BalanceMismatch;
+pub use storage::{
+    get_insurance_balance, get_insurance_payout_cap, is_insurance_claim_processed,
+    set_insurance_balance, set_insurance_claim_processed, set_insurance_payout_cap,
+};
 use storage::{
     add_daily_fee_total, add_to_revenue_share_pool_index, get_admin, get_burn_rate,
     get_congestion_config, get_congestion_signal, get_daily_fee_total,
@@ -199,12 +205,6 @@ impl FeeCollector {
         }
         let admin = get_admin(&env);
         admin.require_auth();
-        pausable::set_paused(&env, true);
-        Ok(())
-    }
-
-    /// Resume fund-moving operations. Admin auth required.
-    pub fn unpause(env: Env) -> Result<(), ContractError> {
 
         let current_version = shared::version::get_contract_version(&env);
         shared::version::guard_upgrade(current_version, new_version)
@@ -214,6 +214,36 @@ impl FeeCollector {
         shared::version::set_contract_version(&env, new_version);
         shared::version::emit_contract_upgraded(&env, current_version, new_version);
         Ok(())
+    }
+
+    /// Admin-only: pause fund-moving operations.
+    pub fn pause(env: Env) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        pausable::set_paused(&env, true);
+        Ok(())
+    }
+
+    /// Resume fund-moving operations. Admin auth required.
+    pub fn unpause(env: Env) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        pausable::set_paused(&env, false);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        pausable::is_paused(&env)
+    }
+
+    pub fn require_not_paused(env: &Env) -> Result<(), ContractError> {
+        pausable::require_not_paused(env).map_err(|_| ContractError::ContractPaused)
     }
 
     // ── Issue #813: cross-contract authentication hardening ─────────────────
@@ -411,7 +441,7 @@ impl FeeCollector {
             return Err(ContractError::InvalidAmount);
         }
         // Validate token metadata before allowing withdrawal.
-        validate_token_metadata_for_token(&env, &token)?;
+        Self::validate_token_metadata_for_token(&env, &token)?;
         if amount > get_treasury_balance(&env, &token) {
             return Err(ContractError::InsufficientTreasuryBalance);
         }
@@ -474,7 +504,7 @@ impl FeeCollector {
         admin.require_auth();
 
         // Validate registered token metadata before allowing withdrawal.
-        validate_token_metadata_for_token(&env, &token)?;
+        Self::validate_token_metadata_for_token(&env, &token)?;
 
         let queued = match get_queued_withdrawal(&env) {
             Some(q) if q.recipient == recipient && q.token == token && q.amount == amount => q,
@@ -514,6 +544,178 @@ impl FeeCollector {
                 token: token.clone(),
                 amount,
                 remaining_balance: new_balance,
+            },
+        );
+
+        Ok(())
+    }
+
+    // ── Issue #960: Insurance Payout Function with Cap and Audit Log ─────────
+
+    /// Admin-only: configure the maximum insurance payout cap per claim for a token.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `caller`: Admin address (must match contract admin).
+    /// - `token`: Asset token address.
+    /// - `max_cap`: Maximum amount allowed per insurance claim (must be >= 0).
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::UnauthorizedCaller`] — caller is not the admin.
+    /// - [`ContractError::InvalidAmount`] — `max_cap` < 0.
+    pub fn set_insurance_payout_cap(
+        env: Env,
+        caller: Address,
+        token: Address,
+        max_cap: i128,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        caller.require_auth();
+        let admin = get_admin(&env);
+        if caller != admin {
+            return Err(ContractError::UnauthorizedCaller);
+        }
+        if max_cap < 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let old_cap = get_insurance_payout_cap(&env, &token);
+        set_insurance_payout_cap(&env, &token, max_cap);
+        emit_insurance_payout_cap_updated(&env, &token, old_cap, max_cap, &caller);
+        Ok(())
+    }
+
+    /// Query the configured maximum insurance payout cap per claim for a token.
+    pub fn get_insurance_payout_cap(env: Env, token: Address) -> i128 {
+        get_insurance_payout_cap(&env, &token)
+    }
+
+    /// Query the current insurance fund balance for a token.
+    pub fn get_insurance_balance(env: Env, token: Address) -> i128 {
+        get_insurance_balance(&env, &token)
+    }
+
+    /// Deposit funds directly into the insurance fund.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `from`: Funding account authorizing the deposit.
+    /// - `token`: Asset token address.
+    /// - `amount`: Amount to deposit (must be > 0).
+    pub fn deposit_insurance_fund(
+        env: Env,
+        from: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        Self::require_not_paused(&env)?;
+        from.require_auth();
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &from,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let current_bal = get_insurance_balance(&env, &token);
+        let new_bal = current_bal
+            .checked_add(amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        set_insurance_balance(&env, &token, new_bal);
+        Ok(())
+    }
+
+    /// Checks whether an insurance claim ID has already been paid out.
+    pub fn is_insurance_claim_processed(env: Env, claim_id: String) -> bool {
+        is_insurance_claim_processed(&env, &claim_id)
+    }
+
+    /// Pays out insurance funds to a provider or treasury while enforcing
+    /// the maximum payout cap per claim and emitting an audit event.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `caller`: Admin or allowlisted keeper address.
+    /// - `recipient`: Recipient provider or treasury address.
+    /// - `token`: Asset token address.
+    /// - `amount`: Payout amount (must be > 0 and <= max_cap if cap configured).
+    /// - `claim_id`: Unique identifier for the insurance claim (prevents double payout).
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::ContractPaused`] — contract is paused.
+    /// - [`ContractError::UnauthorizedCaller`] — caller is neither admin nor allowlisted caller.
+    /// - [`ContractError::InvalidAmount`] — amount <= 0.
+    /// - [`ContractError::ClaimAlreadyProcessed`] — claim_id already paid out.
+    /// - [`ContractError::PayoutExceedsCap`] — amount exceeds configured cap per claim.
+    /// - [`ContractError::InsufficientInsuranceBalance`] — insurance balance insufficient.
+    pub fn payout_insurance(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+        token: Address,
+        amount: i128,
+        claim_id: String,
+    ) -> Result<(), ContractError> {
+        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        Self::require_not_paused(&env)?;
+
+        caller.require_auth();
+        let admin = get_admin(&env);
+        if caller != admin && !is_authorized_caller(&env, &caller) {
+            return Err(ContractError::UnauthorizedCaller);
+        }
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        if is_insurance_claim_processed(&env, &claim_id) {
+            return Err(ContractError::ClaimAlreadyProcessed);
+        }
+
+        let cap = get_insurance_payout_cap(&env, &token);
+        if cap > 0 && amount > cap {
+            return Err(ContractError::PayoutExceedsCap);
+        }
+
+        let current_balance = get_insurance_balance(&env, &token);
+        if amount > current_balance {
+            return Err(ContractError::InsufficientInsuranceBalance);
+        }
+
+        let new_balance = current_balance
+            .checked_sub(amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        set_insurance_balance(&env, &token, new_balance);
+        set_insurance_claim_processed(&env, &claim_id, true);
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+
+        emit_insurance_payout(
+            &env,
+            EvtInsurancePayout {
+                recipient,
+                token,
+                amount,
+                claim_id,
+                timestamp: env.ledger().timestamp(),
             },
         );
 
@@ -1077,7 +1279,7 @@ impl FeeCollector {
         }
         Self::require_not_paused(&env)?;
         // Validate registered token metadata before allowing fee claims.
-        validate_token_metadata_for_token(&env, &token)?;
+        Self::validate_token_metadata_for_token(&env, &token)?;
         let mut auth_args: Vec<Val> = Vec::new(&env);
         auth_args.push_back(provider.clone().into_val(&env));
         auth_args.push_back(token.clone().into_val(&env));
@@ -1310,9 +1512,9 @@ impl FeeCollector {
         env: &Env,
         token: &Address,
     ) -> Result<(), ContractError> {
-        let metadata = storage::get_registered_token_metadata(env, token)
-            .ok_or(ContractError::InvalidTokenMetadata)?;
-        validate_token_metadata(&metadata).map_err(|_| ContractError::InvalidTokenMetadata)?;
+        if let Some(metadata) = storage::get_registered_token_metadata(env, token) {
+            validate_token_metadata(&metadata).map_err(|_| ContractError::InvalidTokenMetadata)?;
+        }
         Ok(())
     }
 
@@ -1792,6 +1994,7 @@ impl FeeCollector {
             is_paused: pausable::is_paused(&env),
             version,
             admin,
+            initialized_at: 0,
         }
     }
 }

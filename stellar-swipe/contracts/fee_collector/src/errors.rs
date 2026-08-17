@@ -64,6 +64,16 @@ pub enum ContractError {
     UnauthorizedCaller = 28,
     /// Issue #814: no snapshot data exists for the requested ledger sequence.
     SnapshotNotFound = 29,
+    /// Token metadata is missing, invalid, or ambiguous.
+    InvalidTokenMetadata = 30,
+    /// Requested payout exceeds the configured maximum payout cap per claim (#960).
+    PayoutExceedsCap = 31,
+    /// Insurance balance is insufficient for requested payout.
+    InsufficientInsuranceBalance = 32,
+    /// Claim ID has already been paid out (#960).
+    ClaimAlreadyProcessed = 33,
+    /// Contract is currently paused (#561).
+    ContractPaused = 34,
 }
 
 impl ContractError {
@@ -138,6 +148,21 @@ impl ContractError {
             }
             ContractError::SnapshotNotFound => {
                 "no fee snapshot exists for the requested ledger sequence"
+            }
+            ContractError::InvalidTokenMetadata => {
+                "token metadata is missing, invalid, or ambiguous"
+            }
+            ContractError::PayoutExceedsCap => {
+                "requested payout exceeds the configured maximum payout cap per claim"
+            }
+            ContractError::InsufficientInsuranceBalance => {
+                "insurance balance is insufficient for requested payout"
+            }
+            ContractError::ClaimAlreadyProcessed => {
+                "claim ID has already been paid out"
+            }
+            ContractError::ContractPaused => {
+                "contract is currently paused"
             }
         }
     }

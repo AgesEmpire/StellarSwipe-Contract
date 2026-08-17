@@ -216,7 +216,11 @@ pub fn delegation_count(env: &Env, delegator: &Address) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{contract, testutils::Address as _, Env};
+    use soroban_sdk::{
+        contract,
+        testutils::{Address as _, Ledger as _},
+        Env,
+    };
 
     #[contract]
     struct TestContract;

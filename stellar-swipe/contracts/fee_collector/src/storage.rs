@@ -4,6 +4,7 @@ use soroban_sdk::{contracttype, Address, Env, String, Vec};
 use stellar_swipe_common::storage_crud::{
     crud_get, crud_get_or, crud_has, crud_remove, crud_set, StorageTier,
 };
+use stellar_swipe_common::token_metadata::TokenMetadata;
 use stellar_swipe_common::Asset;
 
 // ── #690: Fee Distribution Waterfall ────────────────────────────────────────
@@ -136,6 +137,14 @@ pub enum StorageKey {
     RevenueSharePoolIndex,
     /// Deterministic fee distribution snapshot keyed by ledger sequence.
     Snapshot(u64),
+    /// Registered token metadata (Issue #2).
+    RegisteredTokenMetadata(Address),
+    /// #960: Insurance fund balance per token.
+    InsuranceBalance(Address),
+    /// #960: Max insurance payout cap per claim per token.
+    InsurancePayoutCap(Address),
+    /// #960: Processed insurance claim ID tracking to prevent duplicate payouts.
+    ProcessedInsuranceClaim(String),
 }
 
 #[contracttype]
@@ -978,4 +987,60 @@ pub fn set_congestion_signal(env: &Env, signal: &CongestionSignal) {
     env.storage()
         .instance()
         .set(&StorageKey::CongestionSignal, signal);
+}
+
+// ── Issue #960: Insurance Payout & Cap Storage ───────────────────────────────
+
+pub fn get_insurance_balance(env: &Env, token: &Address) -> i128 {
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::InsuranceBalance(token.clone()),
+        0i128,
+    )
+}
+
+pub fn set_insurance_balance(env: &Env, token: &Address, balance: i128) {
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::InsuranceBalance(token.clone()),
+        &balance,
+    );
+}
+
+pub fn get_insurance_payout_cap(env: &Env, token: &Address) -> i128 {
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::InsurancePayoutCap(token.clone()),
+        0i128,
+    )
+}
+
+pub fn set_insurance_payout_cap(env: &Env, token: &Address, cap: i128) {
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::InsurancePayoutCap(token.clone()),
+        &cap,
+    );
+}
+
+pub fn is_insurance_claim_processed(env: &Env, claim_id: &String) -> bool {
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::ProcessedInsuranceClaim(claim_id.clone()),
+        false,
+    )
+}
+
+pub fn set_insurance_claim_processed(env: &Env, claim_id: &String, processed: bool) {
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::ProcessedInsuranceClaim(claim_id.clone()),
+        &processed,
+    );
 }
