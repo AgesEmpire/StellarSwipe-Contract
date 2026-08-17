@@ -23,6 +23,7 @@ pub struct NetworkErrorDetail {
 }
 
 #[contracterror]
+#[cfg_attr(test, derive(soroban_sdk::testutils::arbitrary::Arbitrary))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ContractError {
@@ -188,6 +189,9 @@ impl ContractError {
             }
             ContractError::TradeExpired => {
                 "trade's expiry_ts has passed; the replay-protection window has closed"
+            }
+            ContractError::ContractPaused => {
+                "contract is paused (governance-driven emergency pause)"
             }
         }
     }
