@@ -134,7 +134,7 @@ pub fn set_paused_scope(env: &Env, paused: bool, scope: PauseScope) {
 
             #[allow(deprecated)]
             env.events().publish(
-                (symbol_short!("pause_scope"),),
+                (Symbol::new(env, "pause_scope"),),
                 ((scope as u32), paused),
             );
         }

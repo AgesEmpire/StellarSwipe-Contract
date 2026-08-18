@@ -8,4 +8,5 @@ pub mod test_grace_period;
 pub mod test_market_simulation;
 pub mod test_nonce_replay_audit;
 pub mod test_oracle_staleness;
+pub mod test_partial_fill;
 pub mod test_storage_rent_benchmark;
