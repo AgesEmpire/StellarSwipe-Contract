@@ -1,10 +1,12 @@
 #![cfg(test)]
 
-use soroban_sdk::{testutils::{Address as _, Ledger as _}, Env};
 use crate::governance::{
-    create_proposal, execute_proposal, get_proposal,
-    GovernanceError, ProposalStatus,
-    PROPOSAL_COOLDOWN_SECONDS, PROPOSAL_TIMELOCK_SECONDS, MAX_EXECUTIONS_PER_PROPOSAL,
+    create_proposal, execute_proposal, get_proposal, GovernanceError, ProposalStatus,
+    MAX_EXECUTIONS_PER_PROPOSAL, PROPOSAL_COOLDOWN_SECONDS, PROPOSAL_TIMELOCK_SECONDS,
+};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    Env,
 };
 
 fn setup() -> (Env, soroban_sdk::Address) {
@@ -49,7 +51,8 @@ fn test_execute_after_timelock_succeeds() {
     let (env, caller) = setup();
     env.as_contract(&env.register(crate::AutoTradeContract, ()), || {
         let id = create_proposal(&env, caller.clone());
-        env.ledger().set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
+        env.ledger()
+            .set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
         assert!(execute_proposal(&env, id, &caller).is_ok());
     });
 }
@@ -61,7 +64,8 @@ fn test_repeated_execution_within_cooldown_is_rejected() {
     let (env, caller) = setup();
     env.as_contract(&env.register(crate::AutoTradeContract, ()), || {
         let id = create_proposal(&env, caller.clone());
-        env.ledger().set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
+        env.ledger()
+            .set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
 
         // First execution — ok
         assert!(execute_proposal(&env, id, &caller).is_ok());
@@ -77,7 +81,8 @@ fn test_execution_after_cooldown_succeeds() {
     let (env, caller) = setup();
     env.as_contract(&env.register(crate::AutoTradeContract, ()), || {
         let id = create_proposal(&env, caller.clone());
-        env.ledger().set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
+        env.ledger()
+            .set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
         assert!(execute_proposal(&env, id, &caller).is_ok());
 
         // Advance past cooldown
@@ -152,12 +157,19 @@ fn test_proposal_status_transitions_correctly() {
     let (env, caller) = setup();
     env.as_contract(&env.register(crate::AutoTradeContract, ()), || {
         let id = create_proposal(&env, caller.clone());
-        assert_eq!(get_proposal(&env, id).unwrap().status, ProposalStatus::Pending);
+        assert_eq!(
+            get_proposal(&env, id).unwrap().status,
+            ProposalStatus::Pending
+        );
 
-        env.ledger().set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
+        env.ledger()
+            .set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
         execute_proposal(&env, id, &caller).unwrap();
         // After first execution (not yet at cap) status is Active
-        assert_eq!(get_proposal(&env, id).unwrap().status, ProposalStatus::Active);
+        assert_eq!(
+            get_proposal(&env, id).unwrap().status,
+            ProposalStatus::Active
+        );
     });
 }
 

@@ -100,11 +100,7 @@ pub fn delegate_capability(
     }
 
     let count_key = CapabilityStorageKey::DelegationCount(delegator.clone());
-    let count: u32 = env
-        .storage()
-        .instance()
-        .get(&count_key)
-        .unwrap_or(0);
+    let count: u32 = env.storage().instance().get(&count_key).unwrap_or(0);
 
     if count >= MAX_DELEGATIONS_PER_DELEGATOR {
         return Err(CapabilityError::MaxDelegationsReached);
@@ -127,15 +123,21 @@ pub fn delegate_capability(
     put_capability_state(env, &state);
 
     if is_new {
-        env.storage()
-            .instance()
-            .set(&count_key, &(count + 1));
+        env.storage().instance().set(&count_key, &(count + 1));
     }
 
     #[allow(deprecated)]
     env.events().publish(
-        (Symbol::new(env, "capability"), Symbol::new(env, "delegated")),
-        (delegator.clone(), delegate.clone(), scope as u32, expires_at),
+        (
+            Symbol::new(env, "capability"),
+            Symbol::new(env, "delegated"),
+        ),
+        (
+            delegator.clone(),
+            delegate.clone(),
+            scope as u32,
+            expires_at,
+        ),
     );
 
     Ok(())
@@ -161,15 +163,9 @@ pub fn revoke_capability(
     put_capability_state(env, &state);
 
     let count_key = CapabilityStorageKey::DelegationCount(delegator.clone());
-    let count: u32 = env
-        .storage()
-        .instance()
-        .get(&count_key)
-        .unwrap_or(0);
+    let count: u32 = env.storage().instance().get(&count_key).unwrap_or(0);
     if count > 0 {
-        env.storage()
-            .instance()
-            .set(&count_key, &(count - 1));
+        env.storage().instance().set(&count_key, &(count - 1));
     }
 
     #[allow(deprecated)]
@@ -216,7 +212,11 @@ pub fn delegation_count(env: &Env, delegator: &Address) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{contract, testutils::Address as _, Env};
+    use soroban_sdk::{
+        contract,
+        testutils::{Address as _, Ledger as _},
+        Env,
+    };
 
     #[contract]
     struct TestContract;
@@ -279,7 +279,8 @@ mod tests {
 
         env.as_contract(&_id, || {
             let now = env.ledger().timestamp();
-            delegate_capability(&env, &admin, &operator, CapabilityScope::Upgrade, now + 50).unwrap();
+            delegate_capability(&env, &admin, &operator, CapabilityScope::Upgrade, now + 50)
+                .unwrap();
             assert!(require_capability(&env, &operator, CapabilityScope::Upgrade).is_ok());
 
             env.ledger().with_mut(|l| l.sequence_number += 100);

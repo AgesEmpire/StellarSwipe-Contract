@@ -191,7 +191,7 @@ mod tests {
             let factor = pow10(high - low).unwrap_or(i128::MAX);
             // Truncation toward zero: |scaled| ≤ |amount / factor|
             let expected_trunc = amount / factor;
-            prop_assert_eq!(scaled, expected_trunc);
+            prop_assert_eq!(scaled, Some(expected_trunc));
         }
 
         #[test]

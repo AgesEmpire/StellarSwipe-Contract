@@ -138,6 +138,9 @@ const LARGE_WITHDRAWAL_THRESHOLD: i128 = 500_000_000;
 /// Bounds instance storage growth and per-call compute cost of `queue_unstake`.
 const DEFAULT_MAX_UNSTAKE_QUEUE_SIZE: u32 = 200;
 
+/// Maximum number of items permitted in a batch operation (e.g. batch_slash_stake, batch_resolve_appeal).
+const MAX_BATCH_SIZE: u32 = 100;
+
 pub const GOLD_TIER_STAKE: i128 = 1_000_000_000;
 pub const SILVER_TIER_STAKE: i128 = GOLD_TIER_STAKE / 2;
 pub const BRONZE_TIER_STAKE: i128 = GOLD_TIER_STAKE / 10;
@@ -157,7 +160,11 @@ fn stake_tier_for_amount(amount: i128) -> u32 {
 /// Validates slash tier basis points (issue #816): each value must be within
 /// `[0, 10_000]` and severity must be non-decreasing (minor <= major <= critical)
 /// so a "worse" violation can never slash a smaller fraction than a lesser one.
-fn validate_slash_tiers(minor_bps: u32, major_bps: u32, critical_bps: u32) -> Result<(), StakeVaultError> {
+fn validate_slash_tiers(
+    minor_bps: u32,
+    major_bps: u32,
+    critical_bps: u32,
+) -> Result<(), StakeVaultError> {
     if minor_bps > 10_000 || major_bps > 10_000 || critical_bps > 10_000 {
         return Err(StakeVaultError::InvalidSlashTier);
     }
@@ -348,6 +355,14 @@ pub enum StakeVaultError {
     /// `MaxUnstakeQueueSize`; distinct from `QueueEmpty` (processing an empty
     /// queue). Previously referenced without a backing variant — added here.
     QueueFull = 36,
+    /// Slash tier severity order is invalid (minor > major or major > critical).
+    InvalidSlashTierOrder = 37,
+    /// Withdrawal cooldown duration exceeds maximum allowed limit.
+    InvalidCooldown = 38,
+    /// Batch size is 0 or exceeds MAX_BATCH_SIZE.
+    BatchSizeInvalid = 39,
+    /// Lengths of parallel batch parameter arrays do not match.
+    BatchLengthMismatch = 40,
 }
 
 impl StakeVaultError {
@@ -374,9 +389,7 @@ impl StakeVaultError {
             StakeVaultError::FlashLoanDetected => {
                 "stake and unstake in the same ledger is not allowed (flash-loan pattern)"
             }
-            StakeVaultError::InvalidSlashTier => {
-                "slash tier percentage would exceed 100% of stake"
-            }
+            StakeVaultError::InvalidSlashTier => "slash tier percentage would exceed 100% of stake",
             StakeVaultError::StakeDurationNotElapsed => {
                 "voting power is locked until the minimum stake duration elapses"
             }
@@ -418,10 +431,10 @@ impl StakeVaultError {
                 "appeal window for this slash has already elapsed"
             }
             StakeVaultError::SlashNotFound => "no slash record exists for the given id",
-            StakeVaultError::AppealAlreadyExists => "an appeal has already been filed for this slash",
-            StakeVaultError::AppealAlreadyResolved => {
-                "this appeal has already been resolved"
+            StakeVaultError::AppealAlreadyExists => {
+                "an appeal has already been filed for this slash"
             }
+            StakeVaultError::AppealAlreadyResolved => "this appeal has already been resolved",
             StakeVaultError::RateLimitExceeded => {
                 "caller has exceeded the allowed rate of stake/unstake operations"
             }
@@ -437,6 +450,16 @@ impl StakeVaultError {
             }
             StakeVaultError::QueueFull => {
                 "unstake queue is at MaxUnstakeQueueSize; wait for entries to process"
+            }
+            StakeVaultError::InvalidSlashTierOrder => {
+                "slash tiers must be non-decreasing: minor <= major <= critical"
+            }
+            StakeVaultError::InvalidCooldown => {
+                "withdrawal cooldown exceeds maximum allowed duration"
+            }
+            StakeVaultError::BatchSizeInvalid => "batch is empty or exceeds maximum batch size",
+            StakeVaultError::BatchLengthMismatch => {
+                "batch parameter arrays have mismatched lengths"
             }
         }
     }
@@ -670,7 +693,11 @@ impl StakeVaultContract {
 
     /// Set the central governance contract address authorized to call
     /// `apply_governance_pause`. Admin only.
-    pub fn set_governance(env: Env, admin: Address, governance: Address) -> Result<(), StakeVaultError> {
+    pub fn set_governance(
+        env: Env,
+        admin: Address,
+        governance: Address,
+    ) -> Result<(), StakeVaultError> {
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -2196,101 +2223,6 @@ impl StakeVaultContract {
 
         events::emit_batch_appeals_resolved(&env, processed_count);
         Ok(processed_count)
-    }
-
-    /// Core appeal-resolution logic shared by [`Self::resolve_appeal`] and
-    /// [`Self::batch_resolve_appeal`]. Admin authorization is the
-    /// responsibility of the entry point — this assumes the caller is
-    /// already validated.
-    fn do_resolve_appeal(env: &Env, slash_id: u64, uphold: bool) -> Result<(), StakeVaultError> {
-        // Load slash record.
-        let record: SlashRecord = env
-            .storage()
-            .persistent()
-            .get(&StorageKey::SlashRecord(slash_id))
-            .ok_or(StakeVaultError::SlashNotFound)?;
-
-        // Load appeal record.
-        let mut appeal: SlashAppeal = env
-            .storage()
-            .persistent()
-            .get(&StorageKey::SlashAppeal(slash_id))
-            .ok_or(StakeVaultError::SlashNotFound)?;
-
-        if appeal.status != AppealStatus::Pending {
-            return Err(StakeVaultError::AppealAlreadyResolved);
-        }
-
-        // Retrieve held funds (only present when an appeal window is configured
-        // and the slash_stake did not burn immediately).
-        let held: i128 = env
-            .storage()
-            .persistent()
-            .get(&StorageKey::SlashedFundsHeld(slash_id))
-            .unwrap_or(0);
-
-        let token: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::StakeToken)
-            .ok_or(StakeVaultError::NotInitialized)?;
-
-        if uphold {
-            appeal.status = AppealStatus::Upheld;
-            // Slash confirmed — burn the held funds now.
-            if held > 0 {
-                env.storage()
-                    .persistent()
-                    .remove(&StorageKey::SlashedFundsHeld(slash_id));
-                token::Client::new(&env, &token).burn(&env.current_contract_address(), &held);
-            }
-        } else {
-            // Reversed — tokens are still in the vault; credit provider's stake.
-            appeal.status = AppealStatus::Reversed;
-
-            let amount_to_restore = if held > 0 { held } else { record.slash_amount };
-
-            let mut stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
-                .storage()
-                .persistent()
-                .get(&MigrationKey::StakesV2)
-                .unwrap_or_else(|| soroban_sdk::Map::new(&env));
-
-            let current_info = stakes.get(record.provider.clone()).unwrap_or(StakeInfoV2 {
-                balance: 0,
-                locked_until: 0,
-                last_updated: 0,
-            });
-
-            let restored_balance = current_info.balance.saturating_add(amount_to_restore);
-            let now = env.ledger().timestamp();
-
-            stakes.set(
-                record.provider.clone(),
-                StakeInfoV2 {
-                    balance: restored_balance,
-                    locked_until: current_info.locked_until,
-                    last_updated: now,
-                },
-            );
-            env.storage()
-                .persistent()
-                .set(&MigrationKey::StakesV2, &stakes);
-
-            if held > 0 {
-                env.storage()
-                    .persistent()
-                    .remove(&StorageKey::SlashedFundsHeld(slash_id));
-            }
-        }
-
-        env.storage()
-            .persistent()
-            .set(&StorageKey::SlashAppeal(slash_id), &appeal);
-
-        events::emit_appeal_resolved(&env, slash_id, uphold, record.provider);
-
-        Ok(())
     }
 
     /// Returns the [`SlashRecord`] for the given `slash_id`, or `None`.

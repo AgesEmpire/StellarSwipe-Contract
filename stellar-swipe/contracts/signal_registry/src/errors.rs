@@ -306,7 +306,9 @@ impl TemplateError {
         match self {
             TemplateError::TemplateNotFound => "no signal template exists for the given id",
             TemplateError::Unauthorized => "caller is not authorized to perform this action",
-            TemplateError::PrivateTemplate => "template is private and not accessible to this caller",
+            TemplateError::PrivateTemplate => {
+                "template is private and not accessible to this caller"
+            }
             TemplateError::MissingVariable => "a required template variable was not supplied",
             TemplateError::InvalidTemplate => "template payload is malformed or fails validation",
             TemplateError::InvalidAction => "requested action is not valid for a template",
@@ -349,7 +351,9 @@ impl ImportError {
             ImportError::InvalidAction => "requested action is not valid for an imported signal",
             ImportError::InvalidRationale => "rationale is empty or exceeds the allowed length",
             ImportError::InvalidExpiry => "expiry is in the past or otherwise invalid",
-            ImportError::BatchSizeExceeded => "batch contains more entries than the allowed maximum",
+            ImportError::BatchSizeExceeded => {
+                "batch contains more entries than the allowed maximum"
+            }
             ImportError::EmptyData => "import payload contains no data",
             ImportError::ParseError => "import payload could not be parsed",
         }
@@ -470,7 +474,9 @@ impl ComboError {
             ComboError::InvalidConditionReference => {
                 "referenced condition does not exist on this combo"
             }
-            ComboError::ComboNotActive => "combo is not in the Active state required for this action",
+            ComboError::ComboNotActive => {
+                "combo is not in the Active state required for this action"
+            }
             ComboError::InvalidAmount => "amount is zero, negative, or outside allowed bounds",
             ComboError::TradingPaused => "trading is currently paused",
             ComboError::CircuitBreakerTriggered => {
@@ -641,7 +647,9 @@ impl SignalEditError {
             SignalEditError::EditWindowClosed => {
                 "the window during which this signal may be edited has closed"
             }
-            SignalEditError::FieldNotEditable => "this field cannot be edited after signal creation",
+            SignalEditError::FieldNotEditable => {
+                "this field cannot be edited after signal creation"
+            }
             SignalEditError::SignalAlreadyCopied => {
                 "signal has already been copied by followers; edits are locked"
             }
@@ -713,7 +721,9 @@ impl SubmissionError {
             SubmissionError::BelowMinimumStake => {
                 "caller's stake is below the minimum required to submit signals"
             }
-            SubmissionError::InvalidAssetPair => "asset pair is empty, malformed, or not recognized",
+            SubmissionError::InvalidAssetPair => {
+                "asset pair is empty, malformed, or not recognized"
+            }
             SubmissionError::InvalidPrice => "price must be greater than zero",
             SubmissionError::EmptyRationale => "rationale text is empty",
             SubmissionError::DuplicateSignal => "an identical signal has already been submitted",

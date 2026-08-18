@@ -58,10 +58,7 @@ pub enum WorkflowResult {
     /// All steps completed successfully.
     Success,
     /// A step returned an error; `step_index` identifies which one.
-    Failed {
-        step_index: u32,
-        step_name: String,
-    },
+    Failed { step_index: u32, step_name: String },
 }
 
 // ── Core harness ──────────────────────────────────────────────────────────────
@@ -146,13 +143,17 @@ mod tests {
     fn first_step_failure_returns_failed_index_0() {
         let e = env();
         let steps = make_steps(&e, &["init", "validate", "settle"]);
-        let result = run_workflow(&e, &steps, |_, step| {
-            if step.index == 0 {
-                Err(())
-            } else {
-                Ok(())
-            }
-        });
+        let result = run_workflow(
+            &e,
+            &steps,
+            |_, step| {
+                if step.index == 0 {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            },
+        );
         match result {
             WorkflowResult::Failed { step_index, .. } => assert_eq!(step_index, 0),
             _ => panic!("expected Failed"),
@@ -188,13 +189,17 @@ mod tests {
     fn last_step_failure_returns_correct_index() {
         let e = env();
         let steps = make_steps(&e, &["a", "b", "c"]);
-        let result = run_workflow(&e, &steps, |_, step| {
-            if step.index == 2 {
-                Err(())
-            } else {
-                Ok(())
-            }
-        });
+        let result = run_workflow(
+            &e,
+            &steps,
+            |_, step| {
+                if step.index == 2 {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            },
+        );
         match result {
             WorkflowResult::Failed { step_index, .. } => assert_eq!(step_index, 2),
             _ => panic!("expected Failed"),
@@ -232,16 +237,23 @@ mod tests {
     fn failure_step_name_preserved() {
         let e = env();
         let steps = make_steps(&e, &["init", "bridge_transfer", "finalize"]);
-        let result = run_workflow(&e, &steps, |_, step| {
-            if step.index == 1 {
-                Err(())
-            } else {
-                Ok(())
-            }
-        });
+        let result = run_workflow(
+            &e,
+            &steps,
+            |_, step| {
+                if step.index == 1 {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            },
+        );
         match result {
             WorkflowResult::Failed { step_name, .. } => {
-                assert_eq!(step_name, soroban_sdk::String::from_str(&e, "bridge_transfer"))
+                assert_eq!(
+                    step_name,
+                    soroban_sdk::String::from_str(&e, "bridge_transfer")
+                )
             }
             _ => panic!("expected Failed"),
         }

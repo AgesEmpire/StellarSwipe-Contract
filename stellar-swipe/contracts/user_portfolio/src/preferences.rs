@@ -213,11 +213,9 @@ fn style_matches_signal(style: &TradingStyle, signal: &Signal) -> bool {
 }
 
 fn to_signal_summary(signal: &Signal) -> SignalSummary {
-    let success_rate = if signal.executions > 0 {
-        (signal.successful_executions * 10_000) / signal.executions
-    } else {
-        0
-    };
+    let success_rate = (signal.successful_executions * 10_000)
+        .checked_div(signal.executions)
+        .unwrap_or(0);
     SignalSummary {
         id: signal.id,
         provider: signal.provider.clone(),

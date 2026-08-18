@@ -69,7 +69,11 @@ fn test_execute_trade_latency_regression() {
         instructions <= BASELINE_AUTO_TRADE_INSTRUCTIONS * 3,
         "execute_trade {instructions} exceeds 3x baseline"
     );
-    measure_and_emit("auto_trade.execute_auto_trade", BASELINE_AUTO_TRADE_INSTRUCTIONS, instructions);
+    measure_and_emit(
+        "auto_trade.execute_auto_trade",
+        BASELINE_AUTO_TRADE_INSTRUCTIONS,
+        instructions,
+    );
 }
 
 #[test]
