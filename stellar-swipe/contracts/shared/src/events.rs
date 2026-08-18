@@ -427,6 +427,37 @@ pub fn emit_dca_plan_cancelled(env: &Env, evt: EvtDCAPlanCancelled) {
     );
 }
 
+// ── Partial fill event (Issue #959) ──────────────────────────────────────────
+
+/// Emitted when a copy-trade SDEX offer is only partially matched.
+/// Indexers should record the shortfall (`remaining_amount`) and surface it to
+/// the follower so they can decide whether to place a follow-up order.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtPartialFill {
+    pub schema_version: u32,
+    /// Address of the follower whose copy-trade was partially filled.
+    pub user: Address,
+    /// Monotonic receipt / trade ID assigned by the executor.
+    pub trade_id: u64,
+    /// Amount originally requested for the copy-trade.
+    pub requested_amount: i128,
+    /// Amount actually filled by the SDEX (may be 0 for a zero-fill).
+    pub filled_amount: i128,
+    /// Unfilled remainder (`requested_amount - filled_amount`).
+    pub remaining_amount: i128,
+}
+
+pub fn emit_partial_fill(env: &Env, evt: EvtPartialFill) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "partial_fill"),
+        ),
+        evt,
+    );
+}
+
 // ── Analytics event structs (Issue #365) ─────────────────────────────────────
 
 #[contracttype]
