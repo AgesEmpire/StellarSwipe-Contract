@@ -16,10 +16,7 @@ const CANONICAL_DECIMALS: u32 = 7;
 /// asset pair are dropped before aggregation; if every report is stale the
 /// call is rejected with `OracleError::StalePrice` rather than silently
 /// falling back to insufficient-sources.
-pub fn process_external_prices(
-    env: &Env,
-    prices: Vec<ExternalPrice>,
-) -> Result<i128, OracleError> {
+pub fn process_external_prices(env: &Env, prices: Vec<ExternalPrice>) -> Result<i128, OracleError> {
     if prices.is_empty() {
         return Err(OracleError::InsufficientOracles);
     }

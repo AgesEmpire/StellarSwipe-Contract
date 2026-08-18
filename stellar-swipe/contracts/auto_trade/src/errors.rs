@@ -162,7 +162,9 @@ impl AutoTradeError {
             AutoTradeError::PositionLimitExceeded => {
                 "caller already holds the maximum number of allowed open positions"
             }
-            AutoTradeError::StopLossTriggered => "trade blocked: a stop-loss threshold was triggered",
+            AutoTradeError::StopLossTriggered => {
+                "trade blocked: a stop-loss threshold was triggered"
+            }
             AutoTradeError::StrategyNotFound => "no auto-trade strategy exists for the given id",
             AutoTradeError::PositionAlreadyExists => {
                 "an active position already exists; cannot open a duplicate"
@@ -175,11 +177,15 @@ impl AutoTradeError {
             AutoTradeError::PrivacyModeEnabled => {
                 "action is blocked because privacy mode is enabled for this account"
             }
-            AutoTradeError::TradingPaused => "trading is currently paused for this account/contract",
+            AutoTradeError::TradingPaused => {
+                "trading is currently paused for this account/contract"
+            }
             AutoTradeError::InvalidBasketSize => {
                 "statistical-arbitrage basket size is outside the allowed range"
             }
-            AutoTradeError::InvalidPriceData => "supplied price data is malformed or fails validation",
+            AutoTradeError::InvalidPriceData => {
+                "supplied price data is malformed or fails validation"
+            }
             AutoTradeError::NonCointegratedBasket => {
                 "basket assets fail the cointegration test required for stat-arb"
             }
@@ -192,7 +198,9 @@ impl AutoTradeError {
             AutoTradeError::NoTradeSignal => {
                 "no trade signal is currently available for this portfolio/strategy"
             }
-            AutoTradeError::InvalidStatArbConfig => "statistical-arbitrage configuration is invalid",
+            AutoTradeError::InvalidStatArbConfig => {
+                "statistical-arbitrage configuration is invalid"
+            }
             AutoTradeError::ExitStrategyNotFound => "no exit strategy exists for the given id",
             AutoTradeError::InvalidExitConfig => "exit-strategy configuration is invalid",
             AutoTradeError::InsuranceNotConfigured => {
@@ -217,7 +225,9 @@ impl AutoTradeError {
                 "conditional order operation failed; see ConditionalOrderNotFound/\
                  ConditionalOrderNotPending/ConditionalOrderNotTriggered for the specific cause"
             }
-            AutoTradeError::InvalidConditionalConfig => "conditional-order configuration is invalid",
+            AutoTradeError::InvalidConditionalConfig => {
+                "conditional-order configuration is invalid"
+            }
             AutoTradeError::RateLimitExceeded => {
                 "a rate/transfer/volume limit was exceeded; see the specific alias \
                  (hourly/daily transfer, hourly/daily volume, cooldown, penalty) for the cause"
@@ -236,7 +246,9 @@ impl AutoTradeError {
                 "the pair fails the cointegration test required for pairs trading"
             }
             AutoTradeError::InvalidPairsConfig => "pairs-trading configuration is invalid",
-            AutoTradeError::OracleUnavailable => "no oracle price is currently available for this asset",
+            AutoTradeError::OracleUnavailable => {
+                "no oracle price is currently available for this asset"
+            }
             AutoTradeError::DcaError => {
                 "DCA operation failed; see DcaStrategyNotFound/DcaStrategyInactive/\
                  DcaEndTimeReached for the specific cause"

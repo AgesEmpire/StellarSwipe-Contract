@@ -452,3 +452,62 @@ pub fn emit_snapshot_recorded(env: &Env, evt: EvtSnapshotRecorded) {
         (evt.ledger, evt.timestamp, evt.total_amount, evt.entry_count),
     );
 }
+
+// ── Issue #960: Insurance Payout & Cap events ────────────────────────────────
+
+#[contractevent]
+pub struct InsurancePayout {
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub claim_id: String,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+pub struct InsurancePayoutCapUpdated {
+    pub token: Address,
+    pub old_cap: i128,
+    pub new_cap: i128,
+    pub updated_by: Address,
+}
+
+pub struct EvtInsurancePayout {
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub claim_id: String,
+    pub timestamp: u64,
+}
+
+pub fn emit_insurance_payout(env: &Env, evt: EvtInsurancePayout) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "insurance_payout"),
+        ),
+        (
+            evt.recipient,
+            evt.token,
+            evt.amount,
+            evt.claim_id,
+            evt.timestamp,
+        ),
+    );
+}
+
+pub fn emit_insurance_payout_cap_updated(
+    env: &Env,
+    token: &Address,
+    old_cap: i128,
+    new_cap: i128,
+    updated_by: &Address,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "ins_cap_updated"),
+        ),
+        (token.clone(), old_cap, new_cap, updated_by.clone()),
+    );
+}

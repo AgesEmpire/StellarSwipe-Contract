@@ -222,7 +222,10 @@ mod tests {
             checked_bps_floor(i128::MAX / 2, 1),
             Some(i128::MAX / 2 / 10_000)
         );
-        assert_eq!(checked_div(i128::MAX, 1, RoundingMode::Floor), Some(i128::MAX));
+        assert_eq!(
+            checked_div(i128::MAX, 1, RoundingMode::Floor),
+            Some(i128::MAX)
+        );
     }
 
     #[test]

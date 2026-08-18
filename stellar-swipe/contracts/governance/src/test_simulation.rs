@@ -5,7 +5,6 @@
 ///   2. Simulating a proposal that would fail (insufficient treasury balance)
 ///   3. Simulating a non-existent proposal returns ProposalNotFound
 ///   4. Simulation does NOT mutate stored state
-
 extern crate std;
 
 use crate::distribution::DistributionRecipients;
@@ -53,7 +52,6 @@ fn stake_tokens(c: &GovernanceContractClient, user: &Address, amount: i128) {
     c.stake(user, &amount);
 }
 
-
 // -- #917: simulate a SignalProposal
 
 #[test]
@@ -75,7 +73,11 @@ fn simulate_signal_proposal_returns_effects_without_mutating() {
 
     let result = c.simulate_proposal(&pid);
     assert!(result.success, "signal proposal simulation should succeed");
-    assert_eq!(result.error, String::from_str(&env, ""), "no error expected");
+    assert_eq!(
+        result.error,
+        String::from_str(&env, ""),
+        "no error expected"
+    );
     assert!(
         result.effects.len() >= 1,
         "expected at least 1 effect, got {}",
@@ -115,12 +117,12 @@ fn simulate_parameter_change_proposal_reports_current_and_proposed() {
     let result = c.simulate_proposal(&pid);
     assert!(result.success, "parameter change simulation should succeed");
 
-    let found = result.effects.iter().any(|eff| {
-        eff.key == String::from_str(&env, "parameter:max_fee")
-    });
+    let found = result
+        .effects
+        .iter()
+        .any(|eff| eff.key == String::from_str(&env, "parameter:max_fee"));
     assert!(found, "expected effect key 'parameter:max_fee'");
 }
-
 
 // -- #917: TreasurySpend with insufficient balance reports failure
 
@@ -152,7 +154,10 @@ fn simulate_treasury_spend_insufficient_balance_reports_failure() {
 
     let result = c.simulate_proposal(&pid);
     assert!(!result.success, "simulation should report failure");
-    assert!(result.effects.len() == 0, "no effects expected when simulation fails early");
+    assert!(
+        result.effects.len() == 0,
+        "no effects expected when simulation fails early"
+    );
 }
 
 // -- #917: non-existent proposal returns ProposalNotFound
@@ -163,8 +168,7 @@ fn simulate_nonexistent_proposal_returns_error() {
     let c = client(&env, &id);
     init(&c, &env, &admin, &r);
 
-    let result: Result<SimulationResult, GovernanceError> =
-        c.try_simulate_proposal(&999_999u64);
+    let result: Result<SimulationResult, GovernanceError> = c.try_simulate_proposal(&999_999u64);
     assert_eq!(
         result,
         Err(Ok(GovernanceError::ProposalNotFound)),
@@ -195,9 +199,10 @@ fn simulate_feature_toggle_reports_effect() {
     let result = c.simulate_proposal(&pid);
     assert!(result.success, "feature toggle simulation should succeed");
 
-    let found = result.effects.iter().any(|eff| {
-        eff.key == String::from_str(&env, "feature:flash_loans")
-    });
+    let found = result
+        .effects
+        .iter()
+        .any(|eff| eff.key == String::from_str(&env, "feature:flash_loans"));
     assert!(found, "expected effect key 'feature:flash_loans'");
 }
 

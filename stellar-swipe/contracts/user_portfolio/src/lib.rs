@@ -1451,6 +1451,7 @@ impl UserPortfolio {
             is_paused: false,
             version,
             admin,
+            initialized_at: env.ledger().timestamp(),
         }
     }
 

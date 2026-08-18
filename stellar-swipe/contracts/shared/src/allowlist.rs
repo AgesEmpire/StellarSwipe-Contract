@@ -79,15 +79,15 @@ pub fn add_allowed_contract(
     contract: &Address,
 ) -> Result<(), AllowlistError> {
     let mut contracts = get_allowed_contracts(env, entrypoint);
-    
+
     if is_in_allowlist(&contracts, contract) {
         return Err(AllowlistError::ContractAlreadyAllowed);
     }
-    
+
     if contracts.len() >= MAX_ALLOWLIST_SIZE {
         return Err(AllowlistError::AllowlistFull);
     }
-    
+
     contracts.push_back(contract.clone());
     set_allowed_contracts(env, entrypoint, &contracts);
     emit_contract_allowed(env, entrypoint, contract);
@@ -103,11 +103,11 @@ pub fn remove_allowed_contract(
     contract: &Address,
 ) -> Result<(), AllowlistError> {
     let mut contracts = get_allowed_contracts(env, entrypoint);
-    
+
     if !is_in_allowlist(&contracts, contract) {
         return Err(AllowlistError::ContractNotInAllowlist);
     }
-    
+
     let mut new_contracts = Vec::new(env);
     for i in 0..contracts.len() {
         let addr = contracts.get(i).unwrap();
@@ -115,7 +115,7 @@ pub fn remove_allowed_contract(
             new_contracts.push_back(addr);
         }
     }
-    
+
     set_allowed_contracts(env, entrypoint, &new_contracts);
     emit_contract_removed(env, entrypoint, contract);
     Ok(())
@@ -271,7 +271,7 @@ mod tests {
             let addr2 = Address::generate(&env);
             add_allowed_contract(&env, &entrypoint, &addr1).unwrap();
             add_allowed_contract(&env, &entrypoint, &addr2).unwrap();
-            
+
             let list = get_allowlist(&env, &entrypoint);
             assert_eq!(list.len(), 2);
             assert!(is_in_allowlist(&list, &addr1));

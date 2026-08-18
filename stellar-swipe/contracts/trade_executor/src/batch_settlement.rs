@@ -75,7 +75,9 @@ pub struct SettlementOrder {
 impl SettlementOrder {
     /// Remaining amount that still needs to be filled.
     pub fn remaining(&self) -> i128 {
-        self.requested_amount.saturating_sub(self.settled_amount).max(0)
+        self.requested_amount
+            .saturating_sub(self.settled_amount)
+            .max(0)
     }
 
     /// True when the order has been fully settled or failed.
@@ -178,7 +180,11 @@ fn load_fill(env: &Env, order_id: u64, fill_index: u32) -> Option<FillRecord> {
 
 fn append_user_order(env: &Env, user: &Address, order_id: u64) {
     let key = SettlementKey::UserOrders(user.clone());
-    let mut ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or_else(|| Vec::new(env));
+    let mut ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
     ids.push_back(order_id);
     env.storage().persistent().set(&key, &ids);
 }
@@ -201,7 +207,14 @@ fn emit_fill_recorded(
 ) {
     env.events().publish(
         (symbol_short!("settle"), symbol_short!("fill")),
-        (order_id, fill_index, filled_amount, total_settled, remaining, status),
+        (
+            order_id,
+            fill_index,
+            filled_amount,
+            total_settled,
+            remaining,
+            status,
+        ),
     );
 }
 
@@ -341,7 +354,12 @@ pub fn fail_settlement_order(env: &Env, order_id: u64) -> Result<(), SettlementE
 
     order.status = SettlementStatus::Failed;
     save_order(env, &order);
-    emit_order_closed(env, order_id, SettlementStatus::Failed, order.settled_amount);
+    emit_order_closed(
+        env,
+        order_id,
+        SettlementStatus::Failed,
+        order.settled_amount,
+    );
     Ok(())
 }
 
@@ -536,7 +554,10 @@ mod tests {
 
             let order = get_settlement_order(&env, id).unwrap();
             assert_eq!(order.status, SettlementStatus::Failed);
-            assert_eq!(order.settled_amount, 400_000, "partial fill must be preserved");
+            assert_eq!(
+                order.settled_amount, 400_000,
+                "partial fill must be preserved"
+            );
             assert!(order.is_closed());
         });
     }

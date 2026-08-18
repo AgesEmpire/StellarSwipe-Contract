@@ -472,12 +472,7 @@ pub fn emit_lock_multiplier_tier_updated(env: &Env, weeks: u32, bps: u32) {
     );
 }
 
-pub fn emit_emergency_configured(
-    env: &Env,
-    required: u32,
-    penalty_bps: u32,
-    timeout_secs: u64,
-) {
+pub fn emit_emergency_configured(env: &Env, required: u32, penalty_bps: u32, timeout_secs: u64) {
     env.events().publish(
         (contract_topic(env), topics::TOPIC_STAKE_EMERGENCY_CFG()),
         EvtEmergencyConfigured {
@@ -516,10 +511,7 @@ pub fn emit_emergency_approved(env: &Env, staker: Address, signer: Address, appr
 
 pub fn emit_emergency_expired(env: &Env, staker: Address) {
     env.events().publish(
-        (
-            contract_topic(env),
-            topics::TOPIC_STAKE_EMERGENCY_EXPIRED(),
-        ),
+        (contract_topic(env), topics::TOPIC_STAKE_EMERGENCY_EXPIRED()),
         EvtEmergencyExpired {
             schema_version: SCHEMA_VERSION,
             staker,

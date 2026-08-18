@@ -23,6 +23,7 @@ pub struct NetworkErrorDetail {
 }
 
 #[contracterror]
+#[cfg_attr(test, derive(soroban_sdk::testutils::arbitrary::Arbitrary))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ContractError {
@@ -145,7 +146,9 @@ impl ContractError {
             ContractError::DCAPlanAlreadyExists => {
                 "a DCA plan with this id/configuration already exists"
             }
-            ContractError::SignalExpired => "the trade signal referenced by this action has expired",
+            ContractError::SignalExpired => {
+                "the trade signal referenced by this action has expired"
+            }
             ContractError::IntervalNotDue => {
                 "the next scheduled interval for this recurring action has not been reached yet"
             }
@@ -188,7 +191,7 @@ impl ContractError {
                 "trade's expiry_ts has passed; the replay-protection window has closed"
             }
             ContractError::ContractPaused => {
-                "contract is paused via governance-driven emergency pause; try again later"
+                "contract is paused (governance-driven emergency pause)"
             }
         }
     }

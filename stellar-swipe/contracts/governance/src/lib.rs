@@ -4,7 +4,8 @@
 mod committees;
 mod conviction_voting;
 mod distribution;
-mod errors;
+pub mod errors;
+pub use errors::GovernanceError;
 mod proposal_deposit;
 mod proposals;
 mod quadratic_voting;
@@ -65,11 +66,9 @@ use proposals::{
     get_active_proposals, get_all_proposals, get_category_threshold, get_governance_config,
     get_proposal, reclaim_expired_proposal, set_category_thresholds, simulate_proposal,
     withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalType,
-    SimulationEffect, SimulationResult, Vote, VoteDelegation,
-    VoteType as GovernanceVoteType,
+    SimulationEffect, SimulationResult, Vote, VoteDelegation, VoteType as GovernanceVoteType,
 };
 pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
-use shared::capabilities::{self, Capability, CapabilityError};
 use quadratic_voting::{
     allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
     get_quadratic_vote, get_quadratic_voting_config, get_vote_credits, reallocate_quadratic_votes,
@@ -84,6 +83,7 @@ use reputation::{
     GovernanceReputation, ReputationConfig, ReputationTier, StalenessLevel,
 };
 pub use shadow_mode::ShadowModeState;
+use shared::capabilities::{self, Capability, CapabilityError};
 use shared::pausable;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Map, String, Symbol,
@@ -395,21 +395,15 @@ impl GovernanceContract {
         if pending != new_admin {
             return Err(GovernanceError::Unauthorized);
         }
-        env.storage()
-            .instance()
-            .set(&StorageKey::Admin, &new_admin);
-        env.storage()
-            .instance()
-            .remove(&StorageKey::PendingAdmin);
+        env.storage().instance().set(&StorageKey::Admin, &new_admin);
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
         Ok(())
     }
 
     /// Admin-only: cancel a pending key rotation.
     pub fn cancel_key_rotation(env: Env, admin: Address) -> Result<(), GovernanceError> {
         require_admin(&env, &admin)?;
-        env.storage()
-            .instance()
-            .remove(&StorageKey::PendingAdmin);
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
         Ok(())
     }
 
@@ -426,17 +420,17 @@ impl GovernanceContract {
             return Err(GovernanceError::Unauthorized);
         }
         guardian.require_auth();
-        env.storage()
-            .instance()
-            .remove(&StorageKey::Admin);
-        env.storage()
-            .instance()
-            .remove(&StorageKey::PendingAdmin);
+        env.storage().instance().remove(&StorageKey::Admin);
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
         Ok(())
     }
 
     /// Admin-only: set the guardian address for emergency recovery.
-    pub fn set_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), GovernanceError> {
+    pub fn set_guardian(
+        env: Env,
+        admin: Address,
+        guardian: Address,
+    ) -> Result<(), GovernanceError> {
         require_admin(&env, &admin)?;
         env.storage()
             .instance()

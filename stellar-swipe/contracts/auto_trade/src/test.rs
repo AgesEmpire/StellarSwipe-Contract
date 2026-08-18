@@ -686,8 +686,8 @@ fn test_trailing_stop_triggers_auto_sell_and_event() {
         risk::update_position(&env, &user, 1, 1_000, 100);
         AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 200);
 
-        let result = AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 180)
-            .unwrap();
+        let result =
+            AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 180).unwrap();
         assert_eq!(result.execution_price, 180);
         assert_eq!(result.trigger_price, 180);
         assert_eq!(result.sold_amount, 1_000);
@@ -734,8 +734,8 @@ fn test_trailing_stop_partial_fill_keeps_remaining_position() {
             .temporary()
             .set(&(symbol_short!("asset_liq"), 1u32), &400i128);
 
-        let result = AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 170)
-            .unwrap();
+        let result =
+            AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 170).unwrap();
         assert_eq!(result.sold_amount, 400);
         assert_eq!(result.remaining_amount, 600);
 
@@ -769,17 +769,13 @@ fn test_fixed_stop_used_when_trailing_disabled() {
         risk::update_position(&env, &user, 1, 1_000, 100);
         AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 200);
 
-        let result = AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 85)
-            .unwrap();
+        let result =
+            AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 85).unwrap();
         assert_eq!(result.execution_price, 85);
 
         let events = env.events().all();
-        let expected_topics = (
-            Symbol::new(&env, "stop_loss_triggered"),
-            user.clone(),
-            1u32,
-        )
-            .into_val(&env);
+        let expected_topics =
+            (Symbol::new(&env, "stop_loss_triggered"), user.clone(), 1u32).into_val(&env);
         assert!(events.iter().any(|event| event.1 == expected_topics));
     });
 }

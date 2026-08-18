@@ -178,11 +178,9 @@ pub fn get_provider_churn_risk(
 
     // Component 3: performance trend decline score (0–100).
     let overall_rate = stats.map(|s| s.success_rate).unwrap_or(0);
-    let recent_rate = if recent_closed > 0 {
-        (recent_successful * 10_000) / recent_closed
-    } else {
-        overall_rate
-    };
+    let recent_rate = (recent_successful * 10_000)
+        .checked_div(recent_closed)
+        .unwrap_or(overall_rate);
     let perf_trend_score = perf_decline_score(recent_rate, overall_rate);
 
     // Composite: 40/30/30 weighting (sum of weights == 100).

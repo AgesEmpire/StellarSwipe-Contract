@@ -74,9 +74,10 @@ pub enum CapabilityStorageKey {
 /// Grant `capability` to `address`. Only the SuperAdmin may call this.
 pub fn grant_capability(env: &Env, caller: &Address, address: &Address, capability: Capability) {
     require_capability(env, caller, Capability::SuperAdmin);
-    env.storage()
-        .instance()
-        .set(&CapabilityStorageKey::Grant(capability, address.clone()), &true);
+    env.storage().instance().set(
+        &CapabilityStorageKey::Grant(capability, address.clone()),
+        &true,
+    );
 }
 
 /// Revoke `capability` from `address`. Only the SuperAdmin may call this.

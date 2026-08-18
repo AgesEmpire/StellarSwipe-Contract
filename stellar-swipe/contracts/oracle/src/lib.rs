@@ -305,7 +305,11 @@ impl OracleContract {
 
     /// Set the central governance contract address authorized to call
     /// `apply_governance_pause`. Admin only.
-    pub fn set_governance(env: Env, admin: Address, governance: Address) -> Result<(), OracleError> {
+    pub fn set_governance(
+        env: Env,
+        admin: Address,
+        governance: Address,
+    ) -> Result<(), OracleError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage()
