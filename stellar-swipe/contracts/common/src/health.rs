@@ -1,7 +1,7 @@
 //! Shared contract health reporting for monitoring and front-end probes.
 
 use crate::constants::PLACEHOLDER_ADMIN_STR;
-use soroban_sdk::{contracttype, Address, Env, String};
+use soroban_sdk::{contracttype, Address, Env, String, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

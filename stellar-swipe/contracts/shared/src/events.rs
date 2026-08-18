@@ -365,6 +365,37 @@ pub fn emit_fee_deducted_from_received(env: &Env, evt: EvtFeeDeductedFromReceive
     );
 }
 
+// ── Partial fill event (Issue #959) ──────────────────────────────────────────
+
+/// Emitted when a copy-trade SDEX offer is only partially matched.
+/// Indexers should record the shortfall (`remaining_amount`) and surface it to
+/// the follower so they can decide whether to place a follow-up order.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtPartialFill {
+    pub schema_version: u32,
+    /// Address of the follower whose copy-trade was partially filled.
+    pub user: Address,
+    /// Monotonic receipt / trade ID assigned by the executor.
+    pub trade_id: u64,
+    /// Amount originally requested for the copy-trade.
+    pub requested_amount: i128,
+    /// Amount actually filled by the SDEX (may be 0 for a zero-fill).
+    pub filled_amount: i128,
+    /// Unfilled remainder (`requested_amount - filled_amount`).
+    pub remaining_amount: i128,
+}
+
+pub fn emit_partial_fill(env: &Env, evt: EvtPartialFill) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "partial_fill"),
+        ),
+        evt,
+    );
+}
+
 // ── DCA event structs (Issue #360) ───────────────────────────────────────────
 
 #[contracttype]
@@ -1180,8 +1211,6 @@ mod tests {
 // `ledger_sequence` — soroban ledger sequence at publish time.
 // `timestamp` — unix timestamp at publish time.
 
-use soroban_sdk::{contracttype};
-
 #[contracttype]
 pub enum ReplayStorageKey {
     NextEnvelopeId,
@@ -1227,7 +1256,7 @@ pub fn emit_replay_envelope(env: &Env) {
 /// Convenience: emit an envelope immediately followed by a business event.
 /// This helps analytics pipelines pair the envelope metadata with the actual
 /// payload while preserving stable ordering.
-pub fn emit_with_replay<E: soroban_sdk::TryIntoVal<Env, soroban_sdk::Val>>(
+pub fn emit_with_replay<E: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
     env: &Env,
     topic: (Symbol, Symbol),
     event: E,

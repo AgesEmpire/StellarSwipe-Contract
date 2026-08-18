@@ -114,6 +114,9 @@ pub enum StorageKey {
     /// Issue #865: central governance contract address authorized to call
     /// `apply_governance_pause`.
     GovernanceAddress,
+    /// Issue #959: per-user partial fill record keyed by trade receipt ID.
+    /// Stores a `PartialFillRecord` when the SDEX only fills part of the requested amount.
+    PartialFillRecord(Address, u64),
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -123,6 +126,22 @@ pub const CIRCUIT_BREAKER_DURATION_LEDGERS: u32 = 720;
 /// Denominator used to convert `entry_price * amount` into `to_token` units.
 /// Entry prices are expected to be in 7‑decimal format (e.g. 10_000_000 = 1.0).
 const ENTRY_PRICE_DENOMINATOR: i128 = 10_000_000;
+
+/// Recorded when the SDEX only partially matches a copy-trade offer (Issue #959).
+/// Persisted in instance storage under `StorageKey::PartialFillRecord(user, trade_id)`
+/// so the frontend / keeper can inspect the shortfall without re-parsing events.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialFillRecord {
+    /// Amount originally submitted to the SDEX.
+    pub requested_amount: i128,
+    /// Amount actually received from the SDEX.
+    pub filled_amount: i128,
+    /// Unfilled remainder (`requested_amount - filled_amount`).
+    pub remaining_amount: i128,
+    /// Ledger sequence at which the partial fill was detected.
+    pub detected_at_ledger: u32,
+}
 
 /// A trade queued for execution, subject to a configurable grace period.
 #[contracttype]
@@ -655,8 +674,10 @@ pub struct SimulationResult {
     pub required_balance: i128,
     pub validations: SimulationValidations,
     /// The first failing check, in the same evaluation order as `execute_market_copy_trade`.
-    /// `None` when `would_succeed` is true.
-    pub failure_reason: Option<ContractError>,
+    /// `None` when `would_succeed` is true. Stores the `ContractError` discriminant as `u32`
+    /// (cast from `ContractError as u32`) because `contracterror` enums cannot be embedded
+    /// directly in a `contracttype` struct.
+    pub failure_reason: Option<u32>,
 }
 
 /// Dry-run a market copy trade. Mirrors the validation gate order in
@@ -675,10 +696,10 @@ fn simulate_market_copy_trade(
     amount: i128,
     portfolio_pct_bps: Option<u32>,
 ) -> SimulationResult {
-    let mut failure_reason: Option<ContractError> = None;
-    let fail = |reason: ContractError, failure_reason: &mut Option<ContractError>| {
+    let mut failure_reason: Option<u32> = None;
+    let fail = |reason: ContractError, failure_reason: &mut Option<u32>| {
         if failure_reason.is_none() {
-            *failure_reason = Some(reason);
+            *failure_reason = Some(reason as u32);
         }
     };
 
@@ -1216,6 +1237,125 @@ impl TradeExecutorContract {
 
         Ok(())
     }
+
+    // ── Partial fill handling (Issue #959) ────────────────────────────────────
+
+    /// Report a partial fill for a pending copy-trade.
+    ///
+    /// Called by a keeper / off-chain executor once the SDEX path-payment or
+    /// offer response is known.  When `filled_amount < requested_amount`, the
+    /// contract:
+    ///
+    /// 1. Validates inputs (amounts non-negative, filled ≤ requested, trade exists).
+    /// 2. Records a [`PartialFillRecord`] in persistent storage so the frontend
+    ///    can surface the shortfall without re-scanning events.
+    /// 3. Updates the pending-trade status to [`wire::TradeStatus::PartiallyFilled`].
+    /// 4. Emits a [`shared::events::EvtPartialFill`] event containing
+    ///    `requested_amount`, `filled_amount`, and `remaining_amount`.
+    ///
+    /// A 100 % fill (`filled_amount == requested_amount`) is accepted as a no-op
+    /// (no partial-fill event is emitted) so callers can always report the SDEX
+    /// result without needing to pre-check.
+    ///
+    /// A 0 % fill (`filled_amount == 0`) is valid and emits the event with
+    /// `remaining_amount == requested_amount`.
+    ///
+    /// # Parameters
+    /// - `caller`: Address of the authorised keeper reporting the fill.
+    /// - `user`: Address of the follower whose trade was partially filled.
+    /// - `trade_id`: Receipt ID previously assigned by `execute_copy_trade`.
+    /// - `requested_amount`: Amount that was submitted to the SDEX.
+    /// - `filled_amount`: Amount actually matched by the SDEX (0 ≤ filled ≤ requested).
+    ///
+    /// # Errors
+    /// - [`ContractError::Unauthorized`] — `caller` is not the contract admin.
+    /// - [`ContractError::InvalidAmount`] — amounts are negative or filled > requested.
+    /// - [`ContractError::TradeNotFound`] — no pending trade matches the given IDs.
+    pub fn record_partial_fill(
+        env: Env,
+        caller: Address,
+        user: Address,
+        trade_id: u64,
+        requested_amount: i128,
+        filled_amount: i128,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        require_admin(&env)?;
+
+        // ── Input validation ──────────────────────────────────────────────
+        if requested_amount < 0 || filled_amount < 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+        if filled_amount > requested_amount {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        // ── Verify the pending trade exists and belongs to this user ──────
+        let mut order: wire::TradeOrder = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingTradeConfirmation)
+            .ok_or(ContractError::TradeNotFound)?;
+
+        if order.trade_id != trade_id || order.user != user {
+            return Err(ContractError::TradeNotFound);
+        }
+
+        // 100 % fill: no partial-fill record or event needed.
+        if filled_amount == requested_amount {
+            return Ok(());
+        }
+
+        let remaining_amount = requested_amount
+            .checked_sub(filled_amount)
+            .unwrap_or(requested_amount);
+
+        // ── Persist the partial fill record ───────────────────────────────
+        let record = PartialFillRecord {
+            requested_amount,
+            filled_amount,
+            remaining_amount,
+            detected_at_ledger: env.ledger().sequence(),
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::PartialFillRecord(user.clone(), trade_id), &record);
+
+        // ── Update pending trade status ───────────────────────────────────
+        order.status = wire::TradeStatus::PartiallyFilled;
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingTradeConfirmation, &order);
+
+        // ── Emit partial_fill event ───────────────────────────────────────
+        shared::events::emit_partial_fill(
+            &env,
+            shared::events::EvtPartialFill {
+                schema_version: shared::events::SCHEMA_VERSION,
+                user,
+                trade_id,
+                requested_amount,
+                filled_amount,
+                remaining_amount,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Read-only: return the [`PartialFillRecord`] for `(user, trade_id)`, if any.
+    ///
+    /// Returns `None` when the trade was fully filled or no partial-fill was reported.
+    pub fn get_partial_fill(
+        env: Env,
+        user: Address,
+        trade_id: u64,
+    ) -> Option<PartialFillRecord> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::PartialFillRecord(user, trade_id))
+    }
+
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
         m.set(

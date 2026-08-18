@@ -187,6 +187,9 @@ impl ContractError {
             ContractError::TradeExpired => {
                 "trade's expiry_ts has passed; the replay-protection window has closed"
             }
+            ContractError::ContractPaused => {
+                "contract is paused via governance-driven emergency pause; try again later"
+            }
         }
     }
 }
