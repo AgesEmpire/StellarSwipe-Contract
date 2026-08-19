@@ -3643,6 +3643,9 @@ mod test_adoption;
 /// Signal categorization query tests (Issue #660).
 #[cfg(test)]
 mod test_categorization;
+/// Composite churn-risk scoring tests (Issue #944).
+#[cfg(test)]
+mod test_churn_risk;
 #[cfg(test)]
 mod test_daily_signal_limit;
 #[cfg(test)]
