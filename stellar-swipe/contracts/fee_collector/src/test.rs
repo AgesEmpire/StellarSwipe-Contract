@@ -2069,3 +2069,187 @@ fn test_insurance_payout_invalid_amount() {
     let res_neg = client.try_payout_insurance(&admin, &provider, &token, &-50i128, &claim_neg);
     assert_eq!(res_neg, Err(Ok(ContractError::InvalidAmount)));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #940: Fee rebate cap tests
+// ---------------------------------------------------------------------------
+
+/// Helper: sets pending fees for a provider directly in contract storage.
+fn set_provider_pending(env: &Env, contract_id: &Address, provider: &Address, token: &Address, amount: i128) {
+    env.as_contract(contract_id, || {
+        set_pending_fees(env, provider, token, amount);
+    });
+}
+
+/// Helper: records daily fee total for the current epoch day.
+fn set_epoch_fees(env: &Env, contract_id: &Address, token: &Address, amount: i128) {
+    let epoch_day = env.ledger().timestamp() / crate::storage::SECONDS_PER_DAY_FC;
+    env.as_contract(contract_id, || {
+        crate::storage::add_daily_fee_total(env, token, epoch_day, amount);
+    });
+}
+
+#[test]
+fn test_claim_fees_below_rebate_cap_pays_full_amount() {
+    // Total rebates below cap → each provider receives full pending amount.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Epoch fees: 1_000. Cap at 80% = 800. Pending = 500 (well below cap).
+    let epoch_fees: i128 = 1_000;
+    let pending: i128 = 500;
+    set_epoch_fees(&env, &contract_id, &token, epoch_fees);
+    set_provider_pending(&env, &contract_id, &provider, &token, pending);
+    StellarAssetClient::new(&env, &token).mint(&contract_id, &pending);
+
+    let claimed = client.claim_fees(&provider, &token);
+    // Full amount paid — no cap triggered.
+    assert_eq!(claimed, pending);
+    assert_eq!(TokenClient::new(&env, &token).balance(&provider), pending);
+}
+
+#[test]
+fn test_claim_fees_above_rebate_cap_scales_proportionally() {
+    // Total rebates above cap → provider receives the capped (scaled-down) amount.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Epoch fees: 1_000. Cap at 80% = 800. Pending = 1_200 (exceeds cap).
+    let epoch_fees: i128 = 1_000;
+    let pending: i128 = 1_200;
+    let expected_cap: i128 = 800; // 1_000 * 8_000 / 10_000
+    set_epoch_fees(&env, &contract_id, &token, epoch_fees);
+    set_provider_pending(&env, &contract_id, &provider, &token, pending);
+    StellarAssetClient::new(&env, &token).mint(&contract_id, &pending);
+
+    let claimed = client.claim_fees(&provider, &token);
+    // Cap triggered: provider receives only the cap amount.
+    assert_eq!(claimed, expected_cap);
+    assert_eq!(TokenClient::new(&env, &token).balance(&provider), expected_cap);
+}
+
+#[test]
+fn test_claim_fees_exactly_at_rebate_cap_pays_full() {
+    // Single claimant at exactly the cap → receives exactly the cap amount in full.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Epoch fees: 1_000. Cap = 80% = 800. Pending = exactly 800.
+    let epoch_fees: i128 = 1_000;
+    let pending: i128 = 800; // exactly at cap
+    set_epoch_fees(&env, &contract_id, &token, epoch_fees);
+    set_provider_pending(&env, &contract_id, &provider, &token, pending);
+    StellarAssetClient::new(&env, &token).mint(&contract_id, &pending);
+
+    let claimed = client.claim_fees(&provider, &token);
+    // Exactly at cap: full amount paid, no scaling needed.
+    assert_eq!(claimed, pending);
+    assert_eq!(TokenClient::new(&env, &token).balance(&provider), pending);
+}
+
+#[test]
+fn test_set_max_rebate_bps_admin_only() {
+    // Non-admin cannot set max rebate bps.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Admin can set it.
+    client.set_max_rebate_bps(&5_000u32);
+    assert_eq!(client.get_max_rebate_bps(), 5_000u32);
+
+    // Exceeding 10_000 is rejected.
+    let result = client.try_set_max_rebate_bps(&10_001u32);
+    assert_eq!(result, Err(Ok(ContractError::InvalidFeeConfiguration)));
+}
+
+#[test]
+fn test_get_max_rebate_bps_default_is_8000() {
+    // Unset → default 8000.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    assert_eq!(client.get_max_rebate_bps(), 8_000u32);
+}
+
+#[test]
+fn test_rebate_cap_second_claim_uses_remaining_headroom() {
+    // Two sequential claims in the same epoch: second gets only the leftover headroom.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider_a = Address::generate(&env);
+    let provider_b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Epoch fees: 1_000. Cap = 80% = 800.
+    // Provider A pending = 600. Provider B pending = 400.
+    // After A claims 600, headroom = 200. B can only get 200.
+    let epoch_fees: i128 = 1_000;
+    set_epoch_fees(&env, &contract_id, &token, epoch_fees);
+
+    set_provider_pending(&env, &contract_id, &provider_a, &token, 600);
+    set_provider_pending(&env, &contract_id, &provider_b, &token, 400);
+    StellarAssetClient::new(&env, &token).mint(&contract_id, &1_000i128);
+
+    let claimed_a = client.claim_fees(&provider_a, &token);
+    assert_eq!(claimed_a, 600); // under cap
+
+    let claimed_b = client.claim_fees(&provider_b, &token);
+    assert_eq!(claimed_b, 200); // only headroom remaining (800 - 600 = 200)
+
+    assert_eq!(TokenClient::new(&env, &token).balance(&provider_a), 600);
+    assert_eq!(TokenClient::new(&env, &token).balance(&provider_b), 200);
+}

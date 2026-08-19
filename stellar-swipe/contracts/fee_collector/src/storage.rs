@@ -145,6 +145,10 @@ pub enum StorageKey {
     InsurancePayoutCap(Address),
     /// #960: Processed insurance claim ID tracking to prevent duplicate payouts.
     ProcessedInsuranceClaim(String),
+    /// #940: Maximum rebate bps cap (default: 8000 = 80% of epoch fees).
+    MaxRebateBps,
+    /// #940: Total rebates distributed in a given epoch (token, epoch_day).
+    EpochRebateDistributed(Address, u64),
 }
 
 #[contracttype]
@@ -1050,5 +1054,47 @@ pub fn set_insurance_claim_processed(env: &Env, claim_id: &String, processed: bo
         StorageTier::Persistent,
         &StorageKey::ProcessedInsuranceClaim(claim_id.clone()),
         &processed,
+    );
+}
+
+// ── Issue #940: Fee Rebate Cap Storage ───────────────────────────────────────
+
+/// Default maximum rebate as a percentage of epoch fees (80%).
+pub const DEFAULT_MAX_REBATE_BPS: u32 = 8_000;
+
+/// Returns the configured maximum rebate bps.
+/// Defaults to 8000 (80% of epoch fees may be rebated).
+pub fn get_max_rebate_bps(env: &Env) -> u32 {
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &StorageKey::MaxRebateBps,
+        DEFAULT_MAX_REBATE_BPS,
+    )
+}
+
+/// Stores the maximum rebate bps (admin-only, must be <= 10_000).
+pub fn set_max_rebate_bps(env: &Env, bps: u32) {
+    crud_set(env, StorageTier::Instance, &StorageKey::MaxRebateBps, &bps);
+}
+
+/// Returns total rebates distributed in the given epoch (token, epoch_day).
+pub fn get_epoch_rebate_distributed(env: &Env, token: &Address, epoch_day: u64) -> i128 {
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::EpochRebateDistributed(token.clone(), epoch_day),
+        0i128,
+    )
+}
+
+/// Accumulates rebate distributed for an epoch.
+pub fn add_epoch_rebate_distributed(env: &Env, token: &Address, epoch_day: u64, amount: i128) {
+    let current = get_epoch_rebate_distributed(env, token, epoch_day);
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::EpochRebateDistributed(token.clone(), epoch_day),
+        &current.saturating_add(amount),
     );
 }
