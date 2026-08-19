@@ -2075,7 +2075,13 @@ fn test_insurance_payout_invalid_amount() {
 // ---------------------------------------------------------------------------
 
 /// Helper: sets pending fees for a provider directly in contract storage.
-fn set_provider_pending(env: &Env, contract_id: &Address, provider: &Address, token: &Address, amount: i128) {
+fn set_provider_pending(
+    env: &Env,
+    contract_id: &Address,
+    provider: &Address,
+    token: &Address,
+    amount: i128,
+) {
     env.as_contract(contract_id, || {
         set_pending_fees(env, provider, token, amount);
     });
@@ -2147,7 +2153,10 @@ fn test_claim_fees_above_rebate_cap_scales_proportionally() {
     let claimed = client.claim_fees(&provider, &token);
     // Cap triggered: provider receives only the cap amount.
     assert_eq!(claimed, expected_cap);
-    assert_eq!(TokenClient::new(&env, &token).balance(&provider), expected_cap);
+    assert_eq!(
+        TokenClient::new(&env, &token).balance(&provider),
+        expected_cap
+    );
 }
 
 #[test]
