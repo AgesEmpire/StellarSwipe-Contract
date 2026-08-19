@@ -31,8 +31,8 @@ pub use reports::{EarningsLeaderboardEntry, EarningsReport, ReportPeriod};
 mod storage;
 pub use storage::BalanceMismatch;
 use storage::{
-    add_daily_fee_total, add_epoch_rebate_distributed, add_to_revenue_share_pool_index,
-    get_admin, get_burn_rate, get_congestion_config, get_congestion_signal, get_daily_fee_total,
+    add_daily_fee_total, add_epoch_rebate_distributed, add_to_revenue_share_pool_index, get_admin,
+    get_burn_rate, get_congestion_config, get_congestion_signal, get_daily_fee_total,
     get_epoch_rebate_distributed, get_failed_fee_collection, get_fee_optimization_config,
     get_fee_rate, get_fee_snapshot, get_forecast_config, get_last_error_report,
     get_last_forecast_day, get_max_rebate_bps, get_monthly_trade_volume,
