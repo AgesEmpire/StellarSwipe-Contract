@@ -511,3 +511,23 @@ pub fn emit_insurance_payout_cap_updated(
         (token.clone(), old_cap, new_cap, updated_by.clone()),
     );
 }
+
+// ── Issue #940: Rebate Cap Applied event ────────────────────────────────────
+
+/// Emitted when the per-epoch rebate cap is triggered and provider claims
+/// are scaled down proportionally.
+pub struct EvtRebateCapApplied {
+    pub epoch: u64,
+    pub requested: i128,
+    pub distributed: i128,
+}
+
+pub fn emit_rebate_cap_applied(env: &Env, evt: EvtRebateCapApplied) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "rebate_cap_applied"),
+        ),
+        (evt.epoch, evt.requested, evt.distributed),
+    );
+}

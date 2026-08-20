@@ -9,13 +9,13 @@ use events::{
     emit_effective_multiplier_changed, emit_error_reported, emit_fee_collected, emit_fee_forecast,
     emit_fee_rate_updated, emit_fees_claimed, emit_fees_claimed_converted,
     emit_first_trade_fee_waived, emit_insurance_payout, emit_insurance_payout_cap_updated,
-    emit_network_condition_updated, emit_payout_currency_set, emit_referral_fee_paid,
-    emit_referral_fee_share_updated, emit_referral_registered, emit_retry_attempted,
-    emit_snapshot_recorded, emit_treasury_withdrawal, emit_volume_discount_config_updated,
-    emit_waterfall_distribution, emit_withdrawal_queued, EvtEffectiveMultiplierChanged,
-    EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed, EvtInsurancePayout,
-    EvtNetworkConditionUpdated, EvtRetryAttempted, EvtSnapshotRecorded, EvtTreasuryWithdrawal,
-    EvtWithdrawalQueued,
+    emit_network_condition_updated, emit_payout_currency_set, emit_rebate_cap_applied,
+    emit_referral_fee_paid, emit_referral_fee_share_updated, emit_referral_registered,
+    emit_retry_attempted, emit_snapshot_recorded, emit_treasury_withdrawal,
+    emit_volume_discount_config_updated, emit_waterfall_distribution, emit_withdrawal_queued,
+    EvtEffectiveMultiplierChanged, EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated,
+    EvtFeesClaimed, EvtInsurancePayout, EvtNetworkConditionUpdated, EvtRebateCapApplied,
+    EvtRetryAttempted, EvtSnapshotRecorded, EvtTreasuryWithdrawal, EvtWithdrawalQueued,
 };
 pub use events::{
     EffectiveMultiplierChanged, FeeRateUpdated, FeesBurned, FeesClaimed, FirstTradeFeeWaived,
@@ -31,10 +31,11 @@ pub use reports::{EarningsLeaderboardEntry, EarningsReport, ReportPeriod};
 mod storage;
 pub use storage::BalanceMismatch;
 use storage::{
-    add_daily_fee_total, add_to_revenue_share_pool_index, get_admin, get_burn_rate,
-    get_congestion_config, get_congestion_signal, get_daily_fee_total, get_failed_fee_collection,
-    get_fee_optimization_config, get_fee_rate, get_fee_snapshot, get_forecast_config,
-    get_last_error_report, get_last_forecast_day, get_monthly_trade_volume,
+    add_daily_fee_total, add_epoch_rebate_distributed, add_to_revenue_share_pool_index, get_admin,
+    get_burn_rate, get_congestion_config, get_congestion_signal, get_daily_fee_total,
+    get_epoch_rebate_distributed, get_failed_fee_collection, get_fee_optimization_config,
+    get_fee_rate, get_fee_snapshot, get_forecast_config, get_last_error_report,
+    get_last_forecast_day, get_max_rebate_bps, get_monthly_trade_volume,
     get_network_condition_score, get_oracle_contract, get_pending_fees,
     get_provider_payout_currency, get_queued_withdrawal, get_referral_fee_share_bps, get_referrer,
     get_revenue_share_pool_index, get_treasury_balance, get_volume_discount_config,
@@ -45,7 +46,8 @@ use storage::{
     set_congestion_config, set_congestion_signal, set_failed_fee_collection,
     set_fee_optimization_config, set_fee_rate as set_fee_rate_storage, set_fee_snapshot,
     set_forecast_config_storage, set_has_traded, set_initialized, set_last_error_report,
-    set_last_forecast_day, set_monthly_trade_volume, set_network_condition_score,
+    set_last_forecast_day, set_max_rebate_bps as set_max_rebate_bps_storage,
+    set_monthly_trade_volume, set_network_condition_score,
     set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
     set_provider_payout_currency, set_queued_withdrawal, set_referral_fee_share_bps, set_referrer,
     set_treasury_balance, set_volume_discount_config_storage,
@@ -1279,20 +1281,64 @@ impl FeeCollector {
         auth_args.push_back(token.clone().into_val(&env));
         provider.require_auth_for_args(auth_args);
 
-        let amount = get_pending_fees(&env, &provider, &token);
+        let requested = get_pending_fees(&env, &provider, &token);
 
-        if amount > 0 {
-            // #691 – honour preferred payout currency when set and conversion succeeds.
-            let converted = if let Some(pref_token) = get_provider_payout_currency(&env, &provider)
-            {
-                if pref_token != token {
-                    Self::try_claim_in_preferred_currency(
+        if requested > 0 {
+            // ── Issue #940: Per-epoch rebate cap ─────────────────────────────
+            // Compute capped amount: cap = epoch_fees * max_rebate_bps / 10_000.
+            // If the remaining headroom for this epoch is less than the requested
+            // amount, scale the claim down proportionally and emit RebateCapApplied.
+            // When epoch_fees is zero (epoch just started or no fees yet), bypass
+            // the cap to avoid blocking legitimate claims.
+            let epoch_day = env.ledger().timestamp() / SECONDS_PER_DAY_FC;
+            let epoch_fees = get_daily_fee_total(&env, &token, epoch_day);
+            let max_rebate_bps = get_max_rebate_bps(&env);
+
+            let amount = if epoch_fees > 0 {
+                let epoch_cap = epoch_fees
+                    .checked_mul(max_rebate_bps as i128)
+                    .and_then(|v| v.checked_div(10_000))
+                    .unwrap_or(i128::MAX);
+                let already_distributed = get_epoch_rebate_distributed(&env, &token, epoch_day);
+                let remaining_headroom = epoch_cap.saturating_sub(already_distributed);
+
+                if remaining_headroom < requested {
+                    // Cap triggered: scale down and emit event.
+                    emit_rebate_cap_applied(
                         &env,
-                        &provider,
-                        &token,
-                        amount,
-                        &pref_token,
-                    )
+                        EvtRebateCapApplied {
+                            epoch: epoch_day,
+                            requested,
+                            distributed: remaining_headroom,
+                        },
+                    );
+                    remaining_headroom
+                } else {
+                    requested
+                }
+            } else {
+                requested
+            };
+
+            // Record how much was distributed this epoch before transfer.
+            if amount > 0 && epoch_fees > 0 {
+                add_epoch_rebate_distributed(&env, &token, epoch_day, amount);
+            }
+
+            // #691 – honour preferred payout currency when set and conversion succeeds.
+            let converted = if amount > 0 {
+                if let Some(pref_token) = get_provider_payout_currency(&env, &provider) {
+                    if pref_token != token {
+                        Self::try_claim_in_preferred_currency(
+                            &env,
+                            &provider,
+                            &token,
+                            amount,
+                            &pref_token,
+                        )
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -1302,11 +1348,13 @@ impl FeeCollector {
 
             if converted.is_none() {
                 // Default: settle in source token.
-                token::Client::new(&env, &token).transfer(
-                    &env.current_contract_address(),
-                    &provider,
-                    &amount,
-                );
+                if amount > 0 {
+                    token::Client::new(&env, &token).transfer(
+                        &env.current_contract_address(),
+                        &provider,
+                        &amount,
+                    );
+                }
                 set_pending_fees(&env, &provider, &token, 0);
                 emit_fees_claimed(
                     &env,
@@ -1317,6 +1365,8 @@ impl FeeCollector {
                     },
                 );
             }
+
+            Ok(amount)
         } else {
             emit_fees_claimed(
                 &env,
@@ -1326,9 +1376,8 @@ impl FeeCollector {
                     amount: 0,
                 },
             );
+            Ok(0)
         }
-
-        Ok(amount)
     }
 
     /// Attempt to convert `source_amount` of `source_token` into `pref_token`
@@ -1968,6 +2017,37 @@ impl FeeCollector {
         let old_bps = get_referral_fee_share_bps(&env);
         set_referral_fee_share_bps(&env, share_bps);
         emit_referral_fee_share_updated(&env, old_bps, share_bps, &admin);
+        Ok(())
+    }
+
+    // ── Issue #940: Fee Rebate Cap ─────────────────────────────────────────────
+
+    /// Returns the current maximum rebate bps setting.
+    /// Defaults to 8000 (80% of epoch fees).
+    pub fn get_max_rebate_bps(env: Env) -> u32 {
+        get_max_rebate_bps(&env)
+    }
+
+    /// Admin: configure the maximum fraction of epoch fees that may be rebated
+    /// to providers in a single epoch.
+    ///
+    /// - `bps` must be in `[0, 10_000]`.
+    /// - Default: 8000 (80%).
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not yet initialized.
+    /// - [`ContractError::Unauthorized`] — caller is not the admin.
+    /// - [`ContractError::InvalidFeeConfiguration`] — `bps` exceeds 10_000.
+    pub fn set_max_rebate_bps(env: Env, bps: u32) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        if bps > 10_000 {
+            return Err(ContractError::InvalidFeeConfiguration);
+        }
+        set_max_rebate_bps_storage(&env, bps);
         Ok(())
     }
 
