@@ -141,6 +141,10 @@ const DEFAULT_MAX_UNSTAKE_QUEUE_SIZE: u32 = 200;
 /// Maximum number of items permitted in a batch operation (e.g. batch_slash_stake, batch_resolve_appeal).
 const MAX_BATCH_SIZE: u32 = 100;
 
+/// Default cooldown window in ledgers between slash events for the same
+/// provider.  Approx. 8 minutes on Stellar mainnet (~5 s per ledger).
+const DEFAULT_SLASH_COOLDOWN_LEDGERS: u32 = 100;
+
 pub const GOLD_TIER_STAKE: i128 = 1_000_000_000;
 pub const SILVER_TIER_STAKE: i128 = GOLD_TIER_STAKE / 2;
 pub const BRONZE_TIER_STAKE: i128 = GOLD_TIER_STAKE / 10;
@@ -255,6 +259,11 @@ pub enum StorageKey {
     SlashAppeal(u64),
     SlashedFundsHeld(u64),
     AppealWindowSecs,
+    // ── Slash cooldown (issue #816) ──────────────────────────────────────────
+    /// Ledger sequence of the most recent global slash event.
+    LastSlashLedger,
+    /// Admin-configurable cooldown (in ledgers) between slash events.
+    SlashCooldownLedgers,
     // ── Issue #816: configurable withdrawal cooldown ───────────────────────────
     /// Admin-configurable large-withdrawal time-lock duration (seconds).
     /// Falls back to `LARGE_WITHDRAWAL_TIMELOCK_SECS` when unset.
@@ -363,6 +372,9 @@ pub enum StakeVaultError {
     BatchSizeInvalid = 39,
     /// Lengths of parallel batch parameter arrays do not match.
     BatchLengthMismatch = 40,
+    // ── Slash cooldown ────────────────────────────────────────────────────────
+    /// A slash was attempted within the cooldown window after a prior slash.
+    SlashCooldownActive = 41,
 }
 
 impl StakeVaultError {
@@ -461,6 +473,9 @@ impl StakeVaultError {
             StakeVaultError::BatchLengthMismatch => {
                 "batch parameter arrays have mismatched lengths"
             }
+            StakeVaultError::SlashCooldownActive => {
+                "slash cooldown is active; wait for the cooldown window to expire"
+            }
         }
     }
 }
@@ -505,6 +520,8 @@ pub struct SlashRecord {
     pub slashed_at: u64,
     /// Textual reason passed in to slash_stake.
     pub reason: Symbol,
+    /// Ledger sequence when the cooldown expires (0 if no cooldown configured).
+    pub cooldown_expires_at: u32,
 }
 
 /// Mutable appeal record created when a provider calls `appeal_slash`.
@@ -1911,6 +1928,22 @@ impl StakeVaultContract {
             .get(&StorageKey::StakeToken)
             .ok_or(StakeVaultError::NotInitialized)?;
 
+        // ── Slash cooldown check ──────────────────────────────────────────────
+        let current_ledger = env.ledger().sequence();
+        let last_slash_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::LastSlashLedger)
+            .unwrap_or(0);
+        let cooldown: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SlashCooldownLedgers)
+            .unwrap_or(DEFAULT_SLASH_COOLDOWN_LEDGERS);
+        if last_slash_ledger > 0 && current_ledger.saturating_sub(last_slash_ledger) < cooldown {
+            return Err(StakeVaultError::SlashCooldownActive);
+        }
+
         let cfg: SlashTierConfig = env
             .storage()
             .instance()
@@ -2012,10 +2045,16 @@ impl StakeVaultContract {
             slash_amount,
             slashed_at: env.ledger().timestamp(),
             reason: reason.clone(),
+            cooldown_expires_at: if cooldown > 0 { current_ledger.saturating_add(cooldown) } else { 0 },
         };
         env.storage()
             .persistent()
             .set(&StorageKey::SlashRecord(slash_id), &record);
+
+        // ── Record last slash ledger for cooldown enforcement ──────────────────
+        env.storage()
+            .instance()
+            .set(&StorageKey::LastSlashLedger, &current_ledger);
 
         // ── Hold slashed funds pending appeal resolution (issue #689) ──────────
         // Tokens remain in the vault's custody and are NOT burned until the
@@ -2048,6 +2087,31 @@ impl StakeVaultContract {
         );
 
         Ok(slash_amount)
+    }
+
+    // ── Slash cooldown (issue #816) ────────────────────────────────────────────
+
+    /// Admin: configure the cooldown window (in ledgers) between slash events.
+    /// Set to 0 to disable the cooldown entirely.
+    pub fn set_slash_cooldown(env: Env, ledgers: u32) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .unwrap();
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::SlashCooldownLedgers, &ledgers);
+        events::emit_slash_cooldown_updated(&env, ledgers);
+    }
+
+    /// Returns the configured slash cooldown window in ledgers (default: 100).
+    pub fn get_slash_cooldown(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::SlashCooldownLedgers)
+            .unwrap_or(DEFAULT_SLASH_COOLDOWN_LEDGERS)
     }
 
     // ── Issue #689: Slash appeal window ────────────────────────────────────────
