@@ -68,6 +68,11 @@ jobs:
       - name: Tests
         run: cd stellar-swipe && cargo test --workspace --all-targets
 
+      # Property-based tests: verify quality score stays in [0, 100] (issue #780)
+      - name: Proptest (signal_registry)
+        if: github.event_name == 'pull_request'
+        run: cd stellar-swipe && cargo test -p signal_registry --features proptest
+
       # Supply-chain: license, banned crates, source restrictions, advisories.
       # Policy lives in stellar-swipe/deny.toml.  Any violation fails the build.
       # To request a new dependency or policy exception see CONTRIBUTING.md.
