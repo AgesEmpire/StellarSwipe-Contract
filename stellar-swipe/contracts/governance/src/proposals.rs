@@ -634,7 +634,42 @@ pub fn simulate_proposal_action(
 
 pub fn simulate_proposal(env: &Env, proposal_id: u64) -> Result<SimulationResult, GovernanceError> {
     let proposal = get_proposal(env, proposal_id)?;
-    simulate_proposal_action(env, &proposal)
+    let result = simulate_proposal_action(env, &proposal)?;
+
+    // Build human-readable summaries of the simulated state changes.
+    let mut state_changes: Vec<String> = Vec::new(env);
+    let mut i = 0u32;
+    while i < result.effects.len() {
+        let effect = result.effects.get(i).unwrap();
+        let summary = effect.key.clone()
+            + String::from_str(env, ": ")
+            + effect.current.clone()
+            + String::from_str(env, " -> ")
+            + effect.proposed.clone();
+        state_changes.push_back(summary);
+        i += 1;
+    }
+
+    let failure_reason = if result.success {
+        None
+    } else {
+        Some(result.error.clone())
+    };
+
+    let shadow_result = crate::shadow_mode::ShadowModeResult {
+        proposal_id,
+        success: result.success,
+        simulated_state_changes: state_changes,
+        failure_reason,
+    };
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("shadow"), symbol_short!("simres")),
+        shadow_result,
+    );
+
+    Ok(result)
 }
 
 pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {

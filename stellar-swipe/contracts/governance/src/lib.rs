@@ -84,7 +84,7 @@ use reputation::{
     record_proposal_outcome, record_vote, refresh_stale_reputation, resolve_staleness, Badge,
     GovernanceReputation, ReputationConfig, ReputationTier, StalenessLevel,
 };
-pub use shadow_mode::ShadowModeState;
+pub use shadow_mode::{ShadowModeResult, ShadowModeState};
 use shared::capabilities::{self, Capability, CapabilityError};
 use shared::pausable;
 use soroban_sdk::{
