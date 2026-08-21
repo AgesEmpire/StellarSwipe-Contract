@@ -2638,9 +2638,10 @@ impl TradeExecutorContract {
             remaining_amount,
             detected_at_ledger: env.ledger().sequence(),
         };
-        env.storage()
-            .instance()
-            .set(&StorageKey::PartialFillRecord(user.clone(), trade_id), &record);
+        env.storage().instance().set(
+            &StorageKey::PartialFillRecord(user.clone(), trade_id),
+            &record,
+        );
 
         order.status = wire::TradeStatus::PartiallyFilled;
         env.storage()
@@ -2665,11 +2666,7 @@ impl TradeExecutorContract {
     /// Return the [`PartialFillRecord`] for `(user, trade_id)`, if any.
     ///
     /// Returns `None` when the trade was fully filled or no partial-fill was reported.
-    pub fn get_partial_fill(
-        env: Env,
-        user: Address,
-        trade_id: u64,
-    ) -> Option<PartialFillRecord> {
+    pub fn get_partial_fill(env: Env, user: Address, trade_id: u64) -> Option<PartialFillRecord> {
         env.storage()
             .instance()
             .get(&StorageKey::PartialFillRecord(user, trade_id))

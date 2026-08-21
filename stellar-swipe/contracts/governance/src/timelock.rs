@@ -508,9 +508,7 @@ pub fn execute_admin_action(
 ) -> Result<Symbol, GovernanceError> {
     caller.require_auth();
 
-    if env.ledger().timestamp()
-        < get_admin_action_execution_available(env, action_id)?
-    {
+    if env.ledger().timestamp() < get_admin_action_execution_available(env, action_id)? {
         return Err(GovernanceError::InvalidDuration);
     }
 
@@ -573,10 +571,7 @@ pub fn cancel_admin_action(
     Err(GovernanceError::ActionNotFound)
 }
 
-fn get_admin_action_execution_available(
-    env: &Env,
-    action_id: u64,
-) -> Result<u64, GovernanceError> {
+fn get_admin_action_execution_available(env: &Env, action_id: u64) -> Result<u64, GovernanceError> {
     let pending = get_admin_pending_actions(env);
     let mut i = 0;
     while i < pending.len() {

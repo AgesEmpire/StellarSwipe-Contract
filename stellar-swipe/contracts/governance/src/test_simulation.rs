@@ -259,9 +259,7 @@ fn find_shadow_sim_result_event(env: &Env) -> ShadowModeResult {
         let t1 = topics
             .get(1)
             .and_then(|v: Val| Symbol::try_from_val(env, &v).ok());
-        if t0 == Some(Symbol::new(env, "shadow"))
-            && t1 == Some(Symbol::new(env, "simres"))
-        {
+        if t0 == Some(Symbol::new(env, "shadow")) && t1 == Some(Symbol::new(env, "simres")) {
             let decoded = ShadowModeResult::try_from_val(env, &data).unwrap();
             found_data = Some(decoded);
             break;

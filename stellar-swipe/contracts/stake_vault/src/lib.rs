@@ -2045,7 +2045,11 @@ impl StakeVaultContract {
             slash_amount,
             slashed_at: env.ledger().timestamp(),
             reason: reason.clone(),
-            cooldown_expires_at: if cooldown > 0 { current_ledger.saturating_add(cooldown) } else { 0 },
+            cooldown_expires_at: if cooldown > 0 {
+                current_ledger.saturating_add(cooldown)
+            } else {
+                0
+            },
         };
         env.storage()
             .persistent()
@@ -2094,11 +2098,7 @@ impl StakeVaultContract {
     /// Admin: configure the cooldown window (in ledgers) between slash events.
     /// Set to 0 to disable the cooldown entirely.
     pub fn set_slash_cooldown(env: Env, ledgers: u32) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::Admin)
-            .unwrap();
+        let admin: Address = env.storage().instance().get(&StorageKey::Admin).unwrap();
         admin.require_auth();
         env.storage()
             .instance()

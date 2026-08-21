@@ -2261,7 +2261,10 @@ fn test_fee_cache_invalidated_on_set_fee_rate() {
 
     // (c) Must reflect the new rate immediately — cache must not serve stale 30.
     let rate_after = client.current_dynamic_fee_rate(&trader, &token, &trade_asset(&env));
-    assert_eq!(rate_after, 60u32, "cache must be invalidated after set_fee_rate");
+    assert_eq!(
+        rate_after, 60u32,
+        "cache must be invalidated after set_fee_rate"
+    );
 }
 
 /// Same correctness guarantee for set_burn_rate: the cache key changes so
