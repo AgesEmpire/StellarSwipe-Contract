@@ -2604,15 +2604,14 @@ impl TradeExecutorContract {
         requested_amount: i128,
         filled_amount: i128,
     ) -> Result<(), ContractError> {
+        // Validate amounts before auth so InvalidAmount is always the first
+        // error surface for malformed inputs, regardless of caller identity.
+        if requested_amount < 0 || filled_amount < 0 || filled_amount > requested_amount {
+            return Err(ContractError::InvalidAmount);
+        }
+
         caller.require_auth();
         require_admin(&env)?;
-
-        if requested_amount < 0 || filled_amount < 0 {
-            return Err(ContractError::InvalidAmount);
-        }
-        if filled_amount > requested_amount {
-            return Err(ContractError::InvalidAmount);
-        }
 
         let mut order: wire::TradeOrder = env
             .storage()
