@@ -4,14 +4,14 @@ use soroban_sdk::contracterror;
 #[derive(Debug, PartialEq)]
 #[repr(u32)]
 pub enum ContractError {
-    AlreadyInitialized          = 1,
-    NotInitialized              = 2,
-    Unauthorized                = 3,
-    InvalidAmount               = 4,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    InvalidAmount = 4,
     InsufficientTreasuryBalance = 5,
-    WithdrawalNotQueued         = 6,
-    TimelockNotElapsed          = 7,
-    ArithmeticOverflow          = 8,
-    FeeRateTooHigh              = 9,
-    FeeRateTooLow               = 10,
+    WithdrawalNotQueued = 6,
+    TimelockNotElapsed = 7,
+    ArithmeticOverflow = 8,
+    FeeRateTooHigh = 9,
+    FeeRateTooLow = 10,
 }

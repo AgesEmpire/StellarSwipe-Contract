@@ -1,135 +1,5 @@
 #![no_std]
 
- feature/reputation-score
-use soroban_sdk::{contract, contractimpl, contracterror, contracttype, Address, Env, Symbol, symbol_short, token};
-
-use stellar_swipe_common::assets::Asset;
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum FeeCollectorError {
-    TradeTooSmall = 1,
-    ArithmeticOverflow = 2,
-    InvalidAmount = 3,
-    Unauthorized = 4,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FeeConfig {
-    pub max_fee_per_trade: i128, // 100 XLM equivalent
-    pub min_fee_per_trade: i128, // 0.01 XLM equivalent
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub enum StorageKey {
-    ProviderPendingFees(Address, Address),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DataKey {
-    Admin,
-    FeeConfig,
-}
-
-#[contract]
-pub struct FeeCollectorContract;
-
-#[contractimpl]
-impl FeeCollectorContract {
-    /// Initialize the contract with admin and default fee config
-    pub fn initialize(env: Env, admin: Address) {
-        env.storage().instance().set(&DataKey::Admin, &admin);
-
-        // Default config: 100 XLM = 100 * 10^7 stroops = 1_000_000_000
-        // 0.01 XLM = 0.01 * 10^7 = 100_000
-        let default_config = FeeConfig {
-            max_fee_per_trade: 1_000_000_000, // 100 XLM
-            min_fee_per_trade: 100_000,       // 0.01 XLM
-        };
-        env.storage().instance().set(&DataKey::FeeConfig, &default_config);
-    }
-
-    /// Set fee config (admin only)
-    pub fn set_fee_config(env: Env, caller: Address, config: FeeConfig) -> Result<(), FeeCollectorError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != admin {
-            return Err(FeeCollectorError::Unauthorized);
-        }
-
-        if config.min_fee_per_trade <= 0 || config.max_fee_per_trade <= config.min_fee_per_trade {
-            return Err(FeeCollectorError::InvalidAmount);
-        }
-
-        env.storage().instance().set(&DataKey::FeeConfig, &config);
-        Ok(())
-    }
-
-    /// Get current fee config
-    pub fn get_fee_config(env: Env) -> FeeConfig {
-        env.storage().instance().get(&DataKey::FeeConfig).unwrap()
-    }
-
-    /// Collect fee with cap and floor applied
-    /// Returns the clamped fee amount
-    pub fn collect_fee(env: Env, trade_amount: i128, calculated_fee: i128) -> Result<i128, FeeCollectorError> {
-        if trade_amount <= 0 || calculated_fee < 0 {
-            return Err(FeeCollectorError::InvalidAmount);
-        }
-
-        let config = Self::get_fee_config(env);
-
-        // Check if trade amount is too small to cover minimum fee
-        if trade_amount < config.min_fee_per_trade {
-            return Err(FeeCollectorError::TradeTooSmall);
-        }
-
-        // Clamp the fee between min and max
-        let clamped_fee = if calculated_fee < config.min_fee_per_trade {
-            config.min_fee_per_trade
-        } else if calculated_fee > config.max_fee_per_trade {
-            config.max_fee_per_trade
-        } else {
-            calculated_fee
-        };
-
-        // Ensure the clamped fee doesn't exceed the trade amount
-        if clamped_fee > trade_amount {
-            return Err(FeeCollectorError::TradeTooSmall);
-        }
-
-        Ok(clamped_fee)
-    }
-
-    /// Claim pending fees for a provider and token
-    pub fn claim_fees(env: Env, provider: Address, token: Address) -> i128 {
-        provider.require_auth();
-
-        let key = StorageKey::ProviderPendingFees(provider.clone(), token.clone());
-        let amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-
-        if amount > 0 {
-            // Transfer tokens from contract to provider
-            let token_client = token::Client::new(&env, &token);
-            token_client.transfer(&env.current_contract_address(), &provider, &amount);
-
-            // Reset pending balance to 0
-            env.storage().persistent().set(&key, &0);
-        }
-
-        // Emit FeesClaimed event
-        env.events().publish(
-            (symbol_short!("fees"), symbol_short!("claimed")),
-            (provider, amount, token),
-        );
-
-        amount
-    }
-}
-=======
 mod errors;
 pub use errors::ContractError;
 
@@ -138,13 +8,14 @@ pub use events::{FeeRateUpdated, TreasuryWithdrawal, WithdrawalQueued};
 
 mod storage;
 pub use storage::{
-    get_admin, get_fee_rate, get_queued_withdrawal, get_treasury_balance, is_initialized,
-    remove_queued_withdrawal, set_admin, set_fee_rate as set_fee_rate_storage, set_initialized,
-    set_queued_withdrawal, set_treasury_balance, QueuedWithdrawal, StorageKey,
-    MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS,
+    get_admin, get_epoch_fees, get_fee_rate, get_provider_balance, get_queued_withdrawal,
+    get_treasury_balance, is_initialized, remove_queued_withdrawal, set_admin, set_epoch_fees,
+    set_fee_rate as set_fee_rate_storage, set_initialized, set_provider_balance,
+    set_queued_withdrawal, set_treasury_balance, QueuedWithdrawal, StorageKey, MAX_FEE_RATE_BPS,
+    MIN_FEE_RATE_BPS,
 };
 
-use soroban_sdk::{contract, contractimpl, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, Vec};
 
 #[cfg(test)]
 mod test;
@@ -221,11 +92,7 @@ impl FeeCollector {
         admin.require_auth();
 
         let queued = match get_queued_withdrawal(&env) {
-            Some(q)
-                if q.recipient == recipient && q.token == token && q.amount == amount =>
-            {
-                q
-            }
+            Some(q) if q.recipient == recipient && q.token == token && q.amount == amount => q,
             _ => return Err(ContractError::WithdrawalNotQueued),
         };
 
@@ -270,8 +137,6 @@ impl FeeCollector {
     }
 
     /// Admin-only: update the fee rate (in basis points).
-    /// Validates: MIN_FEE_RATE_BPS <= new_rate_bps <= MAX_FEE_RATE_BPS.
-    /// Change takes effect on the next trade — no retroactive application.
     pub fn set_fee_rate(env: Env, new_rate_bps: u32) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
@@ -298,5 +163,109 @@ impl FeeCollector {
 
         Ok(())
     }
+
+    /// Records a fee collected from a copy-trade execution into the current epoch accumulator.
+    /// `fee_amount` is in stroops and must be > 0.
+    pub fn collect_trade_fee(
+        env: Env,
+        token: Address,
+        fee_amount: i128,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        if fee_amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+        let current = get_epoch_fees(&env, &token);
+        let new_total = current
+            .checked_add(fee_amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        set_epoch_fees(&env, &token, new_total);
+        Ok(())
+    }
+
+    /// Closes the current epoch: distributes provider shares and retains the remainder
+    /// as treasury balance.
+    ///
+    /// `providers`      – ordered list of provider addresses
+    /// `shares_bps`     – parallel list of basis-point allocations (must sum ≤ 10_000)
+    ///
+    /// Each provider's credited balance is incremented by:
+    ///   floor(total_epoch_fees * share_bps / 10_000)
+    ///
+    /// Treasury retains: total_epoch_fees - sum(provider_shares)
+    /// Epoch accumulator is reset to 0 after distribution.
+    pub fn close_epoch(
+        env: Env,
+        token: Address,
+        providers: Vec<Address>,
+        shares_bps: Vec<u32>,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+
+        if providers.len() != shares_bps.len() {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let total_fees = get_epoch_fees(&env, &token);
+        if total_fees == 0 {
+            return Ok(());
+        }
+
+        let mut distributed: i128 = 0;
+        let len = providers.len();
+        let mut i: u32 = 0;
+        while i < len {
+            let provider = providers.get(i).unwrap();
+            let bps = shares_bps.get(i).unwrap() as i128;
+            let share = total_fees
+                .checked_mul(bps)
+                .ok_or(ContractError::ArithmeticOverflow)?
+                / 10_000;
+            let prev = get_provider_balance(&env, &provider, &token);
+            let next = prev
+                .checked_add(share)
+                .ok_or(ContractError::ArithmeticOverflow)?;
+            set_provider_balance(&env, &provider, &token, next);
+            distributed = distributed
+                .checked_add(share)
+                .ok_or(ContractError::ArithmeticOverflow)?;
+            i += 1;
+        }
+
+        // Treasury retains the remainder (rounding dust stays here)
+        let treasury_share = total_fees
+            .checked_sub(distributed)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        let prev_treasury = get_treasury_balance(&env, &token);
+        set_treasury_balance(
+            &env,
+            &token,
+            prev_treasury
+                .checked_add(treasury_share)
+                .ok_or(ContractError::ArithmeticOverflow)?,
+        );
+
+        // Reset epoch accumulator
+        set_epoch_fees(&env, &token, 0);
+
+        Ok(())
+    }
+
+    /// Returns the credited (undistributed) balance for a provider.
+    pub fn provider_balance(
+        env: Env,
+        provider: Address,
+        token: Address,
+    ) -> Result<i128, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        Ok(get_provider_balance(&env, &provider, &token))
+    }
 }
- main

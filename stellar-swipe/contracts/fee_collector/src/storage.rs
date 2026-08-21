@@ -1,16 +1,18 @@
 use soroban_sdk::{contracttype, Address, Env};
 
 pub const MAX_FEE_RATE_BPS: u32 = 100; // 1%
-pub const MIN_FEE_RATE_BPS: u32 = 1;   // 0.01%
+pub const MIN_FEE_RATE_BPS: u32 = 1; // 0.01%
 pub const DEFAULT_FEE_RATE_BPS: u32 = 30; // 0.3%
 
 #[contracttype]
 pub enum StorageKey {
     Admin,
     Initialized,
-    TreasuryBalance(Address), // persistent, per-token
-    QueuedWithdrawal,         // instance, single-slot
-    FeeRate,                  // instance, current fee rate in bps
+    TreasuryBalance(Address),          // persistent, per-token
+    QueuedWithdrawal,                  // instance, single-slot
+    FeeRate,                           // instance, current fee rate in bps
+    EpochFees(Address),                // persistent, per-token epoch accumulator
+    ProviderBalance(Address, Address), // persistent, (provider, token)
 }
 
 #[contracttype]
@@ -25,16 +27,11 @@ pub struct QueuedWithdrawal {
 // --- Admin ---
 
 pub fn get_admin(env: &Env) -> Address {
-    env.storage()
-        .instance()
-        .get(&StorageKey::Admin)
-        .unwrap()
+    env.storage().instance().get(&StorageKey::Admin).unwrap()
 }
 
 pub fn set_admin(env: &Env, admin: &Address) {
-    env.storage()
-        .instance()
-        .set(&StorageKey::Admin, admin);
+    env.storage().instance().set(&StorageKey::Admin, admin);
 }
 
 // --- Initialized ---
@@ -70,15 +67,19 @@ pub fn set_treasury_balance(env: &Env, token: &Address, balance: i128) {
 // --- Queued Withdrawal ---
 
 pub fn get_queued_withdrawal(env: &Env) -> Option<QueuedWithdrawal> {
-    env.storage()
-        .instance()
-        .get(&StorageKey::QueuedWithdrawal)
+    env.storage().instance().get(&StorageKey::QueuedWithdrawal)
 }
 
 pub fn set_queued_withdrawal(env: &Env, withdrawal: &QueuedWithdrawal) {
     env.storage()
         .instance()
         .set(&StorageKey::QueuedWithdrawal, withdrawal);
+}
+
+pub fn remove_queued_withdrawal(env: &Env) {
+    env.storage()
+        .instance()
+        .remove(&StorageKey::QueuedWithdrawal);
 }
 
 // --- Fee Rate ---
@@ -91,13 +92,39 @@ pub fn get_fee_rate(env: &Env) -> u32 {
 }
 
 pub fn set_fee_rate(env: &Env, rate: u32) {
-    env.storage()
-        .instance()
-        .set(&StorageKey::FeeRate, &rate);
+    env.storage().instance().set(&StorageKey::FeeRate, &rate);
 }
 
-pub fn remove_queued_withdrawal(env: &Env) {
+// --- Epoch Fee Accumulator ---
+
+pub fn get_epoch_fees(env: &Env, token: &Address) -> i128 {
     env.storage()
-        .instance()
-        .remove(&StorageKey::QueuedWithdrawal);
+        .persistent()
+        .get(&StorageKey::EpochFees(token.clone()))
+        .unwrap_or(0i128)
+}
+
+pub fn set_epoch_fees(env: &Env, token: &Address, amount: i128) {
+    env.storage()
+        .persistent()
+        .set(&StorageKey::EpochFees(token.clone()), &amount);
+}
+
+// --- Provider Balance ---
+
+pub fn get_provider_balance(env: &Env, provider: &Address, token: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::ProviderBalance(
+            provider.clone(),
+            token.clone(),
+        ))
+        .unwrap_or(0i128)
+}
+
+pub fn set_provider_balance(env: &Env, provider: &Address, token: &Address, balance: i128) {
+    env.storage().persistent().set(
+        &StorageKey::ProviderBalance(provider.clone(), token.clone()),
+        &balance,
+    );
 }
