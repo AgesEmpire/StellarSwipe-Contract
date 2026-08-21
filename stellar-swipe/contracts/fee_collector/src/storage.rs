@@ -149,6 +149,9 @@ pub enum StorageKey {
     MaxRebateBps,
     /// #940: Total rebates distributed in a given epoch (token, epoch_day).
     EpochRebateDistributed(Address, u64),
+    /// Monotonic counter bumped on every fee-config write so the tx-scoped
+    /// fee cache auto-misses after any rate change (issue #945).
+    ConfigVersion,
 }
 
 #[contracttype]
@@ -1086,6 +1089,19 @@ pub fn get_epoch_rebate_distributed(env: &Env, token: &Address, epoch_day: u64) 
         &StorageKey::EpochRebateDistributed(token.clone(), epoch_day),
         0i128,
     )
+}
+
+// ── Issue #945: Config version for cache invalidation ───────────────────────
+
+/// Returns the current config version (starts at 0, wraps on overflow).
+pub fn get_config_version(env: &Env) -> u32 {
+    crud_get_or(env, StorageTier::Instance, &StorageKey::ConfigVersion, 0u32)
+}
+
+/// Increments the config version. Call after any fee-rate config write.
+pub fn bump_config_version(env: &Env) {
+    let v = get_config_version(env).wrapping_add(1);
+    crud_set(env, StorageTier::Instance, &StorageKey::ConfigVersion, &v);
 }
 
 /// Accumulates rebate distributed for an epoch.
