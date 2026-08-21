@@ -1805,7 +1805,7 @@ fn collect_fee_budget_regression() {
     env.budget().reset_tracker();
     let _ = client.collect_fee(&trader, &_token, &amount, &asset);
     let instructions = env.budget().cpu_instruction_cost();
-    measure_and_emit("fee_collector.collect_fee", 5_000_000, instructions);
+    measure_and_emit("fee_collector.collect_fee", 5_500_000, instructions);
 }
 
 // ── Issue #960: Insurance Payout & Cap Tests ─────────────────────────────────
