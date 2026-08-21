@@ -2225,6 +2225,92 @@ fn test_get_max_rebate_bps_default_is_8000() {
     assert_eq!(client.get_max_rebate_bps(), 8_000u32);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #945: Fee cache invalidation on config change
+// ---------------------------------------------------------------------------
+
+/// (a) Query effective fee rate before a rate change (cache is populated).
+/// (b) Change the fee rate via set_fee_rate.
+/// (c) Query again — must return the NEW rate, not the stale cached value.
+#[test]
+fn test_fee_cache_invalidated_on_set_fee_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, _asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+
+    // (a) Initial rate is 30 bps.
+    client.set_fee_rate(&30u32);
+    let rate_before = client.current_dynamic_fee_rate(&trader, &token, &trade_asset(&env));
+    assert_eq!(rate_before, 30u32);
+
+    // (b) Change the fee rate.
+    client.set_fee_rate(&60u32);
+
+    // (c) Must reflect the new rate immediately — cache must not serve stale 30.
+    let rate_after = client.current_dynamic_fee_rate(&trader, &token, &trade_asset(&env));
+    assert_eq!(rate_after, 60u32, "cache must be invalidated after set_fee_rate");
+}
+
+/// Same correctness guarantee for set_burn_rate: the cache key changes so
+/// the next load_tx_fee_config call recomputes from storage.
+#[test]
+fn test_fee_cache_invalidated_on_set_burn_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let trader = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let (oracle_id, asset) = setup_oracle(&env, 10_000_000);
+    client.set_oracle_contract(&oracle_id);
+    client.set_fee_rate(&30u32);
+    client.set_burn_rate(&1_000u32); // 10%
+    disable_revenue_share(&client);
+
+    let trade_amount: i128 = 1_000_000;
+    StellarAssetClient::new(&env, &token).mint(&trader, &(trade_amount * 2));
+    mark_trader_has_traded(&env, &contract_id, &trader);
+
+    // First collection uses burn_rate = 10%: fee=3000, burn=300, treasury=2700.
+    let fee1 = client.collect_fee(&trader, &token, &trade_amount, &asset);
+    assert_eq!(fee1, 3_000);
+    assert_eq!(client.treasury_balance(&token), 2_700);
+
+    // Change burn rate to 50%.
+    client.set_burn_rate(&5_000u32);
+
+    // Second collection must use the new burn_rate=50%: fee=3000, burn=1500, treasury+=1500.
+    let fee2 = client.collect_fee(&trader, &token, &trade_amount, &asset);
+    assert_eq!(fee2, 3_000);
+    // treasury = 2700 (from first) + 1500 (from second at 50% burn) = 4200
+    assert_eq!(
+        client.treasury_balance(&token),
+        4_200,
+        "cache must be invalidated after set_burn_rate"
+    );
+}
+
 #[test]
 fn test_rebate_cap_second_claim_uses_remaining_headroom() {
     // Two sequential claims in the same epoch: second gets only the leftover headroom.

@@ -745,6 +745,7 @@ impl FeeCollector {
 
         let old_rate = get_fee_rate(&env);
         set_fee_rate_storage(&env, new_rate_bps);
+        storage::bump_config_version(&env);
 
         emit_fee_rate_updated(
             &env,
@@ -778,6 +779,7 @@ impl FeeCollector {
             return Err(ContractError::BurnRateTooHigh);
         }
         set_burn_rate_storage(&env, new_rate_bps);
+        storage::bump_config_version(&env);
         Ok(())
     }
 
@@ -888,6 +890,7 @@ impl FeeCollector {
             return Err(ContractError::InvalidFeeConfiguration);
         }
         set_fee_optimization_config(&env, &config);
+        storage::bump_config_version(&env);
         Ok(())
     }
 
@@ -907,6 +910,7 @@ impl FeeCollector {
         }
 
         set_network_condition_score(&env, score_bps);
+        storage::bump_config_version(&env);
         emit_network_condition_updated(
             &env,
             EvtNetworkConditionUpdated {
