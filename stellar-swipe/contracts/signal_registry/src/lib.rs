@@ -3646,6 +3646,9 @@ mod test_categorization;
 /// Composite churn-risk scoring tests (Issue #944).
 #[cfg(test)]
 mod test_churn_risk;
+/// Collaborative signal reward distribution tests (Issue #957).
+#[cfg(test)]
+mod test_collaboration;
 #[cfg(test)]
 mod test_daily_signal_limit;
 #[cfg(test)]
