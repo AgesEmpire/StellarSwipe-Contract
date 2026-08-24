@@ -1,0 +1,20 @@
+[package]
+name = "stake_vault"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+shared = { path = "../shared" }
+stellar_swipe_common = { path = "../common" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[lints]
+workspace = true

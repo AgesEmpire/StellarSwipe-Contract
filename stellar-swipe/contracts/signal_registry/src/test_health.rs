@@ -12,6 +12,7 @@ fn health_uninitialized_contract() {
     let h = client.health_check();
     assert!(!h.is_initialized);
     assert!(!h.is_paused);
+    assert_eq!(h.expired_signal_count, 0);
 }
 
 #[test]
@@ -39,9 +40,7 @@ fn health_initialized_paused() {
     let admin = Address::generate(&env);
 
     client.initialize(&admin);
-    client
-        .pause_trading(&admin)
-        .expect("pause should succeed under mock auth");
+    client.pause_trading(&admin);
 
     let h = client.health_check();
     assert!(h.is_initialized);

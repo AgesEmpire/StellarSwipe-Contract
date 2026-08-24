@@ -28,8 +28,8 @@ pub struct MeanReversionStrategy {
     pub user: Address,
     pub asset_pair: u32,
     pub lookback_period_days: u32,
-    pub entry_z_score: i128,  // scaled by PRECISION, e.g. 20000 = 2.0
-    pub exit_z_score: i128,   // scaled by PRECISION, e.g. 5000 = 0.5
+    pub entry_z_score: i128,    // scaled by PRECISION, e.g. 20000 = 2.0
+    pub exit_z_score: i128,     // scaled by PRECISION, e.g. 5000 = 0.5
     pub position_size_pct: u32, // basis points, e.g. 1000 = 10%
     pub max_positions: u32,
     pub active_positions: Vec<ReversionPosition>,
@@ -83,14 +83,26 @@ pub enum MRKey {
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
 fn next_strategy_id(env: &Env) -> u64 {
-    let id: u64 = env.storage().persistent().get(&MRKey::NextStrategyId).unwrap_or(0);
-    env.storage().persistent().set(&MRKey::NextStrategyId, &(id + 1));
+    let id: u64 = env
+        .storage()
+        .persistent()
+        .get(&MRKey::NextStrategyId)
+        .unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&MRKey::NextStrategyId, &(id + 1));
     id
 }
 
 fn next_position_id(env: &Env) -> u64 {
-    let id: u64 = env.storage().persistent().get(&MRKey::NextPositionId).unwrap_or(0);
-    env.storage().persistent().set(&MRKey::NextPositionId, &(id + 1));
+    let id: u64 = env
+        .storage()
+        .persistent()
+        .get(&MRKey::NextPositionId)
+        .unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&MRKey::NextPositionId, &(id + 1));
     id
 }
 
@@ -135,7 +147,11 @@ fn isqrt(n: i128) -> i128 {
 
 // ── Price data helpers (simulated via storage) ────────────────────────────────
 
-fn get_historical_prices(env: &Env, asset_pair: u32, lookback_seconds: u64) -> Result<Vec<i128>, AutoTradeError> {
+fn get_historical_prices(
+    env: &Env,
+    asset_pair: u32,
+    lookback_seconds: u64,
+) -> Result<Vec<i128>, AutoTradeError> {
     // Prices stored as Vec<i128> keyed by (symbol, asset_pair)
     let key = (symbol_short!("hist_px"), asset_pair, lookback_seconds);
     env.storage()
@@ -177,12 +193,12 @@ pub fn calculate_statistical_metrics(
     let sum: i128 = (0..prices.len()).map(|i| prices.get(i).unwrap()).sum();
     let mean = sum / n;
 
-    let variance: i128 = (0..prices.len())
-        .map(|i| {
-            let diff = prices.get(i).unwrap() - mean;
-            (diff * diff) / n
-        })
-        .sum();
+    let mut sum_sq = 0i128;
+    for i in 0..prices.len() {
+        let diff = prices.get(i).unwrap() - mean;
+        sum_sq += diff * diff;
+    }
+    let variance = sum_sq / n;
     let std_dev = isqrt(variance);
 
     // Require minimum volatility to avoid division by near-zero
@@ -193,18 +209,29 @@ pub fn calculate_statistical_metrics(
     let current_price = get_current_price(env, asset_pair)?;
     let z_score = ((current_price - mean) * PRECISION) / std_dev;
 
-    Ok(StatisticalMetrics { mean, std_dev, current_price, z_score })
+    Ok(StatisticalMetrics {
+        mean,
+        std_dev,
+        current_price,
+        z_score,
+    })
 }
 
 // ── Confidence ────────────────────────────────────────────────────────────────
 
 fn reversion_confidence(metrics: &StatisticalMetrics) -> u32 {
     let z_abs = metrics.z_score.abs();
-    if z_abs > 30_000 { 9_000 }
-    else if z_abs > 25_000 { 8_000 }
-    else if z_abs > 20_000 { 7_000 }
-    else if z_abs > 15_000 { 6_000 }
-    else { 5_000 }
+    if z_abs > 30_000 {
+        9_000
+    } else if z_abs > 25_000 {
+        8_000
+    } else if z_abs > 20_000 {
+        7_000
+    } else if z_abs > 15_000 {
+        6_000
+    } else {
+        5_000
+    }
 }
 
 // ── Signal detection ──────────────────────────────────────────────────────────
@@ -219,7 +246,8 @@ pub fn check_mean_reversion_signals(
         return Ok(None);
     }
 
-    let metrics = calculate_statistical_metrics(env, strategy.asset_pair, strategy.lookback_period_days)?;
+    let metrics =
+        calculate_statistical_metrics(env, strategy.asset_pair, strategy.lookback_period_days)?;
     let z_abs = metrics.z_score.abs();
 
     if z_abs < strategy.entry_z_score {
@@ -297,7 +325,11 @@ pub fn execute_mean_reversion_trade(
 
     #[allow(deprecated)]
     env.events().publish(
-        (Symbol::new(env, "mr_trade_opened"), strategy.user.clone(), strategy_id),
+        (
+            Symbol::new(env, "mr_trade_opened"),
+            strategy.user.clone(),
+            strategy_id,
+        ),
         (position_id, signal.z_score, signal.confidence),
     );
 
@@ -308,7 +340,8 @@ pub fn execute_mean_reversion_trade(
 
 pub fn check_reversion_exits(env: &Env, strategy_id: u64) -> Result<Vec<u64>, AutoTradeError> {
     let mut strategy = load(env, strategy_id)?;
-    let metrics = calculate_statistical_metrics(env, strategy.asset_pair, strategy.lookback_period_days)?;
+    let metrics =
+        calculate_statistical_metrics(env, strategy.asset_pair, strategy.lookback_period_days)?;
 
     let mut closed: Vec<u64> = Vec::new(env);
 
@@ -338,8 +371,17 @@ pub fn check_reversion_exits(env: &Env, strategy_id: u64) -> Result<Vec<u64>, Au
 
             #[allow(deprecated)]
             env.events().publish(
-                (Symbol::new(env, "mr_position_closed"), strategy.user.clone(), strategy_id),
-                (pos.position_id, price, pnl, env.ledger().timestamp() - pos.entry_time),
+                (
+                    Symbol::new(env, "mr_position_closed"),
+                    strategy.user.clone(),
+                    strategy_id,
+                ),
+                (
+                    pos.position_id,
+                    price,
+                    pnl,
+                    env.ledger().timestamp() - pos.entry_time,
+                ),
             );
         }
     }
@@ -442,7 +484,10 @@ pub fn create_mean_reversion_strategy(
     Ok(id)
 }
 
-pub fn get_mean_reversion_strategy(env: &Env, id: u64) -> Result<MeanReversionStrategy, AutoTradeError> {
+pub fn get_mean_reversion_strategy(
+    env: &Env,
+    id: u64,
+) -> Result<MeanReversionStrategy, AutoTradeError> {
     load(env, id)
 }
 
@@ -480,19 +525,25 @@ mod tests {
 
     fn set_price(env: &Env, asset: u32, price: i128) {
         env.as_contract(&env.register(TestContract, ()), || {
-            env.storage().temporary().set(&(symbol_short!("price"), asset), &price);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("price"), asset), &price);
         });
     }
 
     fn set_hist_prices(env: &Env, asset: u32, lookback: u64, prices: Vec<i128>) {
         env.as_contract(&env.register(TestContract, ()), || {
-            env.storage().temporary().set(&(symbol_short!("hist_px"), asset, lookback), &prices);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("hist_px"), asset, lookback), &prices);
         });
     }
 
     fn set_balance(env: &Env, user: &Address, balance: i128) {
         env.as_contract(&env.register(TestContract, ()), || {
-            env.storage().temporary().set(&(user.clone(), symbol_short!("balance")), &balance);
+            env.storage()
+                .temporary()
+                .set(&(user.clone(), symbol_short!("balance")), &balance);
         });
     }
 
@@ -509,9 +560,9 @@ mod tests {
         let (env, user) = setup();
         let contract_addr = env.register(TestContract, ());
         env.as_contract(&contract_addr, || {
-            let id = create_mean_reversion_strategy(
-                &env, user.clone(), 1, 14, 20_000, 5_000, 1_000, 3,
-            ).unwrap();
+            let id =
+                create_mean_reversion_strategy(&env, user.clone(), 1, 14, 20_000, 5_000, 1_000, 3)
+                    .unwrap();
             let s = get_mean_reversion_strategy(&env, id).unwrap();
             assert_eq!(s.asset_pair, 1);
             assert_eq!(s.entry_z_score, 20_000);
@@ -525,11 +576,12 @@ mod tests {
         let contract_addr = env.register(TestContract, ());
         env.as_contract(&contract_addr, || {
             let prices = make_prices(&env, 100_000, 30);
-            env.storage().temporary().set(
-                &(symbol_short!("hist_px"), 1u32, 14u64 * 86_400),
-                &prices,
-            );
-            env.storage().temporary().set(&(symbol_short!("price"), 1u32), &102_500i128);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("hist_px"), 1u32, 14u64 * 86_400), &prices);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("price"), 1u32), &102_500i128);
 
             let m = calculate_statistical_metrics(&env, 1, 14).unwrap();
             assert!(m.mean > 0);
@@ -548,26 +600,26 @@ mod tests {
             for _ in 0..30 {
                 prices.push_back(100_000);
             }
-            env.storage().temporary().set(
-                &(symbol_short!("hist_px"), 1u32, 14u64 * 86_400),
-                &prices,
-            );
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("hist_px"), 1u32, 14u64 * 86_400), &prices);
             // Current price 3 std devs above — but std_dev=0 here, so use spread
             // Use varied prices to get non-zero std_dev
             let mut varied: Vec<i128> = Vec::new(&env);
             for i in 0..30i128 {
                 varied.push_back(100_000 + (i % 10) * 100 - 450);
             }
-            env.storage().temporary().set(
-                &(symbol_short!("hist_px"), 1u32, 14u64 * 86_400),
-                &varied,
-            );
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("hist_px"), 1u32, 14u64 * 86_400), &varied);
             // Set current price far above mean (~2.5 std devs)
-            env.storage().temporary().set(&(symbol_short!("price"), 1u32), &101_500i128);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("price"), 1u32), &101_500i128);
 
-            let id = create_mean_reversion_strategy(
-                &env, user.clone(), 1, 14, 20_000, 5_000, 1_000, 3,
-            ).unwrap();
+            let id =
+                create_mean_reversion_strategy(&env, user.clone(), 1, 14, 20_000, 5_000, 1_000, 3)
+                    .unwrap();
 
             let signal = check_mean_reversion_signals(&env, id).unwrap();
             // Signal may or may not fire depending on computed z-score; just verify no panic
@@ -587,16 +639,19 @@ mod tests {
             for i in 0..30i128 {
                 varied.push_back(100_000 + (i % 10) * 100 - 450);
             }
-            env.storage().temporary().set(
-                &(symbol_short!("hist_px"), 1u32, 14u64 * 86_400),
-                &varied,
-            );
-            env.storage().temporary().set(&(symbol_short!("price"), 1u32), &101_500i128);
-            env.storage().temporary().set(&(user.clone(), symbol_short!("balance")), &1_000_000i128);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("hist_px"), 1u32, 14u64 * 86_400), &varied);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("price"), 1u32), &101_500i128);
+            env.storage()
+                .temporary()
+                .set(&(user.clone(), symbol_short!("balance")), &1_000_000i128);
 
-            let id = create_mean_reversion_strategy(
-                &env, user.clone(), 1, 14, 5_000, 2_000, 1_000, 3,
-            ).unwrap();
+            let id =
+                create_mean_reversion_strategy(&env, user.clone(), 1, 14, 5_000, 2_000, 1_000, 3)
+                    .unwrap();
 
             let metrics = calculate_statistical_metrics(&env, 1, 14).unwrap();
             let signal = ReversionSignal {
@@ -613,7 +668,9 @@ mod tests {
             assert_eq!(pos_id, 0);
 
             // Simulate price reverting to mean
-            env.storage().temporary().set(&(symbol_short!("price"), 1u32), &metrics.mean);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("price"), 1u32), &metrics.mean);
 
             let closed = check_reversion_exits(&env, id).unwrap();
             assert_eq!(closed.len(), 1);
@@ -630,16 +687,19 @@ mod tests {
             for i in 0..30i128 {
                 varied.push_back(100_000 + (i % 10) * 100 - 450);
             }
-            env.storage().temporary().set(
-                &(symbol_short!("hist_px"), 1u32, 14u64 * 86_400),
-                &varied,
-            );
-            env.storage().temporary().set(&(symbol_short!("price"), 1u32), &101_500i128);
-            env.storage().temporary().set(&(user.clone(), symbol_short!("balance")), &1_000_000i128);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("hist_px"), 1u32, 14u64 * 86_400), &varied);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("price"), 1u32), &101_500i128);
+            env.storage()
+                .temporary()
+                .set(&(user.clone(), symbol_short!("balance")), &1_000_000i128);
 
-            let id = create_mean_reversion_strategy(
-                &env, user.clone(), 1, 14, 5_000, 2_000, 1_000, 3,
-            ).unwrap();
+            let id =
+                create_mean_reversion_strategy(&env, user.clone(), 1, 14, 5_000, 2_000, 1_000, 3)
+                    .unwrap();
 
             let metrics = calculate_statistical_metrics(&env, 1, 14).unwrap();
             let stop = metrics.current_price + metrics.std_dev * 3;
@@ -656,7 +716,9 @@ mod tests {
             execute_mean_reversion_trade(&env, id, signal).unwrap();
 
             // Price blows through stop loss
-            env.storage().temporary().set(&(symbol_short!("price"), 1u32), &(stop + 1));
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("price"), 1u32), &(stop + 1));
 
             let closed = check_reversion_exits(&env, id).unwrap();
             assert_eq!(closed.len(), 1);
@@ -672,16 +734,27 @@ mod tests {
             for i in 0..30i128 {
                 varied.push_back(100_000 + (i % 10) * 100 - 450);
             }
-            env.storage().temporary().set(
-                &(symbol_short!("hist_px"), 1u32, 14u64 * 86_400),
-                &varied,
-            );
-            env.storage().temporary().set(&(symbol_short!("price"), 1u32), &101_500i128);
-            env.storage().temporary().set(&(user.clone(), symbol_short!("balance")), &1_000_000i128);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("hist_px"), 1u32, 14u64 * 86_400), &varied);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("price"), 1u32), &101_500i128);
+            env.storage()
+                .temporary()
+                .set(&(user.clone(), symbol_short!("balance")), &1_000_000i128);
 
             let id = create_mean_reversion_strategy(
-                &env, user.clone(), 1, 14, 5_000, 2_000, 1_000, 1, // max 1 position
-            ).unwrap();
+                &env,
+                user.clone(),
+                1,
+                14,
+                5_000,
+                2_000,
+                1_000,
+                1, // max 1 position
+            )
+            .unwrap();
 
             let metrics = calculate_statistical_metrics(&env, 1, 14).unwrap();
             let make_signal = |m: &StatisticalMetrics| ReversionSignal {
@@ -710,15 +783,16 @@ mod tests {
             for _ in 0..5 {
                 prices.push_back(100_000);
             }
-            env.storage().temporary().set(
-                &(symbol_short!("hist_px"), 1u32, 14u64 * 86_400),
-                &prices,
-            );
-            env.storage().temporary().set(&(symbol_short!("price"), 1u32), &100_000i128);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("hist_px"), 1u32, 14u64 * 86_400), &prices);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("price"), 1u32), &100_000i128);
 
-            let id = create_mean_reversion_strategy(
-                &env, user.clone(), 1, 14, 20_000, 5_000, 1_000, 3,
-            ).unwrap();
+            let id =
+                create_mean_reversion_strategy(&env, user.clone(), 1, 14, 20_000, 5_000, 1_000, 3)
+                    .unwrap();
 
             let err = check_mean_reversion_signals(&env, id).unwrap_err();
             assert_eq!(err, AutoTradeError::MrInsufficientHistory);

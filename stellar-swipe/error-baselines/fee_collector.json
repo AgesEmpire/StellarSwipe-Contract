@@ -1,0 +1,37 @@
+{
+  "_comment": "Baseline error codes for the fee_collector crate. Generated from contracts/fee_collector/src/errors.rs. Do not renumber existing codes; add new variants with unused numbers only.",
+  "crate": "fee_collector",
+  "source": "contracts/fee_collector/src/errors.rs",
+  "enums": {
+    "ContractError": {
+      "AlreadyInitialized": 1,
+      "NotInitialized": 2,
+      "Unauthorized": 3,
+      "InvalidAmount": 4,
+      "InsufficientTreasuryBalance": 5,
+      "WithdrawalNotQueued": 6,
+      "TimelockNotElapsed": 7,
+      "ArithmeticOverflow": 8,
+      "FeeRateTooHigh": 9,
+      "FeeRateTooLow": 10,
+      "OracleNotConfigured": 11,
+      "OracleConversionFailed": 12,
+      "FeeRoundedToZero": 13,
+      "BurnRateTooHigh": 14,
+      "DivisionByZero": 15,
+      "InvalidFeeConfiguration": 16,
+      "NetworkConditionInvalid": 17,
+      "FailedCollectionNotFound": 18,
+      "RetryLimitExceeded": 19,
+      "IterationLimitExceeded": 20,
+      "WaterfallNotConfigured": 21,
+      "PreferredTokenInsufficient": 22,
+      "PayoutCurrencyUnchanged": 23,
+      "InvalidMultiplierBounds": 24,
+      "SelfReferralNotAllowed": 25,
+      "ReferralAlreadyRegistered": 26,
+      "IncompatibleContractVersion": 27,
+      "UnauthorizedCaller": 28
+    }
+  }
+}

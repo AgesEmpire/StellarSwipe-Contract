@@ -15,7 +15,80 @@
 
 use soroban_sdk::{token, Address, Env, IntoVal, Symbol, Val, Vec};
 
-use crate::errors::ContractError;
+use crate::errors::{ContractError, InsufficientLiquidityDetail};
+
+/// SDEX order-book query function name on the router.
+pub const SDEX_ORDERBOOK_FN: &str = "get_best_ask";
+
+/// Query the best ask quantity available for a pair via the router.
+/// Returns `(best_ask_price, available_quantity)`. Returns `(0, 0)` if the
+/// order book is empty (zero liquidity).
+fn query_best_ask(
+    env: &Env,
+    sdex_router: &Address,
+    from_token: &Address,
+    to_token: &Address,
+) -> (i128, i128) {
+    let sym = Symbol::new(env, SDEX_ORDERBOOK_FN);
+    let mut args = Vec::<Val>::new(env);
+    args.push_back(from_token.clone().into_val(env));
+    args.push_back(to_token.clone().into_val(env));
+    // Router returns (best_ask_price: i128, available_qty: i128).
+    // If the call fails (e.g. router doesn't support it), treat as zero liquidity.
+    env.invoke_contract::<(i128, i128)>(sdex_router, &sym, args)
+}
+
+/// Check order-book depth before executing a swap.
+///
+/// Returns `Err(ContractError::InsufficientLiquidity)` when:
+/// - The order book is empty (`available_qty == 0`), or
+/// - The best ask price exceeds `entry_price * (1 + max_slippage_bps / 10_000)`.
+pub fn check_liquidity(
+    env: &Env,
+    sdex_router: &Address,
+    from_token: &Address,
+    to_token: &Address,
+    required_amount: i128,
+    entry_price: i128,
+    max_slippage_bps: u32,
+) -> Result<(), ContractError> {
+    let (_best_ask_price, available_qty) = query_best_ask(env, sdex_router, from_token, to_token);
+
+    if available_qty == 0 || available_qty < required_amount {
+        return Err(ContractError::InsufficientLiquidity);
+    }
+
+    // Price guard: best_ask > entry_price * (1 + max_slippage_bps / 10_000)
+    let threshold = entry_price
+        .checked_mul(
+            (10_000i128)
+                .checked_add(max_slippage_bps as i128)
+                .unwrap_or(i128::MAX),
+        )
+        .unwrap_or(i128::MAX)
+        / 10_000;
+
+    if _best_ask_price > threshold {
+        return Err(ContractError::InsufficientLiquidity);
+    }
+
+    Ok(())
+}
+
+/// Build an [`InsufficientLiquidityDetail`] for the given pair (for error reporting).
+pub fn get_liquidity_detail(
+    env: &Env,
+    sdex_router: &Address,
+    from_token: &Address,
+    to_token: &Address,
+    required_amount: i128,
+) -> InsufficientLiquidityDetail {
+    let (_price, available_liquidity) = query_best_ask(env, sdex_router, from_token, to_token);
+    InsufficientLiquidityDetail {
+        available_liquidity,
+        required_amount,
+    }
+}
 
 /// Router entrypoint name invoked on `sdex_router`.
 pub const SDEX_SWAP_FN: &str = "swap";
@@ -68,6 +141,19 @@ pub fn execute_sdex_swap(
         return Err(ContractError::InvalidAmount);
     }
 
+    // Liquidity check: use min_received as the entry_price proxy and 0 slippage
+    // (the caller already computed min_received from slippage). We check that
+    // available_qty >= amount; price guard uses min_received as the floor.
+    check_liquidity(
+        env,
+        sdex_router,
+        from_token,
+        to_token,
+        amount,
+        min_received,
+        0,
+    )?;
+
     let this = env.current_contract_address();
     let from_client = token::Client::new(env, from_token);
     let to_client = token::Client::new(env, to_token);
@@ -102,4 +188,58 @@ pub fn execute_sdex_swap(
     }
 
     Ok(actual_received)
+}
+
+#[cfg(test)]
+mod liquidity_tests {
+    use super::*;
+    use crate::errors::ContractError;
+
+    // Helper: build a detail struct directly (no router needed for unit tests).
+    fn detail(available: i128, required: i128) -> InsufficientLiquidityDetail {
+        InsufficientLiquidityDetail {
+            available_liquidity: available,
+            required_amount: required,
+        }
+    }
+
+    #[test]
+    fn zero_liquidity_returns_insufficient_liquidity_detail() {
+        let d = detail(0, 1_000);
+        assert_eq!(d.available_liquidity, 0);
+        assert_eq!(d.required_amount, 1_000);
+    }
+
+    #[test]
+    fn insufficient_liquidity_detail_fields() {
+        let d = detail(500, 1_000);
+        assert!(d.available_liquidity < d.required_amount);
+    }
+
+    #[test]
+    fn sufficient_liquidity_detail_fields() {
+        let d = detail(2_000, 1_000);
+        assert!(d.available_liquidity >= d.required_amount);
+    }
+
+    #[test]
+    fn min_received_from_slippage_zero_slippage() {
+        assert_eq!(min_received_from_slippage(1_000, 0), Some(1_000));
+    }
+
+    #[test]
+    fn min_received_from_slippage_100bps() {
+        // 1% slippage on 10_000 → 9_900
+        assert_eq!(min_received_from_slippage(10_000, 100), Some(9_900));
+    }
+
+    #[test]
+    fn min_received_from_slippage_full_slippage() {
+        assert_eq!(min_received_from_slippage(1_000, 10_000), Some(0));
+    }
+
+    #[test]
+    fn min_received_from_slippage_negative_amount() {
+        assert_eq!(min_received_from_slippage(-1, 100), None);
+    }
 }

@@ -1,0 +1,20 @@
+[package]
+name = "stellar_swipe_liquidity_pool"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/liquidity_pool.rs"
+crate-type = ["lib"]
+
+[workspace]
+
+[features]
+testutils = ["soroban-sdk/testutils"]
+
+[dependencies]
+soroban-sdk = { version = "23", features = [] }
+
+[dev-dependencies]
+soroban-sdk = { version = "23", features = ["testutils"] }

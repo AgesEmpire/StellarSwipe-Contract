@@ -131,9 +131,9 @@ const MAX_SENTIMENT_THRESHOLD: i32 = 9000;
 const SCALE_FACTOR: i32 = 10000;
 const MAX_POSITION_SIZE_PCT: u32 = 5000; // 50%
 
-/// ==========================
-/// Strategy Creation
-/// ==========================
+// ==========================
+// Strategy Creation
+// ==========================
 
 /// Create a new sentiment-based trading strategy
 pub fn create_sentiment_strategy(
@@ -147,26 +147,28 @@ pub fn create_sentiment_strategy(
     sentiment_decay_hours: u32,
 ) -> Result<u64, String> {
     user.require_auth();
-    
+
     // Validate inputs
     if sentiment_sources.is_empty() {
         return Err(String::from_str(env, "No sentiment sources"));
     }
-    
-    if sentiment_threshold < MIN_SENTIMENT_THRESHOLD || sentiment_threshold > MAX_SENTIMENT_THRESHOLD {
+
+    if sentiment_threshold < MIN_SENTIMENT_THRESHOLD
+        || sentiment_threshold > MAX_SENTIMENT_THRESHOLD
+    {
         return Err(String::from_str(env, "Invalid sentiment threshold"));
     }
-    
+
     if position_size_pct == 0 || position_size_pct > MAX_POSITION_SIZE_PCT {
         return Err(String::from_str(env, "Invalid position size"));
     }
-    
+
     if sentiment_decay_hours == 0 {
         return Err(String::from_str(env, "Invalid decay hours"));
     }
-    
+
     let strategy_id = get_next_strategy_id(env);
-    
+
     let strategy = SentimentStrategy {
         strategy_id,
         user: user.clone(),
@@ -179,9 +181,9 @@ pub fn create_sentiment_strategy(
         active_position: sentiment_position_absent(),
         created_at: env.ledger().timestamp(),
     };
-    
+
     store_strategy(env, strategy_id, &strategy);
-    
+
     // Initialize accuracy tracking
     let accuracy = SentimentAccuracy {
         strategy_id,
@@ -192,42 +194,36 @@ pub fn create_sentiment_strategy(
         avg_sentiment_price_corr: 0,
     };
     store_accuracy(env, strategy_id, &accuracy);
-    
+
     env.events().publish(
         (Symbol::new(env, "sentiment_strategy_created"), strategy_id),
         user,
     );
-    
+
     Ok(strategy_id)
 }
 
-/// ==========================
-/// Sentiment Aggregation
-/// ==========================
+// ==========================
+// Sentiment Aggregation
+// ==========================
 
 /// Aggregate sentiment from all configured sources
 pub fn aggregate_sentiment(env: &Env, strategy_id: u64) -> Result<SentimentScore, String> {
     let strategy = get_strategy(env, strategy_id)?;
-    
+
     let mut source_scores = Map::new(env);
     let mut total_weight = 0u32;
     let mut weighted_sum = 0i32;
-    
+
     // Collect sentiment from each source
     for source in strategy.sentiment_sources.iter() {
         let (score, weight) = match source {
-            SentimentSource::Twitter(ref handle) => {
-                collect_twitter_sentiment(env, handle)?
-            }
-            SentimentSource::Reddit(ref subreddit) => {
-                collect_reddit_sentiment(env, subreddit)?
-            }
+            SentimentSource::Twitter(ref handle) => collect_twitter_sentiment(env, handle)?,
+            SentimentSource::Reddit(ref subreddit) => collect_reddit_sentiment(env, subreddit)?,
             SentimentSource::OnChainMetrics(metric_type) => {
                 collect_onchain_sentiment(env, &strategy.asset_pair, metric_type)?
             }
-            SentimentSource::NewsFeeds(ref feed_url) => {
-                collect_news_sentiment(env, feed_url)?
-            }
+            SentimentSource::NewsFeeds(ref feed_url) => collect_news_sentiment(env, feed_url)?,
             SentimentSource::SignalRationale => {
                 collect_signal_sentiment(env, &strategy.asset_pair)?
             }
@@ -238,16 +234,16 @@ pub fn aggregate_sentiment(env: &Env, strategy_id: u64) -> Result<SentimentScore
         weighted_sum += score * weight as i32;
         total_weight += weight;
     }
-    
+
     let overall_score = if total_weight > 0 {
         weighted_sum / total_weight as i32
     } else {
         0
     };
-    
+
     // Calculate confidence based on agreement between sources
     let confidence = calculate_sentiment_confidence(env, &source_scores)?;
-    
+
     Ok(SentimentScore {
         overall_score,
         confidence,
@@ -265,23 +261,23 @@ fn calculate_sentiment_confidence(
     if source_scores.len() < 2 {
         return Ok(5000); // 50% confidence with single source
     }
-    
+
     // Calculate mean
     let mut sum = 0i32;
     let count = source_scores.len();
-    
+
     for score in source_scores.values() {
         sum += score;
     }
     let mean = sum / count as i32;
-    
+
     // Calculate variance
     let mut variance_sum = 0i32;
     for score in source_scores.values() {
         let diff = score - mean;
         variance_sum += (diff * diff) / count as i32;
     }
-    
+
     // Lower variance = higher confidence
     let std_dev = sqrt(variance_sum as u32);
     let confidence = if std_dev == 0 {
@@ -289,7 +285,7 @@ fn calculate_sentiment_confidence(
     } else {
         max(0, 10000 - (std_dev as i32 / 10))
     };
-    
+
     Ok(confidence as u32)
 }
 
@@ -303,9 +299,9 @@ fn format_source_name(env: &Env, source: &SentimentSource) -> String {
     }
 }
 
-/// ==========================
-/// Sentiment Collection (Placeholders for Oracle Integration)
-/// ==========================
+// ==========================
+// Sentiment Collection (Placeholders for Oracle Integration)
+// ==========================
 
 /// Collect Twitter sentiment (would integrate with oracle)
 fn collect_twitter_sentiment(env: &Env, _handle: &String) -> Result<(i32, u32), String> {
@@ -339,37 +335,29 @@ fn collect_onchain_sentiment(
     metric_type: MetricType,
 ) -> Result<(i32, u32), String> {
     let score = match metric_type {
-        MetricType::ActiveAddresses => {
-            calculate_active_addresses_sentiment(env, asset_pair)?
-        }
-        MetricType::TransactionVolume => {
-            calculate_transaction_volume_sentiment(env, asset_pair)?
-        }
+        MetricType::ActiveAddresses => calculate_active_addresses_sentiment(env, asset_pair)?,
+        MetricType::TransactionVolume => calculate_transaction_volume_sentiment(env, asset_pair)?,
         MetricType::HolderConcentration => {
             calculate_holder_concentration_sentiment(env, asset_pair)?
         }
-        MetricType::ExchangeInflows => {
-            calculate_exchange_inflows_sentiment(env, asset_pair)?
-        }
+        MetricType::ExchangeInflows => calculate_exchange_inflows_sentiment(env, asset_pair)?,
     };
-    
+
     let weight = 35; // On-chain metrics get highest weight (35%)
     Ok((score, weight))
 }
 
 /// Calculate sentiment from active addresses
-fn calculate_active_addresses_sentiment(
-    env: &Env,
-    _asset_pair: &AssetPair,
-) -> Result<i32, String> {
+fn calculate_active_addresses_sentiment(env: &Env, _asset_pair: &AssetPair) -> Result<i32, String> {
     // Placeholder - would query actual on-chain data
     // Increasing active addresses = bullish
     let current_addresses = 10000u32;
     let historical_avg = 8000u32;
-    
-    let change_pct = ((current_addresses as i32 - historical_avg as i32) * 100) / historical_avg as i32;
+
+    let change_pct =
+        ((current_addresses as i32 - historical_avg as i32) * 100) / historical_avg as i32;
     let sentiment = change_pct * 100;
-    
+
     Ok(clamp(sentiment, -SCALE_FACTOR, SCALE_FACTOR))
 }
 
@@ -381,10 +369,10 @@ fn calculate_transaction_volume_sentiment(
     // Placeholder - increasing volume = bullish
     let current_volume = 1_000_000i128;
     let historical_avg = 800_000i128;
-    
+
     let change_pct = ((current_volume - historical_avg) * 100) / historical_avg;
     let sentiment = (change_pct * 100) as i32;
-    
+
     Ok(clamp(sentiment, -SCALE_FACTOR, SCALE_FACTOR))
 }
 
@@ -395,29 +383,26 @@ fn calculate_holder_concentration_sentiment(
 ) -> Result<i32, String> {
     // Placeholder - decreasing concentration = bullish (more distribution)
     let top_10_pct = 4000u32; // 40% held by top 10
-    let ideal_pct = 3000u32;  // 30% is ideal
-    
+    let ideal_pct = 3000u32; // 30% is ideal
+
     let diff = ideal_pct as i32 - top_10_pct as i32;
     let sentiment = diff * 100;
-    
+
     Ok(clamp(sentiment, -SCALE_FACTOR, SCALE_FACTOR))
 }
 
 /// Calculate sentiment from exchange inflows
-fn calculate_exchange_inflows_sentiment(
-    env: &Env,
-    _asset_pair: &AssetPair,
-) -> Result<i32, String> {
+fn calculate_exchange_inflows_sentiment(env: &Env, _asset_pair: &AssetPair) -> Result<i32, String> {
     // High exchange inflows = bearish (potential selling)
     // High exchange outflows = bullish (accumulation)
     let inflows_24h = 500_000i128;
     let outflows_24h = 700_000i128;
-    
+
     let net_flow = outflows_24h - inflows_24h;
     let total_supply = 10_000_000i128;
-    
+
     let net_flow_pct = (net_flow * SCALE_FACTOR as i128) / total_supply;
-    
+
     Ok((net_flow_pct * 100) as i32)
 }
 
@@ -426,9 +411,9 @@ fn collect_signal_sentiment(env: &Env, _asset_pair: &AssetPair) -> Result<(i32, 
     // Placeholder - would analyze recent signal rationales
     let sentiment_score = analyze_rationale_sentiment(
         env,
-        &String::from_str(env, "Bullish breakout expected with strong momentum")
+        &String::from_str(env, "Bullish breakout expected with strong momentum"),
     )?;
-    
+
     let weight = 10; // 10% weight for signal sentiment
     Ok((sentiment_score, weight))
 }
@@ -446,39 +431,59 @@ fn analyze_rationale_sentiment(env: &Env, rationale: &String) -> Result<i32, Str
             *b += 32;
         }
     }
-    let text = core::str::from_utf8(&buf[..n])
-        .map_err(|_| String::from_str(env, "invalid utf8"))?;
-    
+    let text =
+        core::str::from_utf8(&buf[..n]).map_err(|_| String::from_str(env, "invalid utf8"))?;
+
     // Bullish keywords
-    let bullish_keywords = ["bullish", "buy", "breakout", "moon", "pump", "strong", 
-                           "uptrend", "accumulate", "undervalued", "rally"];
-    
+    let bullish_keywords = [
+        "bullish",
+        "buy",
+        "breakout",
+        "moon",
+        "pump",
+        "strong",
+        "uptrend",
+        "accumulate",
+        "undervalued",
+        "rally",
+    ];
+
     // Bearish keywords
-    let bearish_keywords = ["bearish", "sell", "dump", "crash", "weak", "downtrend",
-                           "overvalued", "resistance", "distribution", "decline"];
-    
+    let bearish_keywords = [
+        "bearish",
+        "sell",
+        "dump",
+        "crash",
+        "weak",
+        "downtrend",
+        "overvalued",
+        "resistance",
+        "distribution",
+        "decline",
+    ];
+
     let mut bullish_count = 0i32;
     let mut bearish_count = 0i32;
-    
+
     for keyword in bullish_keywords.iter() {
         if text.contains(keyword) {
             bullish_count += 1;
         }
     }
-    
+
     for keyword in bearish_keywords.iter() {
         if text.contains(keyword) {
             bearish_count += 1;
         }
     }
-    
+
     let net_sentiment = (bullish_count - bearish_count) * 2000;
     Ok(clamp(net_sentiment, -SCALE_FACTOR, SCALE_FACTOR))
 }
 
-/// ==========================
-/// Sentiment Decay
-/// ==========================
+// ==========================
+// Sentiment Decay
+// ==========================
 
 /// Apply time-based decay to sentiment score
 pub fn apply_sentiment_decay(
@@ -488,22 +493,26 @@ pub fn apply_sentiment_decay(
 ) -> Result<(), String> {
     let elapsed_seconds = env.ledger().timestamp() - sentiment_score.aggregated_at;
     let elapsed_hours = elapsed_seconds / 3600;
-    
+
     if elapsed_hours > 0 {
         // Linear decay over specified hours
-        let decay_pct = min(SCALE_FACTOR as u64, (elapsed_hours * SCALE_FACTOR as u64) / decay_hours as u64);
+        let decay_pct = min(
+            SCALE_FACTOR as u64,
+            (elapsed_hours * SCALE_FACTOR as u64) / decay_hours as u64,
+        );
         sentiment_score.decay_factor = (SCALE_FACTOR as u64 - decay_pct) as u32;
-        
+
         // Apply decay to overall score
-        sentiment_score.overall_score = (sentiment_score.overall_score * sentiment_score.decay_factor as i32) / SCALE_FACTOR;
+        sentiment_score.overall_score =
+            (sentiment_score.overall_score * sentiment_score.decay_factor as i32) / SCALE_FACTOR;
     }
-    
+
     Ok(())
 }
 
-/// ==========================
-/// Signal Generation
-/// ==========================
+// ==========================
+// Signal Generation
+// ==========================
 
 /// Check if sentiment generates a trading signal
 pub fn check_sentiment_signal(
@@ -511,38 +520,35 @@ pub fn check_sentiment_signal(
     strategy_id: u64,
 ) -> Result<Option<SentimentSignal>, String> {
     let strategy = get_strategy(env, strategy_id)?;
-    
+
     // Don't open new position if one exists
     if strategy.active_position.position_id != 0 {
         return Ok(None);
     }
-    
+
     let mut sentiment = aggregate_sentiment(env, strategy_id)?;
-    
+
     // Apply decay
     apply_sentiment_decay(env, &mut sentiment, strategy.sentiment_decay_hours)?;
-    
+
     // Store latest sentiment
     store_last_sentiment(env, strategy_id, &sentiment);
-    
+
     // Check if sentiment exceeds threshold
     if sentiment.overall_score.abs() < strategy.sentiment_threshold {
         return Ok(None);
     }
-    
+
     // Check technical confirmation if required
     if strategy.tech_confirmation_required {
-        let technical_confirmed = check_technical_confirmation(
-            env,
-            &strategy.asset_pair,
-            sentiment.overall_score > 0,
-        )?;
-        
+        let technical_confirmed =
+            check_technical_confirmation(env, &strategy.asset_pair, sentiment.overall_score > 0)?;
+
         if !technical_confirmed {
             return Ok(None);
         }
     }
-    
+
     let signal = SentimentSignal {
         direction: if sentiment.overall_score > 0 {
             TradeDirection::Buy
@@ -553,7 +559,7 @@ pub fn check_sentiment_signal(
         confidence: sentiment.confidence,
         source_breakdown: sentiment.source_scores,
     };
-    
+
     Ok(Some(signal))
 }
 
@@ -567,7 +573,7 @@ fn check_technical_confirmation(
     // RSI, MACD, etc.
     let rsi = 5500u32; // Slightly above 50
     let macd_bullish = true;
-    
+
     if is_bullish {
         Ok(rsi > 5000 && macd_bullish)
     } else {
@@ -575,9 +581,9 @@ fn check_technical_confirmation(
     }
 }
 
-/// ==========================
-/// Trade Execution
-/// ==========================
+// ==========================
+// Trade Execution
+// ==========================
 
 /// Execute sentiment-based trade
 pub fn execute_sentiment_trade(
@@ -586,21 +592,21 @@ pub fn execute_sentiment_trade(
     signal: SentimentSignal,
 ) -> Result<u64, String> {
     let mut strategy = get_strategy(env, strategy_id)?;
-    
+
     // Get portfolio value (placeholder)
     let portfolio_value = 1_000_000i128;
-    
+
     // Adjust position size based on sentiment confidence
     let confidence_multiplier = signal.confidence as i128;
     let base_size = (portfolio_value * strategy.position_size_pct as i128) / SCALE_FACTOR as i128;
     let position_amount = (base_size * confidence_multiplier) / SCALE_FACTOR as i128;
-    
+
     // Get current price (placeholder)
     let current_price = 100_000i128;
-    
+
     // Create position
     let position_id = get_next_position_id(env);
-    
+
     let position = SentimentPosition {
         position_id,
         entry_sentiment: signal.sentiment_score,
@@ -608,51 +614,53 @@ pub fn execute_sentiment_trade(
         amount: position_amount,
         entry_time: env.ledger().timestamp(),
     };
-    
+
     strategy.active_position = position;
     store_strategy(env, strategy_id, &strategy);
-    
+
     env.events().publish(
-        (Symbol::new(env, "sentiment_trade_executed"), strategy_id, position_id),
+        (
+            Symbol::new(env, "sentiment_trade_executed"),
+            strategy_id,
+            position_id,
+        ),
         (signal.sentiment_score, signal.confidence),
     );
-    
+
     Ok(position_id)
 }
 
-/// ==========================
-/// Position Monitoring & Exit
-/// ==========================
+// ==========================
+// Position Monitoring & Exit
+// ==========================
 
 /// Check if position should be exited
-pub fn check_sentiment_exit(
-    env: &Env,
-    strategy_id: u64,
-) -> Result<Option<u64>, String> {
+pub fn check_sentiment_exit(env: &Env, strategy_id: u64) -> Result<Option<u64>, String> {
     let mut strategy = get_strategy(env, strategy_id)?;
-    
+
     if strategy.active_position.position_id == 0 {
         return Ok(None);
     }
     let position = strategy.active_position.clone();
-    
+
     // Get current sentiment
     let mut current_sentiment = aggregate_sentiment(env, strategy_id)?;
     apply_sentiment_decay(env, &mut current_sentiment, strategy.sentiment_decay_hours)?;
-    
+
     // Exit conditions
-    let sentiment_reversed = 
-        (position.entry_sentiment > 0 && current_sentiment.overall_score < -strategy.sentiment_threshold) ||
-        (position.entry_sentiment < 0 && current_sentiment.overall_score > strategy.sentiment_threshold);
-    
+    let sentiment_reversed = (position.entry_sentiment > 0
+        && current_sentiment.overall_score < -strategy.sentiment_threshold)
+        || (position.entry_sentiment < 0
+            && current_sentiment.overall_score > strategy.sentiment_threshold);
+
     let sentiment_weakened = current_sentiment.overall_score.abs() < 1000; // Near neutral
-    
+
     // Check profit/loss
     let current_price = 105_000i128; // Placeholder
     let pnl_pct = ((current_price - position.entry_price) * 100) / position.entry_price;
     let profit_target_hit = pnl_pct > 10; // 10% profit
     let stop_loss_hit = pnl_pct < -5; // -5% loss
-    
+
     if sentiment_reversed || sentiment_weakened || profit_target_hit || stop_loss_hit {
         let reason = if sentiment_reversed {
             "Sentiment reversed"
@@ -663,28 +671,35 @@ pub fn check_sentiment_exit(
         } else {
             "Stop loss"
         };
-        
+
         // Track accuracy
         track_sentiment_accuracy(env, strategy_id, &position, current_price)?;
-        
+
         env.events().publish(
-            (Symbol::new(env, "sentiment_position_closed"), strategy_id, position.position_id),
-            (current_sentiment.overall_score, String::from_str(env, reason)),
+            (
+                Symbol::new(env, "sentiment_position_closed"),
+                strategy_id,
+                position.position_id,
+            ),
+            (
+                current_sentiment.overall_score,
+                String::from_str(env, reason),
+            ),
         );
-        
+
         let position_id = position.position_id;
         strategy.active_position = sentiment_position_absent();
         store_strategy(env, strategy_id, &strategy);
-        
+
         return Ok(Some(position_id));
     }
-    
+
     Ok(None)
 }
 
-/// ==========================
-/// Accuracy Tracking
-/// ==========================
+// ==========================
+// Accuracy Tracking
+// ==========================
 
 /// Track sentiment prediction accuracy
 fn track_sentiment_accuracy(
@@ -694,13 +709,13 @@ fn track_sentiment_accuracy(
     exit_price: i128,
 ) -> Result<(), String> {
     let mut accuracy = get_accuracy(env, strategy_id)?;
-    
+
     let pnl = exit_price - position.entry_price;
     let predicted_direction = position.entry_sentiment > 0;
     let actual_direction = pnl > 0;
-    
+
     accuracy.total_signals += 1;
-    
+
     if predicted_direction == actual_direction {
         accuracy.accurate_predictions += 1;
     } else if predicted_direction && !actual_direction {
@@ -708,7 +723,7 @@ fn track_sentiment_accuracy(
     } else {
         accuracy.false_negatives += 1;
     }
-    
+
     // Update rolling correlation (simplified)
     let correlation = if accuracy.total_signals > 0 {
         ((accuracy.accurate_predictions * SCALE_FACTOR as u32) / accuracy.total_signals) as i32
@@ -716,9 +731,9 @@ fn track_sentiment_accuracy(
         0
     };
     accuracy.avg_sentiment_price_corr = correlation;
-    
+
     store_accuracy(env, strategy_id, &accuracy);
-    
+
     Ok(())
 }
 
@@ -727,9 +742,9 @@ pub fn get_sentiment_accuracy(env: &Env, strategy_id: u64) -> Result<SentimentAc
     get_accuracy(env, strategy_id)
 }
 
-/// ==========================
-/// Storage Functions
-/// ==========================
+// ==========================
+// Storage Functions
+// ==========================
 
 fn get_next_strategy_id(env: &Env) -> u64 {
     let counter: u64 = env
@@ -795,9 +810,9 @@ pub fn get_last_sentiment(env: &Env, strategy_id: u64) -> Option<SentimentScore>
         .get(&SentimentStorageKey::LastSentiment(strategy_id))
 }
 
-/// ==========================
-/// Utility Functions
-/// ==========================
+// ==========================
+// Utility Functions
+// ==========================
 
 fn clamp(value: i32, min_val: i32, max_val: i32) -> i32 {
     if value < min_val {
@@ -810,42 +825,67 @@ fn clamp(value: i32, min_val: i32, max_val: i32) -> i32 {
 }
 
 fn max(a: i32, b: i32) -> i32 {
-    if a > b { a } else { b }
+    if a > b {
+        a
+    } else {
+        b
+    }
 }
 
 fn min(a: u64, b: u64) -> u64 {
-    if a < b { a } else { b }
+    if a < b {
+        a
+    } else {
+        b
+    }
 }
 
 fn sqrt(n: u32) -> u32 {
     if n == 0 {
         return 0;
     }
-    
+
     let mut x = n;
     let mut y = (x + 1) / 2;
-    
+
     while y < x {
         x = y;
         y = (x + n / x) / 2;
     }
-    
+
     x
 }
 
-/// ==========================
-/// Tests
-/// ==========================
+// ==========================
+// Tests
+// ==========================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger as _}, Env};
+    use crate::AutoTradeContract;
+    use soroban_sdk::contract;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Env,
+    };
+
+    #[contract]
+    struct TestContract;
 
     fn setup_env() -> Env {
         let env = Env::default();
         env.ledger().set_timestamp(1000);
+        env.mock_all_auths();
         env
+    }
+
+    fn with_contract<F, R>(env: &Env, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let cid = env.register(AutoTradeContract, ());
+        env.as_contract(&cid, f)
     }
 
     fn create_test_asset_pair(env: &Env) -> AssetPair {
@@ -869,28 +909,28 @@ mod tests {
         let user = Address::generate(&env);
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
-        
-        env.mock_all_auths();
-        
-        let result = create_sentiment_strategy(
-            &env,
-            user.clone(),
-            asset_pair,
-            sources,
-            5000,  // 50% threshold
-            true,  // require technical confirmation
-            2000,  // 20% position size
-            24,    // 24 hour decay
-        );
-        
-        assert!(result.is_ok());
-        let strategy_id = result.unwrap();
-        assert_eq!(strategy_id, 1);
-        
-        let strategy = get_strategy(&env, strategy_id).unwrap();
-        assert_eq!(strategy.user, user);
-        assert_eq!(strategy.sentiment_threshold, 5000);
-        assert_eq!(strategy.position_size_pct, 2000);
+
+        with_contract(&env, || {
+            let result = create_sentiment_strategy(
+                &env,
+                user.clone(),
+                asset_pair,
+                sources,
+                5000,
+                true,
+                2000,
+                24,
+            );
+
+            assert!(result.is_ok());
+            let strategy_id = result.unwrap();
+            assert_eq!(strategy_id, 1);
+
+            let strategy = get_strategy(&env, strategy_id).unwrap();
+            assert_eq!(strategy.user, user);
+            assert_eq!(strategy.sentiment_threshold, 5000);
+            assert_eq!(strategy.position_size_pct, 2000);
+        });
     }
 
     #[test]
@@ -899,34 +939,26 @@ mod tests {
         let user = Address::generate(&env);
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
-        
-        env.mock_all_auths();
-        
-        // Too low threshold
-        let result = create_sentiment_strategy(
-            &env,
-            user.clone(),
-            asset_pair.clone(),
-            sources.clone(),
-            500,   // Below minimum
-            true,
-            2000,
-            24,
-        );
-        assert!(result.is_err());
-        
-        // Too high threshold
-        let result = create_sentiment_strategy(
-            &env,
-            user,
-            asset_pair,
-            sources,
-            9500,  // Above maximum
-            true,
-            2000,
-            24,
-        );
-        assert!(result.is_err());
+
+        with_contract(&env, || {
+            let result = create_sentiment_strategy(
+                &env,
+                user.clone(),
+                asset_pair.clone(),
+                sources.clone(),
+                500,
+                true,
+                2000,
+                24,
+            );
+            assert!(result.is_err());
+        });
+
+        with_contract(&env, || {
+            let result =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 9500, true, 2000, 24);
+            assert!(result.is_err());
+        });
     }
 
     #[test]
@@ -935,27 +967,20 @@ mod tests {
         let user = Address::generate(&env);
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
-        
-        env.mock_all_auths();
-        
-        let strategy_id = create_sentiment_strategy(
-            &env,
-            user,
-            asset_pair,
-            sources,
-            5000,
-            false,
-            2000,
-            24,
-        ).unwrap();
-        
-        let sentiment = aggregate_sentiment(&env, strategy_id).unwrap();
-        
-        assert!(sentiment.overall_score >= -SCALE_FACTOR);
-        assert!(sentiment.overall_score <= SCALE_FACTOR);
-        assert!(sentiment.confidence > 0);
-        assert!(sentiment.confidence <= 10000);
-        assert!(sentiment.source_scores.len() > 0);
+
+        with_contract(&env, || {
+            let strategy_id =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 5000, false, 2000, 24)
+                    .unwrap();
+
+            let sentiment = aggregate_sentiment(&env, strategy_id).unwrap();
+
+            assert!(sentiment.overall_score >= -SCALE_FACTOR);
+            assert!(sentiment.overall_score <= SCALE_FACTOR);
+            assert!(sentiment.confidence > 0);
+            assert!(sentiment.confidence <= 10000);
+            assert!(sentiment.source_scores.len() > 0);
+        });
     }
 
     #[test]
@@ -964,31 +989,22 @@ mod tests {
         let user = Address::generate(&env);
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
-        
-        env.mock_all_auths();
-        
-        let strategy_id = create_sentiment_strategy(
-            &env,
-            user,
-            asset_pair,
-            sources,
-            5000,
-            false,
-            2000,
-            24,
-        ).unwrap();
-        
-        let mut sentiment = aggregate_sentiment(&env, strategy_id).unwrap();
-        let original_score = sentiment.overall_score;
-        
-        // Advance time by 12 hours
-        env.ledger().set_timestamp(1000 + 12 * 3600);
-        
-        apply_sentiment_decay(&env, &mut sentiment, 24).unwrap();
-        
-        // Score should be decayed (50% after 12 hours with 24 hour decay)
-        assert!(sentiment.overall_score.abs() < original_score.abs());
-        assert_eq!(sentiment.decay_factor, 5000); // 50%
+
+        with_contract(&env, || {
+            let strategy_id =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 5000, false, 2000, 24)
+                    .unwrap();
+
+            let mut sentiment = aggregate_sentiment(&env, strategy_id).unwrap();
+            let original_score = sentiment.overall_score;
+
+            env.ledger().set_timestamp(1000 + 12 * 3600);
+
+            apply_sentiment_decay(&env, &mut sentiment, 24).unwrap();
+
+            assert!(sentiment.overall_score.abs() < original_score.abs());
+            assert_eq!(sentiment.decay_factor, 5000);
+        });
     }
 
     #[test]
@@ -997,27 +1013,19 @@ mod tests {
         let user = Address::generate(&env);
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
-        
-        env.mock_all_auths();
-        
-        let strategy_id = create_sentiment_strategy(
-            &env,
-            user,
-            asset_pair,
-            sources,
-            3000,  // Lower threshold to trigger
-            false, // No technical confirmation
-            2000,
-            24,
-        ).unwrap();
-        
-        let signal = check_sentiment_signal(&env, strategy_id).unwrap();
-        
-        // Should generate signal if sentiment exceeds threshold
-        if let Some(sig) = signal {
-            assert!(sig.sentiment_score.abs() >= 3000);
-            assert!(sig.confidence > 0);
-        }
+
+        with_contract(&env, || {
+            let strategy_id =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 3000, false, 2000, 24)
+                    .unwrap();
+
+            let signal = check_sentiment_signal(&env, strategy_id).unwrap();
+
+            if let Some(sig) = signal {
+                assert!(sig.sentiment_score.abs() >= 3000);
+                assert!(sig.confidence > 0);
+            }
+        });
     }
 
     #[test]
@@ -1026,41 +1034,34 @@ mod tests {
         let user = Address::generate(&env);
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
-        
-        env.mock_all_auths();
-        
-        let strategy_id = create_sentiment_strategy(
-            &env,
-            user,
-            asset_pair,
-            sources,
-            3000,
-            false,
-            2000,
-            24,
-        ).unwrap();
-        
-        let mut source_scores = Map::new(&env);
-        source_scores.set(String::from_str(&env, "test"), 7000);
-        
-        let signal = SentimentSignal {
-            direction: TradeDirection::Buy,
-            sentiment_score: 7000,
-            confidence: 8000,
-            source_breakdown: source_scores,
-        };
-        
-        let result = execute_sentiment_trade(&env, strategy_id, signal);
-        assert!(result.is_ok());
-        
-        let position_id = result.unwrap();
-        assert_eq!(position_id, 1);
-        
-        let strategy = get_strategy(&env, strategy_id).unwrap();
-        assert_ne!(strategy.active_position.position_id, 0);
 
-        let position = strategy.active_position;
-        assert_eq!(position.entry_sentiment, 7000);
+        with_contract(&env, || {
+            let strategy_id =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 3000, false, 2000, 24)
+                    .unwrap();
+
+            let mut source_scores = Map::new(&env);
+            source_scores.set(String::from_str(&env, "test"), 7000);
+
+            let signal = SentimentSignal {
+                direction: TradeDirection::Buy,
+                sentiment_score: 7000,
+                confidence: 8000,
+                source_breakdown: source_scores,
+            };
+
+            let result = execute_sentiment_trade(&env, strategy_id, signal);
+            assert!(result.is_ok());
+
+            let position_id = result.unwrap();
+            assert_eq!(position_id, 1);
+
+            let strategy = get_strategy(&env, strategy_id).unwrap();
+            assert_ne!(strategy.active_position.position_id, 0);
+
+            let position = strategy.active_position;
+            assert_eq!(position.entry_sentiment, 7000);
+        });
     }
 
     #[test]
@@ -1069,36 +1070,27 @@ mod tests {
         let user = Address::generate(&env);
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
-        
-        env.mock_all_auths();
-        
-        let strategy_id = create_sentiment_strategy(
-            &env,
-            user,
-            asset_pair,
-            sources,
-            3000,
-            false,
-            2000,
-            24,
-        ).unwrap();
-        
-        // Create a position
-        let mut source_scores = Map::new(&env);
-        source_scores.set(String::from_str(&env, "test"), 7000);
-        
-        let signal = SentimentSignal {
-            direction: TradeDirection::Buy,
-            sentiment_score: 7000,
-            confidence: 8000,
-            source_breakdown: source_scores,
-        };
-        
-        execute_sentiment_trade(&env, strategy_id, signal).unwrap();
-        
-        // Check exit (would exit based on conditions)
-        let exit_result = check_sentiment_exit(&env, strategy_id);
-        assert!(exit_result.is_ok());
+
+        with_contract(&env, || {
+            let strategy_id =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 3000, false, 2000, 24)
+                    .unwrap();
+
+            let mut source_scores = Map::new(&env);
+            source_scores.set(String::from_str(&env, "test"), 7000);
+
+            let signal = SentimentSignal {
+                direction: TradeDirection::Buy,
+                sentiment_score: 7000,
+                confidence: 8000,
+                source_breakdown: source_scores,
+            };
+
+            execute_sentiment_trade(&env, strategy_id, signal).unwrap();
+
+            let exit_result = check_sentiment_exit(&env, strategy_id);
+            assert!(exit_result.is_ok());
+        });
     }
 
     #[test]
@@ -1107,49 +1099,42 @@ mod tests {
         let user = Address::generate(&env);
         let asset_pair = create_test_asset_pair(&env);
         let sources = create_test_sources(&env);
-        
-        env.mock_all_auths();
-        
-        let strategy_id = create_sentiment_strategy(
-            &env,
-            user,
-            asset_pair,
-            sources,
-            3000,
-            false,
-            2000,
-            24,
-        ).unwrap();
-        
-        let position = SentimentPosition {
-            position_id: 1,
-            entry_sentiment: 7000, // Bullish
-            entry_price: 100_000,
-            amount: 10_000,
-            entry_time: 1000,
-        };
-        
-        // Exit at higher price (correct prediction)
-        track_sentiment_accuracy(&env, strategy_id, &position, 110_000).unwrap();
-        
-        let accuracy = get_sentiment_accuracy(&env, strategy_id).unwrap();
-        assert_eq!(accuracy.total_signals, 1);
-        assert_eq!(accuracy.accurate_predictions, 1);
-        assert_eq!(accuracy.false_positives, 0);
+
+        with_contract(&env, || {
+            let strategy_id =
+                create_sentiment_strategy(&env, user, asset_pair, sources, 3000, false, 2000, 24)
+                    .unwrap();
+
+            let position = SentimentPosition {
+                position_id: 1,
+                entry_sentiment: 7000,
+                entry_price: 100_000,
+                amount: 10_000,
+                entry_time: 1000,
+            };
+
+            track_sentiment_accuracy(&env, strategy_id, &position, 110_000).unwrap();
+
+            let accuracy = get_sentiment_accuracy(&env, strategy_id).unwrap();
+            assert_eq!(accuracy.total_signals, 1);
+            assert_eq!(accuracy.accurate_predictions, 1);
+            assert_eq!(accuracy.false_positives, 0);
+        });
     }
 
     #[test]
     fn test_analyze_rationale_sentiment() {
         let env = setup_env();
-        
+
         let bullish_text = String::from_str(&env, "Very bullish breakout with strong momentum");
         let sentiment = analyze_rationale_sentiment(&env, &bullish_text).unwrap();
         assert!(sentiment > 0);
-        
-        let bearish_text = String::from_str(&env, "Bearish trend with weak support and potential crash");
+
+        let bearish_text =
+            String::from_str(&env, "Bearish trend with weak support and potential crash");
         let sentiment = analyze_rationale_sentiment(&env, &bearish_text).unwrap();
         assert!(sentiment < 0);
-        
+
         let neutral_text = String::from_str(&env, "Market analysis shows mixed signals");
         let sentiment = analyze_rationale_sentiment(&env, &neutral_text).unwrap();
         assert_eq!(sentiment, 0);
@@ -1158,40 +1143,52 @@ mod tests {
     #[test]
     fn test_calculate_sentiment_confidence() {
         let env = setup_env();
-        
+
         // High agreement = high confidence
         let mut scores = Map::new(&env);
         scores.set(String::from_str(&env, "source1"), 7000);
         scores.set(String::from_str(&env, "source2"), 7100);
         scores.set(String::from_str(&env, "source3"), 6900);
-        
+
         let confidence = calculate_sentiment_confidence(&env, &scores).unwrap();
         assert!(confidence > 8000); // High confidence
-        
+
         // Low agreement = low confidence
         let mut scores2 = Map::new(&env);
         scores2.set(String::from_str(&env, "source1"), 8000);
         scores2.set(String::from_str(&env, "source2"), 2000);
         scores2.set(String::from_str(&env, "source3"), 5000);
-        
+
         let confidence2 = calculate_sentiment_confidence(&env, &scores2).unwrap();
         assert!(confidence2 < confidence); // Lower confidence
     }
 
     #[test]
     fn test_clamp() {
-        assert_eq!(clamp(5000, 0, 10000), 5000);
-        assert_eq!(clamp(-1000, 0, 10000), 0);
-        assert_eq!(clamp(15000, 0, 10000), 10000);
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        env.mock_all_auths();
+        let contract = env.register(TestContract, ());
+        env.as_contract(&contract, || {
+            assert_eq!(clamp(5000, 0, 10000), 5000);
+            assert_eq!(clamp(-1000, 0, 10000), 0);
+            assert_eq!(clamp(15000, 0, 10000), 10000);
+        });
     }
 
     #[test]
     fn test_sqrt() {
-        assert_eq!(sqrt(0), 0);
-        assert_eq!(sqrt(1), 1);
-        assert_eq!(sqrt(4), 2);
-        assert_eq!(sqrt(9), 3);
-        assert_eq!(sqrt(16), 4);
-        assert_eq!(sqrt(100), 10);
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        env.mock_all_auths();
+        let contract = env.register(TestContract, ());
+        env.as_contract(&contract, || {
+            assert_eq!(sqrt(0), 0);
+            assert_eq!(sqrt(1), 1);
+            assert_eq!(sqrt(4), 2);
+            assert_eq!(sqrt(9), 3);
+            assert_eq!(sqrt(16), 4);
+            assert_eq!(sqrt(100), 10);
+        });
     }
 }

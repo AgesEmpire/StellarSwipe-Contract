@@ -1,49 +1,134 @@
 #![no_std]
 
+#[allow(deprecated)]
 mod admin;
 mod conversion;
+// Closes #671 — cross-source price deviation alerting
+mod deviation;
 mod errors;
+// Closes #755 — single-update price-deviation circuit breaker
+#[allow(deprecated)]
 mod events;
 mod external_adapter;
 mod history;
 mod multi_hop;
+mod price_cb;
 mod reputation;
 mod sdex;
+// Closes #670 — per-asset update frequency SLA monitoring
+mod sla;
 mod staleness;
 mod storage;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, Env, Map, String, Vec};
-use stellar_swipe_common::emergency::{PauseState, CAT_ALL};
-use stellar_swipe_common::{health_uninitialized, placeholder_admin, Asset, AssetPair, HealthStatus};
 use errors::OracleError;
 use reputation::{
-    adjust_oracle_weight, calculate_reputation, get_oracle_stats, should_remove_oracle, slash_oracle,
-    SlashReason, track_oracle_accuracy,
+    adjust_oracle_weight, calculate_reputation, get_oracle_stats, should_remove_oracle,
+    slash_oracle, track_oracle_accuracy, SlashReason,
 };
-use sdex::{calculate_spot_price, OrderBook, OrderEntry};
-use staleness::StalenessLevel;
+use sdex::{calculate_spot_price, OrderBook};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, BytesN, Env, Map, String, Vec};
+use staleness::{OracleHealth, OracleStatus, StalenessLevel};
+use stellar_swipe_common::emergency::{PauseState, CAT_ALL};
+use stellar_swipe_common::{
+    health_uninitialized, placeholder_admin, Asset, AssetPair, HealthStatus,
+};
 use types::{
     ConsensusPriceData, ExternalPrice, OracleReputation, PriceData, PriceSubmission, StorageKey,
 };
 
-pub use conversion::{convert_to_base, ConversionPath};
+pub use conversion::{convert_to_base, normalize_price, ConversionPath};
+pub use deviation::{check_deviation, get_deviation_threshold, set_deviation_threshold};
 pub use history::{calculate_twap, get_historical_price, get_twap_deviation, store_price};
 pub use multi_hop::{calculate_multi_hop_price, find_optimal_path, LiquidityPath};
+pub use sla::{get_feed_health, record_update as sla_record_update, set_sla, FeedHealth};
 pub use storage::{get_base_currency, get_price, set_base_currency, set_price};
+
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct OracleContract;
 
 #[contractimpl]
 impl OracleContract {
-    /// Initialize oracle with base currency
+    /// # Summary
+    /// One-time oracle initialization. Sets the admin and base currency.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `admin`: Address that will hold admin privileges.
+    /// - `base_currency`: The base asset all prices are quoted against.
+    ///
+    pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
+        let mut m = soroban_sdk::Map::new(&env);
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
+        );
+        m
+    }
+
+    /// # Returns
+    /// Nothing. Panics if already initialized.
     pub fn initialize(env: Env, admin: Address, base_currency: Asset) {
         if env.storage().instance().has(&StorageKey::Admin) {
             panic!("already initialized");
         }
         env.storage().instance().set(&StorageKey::Admin, &admin);
         storage::set_base_currency(&env, base_currency);
+        shared::version::set_contract_version(&env, shared::version::ORACLE_VERSION);
+    }
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+
+    /// Returns this contract's stored version. Cross-contract callers can use
+    /// this to enforce a minimum compatible version before invoking this
+    /// oracle (see `shared::version::validate_callee_version`).
+    pub fn get_contract_version(env: Env) -> u32 {
+        shared::version::get_contract_version(&env)
+    }
+
+    /// Admin-only: replace this contract's executable with `new_wasm_hash`
+    /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
+    /// `new_version` as the contract's version.
+    ///
+    /// `new_version` must be strictly greater than the currently stored
+    /// version, rejecting accidental or malicious downgrades.
+    ///
+    /// # Errors
+    /// - [`OracleError::Unauthorized`] — contract not initialized, or caller
+    ///   is not the admin.
+    /// - [`OracleError::IncompatibleContractVersion`] — `new_version` is not
+    ///   strictly greater than the currently stored version.
+    pub fn upgrade(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), OracleError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(OracleError::Unauthorized)?;
+        admin.require_auth();
+
+        let current_version = shared::version::get_contract_version(&env);
+        shared::version::guard_upgrade(current_version, new_version)
+            .map_err(|_| OracleError::IncompatibleContractVersion)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        shared::version::set_contract_version(&env, new_version);
+        shared::version::emit_contract_upgraded(&env, current_version, new_version);
+        Ok(())
     }
 
     /// Read-only health probe for monitoring and front-ends (no auth).
@@ -58,15 +143,29 @@ impl OracleContract {
             .get(&StorageKey::Admin)
             .unwrap_or_else(|| placeholder_admin(&env));
         let is_paused = admin::is_paused(&env, String::from_str(&env, CAT_ALL));
-        HealthStatus {
+        let status = HealthStatus {
             is_initialized: true,
             is_paused,
             version,
             admin,
-        }
+            initialized_at: env.ledger().timestamp(),
+        };
+        stellar_swipe_common::emit_health_event(&env, &status);
+        status
     }
-
-    /// Set price for an asset pair
+    /// and triggers staleness metadata update.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `pair`: The asset pair to price.
+    /// - `price`: Price value (must be > 0).
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - [`OracleError::CircuitBreakerTripped`] — oracle is paused.
+    /// - [`OracleError::InvalidAsset`] — price <= 0.
     pub fn set_price(env: Env, pair: AssetPair, price: i128) -> Result<(), OracleError> {
         if admin::is_paused(&env, String::from_str(&env, CAT_ALL)) {
             return Err(OracleError::CircuitBreakerTripped);
@@ -74,9 +173,51 @@ impl OracleContract {
         if price <= 0 {
             return Err(OracleError::InvalidAsset);
         }
+        // #755: single-update deviation circuit breaker check.
+        price_cb::check_and_trip(&env, &pair, price)?;
         storage::set_price(&env, &pair, price);
         storage::add_available_pair(&env, pair.clone());
         history::store_price(&env, &pair, price);
+        on_price_update(&env, pair);
+        Ok(())
+    }
+
+    // ── Issue #755: single-update price-deviation circuit breaker ─────────────
+
+    /// Admin: set the maximum allowed single-update price deviation for a pair.
+    /// `max_deviation_bps`: basis points (500 = 5 %). 0 disables the check.
+    pub fn set_update_deviation_threshold(
+        env: Env,
+        admin: Address,
+        pair: AssetPair,
+        max_deviation_bps: u32,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        price_cb::set_threshold(&env, &pair, max_deviation_bps);
+        Ok(())
+    }
+
+    /// Returns the configured single-update deviation threshold in basis points (0 = disabled).
+    pub fn get_update_deviation_threshold(env: Env, pair: AssetPair) -> u32 {
+        price_cb::get_threshold(&env, &pair)
+    }
+
+    /// Returns true if the single-update deviation breaker has tripped for this pair.
+    pub fn is_update_dev_breaker_tripped(env: Env, pair: AssetPair) -> bool {
+        price_cb::is_breaker_tripped(&env, &pair)
+    }
+
+    /// Admin: reset the deviation circuit breaker for a pair after manual review.
+    /// Only an authorized admin/multi-sig may call this.
+    pub fn reset_update_deviation_breaker(
+        env: Env,
+        admin: Address,
+        pair: AssetPair,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        price_cb::reset(&env, &pair, admin);
         Ok(())
     }
 
@@ -85,10 +226,10 @@ impl OracleContract {
         // Check cache first
         let base = storage::get_base_currency(&env);
         if let Some(cached) = storage::get_cached_conversion(&env, &asset, &base) {
-            return Ok(amount
+            return amount
                 .checked_mul(cached.rate)
                 .and_then(|v| v.checked_div(10_000_000))
-                .ok_or(OracleError::ConversionOverflow)?);
+                .ok_or(OracleError::ConversionOverflow);
         }
 
         // Perform conversion
@@ -128,12 +269,19 @@ impl OracleContract {
         history::get_historical_price(&env, &pair, timestamp)
     }
 
+    /// Check oracle heartbeat health for a pair using ledger freshness.
+    pub fn check_oracle_heartbeat(env: Env, pair: AssetPair) -> OracleHealth {
+        let health = staleness::check_oracle_heartbeat(&env, &pair);
+        maybe_emit_heartbeat_missed(&env, &pair, &health);
+        health
+    }
+
     /// Get current pause states
     pub fn get_pause_states(env: Env) -> Map<String, PauseState> {
         admin::get_pause_states(&env)
     }
 
-    /// Pause a category (admin only)
+    /// Pause a category (admin or guardian)
     pub fn pause_category(
         env: Env,
         caller: Address,
@@ -145,8 +293,81 @@ impl OracleContract {
     }
 
     /// Unpause a category (admin only)
-    pub fn unpause_category(env: Env, caller: Address, category: String) -> Result<(), OracleError> {
+    pub fn unpause_category(
+        env: Env,
+        caller: Address,
+        category: String,
+    ) -> Result<(), OracleError> {
         admin::unpause_category(&env, &caller, category)
+    }
+
+    // ── Issue #865: governance-driven pause propagation ────────────────────────
+
+    /// Set the central governance contract address authorized to call
+    /// `apply_governance_pause`. Admin only.
+    pub fn set_governance(
+        env: Env,
+        admin: Address,
+        governance: Address,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::GovernanceAddress, &governance);
+        Ok(())
+    }
+
+    /// Read-only: the configured governance contract address, if any.
+    pub fn get_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::GovernanceAddress)
+    }
+
+    /// Called by the configured governance contract to propagate a pause/unpause
+    /// to this oracle by setting (or clearing) the global `CAT_ALL` pause category.
+    pub fn apply_governance_pause(env: Env, paused: bool) -> Result<(), OracleError> {
+        let governance: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GovernanceAddress)
+            .ok_or(OracleError::Unauthorized)?;
+        governance.require_auth();
+        admin::set_all_paused(&env, paused);
+        Ok(())
+    }
+
+    /// Set guardian address (admin only)
+    pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), OracleError> {
+        admin::set_guardian(&env, &caller, guardian)
+    }
+
+    /// Revoke guardian (admin only)
+    pub fn revoke_guardian(env: Env, caller: Address) -> Result<(), OracleError> {
+        admin::revoke_guardian(&env, &caller)
+    }
+
+    /// Get current guardian, if any.
+    pub fn get_guardian(env: Env) -> Option<Address> {
+        admin::get_guardian(&env)
+    }
+
+    /// Propose admin transfer (current admin only)
+    pub fn propose_admin_transfer(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), OracleError> {
+        admin::propose_admin_transfer(&env, &caller, new_admin)
+    }
+
+    /// Accept admin transfer (new admin only)
+    pub fn accept_admin_transfer(env: Env, caller: Address) -> Result<(), OracleError> {
+        admin::accept_admin_transfer(&env, &caller)
+    }
+
+    /// Cancel pending admin transfer (current admin only)
+    pub fn cancel_admin_transfer(env: Env, caller: Address) -> Result<(), OracleError> {
+        admin::cancel_admin_transfer(&env, &caller)
     }
 
     /// Calculate TWAP for 1 hour
@@ -321,7 +542,7 @@ impl OracleContract {
         let consensus_data = ConsensusPriceData {
             price: consensus_price,
             timestamp: env.ledger().timestamp(),
-            num_oracles: submissions.len() as u32,
+            num_oracles: submissions.len(),
         };
         env.storage()
             .persistent()
@@ -343,11 +564,98 @@ impl OracleContract {
         get_oracle_stats(&env, &oracle)
     }
 
+    // ── Price normalization (Issue #decimal) ──────────────────────────────────
+
+    /// Admin: configure the native decimal precision for an asset pair.
+    ///
+    /// `decimals` is the number of fractional digits in the raw stored price
+    /// (e.g. 6 for a USDC-denominated feed where 1 USDC is stored as 1_000_000).
+    pub fn set_feed_decimals(
+        env: Env,
+        caller: Address,
+        pair: AssetPair,
+        decimals: u32,
+    ) -> Result<(), OracleError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        storage::set_feed_decimals(&env, &pair, decimals);
+        Ok(())
+    }
+
+    /// Read-only: return the configured native decimal precision for `pair`.
+    /// Returns `None` if no decimals have been configured.
+    pub fn get_feed_decimals(env: Env, pair: AssetPair) -> Option<u32> {
+        storage::get_feed_decimals(&env, &pair)
+    }
+
+    /// Read-only: return the current price for `pair` rescaled to `target_decimals`.
+    ///
+    /// Uses the same underlying price as `get_price` and rescales it so that
+    /// downstream consumers always work with a consistent decimal precision
+    /// regardless of how each asset's feed is originally stored.
+    ///
+    /// Falls back to 7 decimals when no feed decimals have been configured,
+    /// preserving backward compatibility with existing feeds.
+    ///
+    /// # Errors
+    /// - [`OracleError::PriceNotFound`] — no price set for `pair`.
+    /// - [`OracleError::ConversionOverflow`] — rescaling would overflow `i128`.
+    pub fn get_normalized_price(
+        env: Env,
+        pair: AssetPair,
+        target_decimals: u32,
+    ) -> Result<i128, OracleError> {
+        let raw_price = storage::get_price(&env, &pair)?;
+        let from_decimals = storage::get_feed_decimals(&env, &pair).unwrap_or(7);
+        storage::rescale_price(raw_price, from_decimals, target_decimals)
+            .ok_or(OracleError::ConversionOverflow)
+    }
+
     fn read_oracles(env: &Env) -> Vec<Address> {
         env.storage()
             .persistent()
             .get(&StorageKey::Oracles)
             .unwrap_or(Vec::new(env))
+    }
+
+    // ── Issue #670: SLA monitoring entrypoints ─────────────────────────────────
+
+    /// Admin: set the expected update interval SLA for an asset pair.
+    pub fn set_feed_sla(
+        env: Env,
+        caller: Address,
+        pair: AssetPair,
+        expected_interval_secs: u64,
+    ) -> Result<(), OracleError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        sla::set_sla(&env, &pair, expected_interval_secs);
+        Ok(())
+    }
+
+    /// Read-only: return the feed health summary (rolling avg, SLA, breach flag).
+    pub fn get_feed_health(env: Env, pair: AssetPair) -> sla::FeedHealth {
+        sla::get_feed_health(&env, &pair)
+    }
+
+    // ── Issue #671: Deviation alert entrypoints ────────────────────────────────
+
+    /// Admin: set the deviation alert threshold for a pair (basis points).
+    pub fn set_deviation_threshold(
+        env: Env,
+        caller: Address,
+        pair: AssetPair,
+        threshold_bps: u32,
+    ) -> Result<(), OracleError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        deviation::set_deviation_threshold(&env, &pair, threshold_bps);
+        Ok(())
+    }
+
+    /// Read-only: return current deviation alert threshold in bps (0 = disabled).
+    pub fn get_deviation_threshold(env: Env, pair: AssetPair) -> u32 {
+        deviation::get_deviation_threshold(&env, &pair)
     }
 
     /// Get all registered oracles
@@ -445,7 +753,21 @@ impl OracleContract {
             .set(&StorageKey::Oracles, &new_oracles);
     }
 
-    /// returns aggregated price
+    /// # Summary
+    /// Get the aggregated price for an asset pair. Applies median aggregation
+    /// across all fresh price sources (staleness TTL: 300s).
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `pair`: The asset pair to query.
+    ///
+    /// # Returns
+    /// The median aggregated price.
+    ///
+    /// # Errors
+    /// - [`OracleError::PriceNotFound`] — no price data for this pair.
+    /// - [`OracleError::StalePrice`] — all price sources are stale (> 300s old).
+    /// - [`OracleError::UnreliablePrice`] — sources disagree by > 10%.
     pub fn get_price(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
         let (price, _) = Self::get_price_with_confidence(env, pair)?;
         Ok(price)
@@ -455,6 +777,8 @@ impl OracleContract {
         env: Env,
         pair: AssetPair,
     ) -> Result<(i128, u32), OracleError> {
+        // #755: reject price reads while the single-update deviation breaker is tripped.
+        price_cb::guard_tripped(&env, &pair)?;
         let key = StorageKey::PriceMap(pair.clone());
         let prices: Vec<PriceData> = env
             .storage()
@@ -463,17 +787,28 @@ impl OracleContract {
             .ok_or(OracleError::PriceNotFound)?;
 
         let current_time = env.ledger().timestamp();
+        let window = staleness::get_staleness_window(&env, &pair);
         let mut fresh_prices: Vec<PriceData> = Vec::new(&env);
 
-        // 1. Filter stale prices (TTL: 300s / 5 mins)
+        // 1. Filter stale prices using the configured freshness window (Issue #864).
         for p in prices.iter() {
-            if current_time.saturating_sub(p.timestamp) < 300 {
+            if current_time.saturating_sub(p.timestamp) < window {
                 fresh_prices.push_back(p);
             }
         }
 
         if fresh_prices.is_empty() {
             return Err(OracleError::StalePrice);
+        }
+
+        // 1b. Enforce minimum independent source count
+        let min_count: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinSourceCount)
+            .unwrap_or(0);
+        if min_count > 0 && fresh_prices.len() < min_count {
+            return Err(OracleError::InsufficientSources);
         }
 
         // 2. Median Aggregation
@@ -503,6 +838,106 @@ impl OracleContract {
         Ok((median_data.price, median_data.confidence))
     }
 
+    /// Set the minimum number of independent fresh sources required before a
+    /// price is considered valid for risk-sensitive operations.
+    /// Admin only. Emits `min_src_count_updated`.
+    pub fn set_min_source_count(
+        env: Env,
+        admin: Address,
+        min_count: u32,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let old: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinSourceCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinSourceCount, &min_count);
+        events::emit_min_source_count_updated(&env, old, min_count);
+        Ok(())
+    }
+
+    /// Return the current minimum independent source count (0 = no requirement).
+    pub fn get_min_source_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinSourceCount)
+            .unwrap_or(0)
+    }
+
+    /// Set the minimum confidence (0-100) required for a submitted quote to be
+    /// accepted by `submit_pair_price`. Admin only. Emits `min_confidence_updated`.
+    /// Issue #864.
+    pub fn set_min_confidence(
+        env: Env,
+        admin: Address,
+        min_confidence: u32,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let old: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinConfidence, &min_confidence);
+        events::emit_min_confidence_updated(&env, old, min_confidence);
+        Ok(())
+    }
+
+    /// Return the current minimum confidence requirement (0 = no requirement).
+    pub fn get_min_confidence(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0)
+    }
+
+    /// Admin: set the freshness window (seconds) for a pair. Quotes older than
+    /// this are rejected by `submit_pair_price`/`get_price_with_confidence`.
+    /// Issue #864.
+    pub fn set_staleness_window(
+        env: Env,
+        admin: Address,
+        pair: AssetPair,
+        window_secs: u64,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        staleness::set_staleness_window(&env, &pair, window_secs);
+        Ok(())
+    }
+
+    /// Read-only: return the configured freshness window in seconds for a pair.
+    pub fn get_staleness_window(env: Env, pair: AssetPair) -> u64 {
+        staleness::get_staleness_window(&env, &pair)
+    }
+
+    /// Admin: set the hard deviation reject threshold (basis points) for a pair.
+    /// Unlike `set_deviation_threshold` (alert-only), exceeding this threshold
+    /// causes `submit_pair_price` to reject the quote. Issue #864.
+    pub fn set_deviation_reject_threshold(
+        env: Env,
+        admin: Address,
+        pair: AssetPair,
+        threshold_bps: u32,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        deviation::set_deviation_reject_threshold(&env, &pair, threshold_bps);
+        Ok(())
+    }
+
+    /// Read-only: return current deviation hard reject threshold in bps (0 = disabled).
+    pub fn get_deviation_reject_threshold(env: Env, pair: AssetPair) -> u32 {
+        deviation::get_deviation_reject_threshold(&env, &pair)
+    }
+
     pub fn add_price_source(
         env: Env,
         admin: Address,
@@ -519,6 +954,12 @@ impl OracleContract {
     }
 
     /// Submit a price observation for aggregation (`PriceMap` path).
+    ///
+    /// Issue #864: rejects the quote before it is accepted if its confidence
+    /// is below the configured minimum, or if it deviates from other
+    /// currently-fresh sources by more than the configured hard reject
+    /// threshold. Existing entries older than the configured staleness
+    /// window are dropped before this comparison is made.
     pub fn submit_pair_price(
         env: Env,
         source: Address,
@@ -532,6 +973,15 @@ impl OracleContract {
 
         source.require_auth();
 
+        if price <= 0 {
+            return Err(OracleError::InvalidPrice);
+        }
+
+        let min_confidence = Self::get_min_confidence(env.clone());
+        if confidence < min_confidence {
+            return Err(OracleError::LowConfidence);
+        }
+
         // Ensure source is a registered oracle
         let weight: u32 = env
             .storage()
@@ -543,24 +993,44 @@ impl OracleContract {
         }
 
         let key = StorageKey::PriceMap(pair.clone());
-        let mut prices: Vec<PriceData> = env
+        let prices: Vec<PriceData> = env
             .storage()
             .temporary()
             .get(&key)
             .unwrap_or(Vec::new(&env));
 
+        let now = env.ledger().timestamp();
+        let window = staleness::get_staleness_window(&env, &pair);
+
+        // Drop existing entries outside the freshness window before comparing.
+        let mut fresh: Vec<PriceData> = Vec::new(&env);
+        for p in prices.iter() {
+            if now.saturating_sub(p.timestamp) < window {
+                fresh.push_back(p);
+            }
+        }
+
+        // #864: compute cross-source deviation (including the new quote) and
+        // reject before persisting if it exceeds the hard reject threshold.
+        let mut source_prices: Vec<(Address, i128)> = Vec::new(&env);
+        for i in 0..fresh.len() {
+            let p = fresh.get(i).unwrap();
+            source_prices.push_back((p.source, p.price));
+        }
+        source_prices.push_back((source.clone(), price));
+        deviation::check_deviation(&env, &pair, &source_prices)?;
+
         let new_entry = PriceData {
-            asset_pair: pair,
+            asset_pair: pair.clone(),
             price,
-            timestamp: env.ledger().timestamp(),
+            timestamp: now,
             source,
             confidence,
         };
+        fresh.push_back(new_entry);
 
-        prices.push_back(new_entry);
-
-        // Cache management: Keep prices for 5 mins
-        env.storage().temporary().set(&key, &prices);
+        // Cache management: Keep prices for the configured freshness window.
+        env.storage().temporary().set(&key, &fresh);
         env.storage().temporary().extend_ttl(&key, 60, 60);
 
         Ok(())
@@ -572,10 +1042,10 @@ impl OracleContract {
         // For this issue, we assume we fetch the orderbook.
         let orderbook = fetch_sdex_orderbook(&env, &pair)?;
 
-        // 2. Calculate price
+        // 2. Calculate price and normalize to canonical 7-decimal precision.
         let price = calculate_spot_price(&env, orderbook)?;
-
-        Ok(price)
+        let normalized = storage::rescale_price(price, 7, 7).unwrap_or(price);
+        Ok(normalized)
     }
 
     pub fn update_with_external_data(
@@ -586,6 +1056,7 @@ impl OracleContract {
         let consensus_price = crate::external_adapter::process_external_prices(&env, prices)?;
         if let Some(pair) = first_pair {
             storage::set_price(&env, &pair, consensus_price);
+            on_price_update(&env, pair);
         }
 
         Ok(consensus_price)
@@ -628,8 +1099,31 @@ pub fn on_price_update(env: &Env, pair: AssetPair) {
     }
 
     metadata.last_update = env.ledger().timestamp();
+    metadata.last_update_ledger = env.ledger().sequence();
     metadata.update_count_24h += 1;
+    metadata.last_heartbeat_status = OracleStatus::Healthy;
     staleness::set_metadata(env, &pair, metadata);
+
+    // #670: update rolling SLA cadence tracking
+    sla::record_update(env, &pair);
+}
+
+fn maybe_emit_heartbeat_missed(env: &Env, pair: &AssetPair, health: &OracleHealth) {
+    if health.status == OracleStatus::Healthy {
+        return;
+    }
+
+    let mut metadata = staleness::get_metadata(env, pair);
+    if metadata.last_heartbeat_status != health.status {
+        events::emit_oracle_heartbeat_missed(
+            env,
+            health.status.clone(),
+            health.last_update_ledger,
+            health.ledgers_since_update,
+        );
+        metadata.last_heartbeat_status = health.status.clone();
+        staleness::set_metadata(env, pair, metadata);
+    }
 }
 
 #[cfg(test)]
@@ -637,3 +1131,9 @@ mod test;
 
 #[cfg(test)]
 mod test_health;
+
+#[cfg(test)]
+mod test_admin_transfer;
+
+#[cfg(test)]
+mod test_price_cb;

@@ -75,11 +75,7 @@ pub enum DCAKey {
 // ── Storage helpers ──────────────────────────────────────────────────────────
 
 fn next_id(env: &Env) -> u64 {
-    let id: u64 = env
-        .storage()
-        .persistent()
-        .get(&DCAKey::NextId)
-        .unwrap_or(0);
+    let id: u64 = env.storage().persistent().get(&DCAKey::NextId).unwrap_or(0);
     env.storage().persistent().set(&DCAKey::NextId, &(id + 1));
     id
 }
@@ -190,10 +186,8 @@ pub fn create_dca_strategy(
     push_active_id(env, id);
 
     #[allow(deprecated)]
-    env.events().publish(
-        (Symbol::new(env, "dca_created"), user, id),
-        purchase_amount,
-    );
+    env.events()
+        .publish((Symbol::new(env, "dca_created"), user, id), purchase_amount);
 
     Ok(id)
 }
@@ -283,10 +277,8 @@ pub fn execute_due_dca_purchases(env: &Env) -> Vec<u64> {
                 Ok(_) => executed.push_back(id),
                 Err(e) => {
                     #[allow(deprecated)]
-                    env.events().publish(
-                        (Symbol::new(env, "dca_failed"), id),
-                        e as u32,
-                    );
+                    env.events()
+                        .publish((Symbol::new(env, "dca_failed"), id), e as u32);
                 }
             }
         }
@@ -303,10 +295,8 @@ pub fn handle_missed_dca_purchases(env: &Env, id: u64) -> Result<u32, AutoTradeE
     if expected > actual {
         let missed = expected - actual;
         #[allow(deprecated)]
-        env.events().publish(
-            (Symbol::new(env, "dca_missed"), id),
-            missed,
-        );
+        env.events()
+            .publish((Symbol::new(env, "dca_missed"), id), missed);
         for _ in 0..missed {
             execute_dca_purchase(env, id)?;
         }
@@ -338,10 +328,8 @@ pub fn update_dca_schedule(
     save(env, id, &s);
 
     #[allow(deprecated)]
-    env.events().publish(
-        (Symbol::new(env, "dca_updated"), id),
-        s.purchase_amount,
-    );
+    env.events()
+        .publish((Symbol::new(env, "dca_updated"), id), s.purchase_amount);
 
     Ok(())
 }

@@ -1,22 +1,35 @@
 use soroban_sdk::{Address, Env, Map, Vec};
+use stellar_swipe_common::{SECONDS_PER_30_DAY_MONTH, SECONDS_PER_DAY};
 
-use crate::events::emit_signal_expired;
+use crate::events::{emit_signal_expired, emit_signals_pruned};
 use crate::types::{Signal, SignalStatus};
 
-pub const DEFAULT_EXPIRY_SECONDS: u64 = 24 * 60 * 60; // 24 hours
+use shared::Expirable;
+
+pub const DEFAULT_EXPIRY_SECONDS: u64 = SECONDS_PER_DAY; // 24 hours
 pub const MAX_CLEANUP_BATCH_SIZE: u32 = 100; // Process max 100 signals per cleanup call
-pub const ARCHIVE_THRESHOLD_SECONDS: u64 = 30 * 24 * 60 * 60; // 30 days
+pub const ARCHIVE_THRESHOLD_SECONDS: u64 = SECONDS_PER_30_DAY_MONTH; // 30 days
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CleanupResult {
     pub signals_processed: u32,
     pub signals_expired: u32,
+    pub expired_signals: Vec<Signal>,
 }
 
-/// Check if a signal has expired based on current time
+impl Expirable for Signal {
+    fn expiry_timestamp(&self) -> u64 {
+        self.expiry
+    }
+}
+
+/// Check if a signal has expired based on current ledger time.
+///
+/// Delegates to the shared [`Expirable`] trait implementation on [`Signal`].
+/// Boundary: `current_time > signal.expiry` (exclusive — at the exact
+/// expiry second the signal is still considered live).
 pub fn is_expired(env: &Env, signal: &Signal) -> bool {
-    let current_time = env.ledger().timestamp();
-    current_time > signal.expiry
+    signal.is_expired(env.ledger().timestamp())
 }
 
 /// Check if signal should be archived (expired for more than 30 days)
@@ -149,6 +162,7 @@ pub fn cleanup_expired_signals(
     let current_time = env.ledger().timestamp();
     let mut signals_processed = 0u32;
     let mut signals_expired = 0u32;
+    let mut expired_signals = Vec::new(env);
     let mut updated_map = signals_map.clone();
 
     // Collect all keys first
@@ -167,8 +181,9 @@ pub fn cleanup_expired_signals(
 
         let signal_id = keys.get(i).unwrap();
         if let Some(mut signal) = signals_map.get(signal_id) {
-            // Skip already expired or executed signals
-            if signal.status == SignalStatus::Expired || signal.status == SignalStatus::Executed {
+            // Only active signals consume provider capacity and can transition
+            // to Expired in this cleanup path.
+            if signal.status != SignalStatus::Active {
                 continue;
             }
 
@@ -179,6 +194,7 @@ pub fn cleanup_expired_signals(
                 signal.status = SignalStatus::Expired;
                 updated_map.set(signal_id, signal.clone());
                 signals_expired += 1;
+                expired_signals.push_back(signal.clone());
 
                 // Emit expiry event
                 emit_signal_expired(env, signal.id, signal.provider.clone(), signal.expiry);
@@ -196,7 +212,74 @@ pub fn cleanup_expired_signals(
     CleanupResult {
         signals_processed,
         signals_expired,
+        expired_signals,
     }
+}
+
+/// Permanently remove up to `max_entries` signals whose expiry timestamp has
+/// passed (issue #779).
+///
+/// Unlike [`cleanup_expired_signals`], which only flips signal status, this
+/// deletes entries from the signals map to reclaim instance storage. Uses the
+/// same expiry boundary as [`is_expired`] (a signal at exactly its expiry
+/// second is still live). Emits a single `signals_pruned` event when at least
+/// one signal is removed.
+///
+/// Returns the pruned signals so callers can update secondary indexes.
+/// `max_entries == 0` is a no-op and returns an empty Vec.
+pub fn prune_expired_signals(
+    env: &Env,
+    signals_map: &Map<u64, Signal>,
+    max_entries: u32,
+) -> Vec<Signal> {
+    let mut pruned = Vec::new(env);
+    if max_entries == 0 {
+        return pruned;
+    }
+
+    let mut updated_map = signals_map.clone();
+    let keys = signals_map.keys();
+    for i in 0..keys.len() {
+        if pruned.len() >= max_entries {
+            break;
+        }
+        let signal_id = keys.get(i).unwrap();
+        if let Some(signal) = signals_map.get(signal_id) {
+            if is_expired(env, &signal) {
+                updated_map.remove(signal_id);
+                pruned.push_back(signal);
+            }
+        }
+    }
+
+    if !pruned.is_empty() {
+        env.storage()
+            .instance()
+            .set(&crate::StorageKey::Signals, &updated_map);
+        emit_signals_pruned(env, pruned.len(), env.ledger().sequence());
+    }
+
+    pruned
+}
+
+/// Count signals whose expiry timestamp has passed, regardless of status —
+/// i.e. what [`prune_expired_signals`] would remove given a large enough
+/// budget. Surfaced through `health_check` (issue #779).
+pub fn count_prunable_signals(env: &Env, signals_map: &Map<u64, Signal>) -> u32 {
+    let current_time = env.ledger().timestamp();
+    let mut count = 0u32;
+
+    let keys = signals_map.keys();
+    for i in 0..keys.len() {
+        let key = keys.get(i).unwrap();
+        if let Some(signal) = signals_map.get(key) {
+            if signal.is_expired(current_time) {
+                count += 1;
+            }
+        }
+    }
+
+    count
 }
 
 /// Archive old expired signals (optional - removes from active storage)
@@ -320,10 +403,20 @@ mod tests {
             successful_executions: 0,
             total_volume: 0,
             total_roi: 0,
-            category: crate::categories::SignalCategory::SwingTrade,
+            category: crate::categories::SignalCategory::SWING,
             risk_level: crate::categories::RiskLevel::Medium,
             is_collaborative: false,
             tags: soroban_sdk::Vec::new(env),
+            submitted_at: env.ledger().timestamp(),
+            rationale_hash: String::from_str(env, "Test signal"),
+            confidence: 50,
+            adoption_count: 0,
+            ai_validation_score: None,
+            avg_copier_roi_bps: 0,
+            copier_closed_count: 0,
+            warning_emitted: false,
+            benchmark_return_bps: None,
+            alpha_bps: None,
         }
     }
 
@@ -426,6 +519,60 @@ mod tests {
         // Active signal (never archive)
         let active = create_test_signal(&env, 3, current_time + 1000);
         assert!(!should_archive(&env, &active));
+    }
+
+    #[test]
+    fn test_prune_expired_signals() {
+        let env = Env::default();
+        env.ledger().set_timestamp(10000);
+        let current_time = env.ledger().timestamp();
+
+        #[allow(deprecated)]
+        let contract_id = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&contract_id, || {
+            let mut signals = Map::new(&env);
+
+            // 3 expired, 2 active
+            for i in 0..3 {
+                signals.set(i, create_test_signal(&env, i, current_time - 1000));
+            }
+            for i in 3..5 {
+                signals.set(i, create_test_signal(&env, i, current_time + 1000));
+            }
+
+            // max_entries = 0 is a no-op
+            assert_eq!(prune_expired_signals(&env, &signals, 0).len(), 0);
+
+            // Partial prune: budget smaller than expired count
+            assert_eq!(prune_expired_signals(&env, &signals, 2).len(), 2);
+
+            // Full prune: budget larger than expired count
+            assert_eq!(prune_expired_signals(&env, &signals, 100).len(), 3);
+
+            // A signal at exactly its expiry second is still live — not pruned
+            let mut boundary = Map::new(&env);
+            boundary.set(1, create_test_signal(&env, 1, current_time));
+            assert_eq!(prune_expired_signals(&env, &boundary, 100).len(), 0);
+        });
+    }
+
+    #[test]
+    fn test_count_prunable_signals() {
+        let env = Env::default();
+        env.ledger().set_timestamp(10000);
+        let current_time = env.ledger().timestamp();
+        let mut signals = Map::new(&env);
+
+        // 2 past expiry (one already marked Expired, one still Active)
+        signals.set(0, create_test_signal(&env, 0, current_time - 1000));
+        let mut marked = create_test_signal(&env, 1, current_time - 1000);
+        marked.status = SignalStatus::Expired;
+        signals.set(1, marked);
+
+        // 1 active in the future
+        signals.set(2, create_test_signal(&env, 2, current_time + 1000));
+
+        assert_eq!(count_prunable_signals(&env, &signals), 2);
     }
 
     #[test]

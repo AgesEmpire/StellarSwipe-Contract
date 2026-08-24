@@ -190,6 +190,54 @@ pub struct CommitteeElection {
     pub election_start: u64,
     pub election_end: u64,
     pub positions_available: u32,
+    /// Minimum number of **unique wallets** that must cast a valid ballot for
+    /// the election to be considered valid.  A value of `0` disables the
+    /// voter-count quorum check (not recommended for production).
+    pub min_participation: u32,
+    /// Minimum total staked weight (across all valid votes) that must be
+    /// reached before the election can succeed.  A value of `0` disables the
+    /// stake-weight quorum check.
+    pub quorum_stake_threshold: i128,
+}
+
+/// The outcome of a finalised (or attempted-to-finalise) committee election.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ElectionStatus {
+    /// The election succeeded and `winners` now hold committee seats.
+    Succeeded,
+    /// The election ended but fewer eligible voters participated than
+    /// `min_participation` required.  The existing committee is unchanged.
+    FailedQuorumParticipation,
+    /// The election ended but the total staked weight behind valid votes
+    /// was below `quorum_stake_threshold`.  The existing committee is
+    /// unchanged.
+    FailedQuorumStake,
+    /// The election ended and at least one quorum threshold was met, but
+    /// fewer than 3 distinct candidates received votes.  The existing
+    /// committee is unchanged.
+    FailedInsufficientWinners,
+    /// The election has not been finalised yet (used when returning the
+    /// current election state before its deadline).
+    Pending,
+}
+
+/// The full result returned by `finalize_election`.  Callers can inspect
+/// `status` to understand *why* an election failed without relying on error
+/// codes alone.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ElectionResult {
+    pub status: ElectionStatus,
+    /// The addresses elected into the committee.  Empty when `status` is any
+    /// failure variant.
+    pub winners: Vec<Address>,
+    /// Total number of valid ballots counted.
+    pub valid_votes: u32,
+    /// Total staked weight behind valid ballots.
+    pub total_stake_weight: i128,
+    /// Number of ballots that were rejected as invalid (e.g. unstaked voter).
+    pub rejected_votes: u32,
 }
 
 #[contracttype]
@@ -480,11 +528,16 @@ pub fn start_election(
     committee_id: u64,
     positions_available: u32,
     duration_days: u32,
+    min_participation: u32,
+    quorum_stake_threshold: i128,
 ) -> Result<CommitteeElection, GovernanceError> {
     let committee = get_committee(state, committee_id)?;
     ensure_committee_active(&committee, env.ledger().timestamp())?;
     if positions_available < 3 || positions_available > committee.max_members || duration_days == 0
     {
+        return Err(GovernanceError::InvalidCommitteeConfig);
+    }
+    if quorum_stake_threshold < 0 {
         return Err(GovernanceError::InvalidCommitteeConfig);
     }
     if let Some(existing) = state.elections.get(committee_id) {
@@ -501,6 +554,8 @@ pub fn start_election(
         election_start: now,
         election_end: now.saturating_add(duration_days as u64 * 86_400),
         positions_available,
+        min_participation,
+        quorum_stake_threshold,
     };
 
     state.elections.set(committee_id, election.clone());
@@ -538,14 +593,28 @@ pub fn vote_in_election(
 ) -> Result<CommitteeElection, GovernanceError> {
     let mut election = get_election(state, committee_id)?;
     let now = env.ledger().timestamp();
+
+    // ── Timing guard ───────────────────────────────────────────────────────
     if now < election.election_start || now >= election.election_end {
         return Err(GovernanceError::CommitteeElectionNotActive);
     }
+
+    // ── Candidate validity ─────────────────────────────────────────────────
+    // Reject ballots for unknown candidates without corrupting election state.
     if !contains_address(&election.candidates, &candidate) {
-        return Err(GovernanceError::NotCommitteeCandidate);
+        return Err(GovernanceError::InvalidElectionVote);
     }
-    if election.votes.contains_key(voter.clone()) || get_staked_balance(env, &voter) <= 0 {
-        return Err(GovernanceError::Unauthorized);
+
+    // ── Voter validity ─────────────────────────────────────────────────────
+    // A voter with no staked balance cannot participate in an election.
+    // Reject the ballot cleanly instead of recording a zero-weight vote.
+    if get_staked_balance(env, &voter) <= 0 {
+        return Err(GovernanceError::InvalidElectionVote);
+    }
+
+    // ── Duplicate-vote guard ───────────────────────────────────────────────
+    if election.votes.contains_key(voter.clone()) {
+        return Err(GovernanceError::AlreadyVoted);
     }
 
     election.votes.set(voter, candidate);
@@ -557,24 +626,69 @@ pub fn finalize_election(
     env: &Env,
     state: &mut CommitteesState,
     committee_id: u64,
-) -> Result<Vec<Address>, GovernanceError> {
+) -> Result<ElectionResult, GovernanceError> {
     let election = get_election(state, committee_id)?;
     if env.ledger().timestamp() < election.election_end {
         return Err(GovernanceError::CommitteeElectionNotActive);
     }
 
-    let winners = select_election_winners(env, &election)?;
-    if winners.len() < 3 {
-        return Err(GovernanceError::InvalidCommitteeConfig);
+    // ── Tally votes, separating valid from invalid ballots ─────────────────
+    let (candidate_votes, valid_votes, total_stake_weight, rejected_votes) =
+        tally_election_votes_with_validation(env, &election)?;
+
+    // ── Quorum: minimum unique-voter participation ─────────────────────────
+    if election.min_participation > 0 && valid_votes < election.min_participation {
+        // Election failed — do NOT modify committee state.
+        // Remove the stale election record so a new one can be started.
+        state.elections.remove(committee_id);
+        return Ok(ElectionResult {
+            status: ElectionStatus::FailedQuorumParticipation,
+            winners: Vec::new(env),
+            valid_votes,
+            total_stake_weight,
+            rejected_votes,
+        });
     }
 
+    // ── Quorum: minimum staked-weight participation ────────────────────────
+    if election.quorum_stake_threshold > 0 && total_stake_weight < election.quorum_stake_threshold {
+        state.elections.remove(committee_id);
+        return Ok(ElectionResult {
+            status: ElectionStatus::FailedQuorumStake,
+            winners: Vec::new(env),
+            valid_votes,
+            total_stake_weight,
+            rejected_votes,
+        });
+    }
+
+    // ── Winner selection ───────────────────────────────────────────────────
+    let winners = select_election_winners(env, &election, &candidate_votes)?;
+    if winners.len() < 3 {
+        state.elections.remove(committee_id);
+        return Ok(ElectionResult {
+            status: ElectionStatus::FailedInsufficientWinners,
+            winners: Vec::new(env),
+            valid_votes,
+            total_stake_weight,
+            rejected_votes,
+        });
+    }
+
+    // ── Commit winner set to committee ─────────────────────────────────────
     let mut committee = get_committee(state, committee_id)?;
     committee.members = winners.clone();
     committee.chair = winners.get(0).unwrap();
     state.committees.set(committee_id, committee);
     state.elections.remove(committee_id);
 
-    Ok(winners)
+    Ok(ElectionResult {
+        status: ElectionStatus::Succeeded,
+        winners,
+        valid_votes,
+        total_stake_weight,
+        rejected_votes,
+    })
 }
 
 pub fn set_community_approval_rating(
@@ -914,6 +1028,7 @@ fn execute_decision_action(
         CommitteeAction::TreasurySpend(action) => {
             let mut treasury_state = get_treasury(env);
             treasury::execute_spend(
+                env,
                 &mut treasury_state,
                 action.recipient.clone(),
                 action.amount,
@@ -929,6 +1044,7 @@ fn execute_decision_action(
         CommitteeAction::GrantApproval(action) => {
             let mut treasury_state = get_treasury(env);
             treasury::execute_spend(
+                env,
                 &mut treasury_state,
                 action.recipient.clone(),
                 action.amount,
@@ -987,8 +1103,8 @@ fn update_avg_decision_time(
 fn select_election_winners(
     env: &Env,
     election: &CommitteeElection,
+    candidate_votes: &Map<Address, i128>,
 ) -> Result<Vec<Address>, GovernanceError> {
-    let candidate_votes = tally_election_votes(env, election)?;
     let mut winners = Vec::new(env);
     let mut selected = Map::<Address, bool>::new(env);
 
@@ -1024,24 +1140,59 @@ fn select_election_winners(
     Ok(winners)
 }
 
-fn tally_election_votes(
+/// Tally election votes, returning:
+/// - `candidate_votes`: stake-weighted vote totals per candidate
+/// - `valid_votes`:     count of ballots from eligible (staked) voters
+/// - `total_stake_weight`: sum of staked balance across all valid voters
+/// - `rejected_votes`:  count of ballots that were dropped as invalid
+///
+/// A ballot is invalid if:
+/// - The voter no longer has any staked balance at finalization time.
+/// - The candidate they voted for is not (or is no longer) on the ballot.
+///
+/// Invalid ballots are silently dropped: they do not affect `candidate_votes`
+/// or the quorum totals, and they do not return an error — the rest of the
+/// election state is preserved intact.
+fn tally_election_votes_with_validation(
     env: &Env,
     election: &CommitteeElection,
-) -> Result<Map<Address, i128>, GovernanceError> {
+) -> Result<(Map<Address, i128>, u32, i128, u32), GovernanceError> {
     let mut candidate_votes = Map::<Address, i128>::new(env);
-    let voters = election.votes.keys();
+    let mut valid_votes: u32 = 0;
+    let mut total_stake_weight: i128 = 0;
+    let mut rejected_votes: u32 = 0;
 
+    let voters = election.votes.keys();
     let mut index = 0;
     while index < voters.len() {
         let voter = voters.get(index).unwrap();
         let candidate = election.votes.get(voter.clone()).unwrap();
+
+        // Validate ballot: voter must still be staked and candidate still on ballot.
         let voting_power = get_staked_balance(env, &voter);
+        let candidate_valid = contains_address(&election.candidates, &candidate);
+
+        if voting_power <= 0 || !candidate_valid {
+            // Invalid ballot — count it but do not apply it.
+            rejected_votes = rejected_votes.saturating_add(1);
+            index += 1;
+            continue;
+        }
+
         let current = candidate_votes.get(candidate.clone()).unwrap_or(0);
         candidate_votes.set(candidate, checked_add(current, voting_power)?);
+        valid_votes = valid_votes.saturating_add(1);
+        total_stake_weight = checked_add(total_stake_weight, voting_power)?;
+
         index += 1;
     }
 
-    Ok(candidate_votes)
+    Ok((
+        candidate_votes,
+        valid_votes,
+        total_stake_weight,
+        rejected_votes,
+    ))
 }
 
 fn pct_change(current: i128, proposed: i128) -> Result<u32, GovernanceError> {

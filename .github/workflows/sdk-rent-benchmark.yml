@@ -1,0 +1,181 @@
+name: SDK Rent Benchmark
+
+# Re-runs the storage rent cost benchmark suite whenever a PR changes the
+# pinned soroban-sdk version in Cargo.toml or Cargo.lock.
+# Non-SDK-version PRs are unaffected: the `detect` job exits early and the
+# benchmark step is skipped entirely.
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      # Only trigger when dependency manifests change.
+      - 'stellar-swipe/Cargo.toml'
+      - 'stellar-swipe/Cargo.lock'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  STELLAR_NETWORK: testnet
+  # How many percent the benchmark metric may increase before CI fails.
+  RENT_DELTA_THRESHOLD_PCT: "20"
+
+jobs:
+  # ── Step 1: detect whether the soroban-sdk version actually changed ──────────
+  detect-sdk-bump:
+    name: Detect soroban-sdk version change
+    runs-on: ubuntu-latest
+    outputs:
+      sdk_changed: ${{ steps.check.outputs.sdk_changed }}
+      old_version: ${{ steps.check.outputs.old_version }}
+      new_version: ${{ steps.check.outputs.new_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need history to diff against base branch
+
+      - name: Check soroban-sdk version change
+        id: check
+        run: |
+          set -euo pipefail
+
+          CARGO_TOML="stellar-swipe/Cargo.toml"
+
+          # Extract version from the current (PR) branch.
+          new_ver=$(grep -E '^soroban-sdk\s*=' "$CARGO_TOML" \
+            | grep -oE '"[^"]+"' | tr -d '"' | head -1)
+
+          # Extract version from the merge-base (base branch).
+          git fetch origin ${{ github.base_ref }} --depth=1
+          old_ver=$(git show "origin/${{ github.base_ref }}:$CARGO_TOML" \
+            | grep -E '^soroban-sdk\s*=' \
+            | grep -oE '"[^"]+"' | tr -d '"' | head -1 || echo "unknown")
+
+          echo "old_version=$old_ver" >> "$GITHUB_OUTPUT"
+          echo "new_version=$new_ver" >> "$GITHUB_OUTPUT"
+
+          if [ "$old_ver" != "$new_ver" ]; then
+            echo "sdk_changed=true"  >> "$GITHUB_OUTPUT"
+            echo "::notice::soroban-sdk version changed: $old_ver -> $new_ver"
+          else
+            echo "sdk_changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::soroban-sdk version unchanged ($new_ver) — skipping benchmark"
+          fi
+
+  # ── Step 2: run benchmarks only when the SDK version changed ─────────────────
+  storage-rent-benchmark:
+    name: Storage rent benchmark (sdk ${{ needs.detect-sdk-bump.outputs.new_version }})
+    needs: detect-sdk-bump
+    if: needs.detect-sdk-bump.outputs.sdk_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard — reject mainnet in CI
+        run: |
+          if [ "${STELLAR_NETWORK}" = "mainnet" ]; then
+            echo "ERROR: STELLAR_NETWORK=mainnet is not allowed in CI" && exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stellar-swipe
+
+      # ── Run benchmark suite on the NEW (post-bump) version ───────────────────
+      - name: Run storage rent benchmarks (new SDK ${{ needs.detect-sdk-bump.outputs.new_version }})
+        id: bench_new
+        run: |
+          set -euo pipefail
+          cd stellar-swipe
+          cargo test -p trade_executor \
+            storage_rent \
+            -- --nocapture 2>&1 | tee /tmp/bench_new.txt
+          echo "Benchmark output written to /tmp/bench_new.txt"
+
+      # ── Checkout baseline (base branch) and run on OLD version ───────────────
+      - name: Stash current changes
+        run: git stash --include-untracked
+
+      - name: Checkout base branch
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          git checkout "origin/${{ github.base_ref }}"
+
+      - name: Run storage rent benchmarks (old SDK ${{ needs.detect-sdk-bump.outputs.old_version }})
+        id: bench_old
+        run: |
+          set -euo pipefail
+          cd stellar-swipe
+          cargo test -p trade_executor \
+            storage_rent \
+            -- --nocapture 2>&1 | tee /tmp/bench_old.txt || true
+          echo "Baseline benchmark output written to /tmp/bench_old.txt"
+
+      - name: Restore PR branch
+        run: |
+          git checkout -
+          git stash pop || true
+
+      # ── Compare and surface delta ─────────────────────────────────────────────
+      - name: Compare benchmark results and surface delta
+        id: compare
+        run: |
+          set -euo pipefail
+
+          echo "## Storage Rent Benchmark Delta" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | Test | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          old_ver="${{ needs.detect-sdk-bump.outputs.old_version }}"
+          new_ver="${{ needs.detect-sdk-bump.outputs.new_version }}"
+
+          # Parse pass/fail counts from cargo test output.
+          parse_results() {
+            local file="$1"
+            grep -E '^test result:' "$file" | tail -1 || echo "test result: UNKNOWN"
+          }
+
+          old_result=$(parse_results /tmp/bench_old.txt)
+          new_result=$(parse_results /tmp/bench_new.txt)
+
+          echo "| $old_ver (base) | storage_rent | $old_result |" >> $GITHUB_STEP_SUMMARY
+          echo "| $new_ver (PR)   | storage_rent | $new_result |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Fail if the new version has MORE test failures than the old.
+          old_failed=$(echo "$old_result" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo "0")
+          new_failed=$(echo "$new_result" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo "0")
+
+          echo "Old failures: $old_failed  |  New failures: $new_failed"
+
+          if [ "$new_failed" -gt "$old_failed" ]; then
+            echo "::error::Storage rent benchmarks introduced $new_failed failure(s) after SDK bump from $old_ver to $new_ver. Review the delta and update BASELINE_* constants if the change is intentional."
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**FAIL** — $new_failed benchmark failure(s) after SDK bump. Update \`BASELINE_*\` constants if the cost change is expected." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          echo "**PASS** — No regression in storage rent benchmarks after SDK bump ($old_ver → $new_ver)." >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rent-benchmark-results
+          path: |
+            /tmp/bench_old.txt
+            /tmp/bench_new.txt
+          if-no-files-found: warn

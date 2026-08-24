@@ -1,0 +1,62 @@
+[package]
+name = "integration_tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+stake_vault = { path = "../stake_vault" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+signal_registry = { path = "../signal_registry", features = ["testutils"] }
+stellar_swipe_common = { path = "../common" }
+trade_executor = { path = "../trade_executor" }
+user_portfolio = { path = "../user_portfolio" }
+fee_collector = { path = "../fee_collector" }
+shared = { path = "../shared" }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[[test]]
+name = "test_contract_upgrade"
+path = "tests/integration/test_contract_upgrade.rs"
+
+[[test]]
+name = "test_complete_user_journey"
+path = "tests/integration/test_complete_user_journey.rs"
+
+[[test]]
+name = "test_multisig_governance"
+path = "tests/integration/test_multisig_governance.rs"
+
+[[test]]
+name = "test_signal_to_reward_lifecycle"
+path = "tests/integration/test_signal_to_reward_lifecycle.rs"
+
+[[test]]
+name = "test_chaos_ordering"
+path = "tests/integration/test_chaos_ordering.rs"
+
+[[test]]
+name = "test_arithmetic_invariants"
+path = "tests/integration/test_arithmetic_invariants.rs"
+
+[[test]]
+name = "test_stake_vault_invariants"
+path = "tests/integration/test_stake_vault_invariants.rs"
+
+[[test]]
+name = "test_signal_registry_reentrancy"
+path = "tests/integration/test_signal_registry_reentrancy.rs"
+
+[[test]]
+name = "test_fee_distribution_end_to_end"
+path = "tests/integration/test_fee_distribution_end_to_end.rs"
+
+[lints]
+workspace = true

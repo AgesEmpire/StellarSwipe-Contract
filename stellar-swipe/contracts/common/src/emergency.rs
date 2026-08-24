@@ -1,4 +1,6 @@
-use soroban_sdk::{contracttype, String, Env};
+use crate::constants::BASIS_POINTS_DENOMINATOR;
+pub use crate::constants::{CAT_ALL, CAT_SIGNALS, CAT_STAKES, CAT_TRADING};
+use soroban_sdk::{contracttype, Env, String};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,21 +42,24 @@ pub fn check_thresholds(
 
     // 1. Mass Failures: >50% trade failure rate in a 10-minute window
     if stats.attempts_window >= 5 && now < stats.window_start + 600 {
-        let failure_rate_bps = (stats.failures_window as u32 * 10000) / stats.attempts_window;
+        let failure_rate_bps =
+            (stats.failures_window * BASIS_POINTS_DENOMINATOR) / stats.attempts_window;
         if failure_rate_bps > config.max_failure_rate_bps {
             return Some(String::from_str(env, "High failure rate"));
         }
     }
 
     // 2. Volume Spike: Current hour volume > 10x the 24-hour average
-    if stats.volume_24h_avg > 0 && stats.volume_1h > stats.volume_24h_avg * (config.volume_spike_mult as i128) {
+    if stats.volume_24h_avg > 0
+        && stats.volume_1h > stats.volume_24h_avg * (config.volume_spike_mult as i128)
+    {
         return Some(String::from_str(env, "Volume spike detected"));
     }
 
     // 3. Price Manipulation: Asset price moves >30% within 5 minutes
     if stats.last_price > 0 && now < stats.last_price_time + 300 {
         let price_diff = (current_price - stats.last_price).abs();
-        let price_move_bps = (price_diff * 10000) / stats.last_price;
+        let price_move_bps = (price_diff * BASIS_POINTS_DENOMINATOR as i128) / stats.last_price;
         if price_move_bps > config.max_price_move_bps as i128 {
             return Some(String::from_str(env, "Extreme price movement"));
         }
@@ -73,8 +78,3 @@ impl Default for PauseState {
         panic!("PauseState must be initialized explicitly");
     }
 }
-
-pub const CAT_TRADING: &str = "trading";
-pub const CAT_SIGNALS: &str = "signals";
-pub const CAT_STAKES: &str = "stakes";
-pub const CAT_ALL: &str = "all";

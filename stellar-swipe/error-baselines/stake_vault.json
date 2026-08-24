@@ -1,0 +1,34 @@
+{
+  "_comment": "Baseline error codes for the stake_vault crate. Generated from contracts/stake_vault/src/lib.rs. Do not renumber existing codes; add new variants with unused numbers only.",
+  "crate": "stake_vault",
+  "source": "contracts/stake_vault/src/lib.rs",
+  "enums": {
+    "StakeVaultError": {
+      "NotInitialized": 1,
+      "Unauthorized": 2,
+      "NoStake": 3,
+      "StakeLocked": 4,
+      "ReentrancyDetected": 5,
+      "StakeBelowMinimum": 6,
+      "ContractPaused": 7,
+      "TimelockRequired": 8,
+      "TimelockNotElapsed": 9,
+      "FlashLoanDetected": 10,
+      "InvalidSlashTier": 11,
+      "StakeDurationNotElapsed": 12,
+      "NoDelegatedStake": 13,
+      "UnstakeAlreadyQueued": 14,
+      "NoUnstakeQueued": 15,
+      "QueueEmpty": 16,
+      "SlashNotFound": 17,
+      "AppealWindowClosed": 18,
+      "AppealAlreadyExists": 19,
+      "AppealAlreadyResolved": 20,
+      "InvalidAppealWindow": 21,
+      "RateLimitExceeded": 22,
+      "InvalidAmount": 23,
+      "RemainingStakeBelowMinimum": 24,
+      "IncompatibleContractVersion": 34
+    }
+  }
+}

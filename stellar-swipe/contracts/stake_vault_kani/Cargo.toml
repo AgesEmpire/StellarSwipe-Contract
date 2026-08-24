@@ -1,0 +1,15 @@
+[package]
+name = "stake_vault_kani"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Kani formal-verification harnesses for StakeVault balance conservation"
+
+[lib]
+# Not a cdylib — pure Rust, no Soroban/WASM dependency.
+name = "stake_vault_kani"
+
+[dependencies]
+
+[lints]
+workspace = true

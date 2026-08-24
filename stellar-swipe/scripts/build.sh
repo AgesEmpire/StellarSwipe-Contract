@@ -25,8 +25,11 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
 TARGET="wasm32-unknown-unknown"
-RELEASE_DIR="target/$TARGET/release"
-DEBUG_DIR="target/$TARGET/debug"
+# Honour CARGO_TARGET_DIR so the reproducible-build CI job can point each
+# build at its own isolated output directory.
+CARGO_TARGET_ROOT="${CARGO_TARGET_DIR:-target}"
+RELEASE_DIR="$CARGO_TARGET_ROOT/$TARGET/release"
+DEBUG_DIR="$CARGO_TARGET_ROOT/$TARGET/debug"
 OPT_DIR="${OPT_DIR:-target/wasm-optimized}"
 
 compare=false
@@ -48,6 +51,14 @@ file_size() {
 if [[ "$compare" == true ]]; then
   echo "==> Building debug WASM (for size comparison)..."
   cargo build --workspace --target "$TARGET"
+fi
+
+echo "==> Computing source hash and embedding into contract metadata..."
+# shellcheck source=scripts/embed_source_hash.sh
+source "$SCRIPT_DIR/embed_source_hash.sh"
+if [[ -z "${STELLAR_SOURCE_HASH:-}" ]]; then
+  echo "error: STELLAR_SOURCE_HASH is empty — aborting release build." >&2
+  exit 1
 fi
 
 echo "==> Building release WASM (workspace [profile.release]: opt-level=z, lto, strip, codegen-units=1)..."

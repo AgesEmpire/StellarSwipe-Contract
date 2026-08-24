@@ -6,6 +6,84 @@ use crate::proposals::{self, ProposalStatus, VoteType};
 use crate::{checked_mul, GovernanceError, StorageKey};
 
 const PRECISION: i128 = 10_000;
+const MAX_REPUTATION: u32 = 10_000;
+pub const MAX_REPUTATION_USERS: u32 = 100;
+
+// ── Decay Schedule Tiers ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReputationTier {
+    Bronze,
+    Silver,
+    Gold,
+    Platinum,
+}
+
+impl ReputationTier {
+    /// Decay rate in basis points (1 BPS = 0.01%) applied per inactive day.
+    pub fn decay_rate_bps(&self) -> u32 {
+        match self {
+            ReputationTier::Bronze => 50,
+            ReputationTier::Silver => 30,
+            ReputationTier::Gold => 20,
+            ReputationTier::Platinum => 10,
+        }
+    }
+
+    /// Minimum inactive days before this tier's decay begins.
+    pub fn grace_period_days(&self) -> u64 {
+        match self {
+            ReputationTier::Bronze => 30,
+            ReputationTier::Silver => 60,
+            ReputationTier::Gold => 90,
+            ReputationTier::Platinum => 180,
+        }
+    }
+
+    /// Maximum days of decay to apply (cap to prevent total wipeout).
+    pub fn max_decay_days(&self) -> u64 {
+        match self {
+            ReputationTier::Bronze => 90,
+            ReputationTier::Silver => 180,
+            ReputationTier::Gold => 270,
+            ReputationTier::Platinum => 365,
+        }
+    }
+}
+
+// ── Staleness Levels ─────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StalenessLevel {
+    /// No manual override; staleness is derived from last activity.
+    Auto,
+    Active,
+    Aging,
+    Stale,
+    Critical,
+}
+
+// ── Reputation Configuration ─────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReputationConfig {
+    pub decay_enabled: bool,
+    pub stale_penalty_enabled: bool,
+    pub default_tier: ReputationTier,
+}
+
+impl Default for ReputationConfig {
+    fn default() -> Self {
+        ReputationConfig {
+            decay_enabled: true,
+            stale_penalty_enabled: true,
+            default_tier: ReputationTier::Bronze,
+        }
+    }
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +118,12 @@ pub struct GovernanceReputation {
     pub badges: Vec<Badge>,
     pub last_activity: u64,
     pub decay_rate: u32,
+    /// Current tier for decay schedule (Bronze/Silver/Gold/Platinum).
+    pub tier: ReputationTier,
+    /// Override grace period in days (0 = use tier default).
+    pub grace_override: u64,
+    /// Manual staleness level override (`Auto` = auto-detected from activity).
+    pub staleness_override: StalenessLevel,
 }
 
 #[contracttype]
@@ -47,6 +131,76 @@ pub struct GovernanceReputation {
 pub struct ReputationState {
     pub reputations: Map<Address, GovernanceReputation>,
     pub users: Vec<Address>,
+}
+
+// ── Storage helpers for ReputationConfig ──────────────────────────────────
+
+pub fn get_reputation_config(env: &Env) -> ReputationConfig {
+    env.storage()
+        .instance()
+        .get(&StorageKey::ReputationConfig)
+        .unwrap_or_else(|| ReputationConfig::default())
+}
+
+pub fn put_reputation_config(env: &Env, config: &ReputationConfig) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::ReputationConfig, config);
+}
+
+// ── Staleness detection ──────────────────────────────────────────────────
+
+/// Detect the staleness level of a user based on their last activity timestamp.
+pub fn detect_staleness(env: &Env, last_activity: u64) -> StalenessLevel {
+    let now = env.ledger().timestamp();
+    if now <= last_activity {
+        return StalenessLevel::Active;
+    }
+    let inactive_days = (now - last_activity) / 86_400;
+    if inactive_days <= 30 {
+        StalenessLevel::Active
+    } else if inactive_days <= 90 {
+        StalenessLevel::Aging
+    } else if inactive_days <= 180 {
+        StalenessLevel::Stale
+    } else {
+        StalenessLevel::Critical
+    }
+}
+
+pub fn resolve_staleness(env: &Env, rep: &GovernanceReputation) -> StalenessLevel {
+    match rep.staleness_override {
+        StalenessLevel::Auto => detect_staleness(env, rep.last_activity),
+        level => level,
+    }
+}
+
+/// Calculate the effective staleness penalty multiplier (BPS basis).
+/// 10_000 = no penalty; lower = reduced voting weight.
+pub fn staleness_penalty_multiplier(level: &StalenessLevel) -> u32 {
+    match level {
+        StalenessLevel::Auto | StalenessLevel::Active => 10_000,
+        StalenessLevel::Aging => 8_000,
+        StalenessLevel::Stale => 5_000,
+        StalenessLevel::Critical => 2_000,
+    }
+}
+
+/// Compute the tier for a user based on participation history.
+pub fn compute_tier(rep: &GovernanceReputation) -> ReputationTier {
+    let p = &rep.participation_history;
+    let total_actions =
+        p.proposals_created + p.votes_cast + p.committee_memberships + p.delegations_received;
+
+    if total_actions >= 500 {
+        ReputationTier::Platinum
+    } else if total_actions >= 200 {
+        ReputationTier::Gold
+    } else if total_actions >= 50 {
+        ReputationTier::Silver
+    } else {
+        ReputationTier::Bronze
+    }
 }
 
 pub fn empty_reputation_state(env: &Env) -> ReputationState {
@@ -71,11 +225,9 @@ pub fn put_reputation_state(env: &Env, state: &ReputationState) {
 
 pub fn get_governance_reputation(env: &Env, user: Address) -> GovernanceReputation {
     let state = get_reputation_state(env);
-    state
-        .reputations
-        .get(user.clone())
-        .unwrap_or_else(|| GovernanceReputation {
-            user,
+    state.reputations.get(user.clone()).unwrap_or_else(|| {
+        let rep = GovernanceReputation {
+            user: user.clone(),
             reputation_score: 0,
             participation_history: ParticipationHistory {
                 proposals_created: 0,
@@ -90,7 +242,12 @@ pub fn get_governance_reputation(env: &Env, user: Address) -> GovernanceReputati
             badges: Vec::new(env),
             last_activity: env.ledger().timestamp(),
             decay_rate: 10,
-        })
+            tier: get_reputation_config(env).default_tier.clone(),
+            grace_override: 0,
+            staleness_override: StalenessLevel::Auto,
+        };
+        rep
+    })
 }
 
 pub fn calculate_reputation_score(env: &Env, user: Address) -> Result<u32, GovernanceError> {
@@ -146,9 +303,26 @@ pub fn calculate_reputation_score(env: &Env, user: Address) -> Result<u32, Gover
     score = score.saturating_add(delegation_score);
 
     score = score.saturating_add(calculate_badge_bonus(&rep.badges));
-    score = apply_reputation_decay(env, score, rep.last_activity, rep.decay_rate);
 
-    Ok(min(10_000, score))
+    // Apply tier-based decay schedule
+    let config = get_reputation_config(env);
+    let effective_tier = rep.tier.clone();
+    score = apply_tiered_decay(
+        env,
+        score,
+        rep.last_activity,
+        rep.grace_override,
+        &effective_tier,
+    );
+
+    // Apply staleness penalty if enabled
+    if config.stale_penalty_enabled {
+        let staleness = resolve_staleness(env, &rep);
+        let penalty_mult = staleness_penalty_multiplier(&staleness);
+        score = ((score as u64).saturating_mul(penalty_mult as u64) / 10_000) as u32;
+    }
+
+    Ok(min(MAX_REPUTATION, score))
 }
 
 pub fn record_proposal_creation(env: &Env, user: Address) -> Result<(), GovernanceError> {
@@ -160,6 +334,7 @@ pub fn record_proposal_creation(env: &Env, user: Address) -> Result<(), Governan
         .proposals_created
         .saturating_add(1);
     rep.last_activity = env.ledger().timestamp();
+    rep.tier = compute_tier(&rep);
     rep.reputation_score = calculate_reputation_score(env, user.clone())?;
     check_and_award_badges(env, &mut rep);
 
@@ -179,6 +354,7 @@ pub fn record_vote(
 
     rep.participation_history.votes_cast = rep.participation_history.votes_cast.saturating_add(1);
     rep.last_activity = env.ledger().timestamp();
+    rep.tier = compute_tier(&rep);
     rep.reputation_score = calculate_reputation_score(env, user.clone())?;
     check_and_award_badges(env, &mut rep);
 
@@ -298,8 +474,14 @@ pub fn cast_reputation_weighted_vote(
     Ok(())
 }
 
-pub fn get_reputation_leaderboard(env: &Env, limit: u32) -> Vec<(Address, u32)> {
+pub fn get_reputation_leaderboard(
+    env: &Env,
+    limit: u32,
+) -> Result<Vec<(Address, u32)>, GovernanceError> {
     let state = get_reputation_state(env);
+    if state.users.len() > MAX_REPUTATION_USERS {
+        return Err(GovernanceError::IterationLimitExceeded);
+    }
     let mut sorted: Vec<(Address, u32)> = Vec::new(env);
 
     let mut i = 0;
@@ -330,7 +512,7 @@ pub fn get_reputation_leaderboard(env: &Env, limit: u32) -> Vec<(Address, u32)> 
         out.push_back(sorted.get(idx).unwrap());
         idx += 1;
     }
-    out
+    Ok(out)
 }
 
 pub fn distribute_reputation_rewards(
@@ -341,7 +523,7 @@ pub fn distribute_reputation_rewards(
         return Err(GovernanceError::InvalidAmount);
     }
 
-    let leaders = get_reputation_leaderboard(env, 100);
+    let leaders = get_reputation_leaderboard(env, 100)?;
     let mut total_reputation = 0u32;
     let mut i = 0;
     while i < leaders.len() {
@@ -367,28 +549,65 @@ pub fn distribute_reputation_rewards(
     Ok(payouts)
 }
 
-fn apply_reputation_decay(env: &Env, score: u32, last_activity: u64, decay_rate: u32) -> u32 {
-    if env.ledger().timestamp() <= last_activity || decay_rate == 0 {
+/// Apply tier-based decay schedule to reputation score.
+/// Uses the user's tier to determine decay rate, grace period, and cap.
+fn apply_tiered_decay(
+    env: &Env,
+    score: u32,
+    last_activity: u64,
+    grace_override: u64,
+    tier: &ReputationTier,
+) -> u32 {
+    let config = get_reputation_config(env);
+    if !config.decay_enabled {
         return score;
     }
-    let inactive_days = (env.ledger().timestamp() - last_activity) / 86_400;
+
+    let now = env.ledger().timestamp();
+    if now <= last_activity {
+        return score;
+    }
+    let inactive_days = (now - last_activity) / 86_400;
     if inactive_days == 0 {
         return score;
     }
 
-    let decay_factor = 10_000u32.saturating_sub(decay_rate);
-    let mut decayed = score as u64;
-    let mut i = 0;
-    let capped_days = if inactive_days > 365 {
-        365
+    // Determine grace period: use override if set (>0), otherwise tier default
+    let grace = if grace_override > 0 {
+        grace_override
     } else {
-        inactive_days
+        tier.grace_period_days()
     };
+
+    // Only decay if inactivity exceeds grace period
+    if inactive_days <= grace {
+        return score;
+    }
+
+    let excess_days = inactive_days - grace;
+    let capped_days = core::cmp::min(excess_days, tier.max_decay_days());
+    let daily_decay_bps = tier.decay_rate_bps();
+    let retention_factor = 10_000u32.saturating_sub(daily_decay_bps);
+
+    let mut decayed = score as u64;
+    let mut i = 0u64;
     while i < capped_days {
-        decayed = (decayed * decay_factor as u64) / 10_000;
+        decayed = (decayed * retention_factor as u64) / 10_000;
         i += 1;
     }
     decayed as u32
+}
+
+/// Publicly exposed stale-score refresh: re-evaluates a user's reputation
+/// with fresh decay and staleness adjustments, storing the updated score.
+pub fn refresh_stale_reputation(env: &Env, user: Address) -> Result<u32, GovernanceError> {
+    let mut state = get_reputation_state(env);
+    let mut rep = get_governance_reputation(env, user.clone());
+    rep.tier = compute_tier(&rep);
+    rep.reputation_score = calculate_reputation_score(env, user.clone())?;
+    upsert_rep(&mut state, &user, rep);
+    put_reputation_state(env, &state);
+    Ok(get_governance_reputation(env, user).reputation_score)
 }
 
 fn calculate_badge_bonus(badges: &Vec<Badge>) -> u32 {

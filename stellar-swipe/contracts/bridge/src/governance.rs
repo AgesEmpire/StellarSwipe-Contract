@@ -6,16 +6,18 @@
 #![allow(dead_code)]
 
 use soroban_sdk::{contracttype, Address, Env, Map, String, Symbol, Vec};
-use stellar_swipe_common::{health_uninitialized, placeholder_admin, HealthStatus};
+use stellar_swipe_common::{
+    emit_health_event, health_uninitialized, placeholder_admin, HealthStatus,
+};
 
 /// Governance proposal statuses
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProposalStatus {
-    Pending,      // Awaiting signatures
-    Executed,     // Successfully executed
-    Cancelled,    // Cancelled by proposer
-    Expired,      // Expired before execution
+    Pending,   // Awaiting signatures
+    Executed,  // Successfully executed
+    Cancelled, // Cancelled by proposer
+    Expired,   // Expired before execution
 }
 
 /// Bridge security configuration
@@ -90,7 +92,7 @@ pub struct Bridge {
 #[contracttype]
 pub enum GovernanceDataKey {
     BridgeGovernance(u64),
-    Proposal(u64, u64),  // (bridge_id, proposal_id)
+    Proposal(u64, u64), // (bridge_id, proposal_id)
     Bridge(u64),
     ProposalCount(u64),
 }
@@ -99,9 +101,9 @@ pub enum GovernanceDataKey {
 const PROPOSAL_EXPIRY_SECONDS: u64 = 604800; // 7 days
 const SUPER_MAJORITY_PERCENT: u32 = 75; // 75% for emergency actions
 
-/// ==========================
-/// Initialization
-/// ==========================
+// ==========================
+// Initialization
+// ==========================
 
 /// Initialize bridge governance
 pub fn initialize_bridge_governance(
@@ -113,7 +115,7 @@ pub fn initialize_bridge_governance(
     if signers.is_empty() {
         return Err(String::from_str(env, "Signers cannot be empty"));
     }
-    
+
     if required_signatures == 0 || required_signatures > signers.len() {
         return Err(String::from_str(env, "Invalid required signatures"));
     }
@@ -169,9 +171,9 @@ pub fn initialize_bridge(
     Ok(())
 }
 
-/// ==========================
-/// Proposal Creation
-/// ==========================
+// ==========================
+// Proposal Creation
+// ==========================
 
 /// Create a bridge governance proposal
 pub fn create_bridge_proposal(
@@ -260,9 +262,9 @@ fn validate_proposal_type(
     Ok(())
 }
 
-/// ==========================
-/// Proposal Signing
-/// ==========================
+// ==========================
+// Proposal Signing
+// ==========================
 
 /// Sign a bridge governance proposal
 pub fn sign_bridge_proposal(
@@ -315,16 +317,12 @@ pub fn sign_bridge_proposal(
     Ok(())
 }
 
-/// ==========================
-/// Proposal Execution
-/// ==========================
+// ==========================
+// Proposal Execution
+// ==========================
 
 /// Execute a bridge governance proposal
-pub fn execute_bridge_proposal(
-    env: &Env,
-    bridge_id: u64,
-    proposal_id: u64,
-) -> Result<(), String> {
+pub fn execute_bridge_proposal(env: &Env, bridge_id: u64, proposal_id: u64) -> Result<(), String> {
     let governance = get_bridge_governance(env, bridge_id)?;
     let mut proposal = get_proposal(env, bridge_id, proposal_id)?;
 
@@ -376,20 +374,24 @@ pub fn execute_bridge_proposal(
     store_proposal(env, bridge_id, proposal_id, &proposal);
 
     env.events().publish(
-        (Symbol::new(env, "proposal_executed"), bridge_id, proposal_id),
+        (
+            Symbol::new(env, "proposal_executed"),
+            bridge_id,
+            proposal_id,
+        ),
         env.ledger().timestamp(),
     );
 
     Ok(())
 }
 
-/// ==========================
-/// Proposal Execution Handlers
-/// ==========================
+// ==========================
+// Proposal Execution Handlers
+// ==========================
 
 fn execute_add_validator(env: &Env, bridge_id: u64, validator: &Address) -> Result<(), String> {
     let mut bridge = get_bridge(env, bridge_id)?;
-    
+
     if bridge.validators.contains(validator) {
         return Err(String::from_str(env, "Already validator"));
     }
@@ -397,10 +399,8 @@ fn execute_add_validator(env: &Env, bridge_id: u64, validator: &Address) -> Resu
     bridge.validators.push_back(validator.clone());
     store_bridge(env, bridge_id, &bridge);
 
-    env.events().publish(
-        (Symbol::new(env, "validator_added"), bridge_id),
-        validator,
-    );
+    env.events()
+        .publish((Symbol::new(env, "validator_added"), bridge_id), validator);
 
     Ok(())
 }
@@ -411,7 +411,7 @@ fn execute_remove_validator(env: &Env, bridge_id: u64, validator: &Address) -> R
     // Find and remove validator
     let mut new_validators = Vec::new(env);
     let mut found = false;
-    
+
     for v in bridge.validators.iter() {
         if v == *validator {
             found = true;
@@ -525,9 +525,9 @@ fn execute_emergency_withdraw(
     Ok(())
 }
 
-/// ==========================
-/// Emergency Fast-Track
-/// ==========================
+// ==========================
+// Emergency Fast-Track
+// ==========================
 
 /// Execute proposal with super-majority for emergency situations
 pub fn emergency_execute_proposal(
@@ -545,18 +545,25 @@ pub fn emergency_execute_proposal(
 
     // Calculate super-majority threshold (75%)
     let super_majority = (governance.signers.len() * SUPER_MAJORITY_PERCENT) / 100;
-    
+
     if proposal.signatures.len() < super_majority {
-        return Err(String::from_str(env, "Requires super-majority for emergency"));
+        return Err(String::from_str(
+            env,
+            "Requires super-majority for emergency",
+        ));
     }
 
     // Only certain proposal types can be emergency executed
     match proposal.proposal_type {
         ProposalType::PauseBridge | ProposalType::EmergencyWithdraw(..) => {
             execute_bridge_proposal(env, bridge_id, proposal_id)?;
-            
+
             env.events().publish(
-                (Symbol::new(env, "emergency_executed"), bridge_id, proposal_id),
+                (
+                    Symbol::new(env, "emergency_executed"),
+                    bridge_id,
+                    proposal_id,
+                ),
                 env.ledger().timestamp(),
             );
         }
@@ -566,9 +573,9 @@ pub fn emergency_execute_proposal(
     Ok(())
 }
 
-/// ==========================
-/// Proposal Management
-/// ==========================
+// ==========================
+// Proposal Management
+// ==========================
 
 /// Cancel a proposal (only by proposer)
 pub fn cancel_proposal(
@@ -593,7 +600,11 @@ pub fn cancel_proposal(
     store_proposal(env, bridge_id, proposal_id, &proposal);
 
     env.events().publish(
-        (Symbol::new(env, "proposal_cancelled"), bridge_id, proposal_id),
+        (
+            Symbol::new(env, "proposal_cancelled"),
+            bridge_id,
+            proposal_id,
+        ),
         caller,
     );
 
@@ -634,10 +645,7 @@ pub fn get_bridge_proposals(
 }
 
 /// Get pending proposals
-pub fn get_pending_proposals(
-    env: &Env,
-    bridge_id: u64,
-) -> Result<Vec<GovernanceProposal>, String> {
+pub fn get_pending_proposals(env: &Env, bridge_id: u64) -> Result<Vec<GovernanceProposal>, String> {
     let governance = get_bridge_governance(env, bridge_id)?;
     let mut pending = Vec::new(env);
 
@@ -652,9 +660,9 @@ pub fn get_pending_proposals(
     Ok(pending)
 }
 
-/// ==========================
-/// Signer Management
-/// ==========================
+// ==========================
+// Signer Management
+// ==========================
 
 /// Rotate bridge signers (requires proposal)
 pub fn rotate_bridge_signers(
@@ -668,7 +676,7 @@ pub fn rotate_bridge_signers(
         return Err(String::from_str(env, "Signers cannot be empty"));
     }
 
-    if new_required_signatures == 0 || new_required_signatures > new_signers.len() as u32 {
+    if new_required_signatures == 0 || new_required_signatures > new_signers.len() {
         return Err(String::from_str(env, "Invalid required signatures"));
     }
 
@@ -686,11 +694,7 @@ pub fn rotate_bridge_signers(
 }
 
 /// Add a signer (requires proposal)
-pub fn add_signer(
-    env: &Env,
-    bridge_id: u64,
-    new_signer: Address,
-) -> Result<(), String> {
+pub fn add_signer(env: &Env, bridge_id: u64, new_signer: Address) -> Result<(), String> {
     let mut governance = get_bridge_governance(env, bridge_id)?;
 
     if governance.signers.contains(&new_signer) {
@@ -700,20 +704,14 @@ pub fn add_signer(
     governance.signers.push_back(new_signer.clone());
     store_governance(env, bridge_id, &governance);
 
-    env.events().publish(
-        (Symbol::new(env, "signer_added"), bridge_id),
-        new_signer,
-    );
+    env.events()
+        .publish((Symbol::new(env, "signer_added"), bridge_id), new_signer);
 
     Ok(())
 }
 
 /// Remove a signer (requires proposal)
-pub fn remove_signer(
-    env: &Env,
-    bridge_id: u64,
-    signer: Address,
-) -> Result<(), String> {
+pub fn remove_signer(env: &Env, bridge_id: u64, signer: Address) -> Result<(), String> {
     let mut governance = get_bridge_governance(env, bridge_id)?;
 
     let mut new_signers = Vec::new(env);
@@ -732,23 +730,24 @@ pub fn remove_signer(
     }
 
     if new_signers.len() < governance.required_signatures {
-        return Err(String::from_str(env, "Would drop below required signatures"));
+        return Err(String::from_str(
+            env,
+            "Would drop below required signatures",
+        ));
     }
 
     governance.signers = new_signers;
     store_governance(env, bridge_id, &governance);
 
-    env.events().publish(
-        (Symbol::new(env, "signer_removed"), bridge_id),
-        signer,
-    );
+    env.events()
+        .publish((Symbol::new(env, "signer_removed"), bridge_id), signer);
 
     Ok(())
 }
 
-/// ==========================
-/// Storage Functions
-/// ==========================
+// ==========================
+// Storage Functions
+// ==========================
 
 fn get_bridge_governance(env: &Env, bridge_id: u64) -> Result<BridgeGovernance, String> {
     env.storage()
@@ -763,11 +762,7 @@ fn store_governance(env: &Env, bridge_id: u64, governance: &BridgeGovernance) {
         .set(&GovernanceDataKey::BridgeGovernance(bridge_id), governance);
 }
 
-fn get_proposal(
-    env: &Env,
-    bridge_id: u64,
-    proposal_id: u64,
-) -> Result<GovernanceProposal, String> {
+fn get_proposal(env: &Env, bridge_id: u64, proposal_id: u64) -> Result<GovernanceProposal, String> {
     env.storage()
         .persistent()
         .get(&GovernanceDataKey::Proposal(bridge_id, proposal_id))
@@ -775,9 +770,10 @@ fn get_proposal(
 }
 
 fn store_proposal(env: &Env, bridge_id: u64, proposal_id: u64, proposal: &GovernanceProposal) {
-    env.storage()
-        .persistent()
-        .set(&GovernanceDataKey::Proposal(bridge_id, proposal_id), proposal);
+    env.storage().persistent().set(
+        &GovernanceDataKey::Proposal(bridge_id, proposal_id),
+        proposal,
+    );
 }
 
 pub(crate) fn get_bridge(env: &Env, bridge_id: u64) -> Result<Bridge, String> {
@@ -793,12 +789,12 @@ fn store_bridge(env: &Env, bridge_id: u64, bridge: &Bridge) {
         .set(&GovernanceDataKey::Bridge(bridge_id), bridge);
 }
 
-/// ==========================
-/// Query Functions
-/// ==========================
+// ==========================
+// Query Functions
+// ==========================
 
 fn vec_first_address(vec: &Vec<Address>, _env: &Env) -> Option<Address> {
-    if vec.len() == 0 {
+    if vec.is_empty() {
         return None;
     }
     vec.get(0)
@@ -821,12 +817,15 @@ pub fn bridge_health_check(env: &Env) -> HealthStatus {
                     .and_then(|g: BridgeGovernance| vec_first_address(&g.signers, env))
                     .unwrap_or_else(|| placeholder_admin(env))
             });
-            return HealthStatus {
+            let status = HealthStatus {
                 is_initialized: true,
                 is_paused,
                 version,
                 admin,
+                initialized_at: env.ledger().timestamp(),
             };
+            emit_health_event(env, &status);
+            return status;
         }
     }
     health_uninitialized(env, version)
@@ -868,9 +867,9 @@ pub fn is_validator(env: &Env, bridge_id: u64, address: &Address) -> Result<bool
     Ok(bridge.validators.contains(address))
 }
 
-/// ==========================
-/// Tests
-/// ==========================
+// ==========================
+// Tests
+// ==========================
 
 #[cfg(test)]
 mod tests {
@@ -1003,7 +1002,8 @@ mod tests {
         let description = String::from_str(&env, "Add new validator");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(&env, 1, proposer, proposal_type, description).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, proposer, proposal_type, description).unwrap();
 
         // Second signer signs
         let result = sign_bridge_proposal(&env, 1, proposal_id, signer2);
@@ -1026,7 +1026,8 @@ mod tests {
         let description = String::from_str(&env, "Add new validator");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(&env, 1, proposer.clone(), proposal_type, description).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, proposer.clone(), proposal_type, description).unwrap();
 
         // Proposer tries to sign again
         let result = sign_bridge_proposal(&env, 1, proposal_id, proposer);
@@ -1048,13 +1049,9 @@ mod tests {
         let description = String::from_str(&env, "Add new validator");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(
-            &env,
-            1,
-            signers.get(0).unwrap(),
-            proposal_type,
-            description,
-        ).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
 
         // Add 2 more signatures to reach threshold of 3
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(1).unwrap()).unwrap();
@@ -1085,13 +1082,9 @@ mod tests {
         let description = String::from_str(&env, "Remove validator");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(
-            &env,
-            1,
-            signers.get(0).unwrap(),
-            proposal_type,
-            description,
-        ).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
 
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(1).unwrap()).unwrap();
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(2).unwrap()).unwrap();
@@ -1118,13 +1111,9 @@ mod tests {
         let description = String::from_str(&env, "Pause bridge");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(
-            &env,
-            1,
-            signers.get(0).unwrap(),
-            proposal_type,
-            description,
-        ).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
 
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(1).unwrap()).unwrap();
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(2).unwrap()).unwrap();
@@ -1153,13 +1142,9 @@ mod tests {
         let description = String::from_str(&env, "Unpause bridge");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(
-            &env,
-            1,
-            signers.get(0).unwrap(),
-            proposal_type,
-            description,
-        ).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
 
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(1).unwrap()).unwrap();
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(2).unwrap()).unwrap();
@@ -1189,13 +1174,9 @@ mod tests {
         let description = String::from_str(&env, "Update security limits");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(
-            &env,
-            1,
-            signers.get(0).unwrap(),
-            proposal_type,
-            description,
-        ).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
 
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(1).unwrap()).unwrap();
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(2).unwrap()).unwrap();
@@ -1216,13 +1197,9 @@ mod tests {
         let description = String::from_str(&env, "Update required signatures");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(
-            &env,
-            1,
-            signers.get(0).unwrap(),
-            proposal_type,
-            description,
-        ).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
 
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(1).unwrap()).unwrap();
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(2).unwrap()).unwrap();
@@ -1245,13 +1222,9 @@ mod tests {
         let description = String::from_str(&env, "Emergency pause");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(
-            &env,
-            1,
-            signers.get(0).unwrap(),
-            proposal_type,
-            description,
-        ).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
 
         // Add signatures to reach 75% (4 out of 5)
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(1).unwrap()).unwrap();
@@ -1277,13 +1250,9 @@ mod tests {
         let description = String::from_str(&env, "Emergency pause");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(
-            &env,
-            1,
-            signers.get(0).unwrap(),
-            proposal_type,
-            description,
-        ).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
 
         // Only 3 signatures (60%), not enough for 75% super-majority
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(1).unwrap()).unwrap();
@@ -1305,13 +1274,9 @@ mod tests {
         let description = String::from_str(&env, "Add validator");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(
-            &env,
-            1,
-            signers.get(0).unwrap(),
-            proposal_type,
-            description,
-        ).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
 
         // Get super-majority signatures
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(1).unwrap()).unwrap();
@@ -1336,7 +1301,8 @@ mod tests {
         let description = String::from_str(&env, "Add validator");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(&env, 1, proposer.clone(), proposal_type, description).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, proposer.clone(), proposal_type, description).unwrap();
 
         let result = cancel_proposal(&env, 1, proposal_id, proposer);
         assert!(result.is_ok());
@@ -1359,7 +1325,8 @@ mod tests {
         let description = String::from_str(&env, "Add validator");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(&env, 1, proposer, proposal_type, description).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, proposer, proposal_type, description).unwrap();
 
         let result = cancel_proposal(&env, 1, proposal_id, other_signer);
         assert!(result.is_err());
@@ -1377,16 +1344,13 @@ mod tests {
         let description = String::from_str(&env, "Add validator");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(
-            &env,
-            1,
-            signers.get(0).unwrap(),
-            proposal_type,
-            description,
-        ).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
 
         // Fast forward past expiry
-        env.ledger().set_timestamp(1000 + PROPOSAL_EXPIRY_SECONDS + 1);
+        env.ledger()
+            .set_timestamp(1000 + PROPOSAL_EXPIRY_SECONDS + 1);
 
         // Try to sign expired proposal
         let result = sign_bridge_proposal(&env, 1, proposal_id, signers.get(1).unwrap());
@@ -1410,7 +1374,8 @@ mod tests {
             let new_validator = Address::generate(&env);
             let proposal_type = ProposalType::AddValidator(new_validator);
             let description = String::from_str(&env, "Add validator");
-            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description).unwrap();
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
         }
 
         let pending = get_pending_proposals(&env, 1).unwrap();
@@ -1431,7 +1396,8 @@ mod tests {
             let new_validator = Address::generate(&env);
             let proposal_type = ProposalType::AddValidator(new_validator);
             let description = String::from_str(&env, "Add validator");
-            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description).unwrap();
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
         }
 
         let proposals = get_bridge_proposals(&env, 1, 3).unwrap();
@@ -1498,13 +1464,9 @@ mod tests {
         let description = String::from_str(&env, "Add new validator");
 
         env.mock_all_auths();
-        let proposal_id = create_bridge_proposal(
-            &env,
-            1,
-            signers.get(0).unwrap(),
-            proposal_type,
-            description,
-        ).unwrap();
+        let proposal_id =
+            create_bridge_proposal(&env, 1, signers.get(0).unwrap(), proposal_type, description)
+                .unwrap();
 
         // Step 3: Gather signatures
         sign_bridge_proposal(&env, 1, proposal_id, signers.get(1).unwrap()).unwrap();
@@ -1541,7 +1503,8 @@ mod tests {
             signers.get(0).unwrap(),
             ProposalType::AddValidator(validator1),
             String::from_str(&env, "Add validator 1"),
-        ).unwrap();
+        )
+        .unwrap();
 
         let validator2 = Address::generate(&env);
         let proposal2_id = create_bridge_proposal(
@@ -1550,7 +1513,8 @@ mod tests {
             signers.get(0).unwrap(),
             ProposalType::AddValidator(validator2),
             String::from_str(&env, "Add validator 2"),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Execute both
         sign_bridge_proposal(&env, 1, proposal1_id, signers.get(1).unwrap()).unwrap();

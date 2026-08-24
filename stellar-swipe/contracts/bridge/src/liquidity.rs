@@ -1,8 +1,7 @@
 use soroban_sdk::{contracttype, Address, Env};
+use stellar_swipe_common::BASIS_POINTS_DENOMINATOR_I128;
 
 use crate::BridgeError;
-
-const BPS_DENOMINATOR: i128 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,7 +175,7 @@ pub fn swap(
     }
 
     let mut pool = get_pool(env, pool_id)?;
-    let fee_paid = (amount_in * pool.fee_bps as i128) / BPS_DENOMINATOR;
+    let fee_paid = (amount_in * pool.fee_bps as i128) / BASIS_POINTS_DENOMINATOR_I128;
     let amount_after_fee = amount_in - fee_paid;
 
     let (amount_out, new_reserve_in, new_reserve_out, input_is_a) = if input_asset == pool.asset_a {
@@ -259,12 +258,12 @@ pub fn get_pool_health(env: &Env, pool_id: u64) -> Result<PoolHealth, BridgeErro
     let imbalance_bps = if larger == 0 {
         0
     } else {
-        (((larger - smaller) * BPS_DENOMINATOR) / larger) as u32
+        (((larger - smaller) * BASIS_POINTS_DENOMINATOR_I128) / larger) as u32
     };
     let utilization_bps = if pool.total_lp_tokens == 0 || total_liquidity == 0 {
         0
     } else {
-        ((pool.total_lp_tokens * BPS_DENOMINATOR) / total_liquidity) as u32
+        ((pool.total_lp_tokens * BASIS_POINTS_DENOMINATOR_I128) / total_liquidity) as u32
     };
 
     Ok(PoolHealth {
@@ -302,7 +301,7 @@ fn next_pool_id(env: &Env) -> u64 {
 }
 
 fn reward_for_liquidity(total_added: i128, reward_bps: u32) -> i128 {
-    (total_added * reward_bps as i128) / BPS_DENOMINATOR
+    (total_added * reward_bps as i128) / BASIS_POINTS_DENOMINATOR_I128
 }
 
 fn quote_swap(

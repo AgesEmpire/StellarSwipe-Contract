@@ -1,6 +1,11 @@
 use crate::errors::ContestError;
 use crate::types::Signal;
-use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, Env, Map, String, Symbol, Vec};
+
+/// Minimum ledgers that must elapse between contest creation and finalization.
+/// Ensures the finalization ledger sequence is unknowable to the contest creator
+/// at creation time, making winner tie-breaking verifiably fair.
+const MIN_RANDOMNESS_DELAY_LEDGERS: u32 = 5;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +48,12 @@ pub struct Contest {
     pub winners: Vec<Address>,
     pub prize_pool: i128,
     pub status: ContestStatus,
+    /// Pre-committed seed (= contest_id at creation). Combined with the future
+    /// ledger sequence at finalization to derive a verifiable tiebreak nonce.
+    pub random_seed: u64,
+    /// Earliest ledger sequence at which finalization is permitted. Ensures the
+    /// finalization ledger (and thus the tiebreak nonce) is unknown at creation.
+    pub finalize_after_ledger: u32,
 }
 
 #[contracttype]
@@ -78,6 +89,7 @@ pub fn create_contest(
     let contest_id: u64 = env.storage().persistent().get(&counter_key).unwrap_or(0) + 1;
     env.storage().persistent().set(&counter_key, &contest_id);
 
+    let creation_ledger = env.ledger().sequence();
     let contest = Contest {
         id: contest_id,
         name,
@@ -89,6 +101,8 @@ pub fn create_contest(
         winners: Vec::new(env),
         prize_pool,
         status: ContestStatus::Active,
+        random_seed: contest_id,
+        finalize_after_ledger: creation_ledger.saturating_add(MIN_RANDOMNESS_DELAY_LEDGERS),
     };
 
     let contests_key = ContestStorageKey::Contests;
@@ -149,16 +163,11 @@ pub fn auto_enter_signal(env: &Env, signal: &Signal) -> Result<(), ContestError>
                     });
 
                 entry.signals_submitted.push_back(signal.id);
-                entry.total_roi += signal.total_roi;
-                entry.total_volume += signal.total_volume;
+                // ROI/volume are applied when trades are recorded (see `apply_trade_to_contest_entries`).
 
                 let total_signals = entry.signals_submitted.len() as u32;
                 let successful = signal.successful_executions;
-                entry.success_rate = if total_signals > 0 {
-                    (successful * 100) / total_signals
-                } else {
-                    0
-                };
+                entry.success_rate = (successful * 100).checked_div(total_signals).unwrap_or(0);
 
                 entry.score = calculate_contest_score(&entry, &contest.metric, env);
                 contest.entries.set(provider, entry);
@@ -171,6 +180,66 @@ pub fn auto_enter_signal(env: &Env, signal: &Signal) -> Result<(), ContestError>
     Ok(())
 }
 
+/// Add this trade's ROI and volume to any active contest entry that lists `signal_id` for `provider`.
+pub fn apply_trade_to_contest_entries(
+    env: &Env,
+    signal_id: u64,
+    provider: &Address,
+    trade_roi: i128,
+    volume: i128,
+) {
+    let current_time = env.ledger().timestamp();
+    let active_key = ContestStorageKey::ActiveContests;
+    let active_contests: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&active_key)
+        .unwrap_or(Vec::new(env));
+
+    let contests_key = ContestStorageKey::Contests;
+    let mut contests: Map<u64, Contest> = env
+        .storage()
+        .persistent()
+        .get(&contests_key)
+        .unwrap_or(Map::new(env));
+
+    let mut any = false;
+    for i in 0..active_contests.len() {
+        let contest_id = active_contests.get(i).unwrap();
+        let Some(mut contest) = contests.get(contest_id) else {
+            continue;
+        };
+        if contest.status != ContestStatus::Active {
+            continue;
+        }
+        if current_time < contest.start_time || current_time > contest.end_time {
+            continue;
+        }
+        let Some(mut entry) = contest.entries.get(provider.clone()) else {
+            continue;
+        };
+        let mut lists_signal = false;
+        for j in 0..entry.signals_submitted.len() {
+            if entry.signals_submitted.get(j).unwrap() == signal_id {
+                lists_signal = true;
+                break;
+            }
+        }
+        if !lists_signal {
+            continue;
+        }
+        entry.total_roi = entry.total_roi.saturating_add(trade_roi);
+        entry.total_volume = entry.total_volume.saturating_add(volume);
+        entry.score = calculate_contest_score(&entry, &contest.metric, env);
+        contest.entries.set(provider.clone(), entry);
+        contests.set(contest_id, contest);
+        any = true;
+    }
+    if any {
+        env.storage().persistent().set(&contests_key, &contests);
+    }
+}
+
 fn calculate_contest_score(entry: &ContestEntry, metric: &ContestMetric, _env: &Env) -> i128 {
     match metric {
         ContestMetric::HighestROI => entry.total_roi,
@@ -178,6 +247,46 @@ fn calculate_contest_score(entry: &ContestEntry, metric: &ContestMetric, _env: &
         ContestMetric::MostVolume => entry.total_volume,
         ContestMetric::MostFollowers => 0, // Placeholder - would integrate with social module
     }
+}
+
+/// Derive a tiebreak nonce from a pre-committed seed and the finalization ledger sequence.
+///
+/// `SHA-256(seed_bytes || finalize_ledger_bytes)` → first 8 bytes as big-endian u64.
+/// Given the same `(random_seed, ledger_sequence)` pair the result is always identical,
+/// enabling independent verification of any past selection.
+fn derive_tiebreak_nonce(env: &Env, random_seed: u64, ledger_sequence: u32) -> u64 {
+    let mut preimage = Bytes::new(env);
+    preimage.append(&Bytes::from_array(env, &random_seed.to_be_bytes()));
+    preimage.append(&Bytes::from_array(env, &ledger_sequence.to_be_bytes()));
+    let hash = env.crypto().sha256(&preimage);
+    let bytes = hash.to_array();
+    u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+/// Returns true if `a` should be swapped after `b` in descending-score order.
+/// Equal scores are broken by a provider-specific hash derived from `tiebreak_nonce`,
+/// ensuring determinism across identical inputs while being opaque at creation time.
+fn should_swap(a: &ContestEntry, b: &ContestEntry, tiebreak_nonce: u64) -> bool {
+    if a.score != b.score {
+        return a.score < b.score;
+    }
+    // Derive a per-provider key: XOR-fold address bytes against the nonce.
+    let a_key = provider_tiebreak_key(tiebreak_nonce, &a.provider);
+    let b_key = provider_tiebreak_key(tiebreak_nonce, &b.provider);
+    a_key > b_key
+}
+
+fn provider_tiebreak_key(nonce: u64, provider: &Address) -> u64 {
+    let s = provider.to_string();
+    let bytes = s.to_bytes();
+    let mut key = nonce;
+    let len = bytes.len().min(8);
+    for i in 0..len {
+        key ^= (bytes.get(i).unwrap_or(0) as u64).wrapping_shl((i as u32) * 8);
+    }
+    key
 }
 
 pub fn finalize_contest(env: &Env, contest_id: u64) -> Result<Vec<Address>, ContestError> {
@@ -200,6 +309,25 @@ pub fn finalize_contest(env: &Env, contest_id: u64) -> Result<Vec<Address>, Cont
         return Err(ContestError::AlreadyFinalized);
     }
 
+    let current_ledger = env.ledger().sequence();
+    if current_ledger < contest.finalize_after_ledger {
+        return Err(ContestError::RandomnessNotAvailable);
+    }
+
+    // Derive a verifiable tiebreak nonce from the pre-committed seed and the
+    // current ledger sequence (unknown at contest creation time).
+    // Inputs are emitted so the result can be independently reproduced.
+    let tiebreak_nonce = derive_tiebreak_nonce(env, contest.random_seed, current_ledger);
+
+    env.events().publish(
+        (Symbol::new(env, "contest_randomness"), contest_id),
+        (
+            contest.random_seed,
+            contest.finalize_after_ledger,
+            current_ledger,
+        ),
+    );
+
     let mut qualified_entries: Vec<ContestEntry> = Vec::new(env);
     let entry_keys = contest.entries.keys();
 
@@ -212,12 +340,12 @@ pub fn finalize_contest(env: &Env, contest_id: u64) -> Result<Vec<Address>, Cont
         }
     }
 
-    // Sort by score descending (bubble sort for simplicity)
+    // Sort by score descending; equal scores broken deterministically by tiebreak_nonce.
     for i in 0..qualified_entries.len() {
         for j in 0..qualified_entries.len().saturating_sub(i + 1) {
             let a = qualified_entries.get(j).unwrap();
             let b = qualified_entries.get(j + 1).unwrap();
-            if a.score < b.score {
+            if should_swap(&a, &b, tiebreak_nonce) {
                 qualified_entries.set(j, b);
                 qualified_entries.set(j + 1, a);
             }

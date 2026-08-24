@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, Env, Map, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, Env, Map, Symbol, Vec};
 
 use crate::proposals::{self, ProposalStatus, ProposalType};
 use crate::{GovernanceError, StorageKey};
@@ -25,6 +25,13 @@ pub struct QueuedAction {
     pub executed: bool,
     pub cancelled: bool,
 }
+
+/// Once an action has been executable for this many seconds without succeeding,
+/// it is considered stuck and becomes eligible for emergency recovery. A failed
+/// contract invocation rolls back all of its storage writes, so a queued action
+/// cannot persist a "blocked" flag from inside the same call that failed to
+/// execute it; eligibility is therefore derived purely from elapsed time.
+const STUCK_GRACE_PERIOD: u64 = 86_400;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,7 +84,9 @@ pub fn initialize_timelock(
     env.storage()
         .instance()
         .set(&StorageKey::TimelockState, &timelock);
-    env.storage().instance().set(&StorageKey::Guardian, &guardian);
+    env.storage()
+        .instance()
+        .set(&StorageKey::Guardian, &guardian);
 
     Ok(timelock)
 }
@@ -93,6 +102,19 @@ pub fn put_timelock(env: &Env, timelock: &Timelock) {
     env.storage()
         .instance()
         .set(&StorageKey::TimelockState, timelock);
+}
+
+pub fn get_queued_action(env: &Env, action_id: u64) -> Result<QueuedAction, GovernanceError> {
+    let timelock = get_timelock(env)?;
+    let mut i = 0;
+    while i < timelock.queued_actions.len() {
+        let action = timelock.queued_actions.get(i).unwrap();
+        if action.id == action_id {
+            return Ok(action);
+        }
+        i += 1;
+    }
+    Err(GovernanceError::ActionNotFound)
 }
 
 pub fn queue_action(env: &Env, proposal_id: u64) -> Result<u64, GovernanceError> {
@@ -151,6 +173,62 @@ pub fn execute_queued_action(
                 return Err(GovernanceError::InvalidCommitteeAction);
             }
             if env.ledger().timestamp() < action.execution_available {
+                return Err(GovernanceError::InvalidDuration);
+            }
+
+            proposals::execute_proposal_action_by_id(env, action.proposal_id)?;
+            action.executed = true;
+            timelock.queued_actions.set(i, action.clone());
+            put_timelock(env, &timelock);
+            proposals::mark_proposal_executed(env, action.proposal_id)?;
+            return Ok(());
+        }
+        i += 1;
+    }
+
+    Err(GovernanceError::ActionNotFound)
+}
+
+/// Emergency recovery path for queued actions that are stuck past their execution
+/// window because of ledger timing or downstream contract state issues (e.g. a
+/// treasury spend that was funded when approved but drained again before the
+/// timelock delay elapsed).
+///
+/// Eligibility: the action must not already be executed or cancelled, and must
+/// be overdue by more than [`STUCK_GRACE_PERIOD`] past `execution_available`.
+/// The grace period keeps this path from being usable to skip the normal
+/// timelock delay — it only kicks in once an action has visibly failed to
+/// execute through the normal path for a sustained period.
+///
+/// Only the configured guardian may call this. Each call retries the
+/// underlying proposal execution: success marks the action executed exactly
+/// once (guarded by the same `executed`/`cancelled` check as the normal path,
+/// so a second call on an already-recovered action is rejected); failure
+/// returns the underlying error and leaves the action queued for another
+/// attempt once whatever was blocking it is resolved.
+pub fn emergency_unblock_action(
+    env: &Env,
+    action_id: u64,
+    guardian: Address,
+) -> Result<(), GovernanceError> {
+    guardian.require_auth();
+    let mut timelock = get_timelock(env)?;
+    if guardian != timelock.guardian {
+        return Err(GovernanceError::Unauthorized);
+    }
+
+    let mut i = 0;
+    while i < timelock.queued_actions.len() {
+        let mut action = timelock.queued_actions.get(i).unwrap();
+        if action.id == action_id {
+            if action.executed || action.cancelled {
+                return Err(GovernanceError::InvalidCommitteeAction);
+            }
+
+            let stuck_since = action
+                .execution_available
+                .saturating_add(STUCK_GRACE_PERIOD);
+            if env.ledger().timestamp() < stuck_since {
                 return Err(GovernanceError::InvalidDuration);
             }
 
@@ -271,7 +349,8 @@ pub fn extend_execution_window(
             if action.executed || action.cancelled {
                 return Err(GovernanceError::InvalidCommitteeAction);
             }
-            action.execution_available = action.execution_available.saturating_add(extension_seconds);
+            action.execution_available =
+                action.execution_available.saturating_add(extension_seconds);
             let new_time = action.execution_available;
             timelock.queued_actions.set(i, action);
             put_timelock(env, &timelock);
@@ -322,7 +401,8 @@ pub fn generate_timelock_analytics(env: &Env) -> Result<TimelockAnalytics, Gover
 
         if action.executed {
             total_executed = total_executed.saturating_add(1);
-            total_wait = total_wait.saturating_add(action.execution_available.saturating_sub(action.queued_at));
+            total_wait = total_wait
+                .saturating_add(action.execution_available.saturating_sub(action.queued_at));
             wait_count = wait_count.saturating_add(1);
         }
         if action.cancelled {
@@ -356,4 +436,157 @@ fn classify_proposal_action(proposal_type: &ProposalType) -> ActionType {
         ProposalType::ContractUpgrade(..) => ActionType::ContractUpgrade,
         _ => ActionType::Custom,
     }
+}
+
+// ── Admin action timelock ────────────────────────────────────────────────────
+//
+// Critical admin-only functions that bypass the proposal pipeline must still
+// respect a timelock delay.  An admin queues an action (which records the
+// intent + a future-execution timestamp), then after the delay elapses the
+// same admin (or anyone with auth) can execute it.
+
+/// Identifier for a queued admin action.  Each `queue_admin_action` call
+/// returns one; the caller must pass it back to `execute_admin_action` after
+/// the delay has elapsed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTimelockEntry {
+    pub id: u64,
+    pub action_type: Symbol,
+    pub caller: Address,
+    pub queued_at: u64,
+    pub execution_available: u64,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
+const ADMIN_ACTION_DELAY: u64 = 2 * 86_400; // 2 days default
+
+pub fn queue_admin_action(
+    env: &Env,
+    caller: Address,
+    action_type: Symbol,
+) -> Result<u64, GovernanceError> {
+    let mut timelock = get_timelock(env)?;
+    let now = env.ledger().timestamp();
+    let delay = ADMIN_ACTION_DELAY;
+    let id = timelock.next_action_id;
+    timelock.queued_actions.push_back(QueuedAction {
+        id,
+        action_type: ActionType::Custom,
+        proposal_id: 0,
+        execution_payload: Bytes::new(env),
+        queued_at: now,
+        execution_available: now.saturating_add(delay),
+        executed: false,
+        cancelled: false,
+    });
+    timelock.next_action_id = id.saturating_add(1);
+    put_timelock(env, &timelock);
+
+    let mut pending = get_admin_pending_actions(env);
+    pending.push_back(AdminTimelockEntry {
+        id,
+        action_type,
+        caller,
+        queued_at: now,
+        execution_available: now.saturating_add(delay),
+        executed: false,
+        cancelled: false,
+    });
+    env.storage()
+        .instance()
+        .set(&StorageKey::AdminPendingActions, &pending);
+
+    Ok(id)
+}
+
+pub fn execute_admin_action(
+    env: &Env,
+    action_id: u64,
+    caller: &Address,
+) -> Result<Symbol, GovernanceError> {
+    caller.require_auth();
+
+    if env.ledger().timestamp() < get_admin_action_execution_available(env, action_id)? {
+        return Err(GovernanceError::InvalidDuration);
+    }
+
+    let mut pending = get_admin_pending_actions(env);
+    let mut i = 0;
+    while i < pending.len() {
+        let mut entry = pending.get(i).unwrap();
+        if entry.id == action_id {
+            if entry.executed || entry.cancelled {
+                return Err(GovernanceError::InvalidCommitteeAction);
+            }
+            if entry.caller != *caller {
+                return Err(GovernanceError::Unauthorized);
+            }
+            let action_type = entry.action_type.clone();
+            entry.executed = true;
+            pending.set(i, entry);
+            env.storage()
+                .instance()
+                .set(&StorageKey::AdminPendingActions, &pending);
+            return Ok(action_type);
+        }
+        i += 1;
+    }
+    Err(GovernanceError::ActionNotFound)
+}
+
+pub fn cancel_admin_action(
+    env: &Env,
+    action_id: u64,
+    canceller: &Address,
+) -> Result<(), GovernanceError> {
+    canceller.require_auth();
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&StorageKey::Admin)
+        .ok_or(GovernanceError::NotInitialized)?;
+    if *canceller != admin {
+        return Err(GovernanceError::Unauthorized);
+    }
+
+    let mut pending = get_admin_pending_actions(env);
+    let mut i = 0;
+    while i < pending.len() {
+        let mut entry = pending.get(i).unwrap();
+        if entry.id == action_id {
+            if entry.executed || entry.cancelled {
+                return Err(GovernanceError::InvalidCommitteeAction);
+            }
+            entry.cancelled = true;
+            pending.set(i, entry);
+            env.storage()
+                .instance()
+                .set(&StorageKey::AdminPendingActions, &pending);
+            return Ok(());
+        }
+        i += 1;
+    }
+    Err(GovernanceError::ActionNotFound)
+}
+
+fn get_admin_action_execution_available(env: &Env, action_id: u64) -> Result<u64, GovernanceError> {
+    let pending = get_admin_pending_actions(env);
+    let mut i = 0;
+    while i < pending.len() {
+        let entry = pending.get(i).unwrap();
+        if entry.id == action_id {
+            return Ok(entry.execution_available);
+        }
+        i += 1;
+    }
+    Err(GovernanceError::ActionNotFound)
+}
+
+pub fn get_admin_pending_actions(env: &Env) -> Vec<AdminTimelockEntry> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::AdminPendingActions)
+        .unwrap_or(Vec::new(env))
 }

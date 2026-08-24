@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+shared = { path = "../shared" }
 stellar_swipe_common = { path = "../common" }
 
 [dev-dependencies]
@@ -15,3 +16,6 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
+
+[lints]
+workspace = true

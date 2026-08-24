@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, Env, Vec};
+use soroban_sdk::{contracttype, Address, Bytes};
 use stellar_swipe_common::AssetPair;
 
 #[contracttype]
@@ -34,6 +34,7 @@ pub struct PriceData {
 #[derive(Clone)]
 pub enum StorageKey {
     Admin,
+    Guardian,
     PriceMap(AssetPair),
     OracleStats,
     Oracles,
@@ -41,6 +42,18 @@ pub enum StorageKey {
     ConsensusPrice,
     PauseStates,
     OracleWeight(Address),
+    PendingAdmin,
+    PendingAdminExpiry,
+    MinSourceCount,
+    /// Issue #864: minimum confidence (0-100) required for a submitted quote to be accepted.
+    MinConfidence,
+    /// Max percentage deviation allowed between consecutive price updates for an asset pair (basis points, 10000 = 100%).
+    DeviationThreshold(AssetPair),
+    /// Set to true when the single-update deviation breaker has tripped for an asset pair.
+    DeviationBreakerTripped(AssetPair),
+    /// Issue #865: central governance contract address authorized to call
+    /// `apply_governance_pause`.
+    GovernanceAddress,
 }
 
 #[contracttype]
@@ -60,4 +73,6 @@ pub struct ExternalPrice {
     pub round_id: u64,
     pub signature: Bytes,
     pub oracle_address: Address,
+    /// Decimal precision of the raw `price` value (e.g. 6 for USDC, 7 for XLM).
+    pub decimals: u32,
 }

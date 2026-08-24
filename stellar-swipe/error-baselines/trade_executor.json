@@ -1,0 +1,34 @@
+{
+  "_comment": "Baseline error codes for the trade_executor crate. Generated from contracts/trade_executor/src/errors.rs. Do not renumber existing codes; add new variants with unused numbers only.",
+  "crate": "trade_executor",
+  "source": "contracts/trade_executor/src/errors.rs",
+  "enums": {
+    "ContractError": {
+      "NotInitialized": 1,
+      "PositionLimitReached": 2,
+      "InsufficientBalance": 3,
+      "InvalidAmount": 4,
+      "ReentrancyDetected": 5,
+      "Unauthorized": 6,
+      "TradeNotFound": 7,
+      "SlippageExceeded": 8,
+      "PositionPctTooHigh": 9,
+      "OraclePriceStale": 10,
+      "OracleUnavailable": 11,
+      "DailyVolumeLimitExceeded": 12,
+      "OracleNotWhitelisted": 13,
+      "CannotRemoveLastOracle": 14,
+      "OpenInterestLimitReached": 15,
+      "DCAPlanNotFound": 16,
+      "DCAPlanAlreadyExists": 17,
+      "SignalExpired": 18,
+      "IntervalNotDue": 19,
+      "NetworkCongestion": 20,
+      "InsufficientLiquidity": 21,
+      "CircuitBreakerActive": 22,
+      "FeatureDisabled": 23,
+      "ReplayDetected": 24,
+      "BelowMinimumTradeSize": 25
+    }
+  }
+}

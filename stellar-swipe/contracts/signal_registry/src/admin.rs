@@ -1,5 +1,9 @@
-use soroban_sdk::{contracttype, Address, Env, Vec, Map, String};
-use stellar_swipe_common::emergency::{PauseState, CAT_ALL, CAT_SIGNALS, CAT_TRADING, CAT_STAKES, CircuitBreakerStats, CircuitBreakerConfig};
+use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
+use stellar_swipe_common::emergency::{
+    CircuitBreakerConfig, CircuitBreakerStats, PauseState, CAT_ALL, CAT_SIGNALS, CAT_STAKES,
+    CAT_TRADING,
+};
+use stellar_swipe_common::validate_signer_config;
 
 use crate::errors::AdminError;
 use crate::events::*;
@@ -7,18 +11,27 @@ use crate::events::*;
 // Constants
 pub const MAX_FEE_BPS: u32 = 100; // 1% max fee
 pub const MAX_RISK_PERCENTAGE: u32 = 100; // 100% max
+/// Wall-clock admin transfer validity (matches admin transfer tests).
+const ADMIN_TRANSFER_EXPIRY_SECS: u64 = 48 * 60 * 60;
 
 // Default values
 pub const DEFAULT_MIN_STAKE: i128 = 100_000_000; // 100 XLM (7 decimals)
 pub const DEFAULT_TRADE_FEE_BPS: u32 = 10; // 0.1%
 pub const DEFAULT_STOP_LOSS: u32 = 15; // 15%
 pub const DEFAULT_POSITION_LIMIT: u32 = 20; // 20%
+pub const DEFAULT_BRONZE_SIGNAL_LIMIT: u32 = 5;
+pub const DEFAULT_SILVER_SIGNAL_LIMIT: u32 = 10;
+pub const DEFAULT_GOLD_SIGNAL_LIMIT: u32 = 20;
 
 #[contracttype]
 #[derive(Clone)]
 pub enum AdminStorageKey {
     Admin,
+    PendingAdminTransfer,
     Guardian,
+    ConfigAdmin,
+    EmergencyAdmin,
+    TreasuryAdmin,
     MinStake,
     TradeFee,
     StopLoss,
@@ -30,6 +43,27 @@ pub enum AdminStorageKey {
     MultiSigSigners,
     MultiSigThreshold,
     FeeCollectionPaused,
+    PendingAdmin,
+    PendingAdminExpiry,
+    BronzeSignalLimit,
+    SilverSignalLimit,
+    GoldSignalLimit,
+    PreventSelfDestruct,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminRole {
+    Config,
+    Emergency,
+    Treasury,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminTransfer {
+    pub pending_admin: Address,
+    pub expires_at_ledger: u32,
 }
 
 #[contracttype]
@@ -39,6 +73,9 @@ pub struct AdminConfig {
     pub trade_fee_bps: u32,
     pub default_stop_loss: u32,
     pub default_position_limit: u32,
+    pub bronze_signal_limit: u32,
+    pub silver_signal_limit: u32,
+    pub gold_signal_limit: u32,
 }
 
 /// Initialize admin with default parameters
@@ -62,9 +99,26 @@ pub fn init_admin(env: &Env, admin: Address) -> Result<(), AdminError> {
     env.storage()
         .instance()
         .set(&AdminStorageKey::PositionLimit, &DEFAULT_POSITION_LIMIT);
+    env.storage().instance().set(
+        &AdminStorageKey::BronzeSignalLimit,
+        &DEFAULT_BRONZE_SIGNAL_LIMIT,
+    );
+    env.storage().instance().set(
+        &AdminStorageKey::SilverSignalLimit,
+        &DEFAULT_SILVER_SIGNAL_LIMIT,
+    );
+    env.storage().instance().set(
+        &AdminStorageKey::GoldSignalLimit,
+        &DEFAULT_GOLD_SIGNAL_LIMIT,
+    );
     env.storage()
         .instance()
         .set(&AdminStorageKey::MultiSigEnabled, &false);
+
+    // Self-destruct protection enabled by default.
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::PreventSelfDestruct, &true);
 
     let states: Map<String, PauseState> = Map::new(env);
     env.storage()
@@ -102,16 +156,26 @@ pub fn get_admin(env: &Env) -> Result<Address, AdminError> {
 
 /// Set guardian address (admin only)
 pub fn set_guardian(env: &Env, caller: &Address, guardian: Address) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
-    env.storage().instance().set(&AdminStorageKey::Guardian, &guardian);
+    set_guardian_direct(env, caller, guardian)
+}
+
+pub fn set_guardian_direct(
+    env: &Env,
+    _caller: &Address,
+    guardian: Address,
+) -> Result<(), AdminError> {
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::Guardian, &guardian);
     emit_guardian_set(env, guardian);
     Ok(())
 }
 
 /// Revoke guardian (admin only)
 pub fn revoke_guardian(env: &Env, caller: &Address) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
     let guardian: Address = env
         .storage()
@@ -133,6 +197,71 @@ fn is_guardian(env: &Env, caller: &Address) -> bool {
     get_guardian(env).map(|g| &g == caller).unwrap_or(false)
 }
 
+fn require_direct_admin_or_not_multisig(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    if is_multisig_enabled(env) {
+        if !is_multisig_signer(env, caller) {
+            return Err(AdminError::Unauthorized);
+        }
+        return Err(AdminError::RequiresMultisigApproval);
+    }
+    require_admin(env, caller)
+}
+
+fn role_key(role: &AdminRole) -> AdminStorageKey {
+    match role {
+        AdminRole::Config => AdminStorageKey::ConfigAdmin,
+        AdminRole::Emergency => AdminStorageKey::EmergencyAdmin,
+        AdminRole::Treasury => AdminStorageKey::TreasuryAdmin,
+    }
+}
+
+pub fn get_admin_role(env: &Env, role: AdminRole) -> Option<Address> {
+    env.storage().instance().get(&role_key(&role))
+}
+
+pub fn set_admin_role(
+    env: &Env,
+    caller: &Address,
+    role: AdminRole,
+    account: Address,
+) -> Result<(), AdminError> {
+    require_direct_admin_or_not_multisig(env, caller)?;
+    caller.require_auth();
+    env.storage().instance().set(&role_key(&role), &account);
+    Ok(())
+}
+
+fn has_scoped_role(env: &Env, caller: &Address, role: &AdminRole) -> bool {
+    env.storage()
+        .instance()
+        .get::<_, Address>(&role_key(role))
+        .map(|role_admin| &role_admin == caller)
+        .unwrap_or(false)
+}
+
+pub fn require_role_or_admin(
+    env: &Env,
+    caller: &Address,
+    role: AdminRole,
+) -> Result<(), AdminError> {
+    if has_scoped_role(env, caller, &role) {
+        return Ok(());
+    }
+    require_admin(env, caller)
+}
+
+pub fn require_config_admin(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_role_or_admin(env, caller, AdminRole::Config)
+}
+
+pub fn require_emergency_admin(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_role_or_admin(env, caller, AdminRole::Emergency)
+}
+
+pub fn require_treasury_admin(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_role_or_admin(env, caller, AdminRole::Treasury)
+}
+
 /// Verify caller is admin
 pub fn require_admin(env: &Env, caller: &Address) -> Result<(), AdminError> {
     let admin = get_admin(env)?;
@@ -152,25 +281,98 @@ pub fn require_admin(env: &Env, caller: &Address) -> Result<(), AdminError> {
     }
 }
 
-/// Transfer admin to new address
-pub fn transfer_admin(env: &Env, caller: &Address, new_admin: Address) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+fn get_pending_admin_transfer(env: &Env) -> Option<PendingAdminTransfer> {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::PendingAdminTransfer)
+}
+
+fn require_active_pending_admin_transfer(env: &Env) -> Result<PendingAdminTransfer, AdminError> {
+    let pending = get_pending_admin_transfer(env).ok_or(AdminError::PendingAdminNotFound)?;
+    if env.ledger().sequence() > pending.expires_at_ledger {
+        env.storage()
+            .instance()
+            .remove(&AdminStorageKey::PendingAdminTransfer);
+        return Err(AdminError::PendingAdminExpired);
+    }
+    Ok(pending)
+}
+
+pub fn propose_admin_transfer(
+    env: &Env,
+    caller: &Address,
+    new_admin: Address,
+) -> Result<(), AdminError> {
+    require_direct_admin_or_not_multisig(env, caller)?;
     caller.require_auth();
+    propose_admin_transfer_direct(env, caller, new_admin)
+}
+
+pub fn propose_admin_transfer_direct(
+    env: &Env,
+    caller: &Address,
+    new_admin: Address,
+) -> Result<(), AdminError> {
+    let expires_at_ledger = env
+        .ledger()
+        .sequence()
+        .saturating_add((ADMIN_TRANSFER_EXPIRY_SECS / 5) as u32);
+    let pending = PendingAdminTransfer {
+        pending_admin: new_admin.clone(),
+        expires_at_ledger,
+    };
+
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::PendingAdminTransfer, &pending);
+
+    emit_admin_transfer_proposed(env, caller.clone(), new_admin, expires_at_ledger as u64);
+    Ok(())
+}
+
+pub fn accept_admin_transfer(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    caller.require_auth();
+
+    let pending = require_active_pending_admin_transfer(env)?;
+    if caller != &pending.pending_admin {
+        return Err(AdminError::Unauthorized);
+    }
 
     let old_admin = get_admin(env)?;
     env.storage()
         .instance()
-        .set(&AdminStorageKey::Admin, &new_admin);
+        .set(&AdminStorageKey::Admin, caller);
+    env.storage()
+        .instance()
+        .remove(&AdminStorageKey::PendingAdminTransfer);
 
-    emit_admin_transferred(env, old_admin, new_admin);
+    emit_admin_transfer_completed(env, old_admin.clone(), caller.clone());
+    emit_admin_transferred(env, old_admin, caller.clone());
+    Ok(())
+}
+
+pub fn cancel_admin_transfer(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+    require_active_pending_admin_transfer(env)?;
+    env.storage()
+        .instance()
+        .remove(&AdminStorageKey::PendingAdminTransfer);
     Ok(())
 }
 
 /// Set minimum stake requirement
 pub fn set_min_stake(env: &Env, caller: &Address, new_amount: i128) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+    require_config_admin(env, caller)?;
     caller.require_auth();
+    set_min_stake_direct(env, caller, new_amount)
+}
 
+pub fn set_min_stake_direct(
+    env: &Env,
+    _caller: &Address,
+    new_amount: i128,
+) -> Result<(), AdminError> {
     if new_amount <= 0 {
         return Err(AdminError::InvalidParameter);
     }
@@ -204,9 +406,16 @@ pub fn get_min_stake(env: &Env) -> i128 {
 
 /// Set trade fee in basis points
 pub fn set_trade_fee(env: &Env, caller: &Address, new_fee_bps: u32) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+    require_config_admin(env, caller)?;
     caller.require_auth();
+    set_trade_fee_direct(env, caller, new_fee_bps)
+}
 
+pub fn set_trade_fee_direct(
+    env: &Env,
+    _caller: &Address,
+    new_fee_bps: u32,
+) -> Result<(), AdminError> {
     if new_fee_bps > MAX_FEE_BPS {
         return Err(AdminError::InvalidFeeRate);
     }
@@ -245,9 +454,17 @@ pub fn set_risk_defaults(
     stop_loss: u32,
     position_limit: u32,
 ) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+    require_config_admin(env, caller)?;
     caller.require_auth();
+    set_risk_defaults_direct(env, caller, stop_loss, position_limit)
+}
 
+pub fn set_risk_defaults_direct(
+    env: &Env,
+    _caller: &Address,
+    stop_loss: u32,
+    position_limit: u32,
+) -> Result<(), AdminError> {
     if stop_loss > MAX_RISK_PERCENTAGE || position_limit > MAX_RISK_PERCENTAGE {
         return Err(AdminError::InvalidRiskParameter);
     }
@@ -303,7 +520,7 @@ pub fn get_default_position_limit(env: &Env) -> u32 {
         .unwrap_or(DEFAULT_POSITION_LIMIT)
 }
 
-/// Pause a category (admin or guardian)
+/// Pause a category (admin or guardian; admin path requires multisig when enabled)
 pub fn pause_category(
     env: &Env,
     caller: &Address,
@@ -314,10 +531,19 @@ pub fn pause_category(
     if is_guardian(env, caller) {
         caller.require_auth();
     } else {
-        require_admin(env, caller)?;
+        require_emergency_admin(env, caller)?;
         caller.require_auth();
     }
+    pause_category_direct(env, caller, category, duration, reason)
+}
 
+pub fn pause_category_direct(
+    env: &Env,
+    caller: &Address,
+    category: String,
+    duration: Option<u64>,
+    reason: String,
+) -> Result<(), AdminError> {
     let now = env.ledger().timestamp();
     let auto_unpause_at = duration.map(|d| now + d);
 
@@ -344,16 +570,23 @@ pub fn pause_trading(env: &Env, caller: &Address) -> Result<(), AdminError> {
         env,
         caller,
         String::from_str(env, CAT_TRADING),
-        None,
+        Some(48 * 60 * 60),
         String::from_str(env, "Manual pause"),
     )
 }
 
 /// Unpause a category
 pub fn unpause_category(env: &Env, caller: &Address, category: String) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
+    unpause_category_direct(env, caller, category)
+}
 
+pub fn unpause_category_direct(
+    env: &Env,
+    caller: &Address,
+    category: String,
+) -> Result<(), AdminError> {
     let mut states = get_pause_states(env);
     if states.contains_key(category.clone()) {
         states.remove(category.clone());
@@ -450,7 +683,62 @@ pub fn get_admin_config(env: &Env) -> AdminConfig {
         trade_fee_bps: get_trade_fee(env),
         default_stop_loss: get_default_stop_loss(env),
         default_position_limit: get_default_position_limit(env),
+        bronze_signal_limit: get_bronze_signal_limit(env),
+        silver_signal_limit: get_silver_signal_limit(env),
+        gold_signal_limit: get_gold_signal_limit(env),
     }
+}
+
+pub fn set_tier_signal_limits(
+    env: &Env,
+    caller: &Address,
+    bronze: u32,
+    silver: u32,
+    gold: u32,
+) -> Result<(), AdminError> {
+    require_config_admin(env, caller)?;
+    caller.require_auth();
+    set_tier_signal_limits_direct(env, caller, bronze, silver, gold)
+}
+
+pub fn set_tier_signal_limits_direct(
+    env: &Env,
+    _caller: &Address,
+    bronze: u32,
+    silver: u32,
+    gold: u32,
+) -> Result<(), AdminError> {
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::BronzeSignalLimit, &bronze);
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::SilverSignalLimit, &silver);
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::GoldSignalLimit, &gold);
+    Ok(())
+}
+
+pub fn get_bronze_signal_limit(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::BronzeSignalLimit)
+        .unwrap_or(DEFAULT_BRONZE_SIGNAL_LIMIT)
+}
+
+pub fn get_silver_signal_limit(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::SilverSignalLimit)
+        .unwrap_or(DEFAULT_SILVER_SIGNAL_LIMIT)
+}
+
+pub fn get_gold_signal_limit(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::GoldSignalLimit)
+        .unwrap_or(DEFAULT_GOLD_SIGNAL_LIMIT)
 }
 
 // ==================== Multi-Sig Functions ====================
@@ -465,18 +753,11 @@ pub fn enable_multisig(
     require_admin(env, caller)?;
     caller.require_auth();
 
-    if threshold == 0 || threshold > signers.len() {
-        return Err(AdminError::InvalidParameter);
-    }
-
-    // Check for duplicate signers
-    for i in 0..signers.len() {
-        for j in (i + 1)..signers.len() {
-            if signers.get(i).unwrap() == signers.get(j).unwrap() {
-                return Err(AdminError::DuplicateSigner);
-            }
-        }
-    }
+    validate_signer_config(&signers, threshold).map_err(|e| match e {
+        stellar_swipe_common::MultisigError::DuplicateSigner => AdminError::DuplicateSigner,
+        stellar_swipe_common::MultisigError::InvalidThreshold => AdminError::InvalidParameter,
+        _ => AdminError::InvalidParameter,
+    })?;
 
     env.storage()
         .instance()
@@ -628,37 +909,33 @@ pub fn remove_multisig_signer(
 
 /// Pause fee collection. Read operations and position closures continue.
 pub fn pause_fee_collection(env: &Env, caller: &Address) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
+    pause_fee_collection_direct(env, caller)
+}
 
+pub fn pause_fee_collection_direct(env: &Env, _caller: &Address) -> Result<(), AdminError> {
     env.storage()
         .instance()
         .set(&AdminStorageKey::FeeCollectionPaused, &true);
 
-    emit_parameter_updated(
-        env,
-        soroban_sdk::Symbol::new(env, "fee_paused"),
-        0,
-        1,
-    );
+    emit_parameter_updated(env, soroban_sdk::Symbol::new(env, "fee_paused"), 0, 1);
     Ok(())
 }
 
 /// Resume fee collection.
 pub fn resume_fee_collection(env: &Env, caller: &Address) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
+    resume_fee_collection_direct(env, caller)
+}
 
+pub fn resume_fee_collection_direct(env: &Env, _caller: &Address) -> Result<(), AdminError> {
     env.storage()
         .instance()
         .set(&AdminStorageKey::FeeCollectionPaused, &false);
 
-    emit_parameter_updated(
-        env,
-        soroban_sdk::Symbol::new(env, "fee_paused"),
-        1,
-        0,
-    );
+    emit_parameter_updated(env, soroban_sdk::Symbol::new(env, "fee_paused"), 1, 0);
     Ok(())
 }
 
@@ -676,7 +953,7 @@ pub fn set_circuit_breaker_config(
     caller: &Address,
     config: CircuitBreakerConfig,
 ) -> Result<(), AdminError> {
-    require_admin(env, caller)?;
+    require_emergency_admin(env, caller)?;
     caller.require_auth();
 
     env.storage()
@@ -760,4 +1037,34 @@ pub fn update_circuit_breaker_stats(env: &Env, failed: bool, volume: i128, price
             emit_circuit_breaker_triggered(env, String::from_str(env, CAT_ALL), reason);
         }
     }
+}
+
+// ==================== Self-Destruct Protection ====================
+
+/// Returns `true` when the contract deletion guard is active.
+pub fn is_self_destruct_protected(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::PreventSelfDestruct)
+        .unwrap_or(true) // safe default: protected
+}
+
+/// Block any operation that would delete the contract while protection is on.
+/// Returns `Err(AdminError::Unauthorized)` if protection is enabled.
+pub fn require_self_destruct_allowed(env: &Env) -> Result<(), AdminError> {
+    if is_self_destruct_protected(env) {
+        return Err(AdminError::Unauthorized);
+    }
+    Ok(())
+}
+
+/// Governance-only: disable self-destruct protection so the contract can be
+/// deleted after a successful governance proposal.
+pub fn disable_self_destruct_protection(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    caller.require_auth();
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::PreventSelfDestruct, &false);
+    Ok(())
 }

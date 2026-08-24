@@ -2,8 +2,8 @@
 
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, String, Vec};
 
-use crate::proposals::{get_proposal, put_proposal, ProposalStatus, VoteType};
 use crate::proposals::get_effective_voting_power;
+use crate::proposals::{get_proposal, put_proposal, ProposalStatus, VoteType};
 use crate::GovernanceError;
 
 pub const PRECISION: i128 = 1_000_000;
@@ -165,7 +165,7 @@ fn store_quadratic_vote(env: &Env, proposal_id: u64, voter: &Address, vote: &Qua
         .persistent()
         .get(&QVStorageKey::ProposalVoters(proposal_id))
         .unwrap_or_else(|| Vec::new(env));
-    
+
     let mut already_in = false;
     for i in 0..voters.len() {
         if voters.get(i).unwrap() == *voter {
@@ -258,8 +258,12 @@ pub fn cast_quadratic_vote(
 
     match vote_type.clone() {
         VoteType::For => proposal.votes_for = proposal.votes_for.saturating_add(votes_desired),
-        VoteType::Against => proposal.votes_against = proposal.votes_against.saturating_add(votes_desired),
-        VoteType::Abstain => proposal.votes_abstain = proposal.votes_abstain.saturating_add(votes_desired),
+        VoteType::Against => {
+            proposal.votes_against = proposal.votes_against.saturating_add(votes_desired)
+        }
+        VoteType::Abstain => {
+            proposal.votes_abstain = proposal.votes_abstain.saturating_add(votes_desired)
+        }
     }
 
     if proposal.status == ProposalStatus::Pending {
@@ -313,9 +317,21 @@ pub fn reallocate_quadratic_votes(
     // Reverse previous tally on proposal
     let mut proposal = get_proposal(env, proposal_id)?;
     match previous_vote.vote_type.clone() {
-        VoteType::For => proposal.votes_for = proposal.votes_for.saturating_sub(previous_vote.votes_allocated),
-        VoteType::Against => proposal.votes_against = proposal.votes_against.saturating_sub(previous_vote.votes_allocated),
-        VoteType::Abstain => proposal.votes_abstain = proposal.votes_abstain.saturating_sub(previous_vote.votes_allocated),
+        VoteType::For => {
+            proposal.votes_for = proposal
+                .votes_for
+                .saturating_sub(previous_vote.votes_allocated)
+        }
+        VoteType::Against => {
+            proposal.votes_against = proposal
+                .votes_against
+                .saturating_sub(previous_vote.votes_allocated)
+        }
+        VoteType::Abstain => {
+            proposal.votes_abstain = proposal
+                .votes_abstain
+                .saturating_sub(previous_vote.votes_allocated)
+        }
     }
     put_proposal(env, &proposal)?;
 
@@ -350,10 +366,8 @@ pub fn verify_identity(
     grant_verified_user_bonus(env, &user)?;
 
     #[allow(deprecated)]
-    env.events().publish(
-        (symbol_short!("qv"), symbol_short!("verified")),
-        user,
-    );
+    env.events()
+        .publish((symbol_short!("qv"), symbol_short!("verified")), user);
 
     Ok(())
 }
@@ -425,7 +439,10 @@ pub fn refund_credits_on_failure(env: &Env, proposal_id: u64) -> Result<(), Gove
 
 // ── Comparative Analysis ──────────────────────────────────────────────────────
 
-pub fn compare_voting_systems(env: &Env, proposal_id: u64) -> Result<VotingComparison, GovernanceError> {
+pub fn compare_voting_systems(
+    env: &Env,
+    proposal_id: u64,
+) -> Result<VotingComparison, GovernanceError> {
     let voters = get_proposal_voters(env, proposal_id);
 
     let mut linear_for = 0i128;
@@ -528,7 +545,7 @@ mod tests {
         assert_eq!(10i128 * 10, 100);
         // 100 credits → 10 votes (√100 = 10)
         let credits: i128 = 100;
-        let votes = integer_sqrt(credits);
+        let votes = crate::proposals::isqrt(credits);
         assert_eq!(votes, 10);
     }
 
@@ -559,18 +576,5 @@ mod tests {
         let new_credits_required: i128 = 25;
         let refund = original_credits_spent - new_credits_required;
         assert_eq!(refund, 75);
-    }
-
-    fn integer_sqrt(value: i128) -> i128 {
-        if value <= 0 {
-            return 0;
-        }
-        let mut x0 = value;
-        let mut x1 = (x0 + value / x0) / 2;
-        while x1 < x0 {
-            x0 = x1;
-            x1 = (x0 + value / x0) / 2;
-        }
-        x0
     }
 }

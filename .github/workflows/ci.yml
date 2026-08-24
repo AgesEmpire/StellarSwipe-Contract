@@ -2,20 +2,39 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, Implement_automated_market ]
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+  pull-requests: write  # post WASM ABI diff report as PR comment
+
 env:
   CARGO_TERM_COLOR: always
+  STELLAR_NETWORK: testnet
 
 jobs:
   ci:
     runs-on: ubuntu-latest
 
     steps:
+      # Safety: ensure mainnet config is never loaded in CI
+      - name: Guard — reject mainnet in CI
+        run: |
+          if [ "${STELLAR_NETWORK}" = "mainnet" ]; then
+            echo "ERROR: STELLAR_NETWORK=mainnet is not allowed in CI" && exit 1
+          fi
+
       # Checkout repository
       - uses: actions/checkout@v4
+
+      # Deployment manifests (deployments/*.manifest.json) describe required
+      # addresses, contract versions, and cross-contract dependencies for a
+      # release. Validate them before anything else so a misconfigured
+      # manifest fails fast, cheaply, and before any build/deploy work.
+      - name: Validate deployment manifests
+        run: python3 stellar-swipe/scripts/validate_deployment_manifest.py
 
       # Setup Rust toolchain with required components and target
       - name: Setup Rust
@@ -38,7 +57,10 @@ jobs:
       - name: Format check
         run: cd stellar-swipe && cargo fmt --all -- --check
 
-      # Clippy linter for all workspace crates
+      # Clippy: any warning is a build failure.
+      # Workspace-level suppressions live in [workspace.lints.clippy] in Cargo.toml
+      # and must be narrowly scoped with a documented reason.  Adding a new
+      # suppress without justification is grounds for PR rejection.
       - name: Clippy
         run: cd stellar-swipe && cargo clippy --workspace --all-targets -- -D warnings
 
@@ -46,16 +68,276 @@ jobs:
       - name: Tests
         run: cd stellar-swipe && cargo test --workspace --all-targets
 
-      # Release WASM (workspace [profile.release]) + stellar contract optimize
-      - name: Install Stellar CLI
-        run: cargo install stellar-cli --locked --version 25.2.0
+      # Property-based tests: verify quality score stays in [0, 100] (issue #780)
+      - name: Proptest (signal_registry)
+        if: github.event_name == 'pull_request'
+        run: cd stellar-swipe && cargo test -p signal_registry --features proptest
 
-      - name: Build optimized Soroban WASM
-        run: cd stellar-swipe && chmod +x scripts/build.sh && ./scripts/build.sh
+      # Supply-chain: license, banned crates, source restrictions, advisories.
+      # Policy lives in stellar-swipe/deny.toml.  Any violation fails the build.
+      # To request a new dependency or policy exception see CONTRIBUTING.md.
+      - name: cargo-deny (license / ban / source / advisory check)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: stellar-swipe/Cargo.toml
+          command: check
+          arguments: --all-features
+
+      # Audit dependency versions consistency
+      - name: Audit workspace dependencies
+        run: python3 stellar-swipe/scripts/audit_dependencies.py
+
+      # Verify #![no_std] compliance of contract crates
+      - name: Verify #![no_std] compliance
+        run: python3 stellar-swipe/scripts/verify_no_std.py
+
+      # Guard against renumbering or reusing #[contracterror] discriminants.
+      # Exit 0 = clean; exit 2 = new codes added (baseline updated, commit the
+      # JSON files); exit 1 = renumbering/reuse detected → fail the build.
+      - name: Check error code baselines
+        run: |
+          python3 stellar-swipe/scripts/check_error_codes.py
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: error code violation detected — see output above." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: new error codes added; baseline files updated."
+            echo "Please commit the updated stellar-swipe/error-baselines/*.json files."
+          fi
+
+      # Validate the baseline JSON files themselves: uniqueness, code-0 guard,
+      # naming conventions, and coverage across all known contract crates.
+      - name: Validate error baseline integrity
+        run: python3 stellar-swipe/scripts/test_error_baselines.py
+
+      # Diff each contract's storage layout against committed baselines.
+      # Exit 0 = clean; exit 2 = new keys added (baseline updated, commit the
+      # JSON files); exit 1 = breaking change (removed/renamed key) → fail build.
+      - name: Check storage layout diff
+        run: |
+          python3 stellar-swipe/scripts/storage_layout_diff.py \
+            --baseline-dir stellar-swipe/storage-baselines
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: Breaking storage layout change detected — see output above." >&2
+            echo "  If the change is intentional, run locally:" >&2
+            echo "    python3 stellar-swipe/scripts/storage_layout_diff.py --update" >&2
+            echo "  then commit the updated stellar-swipe/storage-baselines/*.json files." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: New storage keys detected; baseline files updated."
+            echo "Please commit the updated stellar-swipe/storage-baselines/*.json files."
+          fi
+
+      # Release WASM (workspace [profile.release]) + stellar contract optimize
+      # Prebuilt release binary — avoids compiling libdbus-sys from source via cargo install
+      - name: Install Stellar CLI
+        run: |
+          set -euo pipefail
+          version="25.2.0"
+          install_dir="$HOME/.local/bin"
+          mkdir -p "$install_dir"
+          echo "$install_dir" >> "$GITHUB_PATH"
+          curl -fL \
+            "https://github.com/stellar/stellar-cli/releases/download/v${version}/stellar-cli-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C "$install_dir"
+          chmod +x "$install_dir/stellar"
+          stellar --version
+
+      - name: Build optimized Soroban WASM (with source hash)
+        run: |
+          cd stellar-swipe
+          chmod +x scripts/embed_source_hash.sh scripts/build.sh
+          # embed_source_hash.sh exports STELLAR_SOURCE_HASH; build.sh verifies
+          # it is non-empty before proceeding.  The build fails if the hash
+          # cannot be computed (missing git history, empty workspace, etc.).
+          source scripts/embed_source_hash.sh
+          ./scripts/build.sh
+          if [[ -z "${STELLAR_SOURCE_HASH:-}" ]]; then
+            echo "error: STELLAR_SOURCE_HASH was not set — release aborted." >&2
+            exit 1
+          fi
+          echo "Embedded SourceHash: $STELLAR_SOURCE_HASH"
+
+      # Diff each contract's exported function names and contract-spec hash
+      # against the committed baselines in abi-baselines/.
+      # Exit 0 = clean; exit 2 = new exports added (baseline updated, commit
+      # the JSON files); exit 1 = breaking change (removed export or changed
+      # parameter signature) → fail the build unless
+      # abi-baselines/<contract>.breaking.txt is present.
+      # Generates a markdown report that is also posted as a PR comment.
+      - name: Check WASM ABI exports for breaking changes
+        id: wasm-abi
+        run: |
+          python3 stellar-swipe/scripts/check_wasm_exports.py \
+            --wasm-dir stellar-swipe/target/wasm-optimized \
+            --format markdown \
+            > /tmp/abi-diff-report.md
+          rc=$?
+          cat /tmp/abi-diff-report.md
+          echo ""
+          echo "---"
+          echo "Exit code: $rc"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: Breaking ABI change detected — see report above." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: New exports found; abi-baselines/*.json updated."
+            echo "Please commit the updated stellar-swipe/abi-baselines/*.json files."
+          fi
+
+      # Surface the ABI diff report as a PR comment so contributors can review
+      # export and ABI changes directly in the PR timeline.
+      - name: Post WASM ABI diff report as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('/tmp/abi-diff-report.md', 'utf8');
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const header = 'WASM ABI Export Diff Report';
+            const botComment = comments.find(
+              c => c.user.type === 'Bot' && c.body.includes(header)
+            );
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                comment_id: botComment.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: report,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: report,
+              });
+            }
+
+      # Guard against WASM size regressions.  Any contract that grows more than
+      # 10% above its committed baseline fails the build with a clear diagnostic.
+      # Exit 0 = within budget; exit 1 = regression; exit 2 = new contract
+      # (baseline updated automatically — commit the JSON file).
+      - name: Check WASM size regression baseline
+        run: |
+          python3 stellar-swipe/scripts/check_wasm_size.py \
+            --wasm-dir stellar-swipe/target/wasm-optimized
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: WASM size regression detected — see output above." >&2
+            echo "To accept after review:" >&2
+            echo "  python3 stellar-swipe/scripts/check_wasm_size.py --update" >&2
+            echo "  git add stellar-swipe/baselines/wasm_size_baseline.json" >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: New contracts added to WASM size baseline."
+            echo "Please commit the updated stellar-swipe/baselines/wasm_size_baseline.json."
+          fi
 
       - name: Upload optimized WASM artifacts
         uses: actions/upload-artifact@v4
         with:
           name: soroban-wasm-optimized
           path: stellar-swipe/target/wasm-optimized/*.wasm
+          if-no-files-found: error
+
+  reproducible-build:
+    name: Reproducible WASM build check
+    runs-on: ubuntu-latest
+    # Run in parallel with the main CI job; no dependency on it.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # No shared Rust cache between the two builds so each starts clean.
+      # We intentionally skip Swatinem/rust-cache here to avoid any
+      # cached incremental state that could mask non-determinism.
+
+      - name: Install Stellar CLI
+        run: |
+          set -euo pipefail
+          version="25.2.0"
+          install_dir="$HOME/.local/bin"
+          mkdir -p "$install_dir"
+          echo "$install_dir" >> "$GITHUB_PATH"
+          curl -fL \
+            "https://github.com/stellar/stellar-cli/releases/download/v${version}/stellar-cli-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C "$install_dir"
+          chmod +x "$install_dir/stellar"
+          stellar --version
+
+      # First build — output goes to target/wasm-optimized/ (the default).
+      - name: Build 1 — optimized WASM
+        env:
+          # Remap absolute source paths to a fixed prefix so they don't embed
+          # the runner's working directory and break reproducibility.
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/workspace"
+        run: |
+          cd stellar-swipe
+          chmod +x scripts/build.sh
+          OPT_DIR=target/wasm-build-1 ./scripts/build.sh
+
+      # Second build — completely clean incremental dir, separate output dir.
+      - name: Build 2 — optimized WASM (clean incremental state)
+        env:
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/workspace"
+          CARGO_TARGET_DIR: target-build-2
+        run: |
+          cd stellar-swipe
+          OPT_DIR=target/wasm-build-2 ./scripts/build.sh
+
+      # Compare SHA-256 hashes of every WASM produced by both builds.
+      # Any mismatch causes the job to fail with a clear diff.
+      - name: Compare WASM hashes (fail on mismatch)
+        run: |
+          set -euo pipefail
+          cd stellar-swipe
+          echo "=== Build 1 hashes ==="
+          sha256sum target/wasm-build-1/*.wasm | tee /tmp/build1.sha256
+          echo ""
+          echo "=== Build 2 hashes ==="
+          sha256sum target/wasm-build-2/*.wasm | tee /tmp/build2.sha256
+
+          # Strip directory prefix so we compare filenames only.
+          sed -i 's|target/wasm-build-1/||g' /tmp/build1.sha256
+          sed -i 's|target/wasm-build-2/||g' /tmp/build2.sha256
+
+          if diff /tmp/build1.sha256 /tmp/build2.sha256; then
+            echo ""
+            echo "✓ All WASM hashes match — build is reproducible."
+          else
+            echo ""
+            echo "✗ WASM hash mismatch — non-deterministic build detected!"
+            echo "  Fix: ensure no timestamps, absolute paths, or random"
+            echo "  seeds are embedded (use RUSTFLAGS=--remap-path-prefix)."
+            exit 1
+          fi
+
+      # Record the verified hashes as a CI artifact so they can be attached
+      # to release notes.  Downstream verification process:
+      #   1. Download this artifact from the release workflow run.
+      #   2. Build the same commit locally with the same RUSTFLAGS.
+      #   3. sha256sum your local *.wasm and diff against these hashes.
+      - name: Upload verified WASM hashes artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: soroban-wasm-verified-hashes
+          path: /tmp/build1.sha256
           if-no-files-found: error

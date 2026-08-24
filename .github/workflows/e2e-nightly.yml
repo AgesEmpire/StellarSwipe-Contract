@@ -1,0 +1,38 @@
+name: E2E Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  STELLAR_NETWORK: testnet
+  NEXT_PUBLIC_STELLAR_NETWORK: testnet
+
+jobs:
+  testnet-e2e:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install e2e tooling
+        working-directory: scripts
+        run: npm ci
+
+      - name: Run testnet e2e flow
+        working-directory: scripts
+        env:
+          STELLAR_E2E_DEPLOYMENT_STATE: ../deployments/testnet.json
+          STELLAR_E2E_RPC_URL: https://soroban-testnet.stellar.org
+          STELLAR_E2E_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+          STELLAR_E2E_ADMIN_SECRET: ${{ secrets.STELLAR_E2E_ADMIN_SECRET }}
+          STELLAR_E2E_TRADER_SECRET: ${{ secrets.STELLAR_E2E_TRADER_SECRET }}
+          STELLAR_E2E_PROVIDER_SECRET: ${{ secrets.STELLAR_E2E_PROVIDER_SECRET }}
+          STELLAR_E2E_FEE_TOKEN: ${{ secrets.STELLAR_E2E_FEE_TOKEN }}
+        run: npx tsx ../tests/e2e/test_full_flow.ts

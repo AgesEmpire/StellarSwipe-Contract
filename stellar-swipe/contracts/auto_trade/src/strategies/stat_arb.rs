@@ -824,32 +824,24 @@ fn abs_i128(value: i128) -> i128 {
 pub fn emit_strategy_configured(env: &Env, user: &Address, strategy: &StatArbStrategy) {
     #[allow(deprecated)]
     env.events().publish(
-        (Symbol::new(env, "stat_arb_configured"), user.clone()),
-        strategy.clone(),
+        (Symbol::new(env, "stat_arb_configured"),),
+        (user.clone(), strategy.clone()),
     );
 }
 
 pub fn emit_trade_opened(env: &Env, user: &Address, portfolio: &StatArbPortfolio) {
     #[allow(deprecated)]
     env.events().publish(
-        (
-            Symbol::new(env, "stat_arb_opened"),
-            user.clone(),
-            portfolio.portfolio_id,
-        ),
-        portfolio.clone(),
+        (Symbol::new(env, "stat_arb_opened"),),
+        (user.clone(), portfolio.clone()),
     );
 }
 
 pub fn emit_rebalanced(env: &Env, user: &Address, portfolio: &StatArbPortfolio) {
     #[allow(deprecated)]
     env.events().publish(
-        (
-            Symbol::new(env, "stat_arb_rebalanced"),
-            user.clone(),
-            portfolio.portfolio_id,
-        ),
-        portfolio.clone(),
+        (Symbol::new(env, "stat_arb_rebalanced"),),
+        (user.clone(), portfolio.clone()),
     );
 }
 
@@ -861,12 +853,8 @@ pub fn emit_closed(
 ) {
     #[allow(deprecated)]
     env.events().publish(
-        (
-            Symbol::new(env, "stat_arb_closed"),
-            user.clone(),
-            portfolio.portfolio_id,
-        ),
-        reason,
+        (Symbol::new(env, "stat_arb_closed"),),
+        (user.clone(), portfolio.clone(), reason),
     );
 }
 

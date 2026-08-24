@@ -1,0 +1,18 @@
+{
+  "_comment": "Baseline error codes for the user_portfolio crate. Generated from contracts/user_portfolio/src/lib.rs and contracts/user_portfolio/src/subscriptions.rs. Do not renumber existing codes; add new variants with unused numbers only.",
+  "crate": "user_portfolio",
+  "source": "contracts/user_portfolio/src/lib.rs, contracts/user_portfolio/src/subscriptions.rs",
+  "enums": {
+    "PositionError": {
+      "PositionAlreadyClosed": 1
+    },
+    "SubscriptionError": {
+      "NotInitialized": 1,
+      "NoTermsFromProvider": 2,
+      "InvalidDuration": 3,
+      "Overflow": 4,
+      "InvalidFee": 5,
+      "SelfSubscribe": 6
+    }
+  }
+}
