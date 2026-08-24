@@ -1,3 +1,4 @@
+use crate::categories::SignalCategory;
 use crate::types::{Signal, SignalStatus, SignalSummary, SortOption};
 use soroban_sdk::{Address, Env, Map, Vec};
 

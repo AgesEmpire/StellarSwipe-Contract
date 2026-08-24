@@ -3,6 +3,7 @@
 mod admin;
 mod analytics;
 mod categories;
+mod churn_risk;
 mod collaboration;
 mod combos;
 mod contests;
@@ -30,12 +31,8 @@ use admin::{
     get_admin, get_admin_config, init_admin, is_trading_paused, require_not_paused_legacy as require_not_paused,
     AdminConfig,
 };
- main
 use stellar_swipe_common::emergency::{PauseState, CAT_SIGNALS, CAT_TRADING, CAT_STAKES, CAT_ALL};
 use stellar_swipe_common::rate_limit::{self as rl, ActionType as RLAction, RateLimitConfig};
-
-use stellar_swipe_common::emergency::{PauseState, CAT_ALL, CAT_SIGNALS, CAT_STAKES, CAT_TRADING};
- main
 use categories::{RiskLevel, SignalCategory};
 use combos::{
     cancel_combo, create_combo_signal, execute_combo_signal, get_combo, get_combo_executions_pub,
@@ -119,7 +116,7 @@ impl SignalRegistry {
             .storage()
             .instance()
             .get(&StorageKey::ProviderStats)
-            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+            .unwrap_or_else(|| soroban_sdk::Map::<Address, ProviderPerformance>::new(&env));
         // Delegate to stake module (uses its own Map-based storage for StakeInfo)
         // We record the rate-limit action only; actual stake storage is in stake module.
         rl::record_action(&env, &provider, RLAction::StakeChange);
@@ -509,17 +506,15 @@ fn save_category_index_map(env: &Env, map: &Map<SignalCategory, Vec<u64>>) {
             timestamp: now,
             expiry,
             status: SignalStatus::Active,
-            // Initialize performance tracking fields
             executions: 0,
             successful_executions: 0,
             total_volume: 0,
             total_roi: 0,
-            // Categorization fields
-            category,
+            category: category.clone(),
             tags: unique_tags.clone(),
             risk_level,
-            // Collaboration field
             is_collaborative: false,
+            adoption_count: 0,
         };
 
         // Auto-enter signal into active contests (before moving signal)
@@ -881,8 +876,12 @@ fn save_category_index_map(env: &Env, map: &Map<SignalCategory, Vec<u64>>) {
         signal_id: u64,
         nonce: u64,
     ) -> Result<u32, AdminError> {
-        // Require caller is TradeExecutor contract (hardcoded or storage)
-        let executor_address = Address::generate(&env); // TODO: load from storage or const
+        // Require caller is TradeExecutor contract (loaded from storage)
+        let executor_address: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SignalCounter) // placeholder key — replace with dedicated ExecutorAddress key
+            .ok_or(AdminError::Unauthorized)?;
         caller.require_auth();
         if caller != executor_address {
             return Err(AdminError::Unauthorized);
@@ -895,7 +894,7 @@ fn save_category_index_map(env: &Env, map: &Map<SignalCategory, Vec<u64>>) {
             return Err(AdminError::InvalidParameter); // Already incremented
         }
 
-        let mut signals = get_signals_map(&env);
+        let mut signals = Self::get_signals_map(&env);
         let mut signal = signals.get(signal_id).ok_or(AdminError::InvalidParameter)?;
 
         if signal.status != SignalStatus::Active {
@@ -904,7 +903,7 @@ fn save_category_index_map(env: &Env, map: &Map<SignalCategory, Vec<u64>>) {
 
         signal.adoption_count = signal.adoption_count.checked_add(1).ok_or(AdminError::InvalidParameter)?;
         signals.set(signal_id, signal.clone());
-        save_signals_map(&env, &signals);
+        Self::save_signals_map(&env, &signals);
 
         // Save nonce
         let mut nonces = nonces;
@@ -991,7 +990,6 @@ fn save_category_index_map(env: &Env, map: &Map<SignalCategory, Vec<u64>>) {
 
     /// Follow a provider. Idempotent if already following.
     pub fn follow_provider(env: Env, user: Address, provider: Address) -> Result<(), AdminError> {
- main
         // Rate limit: follow actions
         let trust = reputation::get_trust_score(&env, &user)
             .map(|d| d.score)
@@ -1000,11 +998,8 @@ fn save_category_index_map(env: &Env, map: &Map<SignalCategory, Vec<u64>>) {
             .map_err(|_| AdminError::RateLimitExceeded)?;
         rl::record_action(&env, &user, RLAction::FollowAction);
 
-        social::follow_provider(&env, user, provider).map_err(|_| AdminError::CannotFollowSelf)?;
-
         social::follow_provider(&env, user, provider.clone())
             .map_err(|_| AdminError::CannotFollowSelf)?;
- main
 
         // Update trust score when follower count changes
         Self::update_provider_trust_score(env, provider);
@@ -1667,7 +1662,7 @@ fn save_category_index_map(env: &Env, map: &Map<SignalCategory, Vec<u64>>) {
         }
 
         // Create the signal on Stellar
-        let category = SignalCategory::SwingTrade;
+        let category = SignalCategory::SWING;
         let tags = Vec::new(&env);
         let risk_level = RiskLevel::Medium;
 
@@ -1863,6 +1858,8 @@ fn save_category_index_map(env: &Env, map: &Map<SignalCategory, Vec<u64>>) {
     }
 }
 
+#[cfg(test)]
+mod test_churn_risk;
 #[cfg(test)]
 mod test_combos;
 #[cfg(test)]

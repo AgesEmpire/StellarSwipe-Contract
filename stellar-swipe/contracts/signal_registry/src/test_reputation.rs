@@ -3,6 +3,14 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reputation::{
+        calculate_stake_component, calculate_tenure_component, calculate_trust_score,
+        calculate_weighted_score, get_first_signal_time, get_trust_score, get_trust_score_tier,
+        record_first_signal, store_trust_score, update_median_values, ReputationDataKey,
+        TrustScoreComponents, TrustScoreDetails, TrustScoreTier,
+    };
+    use crate::stake::StakeInfo;
+    use crate::types::ProviderPerformance;
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::{vec, Address, Env, Vec};
 

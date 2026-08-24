@@ -181,7 +181,7 @@ fn calculate_consistency_component(performance: &ProviderPerformance) -> u32 {
 /// Calculate stake component (15% weight)
 /// Normalized against median stake amount
 /// Returns 0-10000 basis points
-fn calculate_stake_component(env: &Env, stake_info: &Option<StakeInfo>) -> u32 {
+pub fn calculate_stake_component(env: &Env, stake_info: &Option<StakeInfo>) -> u32 {
     let stake_amount = match stake_info {
         Some(info) => info.amount,
         None => 0,
@@ -232,7 +232,7 @@ fn calculate_follower_component(env: &Env, provider: &Address) -> u32 {
 /// Calculate tenure component (10% weight)
 /// Days since first signal, normalized to 365 days max
 /// Returns 0-10000 basis points
-fn calculate_tenure_component(env: &Env, provider: &Address, now: u64) -> u32 {
+pub fn calculate_tenure_component(env: &Env, provider: &Address, now: u64) -> u32 {
     let first_signal_time = get_first_signal_time(env, provider);
 
     if first_signal_time == 0 {
@@ -249,7 +249,7 @@ fn calculate_tenure_component(env: &Env, provider: &Address, now: u64) -> u32 {
 }
 
 /// Calculate weighted trust score from components
-fn calculate_weighted_score(
+pub fn calculate_weighted_score(
     success_rate: u32,
     consistency: u32,
     stake: u32,
@@ -266,7 +266,7 @@ fn calculate_weighted_score(
 }
 
 /// Get trust score tier from score
-fn get_trust_score_tier(score: u32) -> TrustScoreTier {
+pub fn get_trust_score_tier(score: u32) -> TrustScoreTier {
     match score {
         80..=100 => TrustScoreTier::HighlyTrusted,
         60..=79 => TrustScoreTier::Trusted,
@@ -312,7 +312,7 @@ pub fn record_first_signal(env: &Env, provider: &Address) {
 }
 
 /// Get first signal time for provider
-fn get_first_signal_time(env: &Env, provider: &Address) -> u64 {
+pub fn get_first_signal_time(env: &Env, provider: &Address) -> u64 {
     env.storage()
         .persistent()
         .get(&ReputationDataKey::FirstSignalTime(provider.clone()))
