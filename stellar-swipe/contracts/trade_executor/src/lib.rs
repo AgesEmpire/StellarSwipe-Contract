@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod batch_settlement;
+pub mod compat;
 pub mod dca;
 mod errors;
 pub mod feature_flags;
