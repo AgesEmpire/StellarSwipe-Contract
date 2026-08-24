@@ -9,7 +9,7 @@ extern crate std;
 
 use crate::distribution::DistributionRecipients;
 use crate::proposals::{
-    ProposalCategory, ProposalStatus, ProposalType, SimulationEffect, SimulationResult,
+    ProposalCategory, ProposalStatus, ProposalType, SimulationEffect,
 };
 use crate::shadow_mode::ShadowModeResult;
 use crate::{GovernanceContract, GovernanceContractClient, GovernanceError};
@@ -34,7 +34,7 @@ fn setup() -> (Env, Address, Address, DistributionRecipients) {
     (env, contract_id, admin, recipients)
 }
 
-fn client(env: &Env, id: &Address) -> GovernanceContractClient {
+fn client<'a>(env: &'a Env, id: &'a Address) -> GovernanceContractClient<'a> {
     GovernanceContractClient::new(env, id)
 }
 
@@ -87,7 +87,7 @@ fn simulate_signal_proposal_returns_effects_without_mutating() {
     let effect = result.effects.get(0).unwrap();
     assert_eq!(effect.key, String::from_str(&env, "signal"));
 
-    let stored = c.get_proposal(&pid);
+    let stored = c.proposal(&pid);
     assert_eq!(
         stored.status,
         ProposalStatus::Pending,
@@ -138,12 +138,16 @@ fn simulate_treasury_spend_insufficient_balance_reports_failure() {
         code: String::from_str(&env, "USDC"),
         issuer: None,
     };
+    // create_proposal requires the treasury to already hold >= 10x the spend
+    // amount at proposal time; fund it here, then drain it below so the
+    // balance is insufficient by the time simulation runs.
+    c.set_treasury_asset(&admin, &asset, &10_000i128);
     let pid = c.create_proposal(
         &r.community_rewards,
         &ProposalType::TreasurySpend(
             Address::generate(&env),
             1_000i128,
-            asset,
+            asset.clone(),
             String::from_str(&env, "test spend"),
         ),
         &String::from_str(&env, "Spend USDC"),
@@ -152,6 +156,7 @@ fn simulate_treasury_spend_insufficient_balance_reports_failure() {
         &ProposalCategory::TreasuryTransfer,
         &false,
     );
+    c.set_treasury_asset(&admin, &asset, &0i128);
 
     let result = c.simulate_proposal(&pid);
     assert!(!result.success, "simulation should report failure");
@@ -169,7 +174,7 @@ fn simulate_nonexistent_proposal_returns_error() {
     let c = client(&env, &id);
     init(&c, &env, &admin, &r);
 
-    let result: Result<SimulationResult, GovernanceError> = c.try_simulate_proposal(&999_999u64);
+    let result = c.try_simulate_proposal(&999_999u64);
     assert_eq!(
         result,
         Err(Ok(GovernanceError::ProposalNotFound)),
@@ -237,7 +242,7 @@ fn simulation_is_read_only_no_storage_writes() {
         "repeated simulations must return the same number of effects"
     );
 
-    let stored = c.get_proposal(&pid);
+    let stored = c.proposal(&pid);
     assert_eq!(
         stored.status,
         ProposalStatus::Pending,
@@ -313,12 +318,16 @@ fn failed_simulation_emits_shadow_mode_result_event_with_reason() {
         code: String::from_str(&env, "USDC"),
         issuer: None,
     };
+    // create_proposal requires the treasury to already hold >= 10x the spend
+    // amount at proposal time; fund it here, then drain it below so the
+    // balance is insufficient by the time simulation runs.
+    c.set_treasury_asset(&admin, &asset, &10_000i128);
     let pid = c.create_proposal(
         &r.community_rewards,
         &ProposalType::TreasurySpend(
             Address::generate(&env),
             1_000i128,
-            asset,
+            asset.clone(),
             String::from_str(&env, "test spend"),
         ),
         &String::from_str(&env, "Spend USDC"),
@@ -327,6 +336,7 @@ fn failed_simulation_emits_shadow_mode_result_event_with_reason() {
         &ProposalCategory::TreasuryTransfer,
         &false,
     );
+    c.set_treasury_asset(&admin, &asset, &0i128);
 
     let result = c.simulate_proposal(&pid);
     assert!(!result.success, "simulation should report failure");
@@ -363,7 +373,7 @@ fn shadow_mode_result_event_preserves_read_only_behavior() {
     );
 
     // Snapshot proposal state before simulation.
-    let before = c.get_proposal(&pid);
+    let before = c.proposal(&pid);
     let before_status = before.status;
     let before_for = before.votes_for;
     let before_against = before.votes_against;
@@ -378,7 +388,7 @@ fn shadow_mode_result_event_preserves_read_only_behavior() {
     assert!(evt.success);
 
     // Verify persistent state is unchanged.
-    let after = c.get_proposal(&pid);
+    let after = c.proposal(&pid);
     assert_eq!(
         after.status, before_status,
         "proposal status must not change after simulation"

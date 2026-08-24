@@ -37,6 +37,68 @@ pub struct SimulationResult {
     pub effects: Vec<SimulationEffect>,
 }
 
+/// One segment of a [`concat_parts`] call: either a static separator/prefix
+/// or a dynamic `soroban_sdk::String` value.
+enum Part<'a> {
+    Static(&'a str),
+    Dynamic(&'a String),
+}
+
+/// Join string-like parts into one `soroban_sdk::String`. `soroban_sdk::String`
+/// has no `+`/concat operator and no `std`, so parts are joined through a
+/// host-side `Bytes` buffer and then copied into a stack buffer for the final
+/// `String::from_bytes` call. The result is truncated if the combined length
+/// exceeds `MAX_LEN`.
+fn concat_parts(env: &Env, parts: &[Part]) -> String {
+    const MAX_LEN: usize = 256;
+    let mut bytes = Bytes::new(env);
+    for part in parts {
+        match part {
+            Part::Static(s) => bytes.append(&Bytes::from_slice(env, s.as_bytes())),
+            Part::Dynamic(s) => bytes.append(&s.to_bytes()),
+        }
+    }
+    let len = (bytes.len() as usize).min(MAX_LEN);
+    let truncated = bytes.slice(0..len as u32);
+    let mut buf = [0u8; MAX_LEN];
+    truncated.copy_into_slice(&mut buf[..len]);
+    String::from_bytes(env, &buf[..len])
+}
+
+/// Build a `"<prefix><value>"` label, e.g. `"parameter:max_fee"`.
+fn labeled_key(env: &Env, prefix: &str, value: &String) -> String {
+    concat_parts(env, &[Part::Static(prefix), Part::Dynamic(value)])
+}
+
+/// Render an `i128` as a `soroban_sdk::String` without `std`.
+fn i128_to_string(env: &Env, value: i128) -> String {
+    if value == 0 {
+        return String::from_str(env, "0");
+    }
+    let mut buf = [0u8; 40];
+    let mut i = buf.len();
+    let mut n = value.unsigned_abs();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    if value < 0 {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    String::from_bytes(env, &buf[i..])
+}
+
+/// Render a `bool` as a `soroban_sdk::String` without `std`.
+fn bool_to_string(env: &Env, value: bool) -> String {
+    if value {
+        String::from_str(env, "true")
+    } else {
+        String::from_str(env, "false")
+    }
+}
+
 // ── #692: Integer square root (Newton's method, no floating-point) ───────────
 //
 // #837: the previous version seeded Newton's method with `(x + 1) / 2`. When
@@ -275,10 +337,13 @@ pub fn get_governance_config(env: &Env) -> GovernanceConfig {
 
 pub fn configure_governance(
     env: &Env,
-    admin: &Address,
+    _admin: &Address,
     config: GovernanceConfig,
 ) -> Result<GovernanceConfig, GovernanceError> {
-    require_admin(env, admin)?;
+    // Callers (`configure_governance`, `configure_governance_timelocked`) already
+    // authenticate and authorize the caller before invoking this; a second
+    // `require_auth()` for the same address in one invocation is rejected by
+    // the host as "frame is already authorized".
     if config.min_proposal_threshold <= 0
         || config.voting_period == 0
         || config.quorum_threshold > 10_000
@@ -539,7 +604,7 @@ pub fn simulate_proposal_action(
     // Simulation reads current state and records effects without writing.
     // TreasurySpend uses `return Ok(SimulationResult{...})` for early-exit
     // when the treasury balance is insufficient.
-    let _ = match &proposal.proposal_type {
+    match &proposal.proposal_type {
         ProposalType::ParameterChange(parameter, _current, proposed) => {
             let params: Map<String, i128> = env
                 .storage()
@@ -548,11 +613,10 @@ pub fn simulate_proposal_action(
                 .unwrap_or(Map::new(env));
             let cur = params.get(parameter.clone()).unwrap_or(0);
             effects.push_back(SimulationEffect {
-                key: String::from_str(env, &(String::from_str(env, "parameter:") + parameter)),
-                current: cur.to_val().to_string(),
-                proposed: (*proposed).to_val().to_string(),
+                key: labeled_key(env, "parameter:", parameter),
+                current: i128_to_string(env, cur),
+                proposed: i128_to_string(env, *proposed),
             });
-            Ok(())
         }
         ProposalType::TreasurySpend(recipient, amount, asset, _purpose) => {
             let treasury = get_treasury(env);
@@ -566,15 +630,14 @@ pub fn simulate_proposal_action(
             }
             effects.push_back(SimulationEffect {
                 key: String::from_str(env, "treasury:balance"),
-                current: bal.to_val().to_string(),
-                proposed: (bal - *amount).to_val().to_string(),
+                current: i128_to_string(env, bal),
+                proposed: i128_to_string(env, bal - *amount),
             });
             effects.push_back(SimulationEffect {
                 key: String::from_str(env, "treasury:recipient"),
                 current: String::from_str(env, "(unchanged)"),
                 proposed: recipient.to_string(),
             });
-            Ok(())
         }
         ProposalType::FeatureToggle(feature, enabled) => {
             let flags: Map<String, bool> = env
@@ -584,11 +647,10 @@ pub fn simulate_proposal_action(
                 .unwrap_or(Map::new(env));
             let cur = flags.get(feature.clone()).unwrap_or(false);
             effects.push_back(SimulationEffect {
-                key: String::from_str(env, &(String::from_str(env, "feature:") + feature)),
-                current: cur.to_val().to_string(),
-                proposed: (*enabled).to_val().to_string(),
+                key: labeled_key(env, "feature:", feature),
+                current: bool_to_string(env, cur),
+                proposed: bool_to_string(env, *enabled),
             });
-            Ok(())
         }
         ProposalType::ContractUpgrade(contract_name, new_hash) => {
             let upgrades: Map<String, Bytes> = env
@@ -598,14 +660,13 @@ pub fn simulate_proposal_action(
                 .unwrap_or(Map::new(env));
             let cur = upgrades.get(contract_name.clone());
             effects.push_back(SimulationEffect {
-                key: String::from_str(env, &(String::from_str(env, "upgrade:") + contract_name)),
+                key: labeled_key(env, "upgrade:", contract_name),
                 current: match cur {
                     Some(h) => h.to_string(),
                     None => String::from_str(env, "(none)"),
                 },
                 proposed: new_hash.to_string(),
             });
-            Ok(())
         }
         ProposalType::SignalProposal(message) => {
             effects.push_back(SimulationEffect {
@@ -613,7 +674,6 @@ pub fn simulate_proposal_action(
                 current: String::from_str(env, "(no state change)"),
                 proposed: message.clone(),
             });
-            Ok(())
         }
         ProposalType::Custom(executor) => {
             effects.push_back(SimulationEffect {
@@ -621,9 +681,8 @@ pub fn simulate_proposal_action(
                 current: String::from_str(env, "(external call)"),
                 proposed: executor.to_string(),
             });
-            Ok(())
         }
-    };
+    }
 
     Ok(SimulationResult {
         success: true,
@@ -641,11 +700,16 @@ pub fn simulate_proposal(env: &Env, proposal_id: u64) -> Result<SimulationResult
     let mut i = 0u32;
     while i < result.effects.len() {
         let effect = result.effects.get(i).unwrap();
-        let summary = effect.key.clone()
-            + String::from_str(env, ": ")
-            + effect.current.clone()
-            + String::from_str(env, " -> ")
-            + effect.proposed.clone();
+        let summary = concat_parts(
+            env,
+            &[
+                Part::Dynamic(&effect.key),
+                Part::Static(": "),
+                Part::Dynamic(&effect.current),
+                Part::Static(" -> "),
+                Part::Dynamic(&effect.proposed),
+            ],
+        );
         state_changes.push_back(summary);
         i += 1;
     }
