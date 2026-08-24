@@ -142,6 +142,7 @@ where
                 signal_id,
                 intervals_completed,
                 reason: 0, // signal_expired
+                refunded_amount: 0,
             },
         );
         return Err(ContractError::SignalExpired);
@@ -192,6 +193,13 @@ where
 }
 
 /// Manually cancel a DCA plan. Only the plan owner may cancel.
+///
+/// DCA intervals are funded per-interval, not escrowed at plan creation:
+/// `execute_dca_interval` draws each interval's amount from the user's own
+/// balance at execution time (the caller is responsible for having funds
+/// available, same as `batch_execute`). This contract never holds the
+/// unexecuted intervals' capital, so there is nothing to return on
+/// cancellation — `refunded_amount` in `DcaPlanCancelled` is always 0.
 pub fn cancel_dca_plan(env: &Env, user: &Address, signal_id: u64) -> Result<(), ContractError> {
     let plan = load_plan(env, user, signal_id)?;
     let intervals_completed = plan.total_intervals - plan.remaining_intervals;
@@ -205,6 +213,7 @@ pub fn cancel_dca_plan(env: &Env, user: &Address, signal_id: u64) -> Result<(), 
             signal_id,
             intervals_completed,
             reason: 1, // manual
+            refunded_amount: 0,
         },
     );
     Ok(())

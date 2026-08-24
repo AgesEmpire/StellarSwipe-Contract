@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write  # post WASM ABI diff report as PR comment
 
 env:
   CARGO_TERM_COLOR: always
@@ -67,6 +68,11 @@ jobs:
       - name: Tests
         run: cd stellar-swipe && cargo test --workspace --all-targets
 
+      # Property-based tests: verify quality score stays in [0, 100] (issue #780)
+      - name: Proptest (signal_registry)
+        if: github.event_name == 'pull_request'
+        run: cd stellar-swipe && cargo test -p signal_registry --features proptest
+
       # Supply-chain: license, banned crates, source restrictions, advisories.
       # Policy lives in stellar-swipe/deny.toml.  Any violation fails the build.
       # To request a new dependency or policy exception see CONTRIBUTING.md.
@@ -106,6 +112,26 @@ jobs:
       - name: Validate error baseline integrity
         run: python3 stellar-swipe/scripts/test_error_baselines.py
 
+      # Diff each contract's storage layout against committed baselines.
+      # Exit 0 = clean; exit 2 = new keys added (baseline updated, commit the
+      # JSON files); exit 1 = breaking change (removed/renamed key) → fail build.
+      - name: Check storage layout diff
+        run: |
+          python3 stellar-swipe/scripts/storage_layout_diff.py \
+            --baseline-dir stellar-swipe/storage-baselines
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: Breaking storage layout change detected — see output above." >&2
+            echo "  If the change is intentional, run locally:" >&2
+            echo "    python3 stellar-swipe/scripts/storage_layout_diff.py --update" >&2
+            echo "  then commit the updated stellar-swipe/storage-baselines/*.json files." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: New storage keys detected; baseline files updated."
+            echo "Please commit the updated stellar-swipe/storage-baselines/*.json files."
+          fi
+
       # Release WASM (workspace [profile.release]) + stellar contract optimize
       # Prebuilt release binary — avoids compiling libdbus-sys from source via cargo install
       - name: Install Stellar CLI
@@ -142,19 +168,62 @@ jobs:
       # the JSON files); exit 1 = breaking change (removed export or changed
       # parameter signature) → fail the build unless
       # abi-baselines/<contract>.breaking.txt is present.
+      # Generates a markdown report that is also posted as a PR comment.
       - name: Check WASM ABI exports for breaking changes
+        id: wasm-abi
         run: |
           python3 stellar-swipe/scripts/check_wasm_exports.py \
-            --wasm-dir stellar-swipe/target/wasm-optimized
+            --wasm-dir stellar-swipe/target/wasm-optimized \
+            --format markdown \
+            > /tmp/abi-diff-report.md
           rc=$?
+          cat /tmp/abi-diff-report.md
+          echo ""
+          echo "---"
+          echo "Exit code: $rc"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
           if [ $rc -eq 1 ]; then
-            echo "ERROR: Breaking ABI change detected — see output above." >&2
+            echo "ERROR: Breaking ABI change detected — see report above." >&2
             exit 1
           fi
           if [ $rc -eq 2 ]; then
             echo "INFO: New exports found; abi-baselines/*.json updated."
             echo "Please commit the updated stellar-swipe/abi-baselines/*.json files."
           fi
+
+      # Surface the ABI diff report as a PR comment so contributors can review
+      # export and ABI changes directly in the PR timeline.
+      - name: Post WASM ABI diff report as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('/tmp/abi-diff-report.md', 'utf8');
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const header = 'WASM ABI Export Diff Report';
+            const botComment = comments.find(
+              c => c.user.type === 'Bot' && c.body.includes(header)
+            );
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                comment_id: botComment.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: report,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: report,
+              });
+            }
 
       # Guard against WASM size regressions.  Any contract that grows more than
       # 10% above its committed baseline fails the build with a clear diagnostic.

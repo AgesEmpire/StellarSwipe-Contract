@@ -959,6 +959,42 @@ mod slash_severity_tests {
     }
 
     #[test]
+    fn governance_can_reconfigure_tiers() {
+        let (env, vault_id, token, admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let balance: i128 = 1_000_000;
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
+        seed(&env, &vault_id, &provider, balance);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let governance = Address::generate(&env);
+        client.set_governance(&admin, &governance);
+
+        client.governance_configure_slash_tiers(&governance, &100, &2_000, &10_000);
+        let slashed = client.slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "test"),
+        );
+        assert_eq!(slashed, 10_000); // 1%
+    }
+
+    #[test]
+    fn unauthorized_governance_reconfigure_rejected() {
+        let (env, vault_id, token, admin, _registry) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let governance = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        client.set_governance(&admin, &governance);
+
+        assert_eq!(
+            client.try_governance_configure_slash_tiers(&attacker, &100, &2_000, &10_000),
+            Err(Ok(StakeVaultError::Unauthorized))
+        );
+    }
+
+    #[test]
     fn invalid_tier_bps_rejected() {
         let (env, vault_id, _token, _admin, _registry) = setup();
         let client = StakeVaultContractClient::new(&env, &vault_id);
@@ -1630,6 +1666,140 @@ mod slash_severity_tests {
             .withdraw_stake(&staker);
 
         assert_eq!(withdrawn, amount, "correctly scoped auth must succeed");
+    }
+}
+
+// ── Slash cooldown tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod slash_cooldown_tests {
+    use crate::{
+        migration::{MigrationKey, StakeInfoV2},
+        SlashSeverity, StakeVaultContract, StakeVaultContractClient, StakeVaultError,
+    };
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token::StellarAssetClient,
+        Address, Env, Map, Symbol,
+    };
+
+    fn sac_token(env: &Env, admin: &Address) -> Address {
+        env.register_stellar_asset_contract_v2(admin.clone())
+            .address()
+    }
+
+    fn seed(env: &Env, contract_id: &Address, staker: &Address, balance: i128) {
+        env.as_contract(contract_id, || {
+            let mut stakes: Map<Address, StakeInfoV2> = env
+                .storage()
+                .persistent()
+                .get(&MigrationKey::StakesV2)
+                .unwrap_or_else(|| Map::new(env));
+            stakes.set(
+                staker.clone(),
+                StakeInfoV2 {
+                    balance,
+                    locked_until: 0,
+                    last_updated: env.ledger().timestamp(),
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&MigrationKey::StakesV2, &stakes);
+        });
+    }
+
+    fn setup() -> (Env, Address, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let signal_registry = Address::generate(&env);
+        let token = sac_token(&env, &admin);
+        let vault_id = env.register(StakeVaultContract, ());
+        StakeVaultContractClient::new(&env, &vault_id).initialize(&admin, &token, &signal_registry);
+        (env, vault_id, token, admin, signal_registry)
+    }
+
+    #[test]
+    fn slash_succeeds_when_no_prior_slash() {
+        let (env, vault_id, token, _admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let balance: i128 = 1_000_000;
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
+        seed(&env, &vault_id, &provider, balance);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let slashed = client.slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "bad"),
+        );
+        assert_eq!(slashed, 50_000);
+        assert_eq!(client.get_stake(&provider), 950_000);
+    }
+
+    #[test]
+    fn second_slash_within_cooldown_rejected() {
+        let (env, vault_id, token, _admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let balance: i128 = 1_000_000;
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
+        seed(&env, &vault_id, &provider, balance);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        // Set a 100-ledger cooldown.
+        client.set_slash_cooldown(&100);
+
+        // First slash succeeds.
+        client.slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "first"),
+        );
+
+        // Second slash in the same ledger should fail.
+        let result = client.try_slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "second"),
+        );
+        assert_eq!(result, Err(Ok(StakeVaultError::SlashCooldownActive)));
+    }
+
+    #[test]
+    fn second_slash_after_cooldown_accepted() {
+        let (env, vault_id, token, _admin, registry) = setup();
+        let provider = Address::generate(&env);
+        let balance: i128 = 1_000_000;
+        StellarAssetClient::new(&env, &token).mint(&vault_id, &balance);
+        seed(&env, &vault_id, &provider, balance);
+
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        // Set a 10-ledger cooldown (short for testing).
+        client.set_slash_cooldown(&10);
+
+        // First slash succeeds.
+        client.slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "first"),
+        );
+
+        // Advance past the cooldown window.
+        env.ledger().with_mut(|l| l.sequence += 15);
+
+        // Second slash after cooldown should succeed.
+        let slashed = client.slash_stake(
+            &registry,
+            &provider,
+            &SlashSeverity::Minor,
+            &Symbol::new(&env, "second"),
+        );
+        assert!(slashed > 0);
     }
 }
 
@@ -2600,4 +2770,37 @@ mod unstake_queue_cap_tests {
             }
         }
     }
+}
+
+// ── Instruction-budget regression snapshots (Issue #budget) ───────────────────
+
+use stellar_swipe_common::budget_regression::measure_and_emit;
+
+#[test]
+fn deposit_stake_budget_regression() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 1_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+
+    env.budget().reset_tracker();
+    StakeVaultContractClient::new(&env, &vault_id).deposit_stake(&staker, &amount);
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("stake_vault.deposit_stake", 6_000_000, instructions);
+}
+
+#[test]
+fn withdraw_stake_budget_regression() {
+    let (env, vault_id, token, _admin, _registry) = setup();
+    let staker = Address::generate(&env);
+    let amount: i128 = 1_000_000;
+
+    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    seed_v2_stake(&env, &vault_id, &staker, amount, 0);
+
+    env.budget().reset_tracker();
+    StakeVaultContractClient::new(&env, &vault_id).withdraw_stake(&staker);
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("stake_vault.withdraw_stake", 6_000_000, instructions);
 }

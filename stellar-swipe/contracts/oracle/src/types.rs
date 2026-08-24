@@ -73,4 +73,6 @@ pub struct ExternalPrice {
     pub round_id: u64,
     pub signature: Bytes,
     pub oracle_address: Address,
+    /// Decimal precision of the raw `price` value (e.g. 6 for USDC, 7 for XLM).
+    pub decimals: u32,
 }

@@ -130,13 +130,7 @@ pub fn get_cohort_retention(
     let data = load_cohort(env, provider, cohort_week_slot);
     let total = data.total_followers;
 
-    let bps = |active: u32| -> u32 {
-        if total == 0 {
-            0
-        } else {
-            (active * 10_000) / total
-        }
-    };
+    let bps = |active: u32| -> u32 { (active * 10_000).checked_div(total).unwrap_or(0) };
 
     CohortRetention {
         week_slot: cohort_week_slot,

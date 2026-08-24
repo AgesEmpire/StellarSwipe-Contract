@@ -7,6 +7,36 @@ use crate::{
     require_admin, GovernanceError, StorageKey,
 };
 
+// -- #917: Dry-run simulation result types ---------------------------------
+
+/// Outcome of a simulated proposal execution.
+///
+/// Returned by `simulate_proposal_action` -- surfaces every effect the proposal
+/// *would* have on storage without actually writing anything, so maintainers
+/// can verify correctness before executing on-chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulationEffect {
+    /// Human-readable label for the affected storage slot, e.g.
+    /// `"parameter:max_fee"`, `"treasury:USDC"`, `"feature:flash_loans"`.
+    pub key: String,
+    /// Current (pre-simulation) value as a debug string.
+    pub current: String,
+    /// Value the proposal would set as a debug string.
+    pub proposed: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulationResult {
+    /// Whether the simulation completed without errors.
+    pub success: bool,
+    /// The error that would have been returned (empty when `success` is true).
+    pub error: String,
+    /// Ordered list of individual storage mutations the execution would cause.
+    pub effects: Vec<SimulationEffect>,
+}
+
 // ── #692: Integer square root (Newton's method, no floating-point) ───────────
 //
 // #837: the previous version seeded Newton's method with `(x + 1) / 2`. When
@@ -499,6 +529,147 @@ pub fn cast_vote(
         proposal.status = ProposalStatus::Active;
     }
     put_proposal(env, &proposal)
+}
+pub fn simulate_proposal_action(
+    env: &Env,
+    proposal: &Proposal,
+) -> Result<SimulationResult, GovernanceError> {
+    let mut effects: Vec<SimulationEffect> = Vec::new(env);
+
+    // Simulation reads current state and records effects without writing.
+    // TreasurySpend uses `return Ok(SimulationResult{...})` for early-exit
+    // when the treasury balance is insufficient.
+    let _ = match &proposal.proposal_type {
+        ProposalType::ParameterChange(parameter, _current, proposed) => {
+            let params: Map<String, i128> = env
+                .storage()
+                .instance()
+                .get(&StorageKey::GovernanceParameters)
+                .unwrap_or(Map::new(env));
+            let cur = params.get(parameter.clone()).unwrap_or(0);
+            effects.push_back(SimulationEffect {
+                key: String::from_str(env, &(String::from_str(env, "parameter:") + parameter)),
+                current: cur.to_val().to_string(),
+                proposed: (*proposed).to_val().to_string(),
+            });
+            Ok(())
+        }
+        ProposalType::TreasurySpend(recipient, amount, asset, _purpose) => {
+            let treasury = get_treasury(env);
+            let bal = treasury.assets.get(asset.clone()).unwrap_or(0);
+            if bal < *amount {
+                return Ok(SimulationResult {
+                    success: false,
+                    error: String::from_str(env, "Insufficient treasury balance"),
+                    effects: Vec::new(env),
+                });
+            }
+            effects.push_back(SimulationEffect {
+                key: String::from_str(env, "treasury:balance"),
+                current: bal.to_val().to_string(),
+                proposed: (bal - *amount).to_val().to_string(),
+            });
+            effects.push_back(SimulationEffect {
+                key: String::from_str(env, "treasury:recipient"),
+                current: String::from_str(env, "(unchanged)"),
+                proposed: recipient.to_string(),
+            });
+            Ok(())
+        }
+        ProposalType::FeatureToggle(feature, enabled) => {
+            let flags: Map<String, bool> = env
+                .storage()
+                .instance()
+                .get(&StorageKey::GovernanceFeatures)
+                .unwrap_or(Map::new(env));
+            let cur = flags.get(feature.clone()).unwrap_or(false);
+            effects.push_back(SimulationEffect {
+                key: String::from_str(env, &(String::from_str(env, "feature:") + feature)),
+                current: cur.to_val().to_string(),
+                proposed: (*enabled).to_val().to_string(),
+            });
+            Ok(())
+        }
+        ProposalType::ContractUpgrade(contract_name, new_hash) => {
+            let upgrades: Map<String, Bytes> = env
+                .storage()
+                .instance()
+                .get(&StorageKey::GovernanceUpgrades)
+                .unwrap_or(Map::new(env));
+            let cur = upgrades.get(contract_name.clone());
+            effects.push_back(SimulationEffect {
+                key: String::from_str(env, &(String::from_str(env, "upgrade:") + contract_name)),
+                current: match cur {
+                    Some(h) => h.to_string(),
+                    None => String::from_str(env, "(none)"),
+                },
+                proposed: new_hash.to_string(),
+            });
+            Ok(())
+        }
+        ProposalType::SignalProposal(message) => {
+            effects.push_back(SimulationEffect {
+                key: String::from_str(env, "signal"),
+                current: String::from_str(env, "(no state change)"),
+                proposed: message.clone(),
+            });
+            Ok(())
+        }
+        ProposalType::Custom(executor) => {
+            effects.push_back(SimulationEffect {
+                key: String::from_str(env, "custom"),
+                current: String::from_str(env, "(external call)"),
+                proposed: executor.to_string(),
+            });
+            Ok(())
+        }
+    };
+
+    Ok(SimulationResult {
+        success: true,
+        error: String::from_str(env, ""),
+        effects,
+    })
+}
+
+pub fn simulate_proposal(env: &Env, proposal_id: u64) -> Result<SimulationResult, GovernanceError> {
+    let proposal = get_proposal(env, proposal_id)?;
+    let result = simulate_proposal_action(env, &proposal)?;
+
+    // Build human-readable summaries of the simulated state changes.
+    let mut state_changes: Vec<String> = Vec::new(env);
+    let mut i = 0u32;
+    while i < result.effects.len() {
+        let effect = result.effects.get(i).unwrap();
+        let summary = effect.key.clone()
+            + String::from_str(env, ": ")
+            + effect.current.clone()
+            + String::from_str(env, " -> ")
+            + effect.proposed.clone();
+        state_changes.push_back(summary);
+        i += 1;
+    }
+
+    let failure_reason = if result.success {
+        None
+    } else {
+        Some(result.error.clone())
+    };
+
+    let shadow_result = crate::shadow_mode::ShadowModeResult {
+        proposal_id,
+        success: result.success,
+        simulated_state_changes: state_changes,
+        failure_reason,
+    };
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("shadow"), symbol_short!("simres")),
+        shadow_result,
+    );
+
+    Ok(result)
 }
 
 pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {

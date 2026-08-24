@@ -277,10 +277,7 @@ mod tests {
 
         assert_eq!(r1.len(), r2.len());
         for i in 0..r1.len() {
-            assert_eq!(
-                r1.get_unchecked(i).signal_id,
-                r2.get_unchecked(i).signal_id
-            );
+            assert_eq!(r1.get_unchecked(i).signal_id, r2.get_unchecked(i).signal_id);
         }
     }
 }

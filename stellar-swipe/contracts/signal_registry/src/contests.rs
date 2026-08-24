@@ -167,11 +167,7 @@ pub fn auto_enter_signal(env: &Env, signal: &Signal) -> Result<(), ContestError>
 
                 let total_signals = entry.signals_submitted.len() as u32;
                 let successful = signal.successful_executions;
-                entry.success_rate = if total_signals > 0 {
-                    (successful * 100) / total_signals
-                } else {
-                    0
-                };
+                entry.success_rate = (successful * 100).checked_div(total_signals).unwrap_or(0);
 
                 entry.score = calculate_contest_score(&entry, &contest.metric, env);
                 contest.entries.set(provider, entry);

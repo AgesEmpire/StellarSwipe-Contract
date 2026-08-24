@@ -1,7 +1,11 @@
 #![no_std]
 
+use shared::reentrancy;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+};
+use stellar_swipe_common::token_metadata::{
+    validate as validate_token_metadata, TokenMetadata, TokenMetadataError,
 };
 use stellar_swipe_common::SECONDS_PER_DAY;
 
@@ -54,6 +58,8 @@ pub enum BridgeError {
     DuplicateNonce = 19,
     /// The bridge is paused (governance-driven emergency pause). See Issue #865.
     ContractPaused = 20,
+    /// Token metadata (decimals, symbol, or name) is invalid or missing.
+    InvalidTokenMetadata = 21,
 }
 
 impl BridgeError {
@@ -114,6 +120,10 @@ impl BridgeError {
             }
             BridgeError::DuplicateNonce => {
                 "message nonce was already confirmed; duplicate delivery rejected"
+            }
+            BridgeError::ContractPaused => "bridge is paused (governance-driven emergency pause)",
+            BridgeError::InvalidTokenMetadata => {
+                "token metadata (decimals, symbol, or name) is invalid or missing"
             }
         }
     }
@@ -305,6 +315,22 @@ impl BridgeContract {
             admin.require_auth();
         }
 
+        // Validate token metadata before accepting registration.
+        let metadata = TokenMetadata {
+            symbol: source_asset.clone(),
+            name: source_asset.clone(),
+            decimals,
+        };
+        validate_token_metadata(&metadata).map_err(|_| BridgeError::InvalidTokenMetadata)?;
+
+        let wrapped_metadata = TokenMetadata {
+            symbol: wrapped_asset.clone(),
+            name: wrapped_asset.clone(),
+            decimals,
+        };
+        validate_token_metadata(&wrapped_metadata)
+            .map_err(|_| BridgeError::InvalidTokenMetadata)?;
+
         let asset = WrappedAsset {
             source_chain,
             source_asset,
@@ -439,6 +465,8 @@ impl BridgeContract {
         admin: Address,
         transfer_id: u64,
     ) -> Result<(), BridgeError> {
+        // Issue #859: Reentrancy guard for cross-contract state transitions.
+        reentrancy::require_not_locked(&env).map_err(|_| BridgeError::InvalidOperation)?;
         if is_paused(&env) {
             return Err(BridgeError::ContractPaused);
         }
@@ -822,12 +850,17 @@ impl BridgeContract {
         let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
         let config: Option<BridgeConfig> = env.storage().instance().get(&DataKey::Config);
         match config {
-            Some(cfg) => stellar_swipe_common::HealthStatus {
-                is_initialized: true,
-                is_paused: is_paused(&env),
-                version,
-                admin: cfg.admin,
-            },
+            Some(cfg) => {
+                let status = stellar_swipe_common::HealthStatus {
+                    is_initialized: true,
+                    is_paused: is_paused(&env),
+                    version,
+                    admin: cfg.admin,
+                    initialized_at: env.ledger().timestamp(),
+                };
+                stellar_swipe_common::emit_health_event(&env, &status);
+                status
+            }
             None => crate::governance::bridge_health_check(&env),
         }
     }
@@ -836,7 +869,11 @@ impl BridgeContract {
 
     /// Set the central governance contract address authorized to call
     /// `apply_governance_pause`. Admin only.
-    pub fn set_governance(env: Env, admin: Address, governance: Address) -> Result<(), BridgeError> {
+    pub fn set_governance(
+        env: Env,
+        admin: Address,
+        governance: Address,
+    ) -> Result<(), BridgeError> {
         require_admin(&env, &admin)?;
         if !cfg!(test) {
             admin.require_auth();

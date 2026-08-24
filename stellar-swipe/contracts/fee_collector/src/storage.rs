@@ -4,6 +4,7 @@ use soroban_sdk::{contracttype, Address, Env, String, Vec};
 use stellar_swipe_common::storage_crud::{
     crud_get, crud_get_or, crud_has, crud_remove, crud_set, StorageTier,
 };
+use stellar_swipe_common::token_metadata::TokenMetadata;
 use stellar_swipe_common::Asset;
 
 // ── #690: Fee Distribution Waterfall ────────────────────────────────────────
@@ -131,6 +132,26 @@ pub enum StorageKey {
     /// trade-settlement keeper contract). See the "Authorized callers"
     /// section below.
     AuthorizedCaller(Address),
+    /// Index of all tokens that have non-zero revenue share pools,
+    /// used for deterministic snapshot iteration (Issue #814).
+    RevenueSharePoolIndex,
+    /// Deterministic fee distribution snapshot keyed by ledger sequence.
+    Snapshot(u64),
+    /// Registered token metadata (Issue #2).
+    RegisteredTokenMetadata(Address),
+    /// #960: Insurance fund balance per token.
+    InsuranceBalance(Address),
+    /// #960: Max insurance payout cap per claim per token.
+    InsurancePayoutCap(Address),
+    /// #960: Processed insurance claim ID tracking to prevent duplicate payouts.
+    ProcessedInsuranceClaim(String),
+    /// #940: Maximum rebate bps cap (default: 8000 = 80% of epoch fees).
+    MaxRebateBps,
+    /// #940: Total rebates distributed in a given epoch (token, epoch_day).
+    EpochRebateDistributed(Address, u64),
+    /// Monotonic counter bumped on every fee-config write so the tx-scoped
+    /// fee cache auto-misses after any rate change (issue #945).
+    ConfigVersion,
 }
 
 #[contracttype]
@@ -192,6 +213,29 @@ pub struct BalanceMismatch {
     pub actual: i128,
     /// Difference: `actual - expected`. Positive means surplus, negative means deficit.
     pub delta: i128,
+}
+
+// ── Issue #814: Deterministic fee distribution snapshots ──────────
+
+/// A single entry in a fee distribution snapshot, recording the token
+/// and its accumulated revenue share pool amount at snapshot time.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SnapshotEntry {
+    pub token: Address,
+    pub amount: i128,
+}
+
+/// A deterministic snapshot of all revenue share pools at a point in
+/// time.  Snapshots are keyed by ledger sequence and recorded in
+/// insertion order sorted by token address for determinism.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeeSnapshot {
+    pub ledger: u64,
+    pub timestamp: u64,
+    pub total_amount: i128,
+    pub entries: Vec<SnapshotEntry>,
 }
 
 // --- Admin ---
@@ -579,7 +623,34 @@ pub fn set_protocol_token(env: &Env, token: &Address) {
     );
 }
 
-// ── Issue #442: Revenue Share ────────────────────────────────────────
+// ── Issue #880: Token Metadata Validation ────────────────────────────────────────
+
+pub fn get_registered_token_metadata(env: &Env, token: &Address) -> Option<TokenMetadata> {
+    crud_get(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RegisteredTokenMetadata(token.clone()),
+    )
+}
+
+pub fn set_registered_token_metadata(env: &Env, token: &Address, metadata: &TokenMetadata) {
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RegisteredTokenMetadata(token.clone()),
+        metadata,
+    );
+}
+
+pub fn remove_registered_token_metadata(env: &Env, token: &Address) {
+    crud_remove(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RegisteredTokenMetadata(token.clone()),
+    );
+}
+
+// ── Issue #442: Revenue Share ────────────────────────────────────────────────────────
 
 pub const DEFAULT_REVENUE_SHARE_RATE_BPS: u32 = 2000; // 20%
 pub const SECONDS_PER_WEEK: u64 = 604_800;
@@ -636,6 +707,9 @@ pub fn add_revenue_share_pool(env: &Env, token: &Address, amount: i128) {
         &StorageKey::RevenueSharePool(token.clone()),
         &current.saturating_add(amount),
     );
+    if amount > 0 {
+        add_to_revenue_share_pool_index(env, token);
+    }
 }
 
 pub fn clear_revenue_share_pool(env: &Env, token: &Address) {
@@ -643,6 +717,70 @@ pub fn clear_revenue_share_pool(env: &Env, token: &Address) {
         env,
         StorageTier::Persistent,
         &StorageKey::RevenueSharePool(token.clone()),
+    );
+    remove_from_revenue_share_pool_index(env, token);
+}
+
+// ── Revenue Share Pool Index (Issue #814) ──────────────────────────
+
+/// Returns the list of tokens that have non-zero revenue share pools.
+/// Used for deterministic snapshot iteration.
+pub fn get_revenue_share_pool_index(env: &Env) -> Vec<Address> {
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RevenueSharePoolIndex,
+        Vec::new(env),
+    )
+}
+
+/// Adds `token` to the pool index if not already present.
+pub fn add_to_revenue_share_pool_index(env: &Env, token: &Address) {
+    let mut index = get_revenue_share_pool_index(env);
+    for i in 0..index.len() {
+        if index.get(i).unwrap() == *token {
+            return;
+        }
+    }
+    index.push_back(token.clone());
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RevenueSharePoolIndex,
+        &index,
+    );
+}
+
+/// Removes `token` from the pool index.
+pub fn remove_from_revenue_share_pool_index(env: &Env, token: &Address) {
+    let index = get_revenue_share_pool_index(env);
+    let mut new_index = Vec::new(env);
+    for i in 0..index.len() {
+        let t = index.get(i).unwrap();
+        if t != *token {
+            new_index.push_back(t);
+        }
+    }
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::RevenueSharePoolIndex,
+        &new_index,
+    );
+}
+
+// ── Snapshot storage (Issue #814) ───────────────────────────────────
+
+pub fn get_fee_snapshot(env: &Env, ledger: u64) -> Option<FeeSnapshot> {
+    crud_get(env, StorageTier::Instance, &StorageKey::Snapshot(ledger))
+}
+
+pub fn set_fee_snapshot(env: &Env, ledger: u64, snapshot: &FeeSnapshot) {
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::Snapshot(ledger),
+        snapshot,
     );
 }
 
@@ -864,4 +1002,115 @@ pub fn set_congestion_signal(env: &Env, signal: &CongestionSignal) {
     env.storage()
         .instance()
         .set(&StorageKey::CongestionSignal, signal);
+}
+
+// ── Issue #960: Insurance Payout & Cap Storage ───────────────────────────────
+
+pub fn get_insurance_balance(env: &Env, token: &Address) -> i128 {
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::InsuranceBalance(token.clone()),
+        0i128,
+    )
+}
+
+pub fn set_insurance_balance(env: &Env, token: &Address, balance: i128) {
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::InsuranceBalance(token.clone()),
+        &balance,
+    );
+}
+
+pub fn get_insurance_payout_cap(env: &Env, token: &Address) -> i128 {
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::InsurancePayoutCap(token.clone()),
+        0i128,
+    )
+}
+
+pub fn set_insurance_payout_cap(env: &Env, token: &Address, cap: i128) {
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::InsurancePayoutCap(token.clone()),
+        &cap,
+    );
+}
+
+pub fn is_insurance_claim_processed(env: &Env, claim_id: &String) -> bool {
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::ProcessedInsuranceClaim(claim_id.clone()),
+        false,
+    )
+}
+
+pub fn set_insurance_claim_processed(env: &Env, claim_id: &String, processed: bool) {
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::ProcessedInsuranceClaim(claim_id.clone()),
+        &processed,
+    );
+}
+
+// ── Issue #940: Fee Rebate Cap Storage ───────────────────────────────────────
+
+/// Default maximum rebate as a percentage of epoch fees (80%).
+pub const DEFAULT_MAX_REBATE_BPS: u32 = 8_000;
+
+/// Returns the configured maximum rebate bps.
+/// Defaults to 8000 (80% of epoch fees may be rebated).
+pub fn get_max_rebate_bps(env: &Env) -> u32 {
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &StorageKey::MaxRebateBps,
+        DEFAULT_MAX_REBATE_BPS,
+    )
+}
+
+/// Stores the maximum rebate bps (admin-only, must be <= 10_000).
+pub fn set_max_rebate_bps(env: &Env, bps: u32) {
+    crud_set(env, StorageTier::Instance, &StorageKey::MaxRebateBps, &bps);
+}
+
+/// Returns total rebates distributed in the given epoch (token, epoch_day).
+pub fn get_epoch_rebate_distributed(env: &Env, token: &Address, epoch_day: u64) -> i128 {
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::EpochRebateDistributed(token.clone(), epoch_day),
+        0i128,
+    )
+}
+
+// ── Issue #945: Config version for cache invalidation ───────────────────────
+
+/// Returns the current config version (starts at 0, wraps on overflow).
+pub fn get_config_version(env: &Env) -> u32 {
+    crud_get_or(env, StorageTier::Instance, &StorageKey::ConfigVersion, 0u32)
+}
+
+/// Increments the config version. Call after any fee-rate config write.
+pub fn bump_config_version(env: &Env) {
+    let v = get_config_version(env).wrapping_add(1);
+    crud_set(env, StorageTier::Instance, &StorageKey::ConfigVersion, &v);
+}
+
+/// Accumulates rebate distributed for an epoch.
+pub fn add_epoch_rebate_distributed(env: &Env, token: &Address, epoch_day: u64, amount: i128) {
+    let current = get_epoch_rebate_distributed(env, token, epoch_day);
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::EpochRebateDistributed(token.clone(), epoch_day),
+        &current.saturating_add(amount),
+    );
 }
