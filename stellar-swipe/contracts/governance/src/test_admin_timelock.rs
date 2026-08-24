@@ -2,8 +2,8 @@ extern crate std;
 
 use crate::distribution::DistributionRecipients;
 use crate::proposals::GovernanceConfig;
-use crate::{GovernanceContract, GovernanceContractClient, GovernanceError};
-use soroban_sdk::testutils::Address as _;
+use crate::{Authority, GovernanceContract, GovernanceContractClient, GovernanceError};
+use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::{Address, Env, String, Vec};
 use stellar_swipe_common::Asset;
 
@@ -142,7 +142,7 @@ fn execute_treasury_spend_timelocked_rejects_without_queue() {
     let c = client(&env, &contract_id);
     let recipient = Address::generate(&env);
     let usdc = asset(&env, "USDC");
-    let result = c.try_execute_treasury_spend_timelocked(
+    let result = c.try_treasury_spend_timelocked(
         &admin,
         &0u64,
         &recipient,
@@ -245,13 +245,13 @@ fn dissolve_committee_timelocked_rejects_without_queue() {
     assert_eq!(result, Err(Ok(GovernanceError::ActionNotFound)));
 }
 
-// ── queue_override_committee_decision ────────────────────────────────────────
+// ── queue_committee_override ─────────────────────────────────────────────────
 
 #[test]
 fn override_committee_decision_timelocked_rejects_without_queue() {
     let (env, contract_id, admin, _) = setup_with_timelock();
     let c = client(&env, &contract_id);
-    let result = c.try_override_committee_decision_timelocked(&admin, &0u64, &1u64, &1u64);
+    let result = c.try_committee_override_timelocked(&admin, &0u64, &1u64, &1u64);
     assert_eq!(result, Err(Ok(GovernanceError::ActionNotFound)));
 }
 

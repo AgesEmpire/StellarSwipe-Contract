@@ -61,7 +61,6 @@ use distribution::{
     releasable_amount, release_vested_tokens as release_schedule_tokens, update_reward_config,
     DistributionRecipients, DistributionState, VestingCategory, VestingSchedule,
 };
-pub use errors::GovernanceError;
 use proposals::{
     calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
     default_governance_config, effective_status, execute_proposal, finalize_proposal,
@@ -119,7 +118,7 @@ const DEFAULT_MIN_CLAIM_THRESHOLD: i128 = 100;
 /// - `ContractUpgrade`/`SignalProposal`/`Custom`: both 0 (no numeric diff).
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct SimulationResult {
+pub struct ExecutionSimulationResult {
     pub proposal_id: u64,
     pub simulation_timestamp: u64,
     pub would_succeed: bool,
@@ -392,7 +391,7 @@ impl GovernanceContract {
     /// Accept a pending key rotation. The caller becomes the new admin.
     /// Only the address currently stored as PendingAdmin can call this.
     pub fn accept_key_rotation(env: Env, new_admin: Address) -> Result<(), GovernanceError> {
-        let pending = env
+        let pending: Address = env
             .storage()
             .instance()
             .get(&StorageKey::PendingAdmin)
@@ -427,6 +426,10 @@ impl GovernanceContract {
         guardian.require_auth();
         env.storage().instance().remove(&StorageKey::Admin);
         env.storage().instance().remove(&StorageKey::PendingAdmin);
+        // Brick the contract until a trusted party re-initializes it with a
+        // fresh admin — an emergency revocation implies the admin key may be
+        // compromised, so other governance state should not stay reachable.
+        env.storage().instance().remove(&StorageKey::Initialized);
         Ok(())
     }
 
@@ -858,12 +861,12 @@ impl GovernanceContract {
     /// returns the projected diff without writing to persistent storage. Emits a
     /// `simulation_complete` event for off-chain/UI consumption.
     ///
-    /// Returns `SimulationResult::would_succeed = true` only when the proposal
+    /// Returns `ExecutionSimulationResult::would_succeed = true` only when the proposal
     /// is in `Succeeded` status and the payload would execute without error.
     pub fn simulate_execution(
         env: Env,
         proposal_id: u64,
-    ) -> Result<SimulationResult, GovernanceError> {
+    ) -> Result<ExecutionSimulationResult, GovernanceError> {
         require_initialized(&env)?;
         let proposal = get_proposal(&env, proposal_id)?;
 
@@ -898,7 +901,7 @@ impl GovernanceContract {
             ProposalType::Custom(_addr) => (0, 0),
         };
 
-        let result = SimulationResult {
+        let result = ExecutionSimulationResult {
             proposal_id,
             simulation_timestamp: env.ledger().timestamp(),
             would_succeed: executable,
@@ -2047,7 +2050,7 @@ impl GovernanceContract {
         asset: Asset,
         amount: i128,
     ) -> Result<Treasury, GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         let mut treasury = get_treasury(&env);
         treasury::set_asset_balance(&env, &mut treasury, asset, amount)?;
@@ -2070,7 +2073,7 @@ impl GovernanceContract {
         queue_admin_action(&env, admin, symbol_short!("tspspend"))
     }
 
-    pub fn execute_treasury_spend_timelocked(
+    pub fn treasury_spend_timelocked(
         env: Env,
         admin: Address,
         action_id: u64,
@@ -2081,7 +2084,7 @@ impl GovernanceContract {
         purpose: String,
         approved_by_proposal: Option<u64>,
     ) -> Result<TreasurySpend, GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         let mut treasury = get_treasury(&env);
         let spend = treasury::execute_spend(
@@ -2130,7 +2133,7 @@ impl GovernanceContract {
         queue_admin_action(&env, admin, symbol_short!("catthresh"))
     }
 
-    pub fn set_category_thresholds_timelocked(
+    pub fn category_thresholds_timelocked(
         env: Env,
         admin: Address,
         action_id: u64,
@@ -2164,7 +2167,7 @@ impl GovernanceContract {
         authorities: Vec<Authority>,
         term_duration_days: Option<u32>,
     ) -> Result<Committee, GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         let mut committees_state = get_committees_state(&env);
         let committee = committees::create_committee(
@@ -2198,7 +2201,7 @@ impl GovernanceContract {
         action_id: u64,
         committee_id: u64,
     ) -> Result<Committee, GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         let mut committees_state = get_committees_state(&env);
         let committee = committees::dissolve_committee(&env, &mut committees_state, committee_id)?;
@@ -2207,7 +2210,7 @@ impl GovernanceContract {
         Ok(committee)
     }
 
-    pub fn queue_override_committee_decision(
+    pub fn queue_committee_override(
         env: Env,
         admin: Address,
         _committee_id: u64,
@@ -2217,14 +2220,14 @@ impl GovernanceContract {
         queue_admin_action(&env, admin, symbol_short!("cmtover"))
     }
 
-    pub fn override_committee_decision_timelocked(
+    pub fn committee_override_timelocked(
         env: Env,
         admin: Address,
         action_id: u64,
         committee_id: u64,
         decision_id: u64,
     ) -> Result<CommitteeDecision, GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         let mut committees_state = get_committees_state(&env);
         let decision =
@@ -2249,7 +2252,7 @@ impl GovernanceContract {
         action_id: u64,
         guardian: Address,
     ) -> Result<(), GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         env.storage()
             .instance()
@@ -2324,7 +2327,7 @@ impl GovernanceContract {
         period_end: u64,
         auto_renew: bool,
     ) -> Result<Budget, GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         let mut treasury = get_treasury(&env);
         let budget = treasury::upsert_budget(
@@ -2353,7 +2356,7 @@ impl GovernanceContract {
         queue_admin_action(&env, admin, symbol_short!("budgapprv"))
     }
 
-    pub fn approve_treasury_budget_timelocked(
+    pub fn treasury_budget_timelocked(
         env: Env,
         admin: Address,
         action_id: u64,
@@ -2361,7 +2364,7 @@ impl GovernanceContract {
         proposal_id: u64,
         approved_cap: i128,
     ) -> Result<BudgetApproval, GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         let mut treasury = get_treasury(&env);
         let approval = treasury::approve_budget(
@@ -2387,7 +2390,7 @@ impl GovernanceContract {
         queue_admin_action(&env, admin, symbol_short!("recur"))
     }
 
-    pub fn create_recurring_payment_timelocked(
+    pub fn recurring_payment_timelocked(
         env: Env,
         admin: Address,
         action_id: u64,
@@ -2400,7 +2403,7 @@ impl GovernanceContract {
         approved_by_proposal: Option<u64>,
         end_date: Option<u64>,
     ) -> Result<RecurringPayment, GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         let mut treasury = get_treasury(&env);
         let payment = treasury::schedule_recurring_payment(
@@ -2450,7 +2453,7 @@ impl GovernanceContract {
         queue_admin_action(&env, admin, symbol_short!("shpromt"))
     }
 
-    pub fn promote_from_shadow_mode_timelocked(
+    pub fn shadow_mode_promote_timelocked(
         env: Env,
         admin: Address,
         action_id: u64,
@@ -2477,7 +2480,7 @@ impl GovernanceContract {
         action_type: ActionType,
         new_delay: u64,
     ) -> Result<(), GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         timelock::update_timelock_delay(&env, action_type, new_delay)
     }
@@ -2492,7 +2495,7 @@ impl GovernanceContract {
         queue_admin_action(&env, admin, symbol_short!("vestadd"))
     }
 
-    pub fn create_vesting_schedule_timelocked(
+    pub fn vesting_schedule_timelocked(
         env: Env,
         admin: Address,
         action_id: u64,
@@ -2502,7 +2505,7 @@ impl GovernanceContract {
         cliff_seconds: u64,
         duration_seconds: u64,
     ) -> Result<(), GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         create_schedule(
             &env,
@@ -2541,7 +2544,7 @@ impl GovernanceContract {
         asset: Asset,
         target_bps: i128,
     ) -> Result<Treasury, GovernanceError> {
-        require_admin(&env, &admin)?;
+        require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
         let mut treasury = get_treasury(&env);
         treasury::set_rebalance_target(&env, &mut treasury, asset, target_bps)?;
@@ -2605,6 +2608,16 @@ pub(crate) fn require_initialized(env: &Env) -> Result<(), GovernanceError> {
 fn require_admin(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
     require_initialized(env)?;
     caller.require_auth();
+    require_admin_identity(env, caller)
+}
+
+/// Same admin-identity check as [`require_admin`] but without the
+/// `require_auth()` call. Use this immediately before `execute_admin_action`,
+/// which performs its own `require_auth()` for the same caller — invoking
+/// `require_auth()` twice for the same address within one top-level
+/// invocation is rejected by the host with "frame is already authorized".
+fn require_admin_identity(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
+    require_initialized(env)?;
     let admin: Address = env
         .storage()
         .instance()
