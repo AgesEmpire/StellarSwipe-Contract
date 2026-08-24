@@ -414,6 +414,14 @@ pub fn emit_signal_orphaned(env: &Env, signal_id: u64, reason: String) {
     env.events().publish(topics, (signal_id, reason));
 }
 
+/// Issue #948: emitted when a caller invokes an entry point kept only for
+/// backward compatibility, so indexers/integrators can see legacy usage and
+/// migrate to `replacement` before the shim is ever removed.
+pub fn emit_deprecated_entry_point_used(env: &Env, entry_point: Symbol, replacement: Symbol) {
+    let topics = (Symbol::new(env, "deprecated_entry_point_used"),);
+    env.events().publish(topics, (entry_point, replacement));
+}
+
 /// Emitted when a provider cancels a signal after the minimum lifetime has elapsed (issue #687).
 pub fn emit_signal_cancelled(env: &Env, signal_id: u64, provider: Address) {
     let topics = (Symbol::new(env, "signal_cancelled"),);
