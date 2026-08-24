@@ -1308,7 +1308,6 @@ impl SignalRegistry {
             submitted_at: now,
             expiry,
             status: SignalStatus::Active,
-            // Initialize performance tracking fields
             executions: 0,
             successful_executions: 0,
             total_volume: 0,
@@ -1317,7 +1316,6 @@ impl SignalRegistry {
             category: category.clone(),
             tags: unique_tags.clone(),
             risk_level,
-            // Collaboration field
             is_collaborative: false,
             rationale_hash,
             confidence: 50,

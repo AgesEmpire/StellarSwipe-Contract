@@ -727,8 +727,6 @@ impl FeeCollector {
     }
 
     /// Admin-only: update the fee rate (in basis points).
-    /// Validates: MIN_FEE_RATE_BPS <= new_rate_bps <= MAX_FEE_RATE_BPS.
-    /// Change takes effect on the next trade — no retroactive application.
     pub fn set_fee_rate(env: Env, new_rate_bps: u32) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);

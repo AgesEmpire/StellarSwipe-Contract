@@ -2011,6 +2011,7 @@ fn test_insurance_payout_authorized_caller() {
     let env = Env::default();
     env.mock_all_auths();
 
+    // --- setup ---
     let admin = Address::generate(&env);
     let keeper = Address::generate(&env);
     let provider = Address::generate(&env);
