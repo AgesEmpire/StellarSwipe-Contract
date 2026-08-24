@@ -2071,7 +2071,7 @@ fn test_insurance_payout_invalid_amount() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #940: Fee rebate cap tests
+// Issue #940: Fee rebate cap tests (duplicate: also closes #947)
 // ---------------------------------------------------------------------------
 
 /// Helper: sets pending fees for a provider directly in contract storage.

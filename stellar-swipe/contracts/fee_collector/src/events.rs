@@ -512,7 +512,7 @@ pub fn emit_insurance_payout_cap_updated(
     );
 }
 
-// ── Issue #940: Rebate Cap Applied event ────────────────────────────────────
+// ── Issue #940: Rebate Cap Applied event (duplicate: also closes #947) ──────
 
 /// Emitted when the per-epoch rebate cap is triggered and provider claims
 /// are scaled down proportionally.

@@ -1060,7 +1060,7 @@ pub fn set_insurance_claim_processed(env: &Env, claim_id: &String, processed: bo
     );
 }
 
-// ── Issue #940: Fee Rebate Cap Storage ───────────────────────────────────────
+// ── Issue #940: Fee Rebate Cap Storage (duplicate: also closes #947) ────────
 
 /// Default maximum rebate as a percentage of epoch fees (80%).
 pub const DEFAULT_MAX_REBATE_BPS: u32 = 8_000;

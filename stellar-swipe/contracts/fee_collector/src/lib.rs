@@ -1288,7 +1288,7 @@ impl FeeCollector {
         let requested = get_pending_fees(&env, &provider, &token);
 
         if requested > 0 {
-            // ── Issue #940: Per-epoch rebate cap ─────────────────────────────
+            // ── Issue #940: Per-epoch rebate cap (duplicate: also closes #947) ──
             // Compute capped amount: cap = epoch_fees * max_rebate_bps / 10_000.
             // If the remaining headroom for this epoch is less than the requested
             // amount, scale the claim down proportionally and emit RebateCapApplied.
@@ -2024,7 +2024,7 @@ impl FeeCollector {
         Ok(())
     }
 
-    // ── Issue #940: Fee Rebate Cap ─────────────────────────────────────────────
+    // ── Issue #940: Fee Rebate Cap (duplicate: also closes #947) ────────────────
 
     /// Returns the current maximum rebate bps setting.
     /// Defaults to 8000 (80% of epoch fees).
