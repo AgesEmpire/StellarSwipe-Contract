@@ -36,6 +36,9 @@ jobs:
       - name: Validate deployment manifests
         run: python3 stellar-swipe/scripts/validate_deployment_manifest.py
 
+      - name: Validate event schema
+        run: python3 scripts/validate_event_schema.py
+
       # Setup Rust toolchain with required components and target
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -67,6 +70,9 @@ jobs:
       # Run tests for all workspace crates
       - name: Tests
         run: cd stellar-swipe && cargo test --workspace --all-targets
+
+      - name: Reward conservation regression tests
+        run: cd scripts && npx tsx --test reward_conservation.test.ts
 
       # Property-based tests: verify quality score stays in [0, 100] (issue #780)
       - name: Proptest (signal_registry)
