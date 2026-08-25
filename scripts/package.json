@@ -5,6 +5,7 @@
   "description": "Off-chain scripts (deploy, event parsing tests) for StellarSwipe contracts",
   "scripts": {
     "test:events": "npx tsx test_event_parsing.ts",
+    "test:rewards": "npx tsx --test reward_conservation.test.ts",
     "replay-events": "npx tsx replay_events.ts",
     "replay-state": "npx tsx replay_state.ts",
     "test:replay": "npx tsx --test replay_state.test.ts",
