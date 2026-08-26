@@ -1182,6 +1182,31 @@ pub fn reclaim_expired_proposal(
     Ok(())
 }
 
+pub fn cleanup_terminal_proposals(
+    env: &Env, cursor: u32, limit: u32,
+) -> Result<u32, GovernanceError> {
+    if limit == 0 || limit > 50 { return Err(GovernanceError::InvalidAmount); }
+    let mut state = get_proposals_state(env);
+    let mut i = cursor.min(state.proposal_ids.len());
+    let mut removed = 0;
+    while i < state.proposal_ids.len() && removed < limit {
+        let id = state.proposal_ids.get_unchecked(i);
+        let proposal = state.proposals.get(id).ok_or(GovernanceError::ProposalNotFound)?;
+        let terminal = matches!(effective_status(env, &proposal), ProposalStatus::Failed
+            | ProposalStatus::Executed | ProposalStatus::Cancelled
+            | ProposalStatus::Expired | ProposalStatus::Withdrawn);
+        if terminal {
+            state.proposals.remove(id);
+            state.proposal_ids.remove(i);
+            env.events().publish((symbol_short!("gov"), symbol_short!("cleanup")),
+                (id, proposal.status, env.ledger().timestamp()));
+            removed += 1;
+        } else { i += 1; }
+    }
+    put_proposals_state(env, &state);
+    Ok(removed)
+}
+
 /// Proposals that are still eligible for voting or execution: `Pending`,
 /// `Active`, or `Succeeded` (awaiting execution) *and* not past their
 /// `execution_deadline`. Proposals whose execution window has closed are

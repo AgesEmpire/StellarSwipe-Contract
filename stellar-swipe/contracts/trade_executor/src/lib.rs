@@ -118,6 +118,7 @@ pub enum StorageKey {
     /// Issue #959: per-user partial fill record keyed by (user, trade_id).
     /// Stores a `PartialFillRecord` when the SDEX only fills part of the requested amount.
     PartialFillRecord(Address, u64),
+    CallbackContext(u64),
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -142,6 +143,15 @@ pub struct PartialFillRecord {
     pub remaining_amount: i128,
     /// Ledger sequence at which the partial fill was detected.
     pub detected_at_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallbackContext {
+    pub executor: Address,
+    pub route: BytesN<32>,
+    pub from_asset: Address,
+    pub to_asset: Address,
 }
 
 /// A trade queued for execution, subject to a configurable grace period.
@@ -1197,6 +1207,35 @@ fn grace_period_elapsed(env: &Env, queued_at_ledger: u32) -> bool {
 
 #[contractimpl]
 impl TradeExecutorContract {
+    pub fn expect_settlement_callback(
+        env: Env, trade_id: u64, executor: Address, route: BytesN<32>,
+        from_asset: Address, to_asset: Address,
+    ) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        let key = StorageKey::CallbackContext(trade_id);
+        if env.storage().instance().has(&key) { return Err(ContractError::ReplayDetected); }
+        env.storage().instance().set(&key, &CallbackContext {
+            executor, route, from_asset, to_asset,
+        });
+        Ok(())
+    }
+
+    pub fn accept_settlement_callback(
+        env: Env, caller: Address, trade_id: u64, route: BytesN<32>,
+        from_asset: Address, to_asset: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let key = StorageKey::CallbackContext(trade_id);
+        let expected: CallbackContext = env.storage().instance().get(&key)
+            .ok_or(ContractError::TradeNotFound)?;
+        if expected.executor != caller || expected.route != route
+            || expected.from_asset != from_asset || expected.to_asset != to_asset {
+            return Err(ContractError::Unauthorized);
+        }
+        env.storage().instance().remove(&key);
+        Ok(())
+    }
+
     /// # Summary
     /// One-time contract initialization. Stores the admin address.
     ///
