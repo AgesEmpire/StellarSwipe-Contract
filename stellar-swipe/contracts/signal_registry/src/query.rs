@@ -754,8 +754,7 @@ mod provider_history_tests {
             assert!(page.signals.len() > 0);
 
             // Oversized request is clamped to MAX_HISTORY_PAGE_SIZE.
-            let oversized =
-                get_provider_signal_history(env, &map, &provider, None, 10_000);
+            let oversized = get_provider_signal_history(env, &map, &provider, None, 10_000);
             assert!(oversized.signals.len() <= MAX_HISTORY_PAGE_SIZE);
         });
     }
