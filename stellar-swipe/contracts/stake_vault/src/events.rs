@@ -194,6 +194,14 @@ pub struct EvtLockMultiplierTierUpdated {
     pub bps: u32,
 }
 
+/// Slash cooldown updated by admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtSlashCooldownUpdated {
+    pub schema_version: u32,
+    pub cooldown_ledgers: u32,
+}
+
 // ── Emergency multi-sig unstake events (issue #754) ───────────────────────────
 
 #[contracttype]
@@ -468,6 +476,16 @@ pub fn emit_lock_multiplier_tier_updated(env: &Env, weeks: u32, bps: u32) {
             schema_version: SCHEMA_VERSION,
             weeks,
             bps,
+        },
+    );
+}
+
+pub fn emit_slash_cooldown_updated(env: &Env, cooldown_ledgers: u32) {
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_STAKE_SLASH_COOLDOWN()),
+        EvtSlashCooldownUpdated {
+            schema_version: SCHEMA_VERSION,
+            cooldown_ledgers,
         },
     );
 }

@@ -109,10 +109,6 @@ pub enum GovernanceError {
     InvalidTimelockConfig = 49,
     /// No conviction-voting pool exists for the given id.
     ConvictionPoolNotFound = 50,
-    /// No pending admin rotation has been proposed.
-    PendingAdminNotFound = 51,
-    /// Guardian address has not been configured.
-    GuardianNotSet = 52,
 }
 
 impl GovernanceError {
@@ -233,8 +229,6 @@ impl GovernanceError {
             GovernanceError::ConvictionPoolNotFound => {
                 "no conviction-voting pool exists for the given id"
             }
-            GovernanceError::PendingAdminNotFound => "no pending admin rotation has been proposed",
-            GovernanceError::GuardianNotSet => "guardian address has not been configured",
         }
     }
 }
@@ -258,4 +252,8 @@ impl GovernanceError {
     /// passed — it can no longer be executed and must instead be reclaimed
     /// via `reclaim_expired_proposal` (Issue #796).
     pub const ProposalExpired: GovernanceError = GovernanceError::BudgetPeriodEnded;
+    /// No pending admin rotation has been proposed.
+    pub const PendingAdminNotFound: GovernanceError = GovernanceError::Unauthorized;
+    /// Guardian address has not been configured.
+    pub const GuardianNotSet: GovernanceError = GovernanceError::Unauthorized;
 }

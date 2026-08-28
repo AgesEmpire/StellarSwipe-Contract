@@ -1308,7 +1308,6 @@ impl SignalRegistry {
             submitted_at: now,
             expiry,
             status: SignalStatus::Active,
-            // Initialize performance tracking fields
             executions: 0,
             successful_executions: 0,
             total_volume: 0,
@@ -1317,7 +1316,6 @@ impl SignalRegistry {
             category: category.clone(),
             tags: unique_tags.clone(),
             risk_level,
-            // Collaboration field
             is_collaborative: false,
             rationale_hash,
             confidence: 50,
@@ -3660,6 +3658,12 @@ mod test_adoption;
 /// Signal categorization query tests (Issue #660).
 #[cfg(test)]
 mod test_categorization;
+/// Composite churn-risk scoring tests (Issue #944).
+#[cfg(test)]
+mod test_churn_risk;
+/// Collaborative signal reward distribution tests (Issue #957).
+#[cfg(test)]
+mod test_collaboration;
 #[cfg(test)]
 mod test_daily_signal_limit;
 #[cfg(test)]

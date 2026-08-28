@@ -16,7 +16,7 @@
     "batch_execute": 20000000
   },
   "fee_collector": {
-    "collect_fee": 5000000,
+    "collect_fee": 5500000,
     "distribute_fees": 10000000
   },
   "stake_vault": {

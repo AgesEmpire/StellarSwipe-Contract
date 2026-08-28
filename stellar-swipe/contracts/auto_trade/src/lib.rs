@@ -6,6 +6,7 @@ use soroban_sdk::{
 
 mod auth;
 pub mod budget_guard;
+pub mod compat;
 mod errors;
 pub mod governance;
 mod history;
@@ -66,6 +67,161 @@ pub struct TradeResult {
 
 #[contract]
 pub struct AutoTradeContract;
+
+/// ==========================
+/// Shared implementation
+/// ==========================
+
+/// Core trade-execution logic shared between the canonical `execute_trade`
+/// entry point and the `compat::copy_trade` backward-compatibility shim.
+///
+/// Performs the full validation and execution pipeline: amount guard,
+/// auth check, signal lookup, expiry check, rate-limit, authorization,
+/// balance check, risk validation, SDEX routing, position tracking,
+/// history recording, and event emission.
+pub fn execute_trade_impl(
+    env: &Env,
+    user: Address,
+    signal_id: u64,
+    order_type: OrderType,
+    amount: i128,
+) -> Result<TradeResult, AutoTradeError> {
+    if amount <= 0 {
+        return Err(AutoTradeError::InvalidAmount);
+    }
+
+    user.require_auth();
+
+    let signal = storage::get_signal(env, signal_id).ok_or(AutoTradeError::SignalNotFound)?;
+
+    if env.ledger().timestamp() > signal.expiry {
+        return Err(AutoTradeError::SignalExpired);
+    }
+
+    let last_execution = env
+        .storage()
+        .persistent()
+        .get::<DataKey, u64>(&DataKey::LastExecution(user.clone(), signal_id))
+        .unwrap_or(0);
+    let now = env.ledger().timestamp();
+    if now < last_execution.saturating_add(EXECUTION_RATE_LIMIT_SECONDS) {
+        return Err(AutoTradeError::ExecutionRateLimited);
+    }
+
+    if !auth::is_authorized(env, &user, amount) {
+        return Err(AutoTradeError::Unauthorized);
+    }
+
+    if !sdex::has_sufficient_balance(env, &user, &signal.base_asset, amount) {
+        return Err(AutoTradeError::InsufficientBalance);
+    }
+
+    let is_sell = false;
+
+    risk::set_asset_price(env, signal.base_asset, signal.price);
+
+    let stop_loss_triggered = risk::validate_trade(
+        env,
+        &user,
+        signal.base_asset,
+        amount,
+        signal.price,
+        is_sell,
+    )?;
+
+    if stop_loss_triggered {
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(env, "stop_loss_triggered"),
+                user.clone(),
+                signal.base_asset,
+            ),
+            signal.price,
+        );
+    }
+
+    let execution = match order_type {
+        OrderType::Market => sdex::execute_market_order(env, &user, &signal, amount)?,
+        OrderType::Limit => sdex::execute_limit_order(env, &user, &signal, amount)?,
+    };
+
+    let status = if execution.executed_amount == 0 {
+        TradeStatus::Failed
+    } else if execution.executed_amount < amount {
+        TradeStatus::PartiallyFilled
+    } else {
+        TradeStatus::Filled
+    };
+
+    let trade = Trade {
+        signal_id,
+        user: user.clone(),
+        requested_amount: amount,
+        executed_amount: execution.executed_amount,
+        executed_price: execution.executed_price,
+        timestamp: env.ledger().timestamp(),
+        status: status.clone(),
+    };
+
+    if execution.executed_amount > 0 {
+        let positions = risk::get_user_positions(env, &user);
+        let current_amount = positions
+            .get(signal.base_asset)
+            .map(|p| p.amount)
+            .unwrap_or(0);
+        let new_amount = if is_sell {
+            current_amount - execution.executed_amount
+        } else {
+            current_amount + execution.executed_amount
+        };
+        risk::update_position(env, &user, signal.base_asset, new_amount, execution.executed_price);
+        risk::add_trade_record(env, &user, signal_id, execution.executed_amount);
+    }
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Trades(user.clone(), signal_id), &trade);
+    env.storage()
+        .persistent()
+        .set(&DataKey::LastExecution(user.clone(), signal_id), &now);
+
+    if execution.executed_amount > 0 {
+        let hist_status = match status {
+            TradeStatus::Filled | TradeStatus::PartiallyFilled => {
+                history::HistoryTradeStatus::Executed
+            }
+            TradeStatus::Failed => history::HistoryTradeStatus::Failed,
+            TradeStatus::Pending => history::HistoryTradeStatus::Pending,
+        };
+        history::record_trade(
+            env,
+            &user,
+            signal_id,
+            signal.base_asset,
+            execution.executed_amount,
+            execution.executed_price,
+            0,
+            hist_status,
+        );
+    }
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (Symbol::new(env, "trade_executed"), user.clone(), signal_id),
+        trade.clone(),
+    );
+
+    if status == TradeStatus::Failed {
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(env, "risk_limit_block"), user.clone(), signal_id),
+            amount,
+        );
+    }
+
+    Ok(TradeResult { trade })
+}
 
 /// ==========================
 /// Implementation
@@ -444,161 +600,7 @@ impl AutoTradeContract {
         order_type: OrderType,
         amount: i128,
     ) -> Result<TradeResult, AutoTradeError> {
-        if amount <= 0 {
-            return Err(AutoTradeError::InvalidAmount);
-        }
-
-        user.require_auth();
-
-        let signal = storage::get_signal(&env, signal_id).ok_or(AutoTradeError::SignalNotFound)?;
-
-        if env.ledger().timestamp() > signal.expiry {
-            return Err(AutoTradeError::SignalExpired);
-        }
-
-        let last_execution = env
-            .storage()
-            .persistent()
-            .get::<DataKey, u64>(&DataKey::LastExecution(user.clone(), signal_id))
-            .unwrap_or(0);
-        let now = env.ledger().timestamp();
-        if now < last_execution.saturating_add(EXECUTION_RATE_LIMIT_SECONDS) {
-            return Err(AutoTradeError::ExecutionRateLimited);
-        }
-
-        if !auth::is_authorized(&env, &user, amount) {
-            return Err(AutoTradeError::Unauthorized);
-        }
-
-        if !sdex::has_sufficient_balance(&env, &user, &signal.base_asset, amount) {
-            return Err(AutoTradeError::InsufficientBalance);
-        }
-
-        // Determine if this is a sell operation (simplified)
-        let is_sell = false; // This should be determined from the signal or order details
-
-        // Set current asset price for risk calculations
-        risk::set_asset_price(&env, signal.base_asset, signal.price);
-
-        // Perform risk checks
-        let stop_loss_triggered = risk::validate_trade(
-            &env,
-            &user,
-            signal.base_asset,
-            amount,
-            signal.price,
-            is_sell,
-        )?;
-
-        // If stop-loss is triggered, emit event and proceed with sell
-        if stop_loss_triggered {
-            #[allow(deprecated)]
-            env.events().publish(
-                (
-                    Symbol::new(&env, "stop_loss_triggered"),
-                    user.clone(),
-                    signal.base_asset,
-                ),
-                signal.price,
-            );
-        }
-
-        let execution = match order_type {
-            OrderType::Market => sdex::execute_market_order(&env, &user, &signal, amount)?,
-            OrderType::Limit => sdex::execute_limit_order(&env, &user, &signal, amount)?,
-        };
-
-        let status = if execution.executed_amount == 0 {
-            TradeStatus::Failed
-        } else if execution.executed_amount < amount {
-            TradeStatus::PartiallyFilled
-        } else {
-            TradeStatus::Filled
-        };
-
-        let trade = Trade {
-            signal_id,
-            user: user.clone(),
-            requested_amount: amount,
-            executed_amount: execution.executed_amount,
-            executed_price: execution.executed_price,
-            timestamp: env.ledger().timestamp(),
-            status: status.clone(),
-        };
-
-        // Update position tracking
-        if execution.executed_amount > 0 {
-            let positions = risk::get_user_positions(&env, &user);
-            let current_amount = positions
-                .get(signal.base_asset)
-                .map(|p| p.amount)
-                .unwrap_or(0);
-
-            let new_amount = if is_sell {
-                current_amount - execution.executed_amount
-            } else {
-                current_amount + execution.executed_amount
-            };
-
-            risk::update_position(
-                &env,
-                &user,
-                signal.base_asset,
-                new_amount,
-                execution.executed_price,
-            );
-
-            // Record trade in history
-            risk::add_trade_record(&env, &user, signal_id, execution.executed_amount);
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Trades(user.clone(), signal_id), &trade);
-        env.storage()
-            .persistent()
-            .set(&DataKey::LastExecution(user.clone(), signal_id), &now);
-
-        if execution.executed_amount > 0 {
-            let hist_status = match status {
-                TradeStatus::Filled | TradeStatus::PartiallyFilled => {
-                    history::HistoryTradeStatus::Executed
-                }
-                TradeStatus::Failed => history::HistoryTradeStatus::Failed,
-                TradeStatus::Pending => history::HistoryTradeStatus::Pending,
-            };
-            history::record_trade(
-                &env,
-                &user,
-                signal_id,
-                signal.base_asset,
-                execution.executed_amount,
-                execution.executed_price,
-                0,
-                hist_status,
-            );
-        }
-
-        #[allow(deprecated)]
-        env.events().publish(
-            (Symbol::new(&env, "trade_executed"), user.clone(), signal_id),
-            trade.clone(),
-        );
-
-        // Emit event if trade was blocked by risk limits (status = Failed due to risk)
-        if status == TradeStatus::Failed {
-            #[allow(deprecated)]
-            env.events().publish(
-                (
-                    Symbol::new(&env, "risk_limit_block"),
-                    user.clone(),
-                    signal_id,
-                ),
-                amount,
-            );
-        }
-
-        Ok(TradeResult { trade })
+        execute_trade_impl(&env, user, signal_id, order_type, amount)
     }
 
     /// Fetch executed trade by user + signal

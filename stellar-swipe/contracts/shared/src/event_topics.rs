@@ -79,6 +79,7 @@ pub const TOPIC_STAKE_EMERGENCY_APPROVED: fn() -> Symbol = || Symbol::short("emg
 pub const TOPIC_STAKE_EMERGENCY_EXPIRED: fn() -> Symbol = || Symbol::short("emgexp");
 pub const TOPIC_STAKE_EMERGENCY_EXECUTED: fn() -> Symbol = || Symbol::short("emgexec");
 pub const TOPIC_STAKE_LOCK_MULTIPLIER: fn() -> Symbol = || Symbol::short("lockmult");
+pub const TOPIC_STAKE_SLASH_COOLDOWN: fn() -> Symbol = || Symbol::short("slhcooldown");
 
 #[cfg(test)]
 mod tests {
@@ -155,5 +156,6 @@ mod tests {
         let _ = TOPIC_STAKE_EMERGENCY_EXPIRED();
         let _ = TOPIC_STAKE_EMERGENCY_EXECUTED();
         let _ = TOPIC_STAKE_LOCK_MULTIPLIER();
+        let _ = TOPIC_STAKE_SLASH_COOLDOWN();
     }
 }

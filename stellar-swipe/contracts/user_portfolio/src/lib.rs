@@ -201,6 +201,13 @@ pub struct TradeHistoryEntry {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeHistoryPage {
+    pub entries: Vec<TradeHistoryEntry>,
+    pub next_cursor: Option<u32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortfolioPosition {
     pub position_id: u64,
     pub position: Position,
@@ -862,6 +869,12 @@ impl UserPortfolio {
         limit: u32,
     ) -> Vec<TradeHistoryEntry> {
         queries::get_trade_history(&env, user, cursor, limit)
+    }
+
+    pub fn get_trade_history_page(
+        env: Env, user: Address, cursor: Option<u32>, limit: u32,
+    ) -> TradeHistoryPage {
+        queries::get_trade_history_page(&env, user, cursor, limit)
     }
 
     /// Provider sets per-day fee token + amount for their premium feed (XLM or USDC, etc.).

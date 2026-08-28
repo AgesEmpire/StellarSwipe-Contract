@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod batch_settlement;
+pub mod compat;
 pub mod dca;
 mod errors;
 pub mod feature_flags;
@@ -117,6 +118,7 @@ pub enum StorageKey {
     /// Issue #959: per-user partial fill record keyed by (user, trade_id).
     /// Stores a `PartialFillRecord` when the SDEX only fills part of the requested amount.
     PartialFillRecord(Address, u64),
+    CallbackContext(u64),
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -141,6 +143,15 @@ pub struct PartialFillRecord {
     pub remaining_amount: i128,
     /// Ledger sequence at which the partial fill was detected.
     pub detected_at_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallbackContext {
+    pub executor: Address,
+    pub route: BytesN<32>,
+    pub from_asset: Address,
+    pub to_asset: Address,
 }
 
 /// A trade queued for execution, subject to a configurable grace period.
@@ -1196,6 +1207,35 @@ fn grace_period_elapsed(env: &Env, queued_at_ledger: u32) -> bool {
 
 #[contractimpl]
 impl TradeExecutorContract {
+    pub fn expect_settlement_callback(
+        env: Env, trade_id: u64, executor: Address, route: BytesN<32>,
+        from_asset: Address, to_asset: Address,
+    ) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        let key = StorageKey::CallbackContext(trade_id);
+        if env.storage().instance().has(&key) { return Err(ContractError::ReplayDetected); }
+        env.storage().instance().set(&key, &CallbackContext {
+            executor, route, from_asset, to_asset,
+        });
+        Ok(())
+    }
+
+    pub fn accept_settlement_callback(
+        env: Env, caller: Address, trade_id: u64, route: BytesN<32>,
+        from_asset: Address, to_asset: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let key = StorageKey::CallbackContext(trade_id);
+        let expected: CallbackContext = env.storage().instance().get(&key)
+            .ok_or(ContractError::TradeNotFound)?;
+        if expected.executor != caller || expected.route != route
+            || expected.from_asset != from_asset || expected.to_asset != to_asset {
+            return Err(ContractError::Unauthorized);
+        }
+        env.storage().instance().remove(&key);
+        Ok(())
+    }
+
     /// # Summary
     /// One-time contract initialization. Stores the admin address.
     ///
@@ -2604,15 +2644,14 @@ impl TradeExecutorContract {
         requested_amount: i128,
         filled_amount: i128,
     ) -> Result<(), ContractError> {
+        // Validate amounts before auth so InvalidAmount is always the first
+        // error surface for malformed inputs, regardless of caller identity.
+        if requested_amount < 0 || filled_amount < 0 || filled_amount > requested_amount {
+            return Err(ContractError::InvalidAmount);
+        }
+
         caller.require_auth();
         require_admin(&env)?;
-
-        if requested_amount < 0 || filled_amount < 0 {
-            return Err(ContractError::InvalidAmount);
-        }
-        if filled_amount > requested_amount {
-            return Err(ContractError::InvalidAmount);
-        }
 
         let mut order: wire::TradeOrder = env
             .storage()
@@ -2639,9 +2678,10 @@ impl TradeExecutorContract {
             remaining_amount,
             detected_at_ledger: env.ledger().sequence(),
         };
-        env.storage()
-            .instance()
-            .set(&StorageKey::PartialFillRecord(user.clone(), trade_id), &record);
+        env.storage().instance().set(
+            &StorageKey::PartialFillRecord(user.clone(), trade_id),
+            &record,
+        );
 
         order.status = wire::TradeStatus::PartiallyFilled;
         env.storage()
@@ -2666,11 +2706,7 @@ impl TradeExecutorContract {
     /// Return the [`PartialFillRecord`] for `(user, trade_id)`, if any.
     ///
     /// Returns `None` when the trade was fully filled or no partial-fill was reported.
-    pub fn get_partial_fill(
-        env: Env,
-        user: Address,
-        trade_id: u64,
-    ) -> Option<PartialFillRecord> {
+    pub fn get_partial_fill(env: Env, user: Address, trade_id: u64) -> Option<PartialFillRecord> {
         env.storage()
             .instance()
             .get(&StorageKey::PartialFillRecord(user, trade_id))
