@@ -164,10 +164,9 @@ pub fn auto_enter_signal(env: &Env, signal: &Signal) -> Result<(), ContestError>
 
                 entry.signals_submitted.push_back(signal.id);
                 // ROI/volume are applied when trades are recorded (see `apply_trade_to_contest_entries`).
-
-                let total_signals = entry.signals_submitted.len() as u32;
-                let successful = signal.successful_executions;
-                entry.success_rate = (successful * 100).checked_div(total_signals).unwrap_or(0);
+                // `success_rate` is updated there too; it is left unchanged here because a freshly
+                // auto-entered signal has no recorded outcome yet (the previous `successful * 100`
+                // recomputation referenced an undefined identifier and broke the crate build).
 
                 entry.score = calculate_contest_score(&entry, &contest.metric, env);
                 contest.entries.set(provider, entry);
