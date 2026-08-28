@@ -229,6 +229,86 @@ fn create_plan_with_already_expired_signal_fails() {
     });
 }
 
+// DCA intervals are funded per-interval rather than escrowed at plan
+// creation (see the doc comment on `dca::cancel_dca_plan`), so cancellation
+// never has capital to return — `refunded_amount` is always 0. These tests
+// cover cancellation at 0, partial, and near-final execution.
+
+#[test]
+fn cancel_with_no_intervals_executed_refunds_zero() {
+    let (env, contract_id) = setup();
+    let user = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        set_ledger(&env, 0);
+        dca::execute_dca_copy_trade(&env, &user, 10, 500, 5, 10, 0).unwrap();
+
+        dca::cancel_dca_plan(&env, &user, 10).unwrap();
+
+        let all = env.events().all();
+        let (_, _, val) = all.last().unwrap();
+        let cancelled: EvtDCAPlanCancelled =
+            soroban_sdk::TryFromVal::try_from_val(&env, &val).unwrap();
+        assert_eq!(cancelled.intervals_completed, 0);
+        assert_eq!(cancelled.refunded_amount, 0);
+    });
+}
+
+#[test]
+fn cancel_after_partial_execution_refunds_zero() {
+    let (env, contract_id) = setup();
+    let user = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        set_ledger(&env, 0);
+        dca::execute_dca_copy_trade(&env, &user, 11, 500, 5, 10, 0).unwrap();
+
+        dca::execute_dca_interval(&env, &user, 11, ok_exec).unwrap();
+        set_ledger(&env, 10);
+        dca::execute_dca_interval(&env, &user, 11, ok_exec).unwrap();
+
+        dca::cancel_dca_plan(&env, &user, 11).unwrap();
+
+        let all = env.events().all();
+        let (_, _, val) = all.last().unwrap();
+        let cancelled: EvtDCAPlanCancelled =
+            soroban_sdk::TryFromVal::try_from_val(&env, &val).unwrap();
+        assert_eq!(cancelled.intervals_completed, 2);
+        assert_eq!(cancelled.refunded_amount, 0);
+    });
+}
+
+#[test]
+fn cancel_before_final_interval_refunds_zero() {
+    let (env, contract_id) = setup();
+    let user = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        set_ledger(&env, 0);
+        dca::execute_dca_copy_trade(&env, &user, 12, 500, 5, 10, 0).unwrap();
+
+        for i in 0u32..4 {
+            set_ledger(&env, i * 10);
+            dca::execute_dca_interval(&env, &user, 12, ok_exec).unwrap();
+        }
+
+        // One interval remains; cancel instead of letting it complete.
+        dca::cancel_dca_plan(&env, &user, 12).unwrap();
+
+        let all = env.events().all();
+        let (_, _, val) = all.last().unwrap();
+        let cancelled: EvtDCAPlanCancelled =
+            soroban_sdk::TryFromVal::try_from_val(&env, &val).unwrap();
+        assert_eq!(cancelled.intervals_completed, 4);
+        assert_eq!(cancelled.refunded_amount, 0);
+
+        assert_eq!(
+            dca::load_plan(&env, &user, 12).unwrap_err(),
+            ContractError::DCAPlanNotFound
+        );
+    });
+}
+
 #[test]
 fn cancel_nonexistent_plan_returns_not_found() {
     let (env, contract_id) = setup();

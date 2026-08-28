@@ -1308,7 +1308,6 @@ impl SignalRegistry {
             submitted_at: now,
             expiry,
             status: SignalStatus::Active,
-            // Initialize performance tracking fields
             executions: 0,
             successful_executions: 0,
             total_volume: 0,
@@ -1317,7 +1316,6 @@ impl SignalRegistry {
             category: category.clone(),
             tags: unique_tags.clone(),
             risk_level,
-            // Collaboration field
             is_collaborative: false,
             rationale_hash,
             confidence: 50,
@@ -2512,6 +2510,23 @@ impl SignalRegistry {
         }
     }
 
+    /// Read-only, cursor-paginated history of all signals a provider has
+    /// ever submitted. Newest-first with deterministic ordering; pages are
+    /// bounded to at most [`query::MAX_HISTORY_PAGE_SIZE`] records so large
+    /// histories do not exceed Soroban resource limits.
+    ///
+    /// See [`query::get_provider_signal_history`] for the full pagination
+    /// semantics (cursor exclusivity, clamping, out-of-range / empty pages).
+    pub fn get_provider_signal_history(
+        env: Env,
+        provider: Address,
+        cursor: Option<u64>,
+        limit: u32,
+    ) -> query::ProviderSignalHistoryPage {
+        let signals_map = Self::get_signals_map(&env);
+        query::get_provider_signal_history(&env, &signals_map, &provider, cursor, limit)
+    }
+
     /* =========================
        SOCIAL / FOLLOW FUNCTIONS
     ========================== */
@@ -3643,6 +3658,12 @@ mod test_adoption;
 /// Signal categorization query tests (Issue #660).
 #[cfg(test)]
 mod test_categorization;
+/// Composite churn-risk scoring tests (Issue #944).
+#[cfg(test)]
+mod test_churn_risk;
+/// Collaborative signal reward distribution tests (Issue #957).
+#[cfg(test)]
+mod test_collaboration;
 #[cfg(test)]
 mod test_daily_signal_limit;
 #[cfg(test)]

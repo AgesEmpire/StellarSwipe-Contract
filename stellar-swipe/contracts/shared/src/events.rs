@@ -395,6 +395,11 @@ pub struct EvtDCAPlanCancelled {
     pub signal_id: u64,
     pub intervals_completed: u32,
     pub reason: u32, // 0 = signal_expired, 1 = manual
+    /// Unexecuted capital returned to the user. DCA intervals are funded
+    /// per-interval rather than escrowed up front (see `dca::cancel_dca_plan`),
+    /// so this is always 0 today; the field exists so a future pre-funded
+    /// plan type can report a real refund without changing the event shape.
+    pub refunded_amount: i128,
 }
 
 pub fn emit_dca_interval_executed(env: &Env, evt: EvtDCAIntervalExecuted) {
