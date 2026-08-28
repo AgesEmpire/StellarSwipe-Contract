@@ -57,8 +57,10 @@ pub struct WorkflowStep {
 pub enum WorkflowResult {
     /// All steps completed successfully.
     Success,
-    /// A step returned an error; `step_index` identifies which one.
-    Failed { step_index: u32, step_name: String },
+    /// A step returned an error; the payload identifies which one. Stored as
+    /// the [`WorkflowStep`] itself because `#[contracttype]` enums only support
+    /// single-value tuple variants.
+    Failed(WorkflowStep),
 }
 
 // ── Core harness ──────────────────────────────────────────────────────────────
@@ -80,10 +82,7 @@ where
     for i in 0..steps.len() {
         let step = steps.get_unchecked(i);
         if executor(env, &step).is_err() {
-            return WorkflowResult::Failed {
-                step_index: step.index,
-                step_name: step.name.clone(),
-            };
+            return WorkflowResult::Failed(step.clone());
         }
     }
     WorkflowResult::Success
@@ -97,7 +96,7 @@ where
 {
     match run_workflow(env, steps, executor) {
         WorkflowResult::Success => {}
-        WorkflowResult::Failed { .. } => {
+        WorkflowResult::Failed(_) => {
             panic!("workflow failed – rolling back");
         }
     }
@@ -155,7 +154,7 @@ mod tests {
             },
         );
         match result {
-            WorkflowResult::Failed { step_index, .. } => assert_eq!(step_index, 0),
+            WorkflowResult::Failed(step) => assert_eq!(step.index, 0),
             _ => panic!("expected Failed"),
         }
     }
@@ -179,7 +178,7 @@ mod tests {
         assert_eq!(executed.get_unchecked(0), 0);
         assert_eq!(executed.get_unchecked(1), 1);
         match result {
-            WorkflowResult::Failed { step_index, .. } => assert_eq!(step_index, 1),
+            WorkflowResult::Failed(step) => assert_eq!(step.index, 1),
             _ => panic!("expected Failed"),
         }
     }
@@ -201,7 +200,7 @@ mod tests {
             },
         );
         match result {
-            WorkflowResult::Failed { step_index, .. } => assert_eq!(step_index, 2),
+            WorkflowResult::Failed(step) => assert_eq!(step.index, 2),
             _ => panic!("expected Failed"),
         }
     }
@@ -249,9 +248,9 @@ mod tests {
             },
         );
         match result {
-            WorkflowResult::Failed { step_name, .. } => {
+            WorkflowResult::Failed(step) => {
                 assert_eq!(
-                    step_name,
+                    step.name,
                     soroban_sdk::String::from_str(&e, "bridge_transfer")
                 )
             }

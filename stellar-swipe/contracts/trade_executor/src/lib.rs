@@ -1,4 +1,9 @@
 #![no_std]
+// The `#[cfg_attr(test, derive(soroban_sdk::testutils::arbitrary::Arbitrary))]`
+// on `ContractError` expands to `std::thread_local!` / `std::cell::Cell` paths,
+// so the test build of this no_std crate must link `std`.
+#[cfg(test)]
+extern crate std;
 
 pub mod batch_settlement;
 pub mod dca;
@@ -25,6 +30,7 @@ use soroban_sdk::{
     Val, Vec,
 };
 
+use stellar_swipe_common::pair_validation::{self, PairValidationError};
 use stellar_swipe_common::replay_protection::{
     purge_expired_nonces as replay_purge_expired_nonces, verify_and_commit, ReplayError,
 };
@@ -117,6 +123,10 @@ pub enum StorageKey {
     /// Issue #959: per-user partial fill record keyed by (user, trade_id).
     /// Stores a `PartialFillRecord` when the SDEX only fills part of the requested amount.
     PartialFillRecord(Address, u64),
+    /// Issue #992: asset registry contract used to validate asset pairs before
+    /// any swap/offer is attempted. When set, pairs must be registered and
+    /// distinct, and the configured route must support them.
+    AssetRegistry,
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -357,6 +367,46 @@ fn map_replay_error(err: ReplayError) -> ContractError {
         ReplayError::Expired => ContractError::TradeExpired,
         ReplayError::InvalidNonce | ReplayError::DuplicateTx => ContractError::NonceAlreadyUsed,
     }
+}
+
+/// Map a [`PairValidationError`] onto the contract's public error surface (Issue #992).
+fn map_pair_error(err: PairValidationError) -> ContractError {
+    match err {
+        PairValidationError::RegistryNotConfigured => ContractError::AssetRegistryNotConfigured,
+        PairValidationError::BaseAssetNotRegistered
+        | PairValidationError::QuoteAssetNotRegistered => ContractError::AssetNotRegistered,
+        PairValidationError::IdenticalAssets => ContractError::IdenticalAssets,
+        PairValidationError::RouteNotConfigured => ContractError::NotInitialized,
+        PairValidationError::RouteUnsupported => ContractError::UnsupportedPair,
+    }
+}
+
+/// Issue #992: reject unsupported asset pairs before any external call or
+/// state mutation.
+///
+/// Enforced only when an asset registry is configured (see
+/// [`Self::set_asset_registry`]). Contracts that never had a registry
+/// configured keep their previous behavior; admins enable enforcement simply
+/// by configuring one. When enforced, the pair must be registered and
+/// distinct, and the configured route (`router`) must support it.
+fn validate_pair_before_swap(
+    env: &Env,
+    registry: Option<&Address>,
+    router: &Address,
+    from_token: &Address,
+    to_token: &Address,
+) -> Result<(), ContractError> {
+    if let Some(registry) = registry {
+        pair_validation::validate_pair_for_route(
+            env,
+            Some(registry),
+            Some(router),
+            from_token,
+            to_token,
+        )
+        .map_err(map_pair_error)?;
+    }
+    Ok(())
 }
 
 fn get_confirmation_depth(env: &Env) -> u32 {
@@ -1720,6 +1770,34 @@ impl TradeExecutorContract {
         env.storage().instance().get(&StorageKey::SdexRouter)
     }
 
+    // ── Asset registry configuration (Issue #992) ────────────────────────────
+
+    /// Set the asset registry contract used to validate asset pairs before any
+    /// swap or token operation. Admin only.
+    ///
+    /// Once a registry is configured, [`Self::swap`], [`Self::swap_with_slippage`]
+    /// and [`Self::cancel_copy_trade`] reject pairs whose assets are not both
+    /// registered in the registry, pairs whose assets are identical, and pairs
+    /// the configured SDEX route does not support — before any external call or
+    /// state mutation. See `docs/asset_pair_validation.md` for the supported-pair
+    /// source and update authority.
+    pub fn set_asset_registry(env: Env, registry: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::AssetRegistry, &registry);
+    }
+
+    /// The configured asset registry contract, if any.
+    pub fn get_asset_registry(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::AssetRegistry)
+    }
+
     /// Admin/keeper-facing price cache used to decide when pending limit orders
     /// are executable against the configured SDEX route.
     pub fn set_sdex_price(env: Env, token: Address, price: i128) {
@@ -2066,6 +2144,9 @@ impl TradeExecutorContract {
     /// - [`ContractError::NotInitialized`] — SDEX router not configured.
     /// - [`ContractError::InvalidAmount`] — amount <= 0 or min_received < 0.
     /// - [`ContractError::SlippageExceeded`] — actual received < min_received.
+    /// - [`ContractError::AssetNotRegistered`] — an asset is not in the configured registry.
+    /// - [`ContractError::IdenticalAssets`] — both tokens are the same asset.
+    /// - [`ContractError::UnsupportedPair`] — the configured route does not support the pair.
     ///
     /// # Example
     /// ```rust,ignore
@@ -2083,6 +2164,8 @@ impl TradeExecutorContract {
             .instance()
             .get(&StorageKey::SdexRouter)
             .ok_or(ContractError::NotInitialized)?;
+        let registry: Option<Address> = env.storage().instance().get(&StorageKey::AssetRegistry);
+        validate_pair_before_swap(&env, registry.as_ref(), &router, &from_token, &to_token)?;
         execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received)
     }
 
@@ -2170,6 +2253,9 @@ impl TradeExecutorContract {
             .instance()
             .get(&StorageKey::SdexRouter)
             .ok_or(ContractError::NotInitialized)?;
+
+        let registry: Option<Address> = env.storage().instance().get(&StorageKey::AssetRegistry);
+        validate_pair_before_swap(&env, registry.as_ref(), &router, &from_token, &to_token)?;
 
         let exit_price =
             execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received)?;
@@ -2639,9 +2725,10 @@ impl TradeExecutorContract {
             remaining_amount,
             detected_at_ledger: env.ledger().sequence(),
         };
-        env.storage()
-            .instance()
-            .set(&StorageKey::PartialFillRecord(user.clone(), trade_id), &record);
+        env.storage().instance().set(
+            &StorageKey::PartialFillRecord(user.clone(), trade_id),
+            &record,
+        );
 
         order.status = wire::TradeStatus::PartiallyFilled;
         env.storage()
@@ -2666,11 +2753,7 @@ impl TradeExecutorContract {
     /// Return the [`PartialFillRecord`] for `(user, trade_id)`, if any.
     ///
     /// Returns `None` when the trade was fully filled or no partial-fill was reported.
-    pub fn get_partial_fill(
-        env: Env,
-        user: Address,
-        trade_id: u64,
-    ) -> Option<PartialFillRecord> {
+    pub fn get_partial_fill(env: Env, user: Address, trade_id: u64) -> Option<PartialFillRecord> {
         env.storage()
             .instance()
             .get(&StorageKey::PartialFillRecord(user, trade_id))

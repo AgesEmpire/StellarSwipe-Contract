@@ -13,7 +13,7 @@
 use crate::{
     errors::ContractError,
     risk_gates::DEFAULT_ESTIMATED_COPY_TRADE_FEE,
-    wire::{TradeStatus, TradeOrder, TRADE_TIMEOUT_LEDGERS},
+    wire::{TradeOrder, TradeStatus, TRADE_TIMEOUT_LEDGERS},
     PartialFillRecord, StorageKey, TradeExecutorContract, TradeExecutorContractClient,
 };
 use soroban_sdk::{
@@ -87,7 +87,10 @@ fn inject_pending_trade(env: &Env, exec_id: &Address, user: Address, trade_id: u
             trade_id,
             user,
             amount: AMOUNT,
-            expires_at_ledger: env.ledger().sequence().saturating_add(TRADE_TIMEOUT_LEDGERS),
+            expires_at_ledger: env
+                .ledger()
+                .sequence()
+                .saturating_add(TRADE_TIMEOUT_LEDGERS),
             status: TradeStatus::ExecutedAwaitingConfirmation,
         };
         env.storage()
@@ -111,7 +114,10 @@ fn full_fill_is_noop() {
     exec.record_partial_fill(&admin, &user, &trade_id, &AMOUNT, &AMOUNT);
 
     let record = exec.get_partial_fill(&user, &trade_id);
-    assert!(record.is_none(), "expected no partial fill record for 100% fill");
+    assert!(
+        record.is_none(),
+        "expected no partial fill record for 100% fill"
+    );
 }
 
 /// A 50 % fill should record the shortfall and emit the partial_fill event.
@@ -169,13 +175,7 @@ fn filled_exceeds_requested_is_invalid() {
     inject_pending_trade(&env, &exec_id, user.clone(), trade_id);
 
     let exec = TradeExecutorContractClient::new(&env, &exec_id);
-    let result = exec.try_record_partial_fill(
-        &admin,
-        &user,
-        &trade_id,
-        &AMOUNT,
-        &(AMOUNT + 1),
-    );
+    let result = exec.try_record_partial_fill(&admin, &user, &trade_id, &AMOUNT, &(AMOUNT + 1));
     assert_eq!(
         result,
         Err(Ok(ContractError::InvalidAmount)),
