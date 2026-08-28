@@ -1790,7 +1790,7 @@ mod slash_cooldown_tests {
         );
 
         // Advance past the cooldown window.
-        env.ledger().with_mut(|l| l.sequence += 15);
+        env.ledger().with_mut(|l| l.sequence_number += 15);
 
         // Second slash after cooldown should succeed.
         let slashed = client.slash_stake(

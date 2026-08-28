@@ -195,8 +195,7 @@ mod tests {
     #[test]
     fn test_activity_at_week_12_fills_all_buckets() {
         let (env, provider, user1, _) = setup();
-        env.ledger()
-            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 0);
+        env.ledger().with_mut(|l| l.timestamp = 0);
         record_follow(&env, &provider, &user1);
 
         // Advance 12 weeks

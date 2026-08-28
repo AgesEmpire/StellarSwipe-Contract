@@ -124,6 +124,9 @@ pub enum StorageKey {
     /// Issue #959: per-user partial fill record keyed by (user, trade_id).
     /// Stores a `PartialFillRecord` when the SDEX only fills part of the requested amount.
     PartialFillRecord(Address, u64),
+    /// Callback context stored before the SDEX routing call, consumed on
+    /// settlement (`accept_settlement_callback`) to atomically claim the trade.
+    CallbackContext(u64),
     /// Issue #992: asset registry contract used to validate asset pairs before
     /// any swap/offer is attempted. When set, pairs must be registered and
     /// distinct, and the configured route must support them.
@@ -1257,28 +1260,50 @@ fn grace_period_elapsed(env: &Env, queued_at_ledger: u32) -> bool {
 #[contractimpl]
 impl TradeExecutorContract {
     pub fn expect_settlement_callback(
-        env: Env, trade_id: u64, executor: Address, route: BytesN<32>,
-        from_asset: Address, to_asset: Address,
+        env: Env,
+        trade_id: u64,
+        executor: Address,
+        route: BytesN<32>,
+        from_asset: Address,
+        to_asset: Address,
     ) -> Result<(), ContractError> {
         require_admin(&env)?;
         let key = StorageKey::CallbackContext(trade_id);
-        if env.storage().instance().has(&key) { return Err(ContractError::ReplayDetected); }
-        env.storage().instance().set(&key, &CallbackContext {
-            executor, route, from_asset, to_asset,
-        });
+        if env.storage().instance().has(&key) {
+            return Err(ContractError::ReplayDetected);
+        }
+        env.storage().instance().set(
+            &key,
+            &CallbackContext {
+                executor,
+                route,
+                from_asset,
+                to_asset,
+            },
+        );
         Ok(())
     }
 
     pub fn accept_settlement_callback(
-        env: Env, caller: Address, trade_id: u64, route: BytesN<32>,
-        from_asset: Address, to_asset: Address,
+        env: Env,
+        caller: Address,
+        trade_id: u64,
+        route: BytesN<32>,
+        from_asset: Address,
+        to_asset: Address,
     ) -> Result<(), ContractError> {
         caller.require_auth();
         let key = StorageKey::CallbackContext(trade_id);
-        let expected: CallbackContext = env.storage().instance().get(&key)
+        let expected: CallbackContext = env
+            .storage()
+            .instance()
+            .get(&key)
             .ok_or(ContractError::TradeNotFound)?;
-        if expected.executor != caller || expected.route != route
-            || expected.from_asset != from_asset || expected.to_asset != to_asset {
+        if expected.executor != caller
+            || expected.route != route
+            || expected.from_asset != from_asset
+            || expected.to_asset != to_asset
+        {
             return Err(ContractError::Unauthorized);
         }
         env.storage().instance().remove(&key);

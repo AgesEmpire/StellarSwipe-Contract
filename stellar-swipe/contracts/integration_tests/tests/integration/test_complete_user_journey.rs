@@ -170,7 +170,13 @@ fn test_complete_user_journey() {
     env.ledger().set_timestamp(expiry + 1);
 
     let outcome_result = env.as_contract(&executor_id, || {
-        registry.try_record_signal_outcome(&executor_id, &signal_id, &SignalOutcome::Profit)
+        registry.try_record_signal_outcome(
+            &executor_id,
+            &signal_id,
+            &SignalOutcome::Profit,
+            &0i128,       // total_fee — not tracked for this journey
+            &150_000i128, // total_roi — +15% on the 1_000_000 entry
+        )
     });
 
     match outcome_result {

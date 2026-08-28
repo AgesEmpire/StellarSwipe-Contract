@@ -456,11 +456,9 @@ mod feed_tests {
         let end = (offset + actual_limit).min(total_active);
         for i in offset..end {
             let signal = active_signals.get(i).unwrap();
-            let success_rate = if signal.executions > 0 {
-                (signal.successful_executions * 10_000) / signal.executions
-            } else {
-                0
-            };
+            let success_rate = (signal.successful_executions * 10_000)
+                .checked_div(signal.executions)
+                .unwrap_or(0);
             results.push_back(SignalSummary {
                 id: signal.id,
                 provider: signal.provider,

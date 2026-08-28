@@ -252,10 +252,8 @@ fn validate_proposal_type(
                 return Err(String::from_str(env, "Invalid signature count"));
             }
         }
-        ProposalType::EmergencyWithdraw(_, amount, _) => {
-            if *amount <= 0 {
-                return Err(String::from_str(env, "Invalid amount"));
-            }
+        ProposalType::EmergencyWithdraw(_, amount, _) if *amount <= 0 => {
+            return Err(String::from_str(env, "Invalid amount"));
         }
         _ => {}
     }

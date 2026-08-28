@@ -554,6 +554,7 @@ mod action {
     pub const CONFIGURE_SLASH_TIERS: u8 = 4;
     pub const SET_APPEAL_WINDOW: u8 = 5;
     pub const SET_WITHDRAWAL_COOLDOWN: u8 = 6;
+    pub const RESOLVE_APPEAL: u8 = 7;
 }
 
 fn encode_action(env: &Env, tag: u8, data: &[u8]) -> Bytes {
@@ -1188,6 +1189,18 @@ impl StakeVaultContract {
                 env.storage()
                     .instance()
                     .set(&StorageKey::WithdrawalCooldownSecs, &cooldown);
+            }
+            action::RESOLVE_APPEAL => {
+                // Payload: [tag][slash_id: 8-byte LE][uphold: 1 byte]
+                let mut buf = [0u8; 8];
+                let mut i = 0;
+                while i < 8 {
+                    buf[i] = payload.get(1 + i as u32).unwrap_or(0);
+                    i += 1;
+                }
+                let slash_id = u64::from_le_bytes(buf);
+                let uphold = payload.get(9).unwrap_or(0) == 1;
+                Self::do_resolve_appeal(&env, slash_id, uphold)?;
             }
             _ => return Err(StakeVaultError::Unauthorized),
         }

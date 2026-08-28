@@ -10,7 +10,7 @@ use crate::categories::{RiskLevel, SignalCategory};
 use crate::errors::AdminError;
 use soroban_sdk::{testutils::Address as _, testutils::Ledger, vec, Address, Env, String};
 
-fn setup(env: &Env) -> (Address, SignalRegistryClient) {
+fn setup(env: &Env) -> (Address, SignalRegistryClient<'_>) {
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = 10_000);
     #[allow(deprecated)]

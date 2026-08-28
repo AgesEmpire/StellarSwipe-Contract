@@ -598,16 +598,14 @@ fn set_price_budget_regression() {
     client.register_oracle(&admin, &oracle1);
 
     env.budget().reset_tracker();
-    client.set_price(
-        AssetPair {
-            base: xlm_asset(&env),
-            quote: Asset {
-                code: String::from_str(&env, "USDC"),
-                issuer: Some(Address::generate(&env)),
-            },
+    let pair = AssetPair {
+        base: xlm_asset(&env),
+        quote: Asset {
+            code: String::from_str(&env, "USDC"),
+            issuer: Some(Address::generate(&env)),
         },
-        100_000_000,
-    );
+    };
+    client.set_price(&pair, &100_000_000);
     let instructions = env.budget().cpu_instruction_cost();
     measure_and_emit("oracle.set_price", 3_000_000, instructions);
 }
@@ -627,11 +625,11 @@ fn get_price_budget_regression() {
             issuer: Some(Address::generate(&env)),
         },
     };
-    client.set_price(pair.clone(), 100_000_000);
+    client.set_price(&pair, &100_000_000);
     client.submit_price(&oracle1, &100_000_000);
 
     env.budget().reset_tracker();
-    let _ = client.get_price(pair);
+    let _ = client.get_price(&pair);
     let instructions = env.budget().cpu_instruction_cost();
     measure_and_emit("oracle.get_price", 2_000_000, instructions);
 }

@@ -262,14 +262,13 @@ pub fn calculate_reputation_score(env: &Env, user: Address) -> Result<u32, Gover
     );
     score = score.saturating_add(proposal_score);
 
-    if rep.participation_history.proposals_created > 0 {
-        let success_rate = rep
-            .participation_history
-            .proposals_succeeded
-            .saturating_mul(10_000)
-            / rep.participation_history.proposals_created;
-        score = score.saturating_add(min(2000, success_rate.saturating_mul(2) / 10));
-    }
+    let success_rate = rep
+        .participation_history
+        .proposals_succeeded
+        .saturating_mul(10_000)
+        .checked_div(rep.participation_history.proposals_created)
+        .unwrap_or(0);
+    score = score.saturating_add(min(2000, success_rate.saturating_mul(2) / 10));
 
     let voting_score = min(
         2000,
@@ -277,14 +276,13 @@ pub fn calculate_reputation_score(env: &Env, user: Address) -> Result<u32, Gover
     );
     score = score.saturating_add(voting_score);
 
-    if rep.participation_history.votes_cast > 0 {
-        let accuracy = rep
-            .participation_history
-            .votes_aligned_with_outcome
-            .saturating_mul(10_000)
-            / rep.participation_history.votes_cast;
-        score = score.saturating_add(min(2000, accuracy.saturating_mul(2) / 10));
-    }
+    let accuracy = rep
+        .participation_history
+        .votes_aligned_with_outcome
+        .saturating_mul(10_000)
+        .checked_div(rep.participation_history.votes_cast)
+        .unwrap_or(0);
+    score = score.saturating_add(min(2000, accuracy.saturating_mul(2) / 10));
 
     let committee_score = min(
         1000,

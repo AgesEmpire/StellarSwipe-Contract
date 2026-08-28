@@ -415,17 +415,11 @@ pub fn generate_timelock_analytics(env: &Env) -> Result<TimelockAnalytics, Gover
         total_queued,
         total_executed,
         total_cancelled,
-        avg_wait_time: if wait_count > 0 {
-            total_wait / wait_count as u64
-        } else {
-            0
-        },
+        avg_wait_time: total_wait.checked_div(wait_count as u64).unwrap_or(0),
         actions_by_type: by_type,
-        cancellation_rate: if total_queued > 0 {
-            (total_cancelled * 10_000) / total_queued
-        } else {
-            0
-        },
+        cancellation_rate: (total_cancelled * 10_000)
+            .checked_div(total_queued)
+            .unwrap_or(0),
     })
 }
 

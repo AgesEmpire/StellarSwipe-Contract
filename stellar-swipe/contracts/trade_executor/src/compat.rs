@@ -46,12 +46,7 @@ pub struct DeprecationNotice {
 ///
 /// Topic: `("depr", old_name)` — indexers can filter by topic
 /// without deserialising the data body.
-pub fn emit_deprecation_warning(
-    env: &Env,
-    old_name: Symbol,
-    new_name: Symbol,
-    since_version: u32,
-) {
+pub fn emit_deprecation_warning(env: &Env, old_name: Symbol, new_name: Symbol, since_version: u32) {
     let notice = DeprecationNotice {
         old_name: old_name.clone(),
         new_name,
@@ -81,9 +76,7 @@ pub fn emit_deprecation_warning(
 /// # Migration
 /// Replace `copy_trade(user, token, amount, portfolio_pct_bps)` with
 /// `execute_copy_trade(user, token, amount, portfolio_pct_bps, Market, None, nonce, tx_hash, expiry_ts)`.
-#[deprecated(
-    note = "Use `execute_copy_trade` instead. This shim will be removed after v4."
-)]
+#[deprecated(note = "Use `execute_copy_trade` instead. This shim will be removed after v4.")]
 pub fn copy_trade(
     env: &Env,
     user: Address,
@@ -94,12 +87,7 @@ pub fn copy_trade(
     tx_hash: Bytes,
     expiry_ts: u64,
 ) -> Result<(), ContractError> {
-    emit_deprecation_warning(
-        env,
-        symbol_short!("copy_trd"),
-        symbol_short!("exec_cpy"),
-        2,
-    );
+    emit_deprecation_warning(env, symbol_short!("copy_trd"), symbol_short!("exec_cpy"), 2);
     crate::TradeExecutorContract::execute_copy_trade(
         env.clone(),
         user,
@@ -124,16 +112,8 @@ pub fn copy_trade(
 /// # Migration
 /// Replace `fetch_receipt(receipt_id)` with `get_trade_receipt(receipt_id)`.
 #[deprecated(note = "Use `get_trade_receipt` instead. This shim will be removed after v4.")]
-pub fn fetch_receipt(
-    env: &Env,
-    receipt_id: u64,
-) -> Option<soroban_sdk::BytesN<32>> {
-    emit_deprecation_warning(
-        env,
-        symbol_short!("fetch_rc"),
-        symbol_short!("get_rcpt"),
-        2,
-    );
+pub fn fetch_receipt(env: &Env, receipt_id: u64) -> Option<soroban_sdk::BytesN<32>> {
+    emit_deprecation_warning(env, symbol_short!("fetch_rc"), symbol_short!("get_rcpt"), 2);
     crate::TradeExecutorContract::get_trade_receipt(env.clone(), receipt_id)
 }
 
@@ -155,12 +135,7 @@ pub fn dry_run(
     amount: i128,
     portfolio_pct_bps: Option<u32>,
 ) -> crate::SimulationResult {
-    emit_deprecation_warning(
-        env,
-        symbol_short!("dry_run"),
-        symbol_short!("sim_cpy"),
-        2,
-    );
+    emit_deprecation_warning(env, symbol_short!("dry_run"), symbol_short!("sim_cpy"), 2);
     crate::TradeExecutorContract::simulate_copy_trade(
         env.clone(),
         user,
@@ -182,12 +157,7 @@ pub fn dry_run(
 /// Replace `ping()` boolean checks with `health_check().is_initialized`.
 #[deprecated(note = "Use `health_check` instead. This shim will be removed after v4.")]
 pub fn ping(env: &Env) -> bool {
-    emit_deprecation_warning(
-        env,
-        symbol_short!("ping"),
-        symbol_short!("health"),
-        2,
-    );
+    emit_deprecation_warning(env, symbol_short!("ping"), symbol_short!("health"), 2);
     crate::TradeExecutorContract::health_check(env.clone()).is_initialized
 }
 
@@ -198,7 +168,7 @@ pub fn ping(env: &Env) -> bool {
 #[cfg(test)]
 mod compat_tests {
     use super::*;
-    use soroban_sdk::{testutils::Events, Env};
+    use soroban_sdk::{testutils::Address as _, testutils::Events, Env};
 
     // ── emit_deprecation_warning ────────────────────────────────────────────
 

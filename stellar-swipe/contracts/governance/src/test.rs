@@ -1340,7 +1340,7 @@ fn reputation_config_can_be_updated_by_admin() {
         default_tier: ReputationTier::Bronze,
     };
     let result = client.update_reputation_config(&admin, &updated);
-    assert_eq!(result.decay_enabled, false);
+    assert!(!result.decay_enabled);
 
     // Verify it's stored
     let config = client.reputation_config();
