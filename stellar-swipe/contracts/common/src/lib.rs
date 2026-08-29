@@ -8,6 +8,8 @@ pub use sanitize::{sanitize_string, SanitizeError};
 
 #[allow(deprecated)]
 pub mod amm_bridge;
+/// Safe arithmetic guardrails for APY / reward-rate calculations (issue #1024).
+pub mod apy_math;
 pub mod assets;
 pub mod budget_regression;
 /// Checked-arithmetic wrapper for financial amounts (issue #599).

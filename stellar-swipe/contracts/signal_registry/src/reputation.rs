@@ -401,6 +401,72 @@ pub fn next_reputation_score(old_score: u32, outcome: &crate::types::SignalOutco
     (((old_score as u64) * 9 + (pts as u64)) / 10) as u32
 }
 
+// ── Cross-contract reputation snapshot (issue #1027) ──────────────────────────
+
+/// Schema version of [`ReputationSnapshot`].
+///
+/// Bumped only on a breaking field change so cross-contract callers can decode
+/// defensively against a known version.
+pub const REPUTATION_SNAPSHOT_VERSION: u32 = 1;
+
+/// Stable, read-only reputation snapshot for a single provider.
+///
+/// Every field is derived from canonical contract state — provider stats, stake
+/// and the rolling reputation score — plus the ledger timestamp it was taken
+/// at.  Other contracts consume this for risk assessment and incentive
+/// decisions without mutating this contract's state.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReputationSnapshot {
+    /// Payload schema version (see [`REPUTATION_SNAPSHOT_VERSION`]).
+    pub version: u32,
+    /// The provider the snapshot describes.
+    pub provider: Address,
+    /// Composite trust score, 0–100 (see [`calculate_trust_score`]).
+    pub trust_score: u32,
+    /// Tier bucket derived from `trust_score`.
+    pub tier: TrustScoreTier,
+    /// Rolling reputation score, 0–100 (issue #170 EMA).
+    pub reputation_score: u32,
+    /// Lifetime signal count from canonical provider stats.
+    pub total_signals: u32,
+    /// Lifetime successful signal count from canonical provider stats.
+    pub successful_signals: u32,
+    /// Success rate in basis points (0–10_000) from canonical provider stats.
+    pub success_rate_bps: u32,
+    /// True once the provider has at least `MIN_SIGNALS_FOR_TRUST_SCORE` signals.
+    pub has_sufficient_history: bool,
+    /// Ledger timestamp the snapshot was taken at.
+    pub as_of: u64,
+}
+
+/// Build a read-only [`ReputationSnapshot`] for `provider` from canonical state.
+///
+/// This function performs no storage writes: it only reads the supplied
+/// performance / stake inputs and the current ledger timestamp, so an external
+/// contract can call the wrapping query without mutating this contract.
+pub fn build_reputation_snapshot(
+    env: &Env,
+    provider: &Address,
+    performance: &ProviderPerformance,
+    stake_info: &Option<StakeInfo>,
+    reputation_score: u32,
+) -> ReputationSnapshot {
+    let details = calculate_trust_score(env, provider, performance, stake_info);
+    ReputationSnapshot {
+        version: REPUTATION_SNAPSHOT_VERSION,
+        provider: provider.clone(),
+        trust_score: details.score,
+        tier: details.tier,
+        reputation_score,
+        total_signals: performance.total_signals,
+        successful_signals: performance.successful_signals,
+        success_rate_bps: performance.success_rate.min(10_000),
+        has_sufficient_history: details.has_sufficient_history,
+        as_of: env.ledger().timestamp(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,6 +642,79 @@ mod tests {
             assert_eq!(list.len(), 1);
             assert_eq!(list.get(0).unwrap().0, provider);
             assert_eq!(list.get(0).unwrap().1.has_sufficient_history, true);
+        });
+    }
+
+    #[test]
+    fn snapshot_derives_from_canonical_state_and_timestamp() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_700_000_000);
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            let provider = Address::generate(&env);
+            let performance = ProviderPerformance {
+                total_signals: 8,
+                successful_signals: 6,
+                failed_signals: 2,
+                success_rate: 7500,
+                avg_return: 4000,
+                ..Default::default()
+            };
+
+            let snap = build_reputation_snapshot(&env, &provider, &performance, &None, 63);
+
+            assert_eq!(snap.version, REPUTATION_SNAPSHOT_VERSION);
+            assert_eq!(snap.provider, provider);
+            assert_eq!(snap.total_signals, 8);
+            assert_eq!(snap.successful_signals, 6);
+            assert_eq!(snap.success_rate_bps, 7500);
+            assert_eq!(snap.reputation_score, 63);
+            assert!(snap.has_sufficient_history);
+            assert_eq!(snap.as_of, 1_700_000_000);
+            assert_eq!(
+                snap.trust_score,
+                calculate_trust_score(&env, &provider, &performance, &None).score
+            );
+        });
+    }
+
+    #[test]
+    fn snapshot_for_unknown_provider_is_zeroed_but_well_formed() {
+        let env = Env::default();
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            let provider = Address::generate(&env);
+            let snap = build_reputation_snapshot(
+                &env,
+                &provider,
+                &ProviderPerformance::default(),
+                &None,
+                50,
+            );
+
+            assert_eq!(snap.trust_score, 0);
+            assert_eq!(snap.tier, TrustScoreTier::NewUnproven);
+            assert!(!snap.has_sufficient_history);
+            assert_eq!(snap.total_signals, 0);
+        });
+    }
+
+    #[test]
+    fn snapshot_clamps_reported_success_rate_to_basis_points() {
+        let env = Env::default();
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            let provider = Address::generate(&env);
+            let performance = ProviderPerformance {
+                total_signals: 10,
+                success_rate: 25_000, // corrupt / out-of-range upstream value
+                ..Default::default()
+            };
+            let snap = build_reputation_snapshot(&env, &provider, &performance, &None, 50);
+            assert_eq!(snap.success_rate_bps, 10_000);
         });
     }
 }

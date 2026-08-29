@@ -77,13 +77,23 @@ fn emit(env: &Env, topic: Symbol, provider: &Address, status: &OnboardingStatus)
 
 /// Register a provider for onboarding review.
 ///
-/// The provider must authenticate the call.  Panics if a record already exists
-/// (use `request_reverification` to restart from `Rejected`).
-pub fn register_provider(env: &Env, provider: &Address) {
+/// The provider must authenticate the call.
+///
+/// Registration is **idempotent** (issue #1025): a retry after a partial
+/// submission or network hiccup does not create a second record or re-emit the
+/// registration event.  If a record already exists — in any state — the current
+/// [`OnboardingRecord`] is returned unchanged and no storage mutation occurs.
+/// A rejected provider that wants a fresh review must call
+/// [`request_reverification`] rather than re-registering.
+pub fn register_provider(env: &Env, provider: &Address) -> OnboardingRecord {
     provider.require_auth();
-    if get_record(env, provider).is_some() {
-        panic!("provider already registered");
+
+    // Idempotent retry: the registration already succeeded — return the
+    // existing state instead of mutating it or emitting a duplicate event.
+    if let Some(existing) = get_record(env, provider) {
+        return existing;
     }
+
     let record = OnboardingRecord {
         provider: provider.clone(),
         status: OnboardingStatus::Pending,
@@ -96,6 +106,7 @@ pub fn register_provider(env: &Env, provider: &Address) {
         provider,
         &OnboardingStatus::Pending,
     );
+    record
 }
 
 /// Governance: approve a `Pending` provider.
@@ -175,6 +186,26 @@ mod tests {
         Env::default()
     }
 
+    /// Fresh env + registered contract id + a provider / governance address.
+    ///
+    /// Each onboarding call is then run in its own `as_contract` frame (see
+    /// [`in_frame`]) to mirror a real, separately-authorized invocation — the
+    /// storage helpers require a contract frame on the stack and `require_auth`
+    /// cannot be replayed twice inside one frame.
+    fn setup() -> (Env, Address, Address, Address) {
+        let e = Env::default();
+        e.mock_all_auths_allowing_non_root_auth();
+        let contract_id = e.register_contract(None, crate::SignalRegistry);
+        let provider = Address::generate(&e);
+        let governance = Address::generate(&e);
+        (e, contract_id, provider, governance)
+    }
+
+    /// Run one onboarding operation in its own contract frame.
+    fn in_frame<T>(e: &Env, contract_id: &Address, f: impl FnOnce() -> T) -> T {
+        e.as_contract(contract_id, f)
+    }
+
     // ── register ──────────────────────────────────────────────────────────
 
     #[test]
@@ -188,13 +219,72 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "provider already registered")]
-    fn register_twice_panics() {
-        let e = env();
-        let provider = Address::generate(&e);
-        e.mock_all_auths();
-        register_provider(&e, &provider);
-        register_provider(&e, &provider);
+    fn register_returns_the_created_record() {
+        let (e, cid, provider, _gov) = setup();
+        let rec = in_frame(&e, &cid, || register_provider(&e, &provider));
+        assert_eq!(rec.provider, provider);
+        assert_eq!(rec.status, OnboardingStatus::Pending);
+    }
+
+    // ── idempotent retry (issue #1025) ────────────────────────────────────
+
+    #[test]
+    fn register_twice_is_idempotent_and_returns_existing_state() {
+        let (e, cid, provider, _gov) = setup();
+
+        let first = in_frame(&e, &cid, || register_provider(&e, &provider));
+        let second = in_frame(&e, &cid, || register_provider(&e, &provider));
+
+        assert_eq!(first, second);
+        assert_eq!(second.updated_at, first.updated_at);
+        assert_eq!(second.status, OnboardingStatus::Pending);
+        assert_eq!(
+            in_frame(&e, &cid, || get_onboarding_record(&e, &provider)).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn retry_does_not_mutate_stored_state() {
+        let (e, cid, provider, _gov) = setup();
+
+        let first = in_frame(&e, &cid, || register_provider(&e, &provider));
+        for _ in 0..3 {
+            in_frame(&e, &cid, || register_provider(&e, &provider));
+        }
+        let stored = in_frame(&e, &cid, || get_onboarding_record(&e, &provider)).unwrap();
+
+        // Storage is byte-for-byte the record created by the first call: no
+        // duplicate record, no refreshed timestamp, no status change.
+        assert_eq!(stored, first);
+    }
+
+    #[test]
+    fn retry_after_approval_returns_approved_without_reverting_to_pending() {
+        let (e, cid, provider, gov) = setup();
+
+        in_frame(&e, &cid, || register_provider(&e, &provider));
+        in_frame(&e, &cid, || approve_provider(&e, &gov, &provider));
+
+        let retried = in_frame(&e, &cid, || register_provider(&e, &provider));
+        assert_eq!(retried.status, OnboardingStatus::Approved);
+        assert_eq!(
+            in_frame(&e, &cid, || get_onboarding_record(&e, &provider))
+                .unwrap()
+                .status,
+            OnboardingStatus::Approved
+        );
+    }
+
+    #[test]
+    fn retry_after_rejection_returns_rejected_state() {
+        let (e, cid, provider, gov) = setup();
+
+        in_frame(&e, &cid, || register_provider(&e, &provider));
+        in_frame(&e, &cid, || reject_provider(&e, &gov, &provider));
+
+        let retried = in_frame(&e, &cid, || register_provider(&e, &provider));
+        assert_eq!(retried.status, OnboardingStatus::Rejected);
     }
 
     // ── approve ───────────────────────────────────────────────────────────
