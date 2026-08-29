@@ -11,7 +11,7 @@ use crate::{
     TradeExecutorContract, TradeExecutorContractClient,
 };
 
-fn setup(env: &Env) -> (TradeExecutorContractClient, Address) {
+fn setup(env: &Env) -> (TradeExecutorContractClient<'_>, Address) {
     let admin = Address::generate(env);
     let contract_id = env.register_contract(None, TradeExecutorContract);
     let client = TradeExecutorContractClient::new(env, &contract_id);

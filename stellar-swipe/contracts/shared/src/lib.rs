@@ -11,8 +11,9 @@ pub use allowlist::{
     add_allowed_contract, get_allowlist, is_contract_allowed, remove_allowed_contract,
     require_allowed_contract, AllowlistError, MAX_ALLOWLIST_SIZE,
 };
-/// Asset metadata registry (Issue #700).
-#[cfg(any(test, feature = "testutils"))]
+/// Asset metadata registry (Issue #700). Single source of truth for which
+/// assets may be traded — consumed in production by `auto_trade` and
+/// `trade_executor` asset-pair validation (Issue #992).
 pub mod asset_registry;
 /// Capability-based authorization model (Issue #860).
 pub mod capabilities;

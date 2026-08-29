@@ -2,6 +2,9 @@
 
 //! Unit tests for Issue #755: single-update price-deviation circuit breaker.
 
+#[cfg(not(target_family = "wasm"))]
+extern crate std;
+
 use super::*;
 use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
@@ -67,12 +70,19 @@ fn test_spike_trips_breaker_and_blocks_get_price() {
     // Establish baseline.
     client.set_price(&pair, &1_000_000i128);
 
-    // 50% spike — should trip the breaker and return an error.
+    // 50% spike — trips the breaker. The update call must succeed (return Ok)
+    // so the trip flag persists; the spiked price is NOT stored.
     let result = client.try_set_price(&pair, &1_500_000i128);
-    assert!(result.is_err(), "spike should trip the breaker");
+    assert!(
+        result.is_ok(),
+        "trip call must succeed so the flag persists"
+    );
 
     // Breaker must now be tripped.
     assert!(client.is_update_dev_breaker_tripped(&pair));
+
+    // Price reads are rejected while the breaker is tripped.
+    assert!(client.try_get_price(&pair).is_err());
 }
 
 /// After an authorized reset the breaker clears and normal operations resume.
@@ -114,9 +124,13 @@ fn test_no_threshold_allows_any_update() {
 }
 
 /// Breaker event is emitted when it trips; reset event is emitted on reset.
+///
+/// Note: the test env clears the event buffer at the start of every top-level
+/// contract invocation, so events must be inspected immediately after the call
+/// that emits them (before any further invocation).
 #[test]
 fn test_breaker_events_emitted() {
-    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{testutils::Events, Symbol, TryFromVal};
 
     let env = Env::default();
     let (admin, id) = setup(&env);
@@ -126,12 +140,34 @@ fn test_breaker_events_emitted() {
     client.set_update_deviation_threshold(&admin, &pair, &500u32);
     client.set_price(&pair, &1_000_000i128);
 
-    let before = env.events().all().len();
-    let _ = client.try_set_price(&pair, &2_000_000i128);
-    let after_trip = env.events().all().len();
-    assert!(after_trip > before, "dev_trip event not emitted");
+    let event_names = |env: &Env| -> std::vec::Vec<Symbol> {
+        env.events()
+            .all()
+            .iter()
+            .filter_map(|(_, topics, _)| topics.get(1))
+            .filter_map(|t| Symbol::try_from_val(env, &t).ok())
+            .collect()
+    };
 
+    // Trip the breaker — dev_trip must be the event of this invocation.
+    let _ = client.try_set_price(&pair, &2_000_000i128);
+    let trip_names = event_names(&env);
+    assert!(
+        trip_names
+            .iter()
+            .any(|n| n == &Symbol::new(&env, "dev_trip")),
+        "dev_trip event not emitted, got {:?}",
+        trip_names
+    );
+
+    // Reset the breaker — dev_reset must be the event of this invocation.
     client.reset_update_deviation_breaker(&admin, &pair);
-    let after_reset = env.events().all().len();
-    assert!(after_reset > after_trip, "dev_reset event not emitted");
+    let reset_names = event_names(&env);
+    assert!(
+        reset_names
+            .iter()
+            .any(|n| n == &Symbol::new(&env, "dev_reset")),
+        "dev_reset event not emitted, got {:?}",
+        reset_names
+    );
 }

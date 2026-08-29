@@ -8,9 +8,7 @@
 extern crate std;
 
 use crate::distribution::DistributionRecipients;
-use crate::proposals::{
-    ProposalCategory, ProposalStatus, ProposalType, SimulationEffect,
-};
+use crate::proposals::{ProposalCategory, ProposalStatus, ProposalType, SimulationEffect};
 use crate::shadow_mode::ShadowModeResult;
 use crate::{GovernanceContract, GovernanceContractClient, GovernanceError};
 use soroban_sdk::testutils::{Address as _, Events, Ledger};

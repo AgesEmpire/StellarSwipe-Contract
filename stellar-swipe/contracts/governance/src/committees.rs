@@ -717,11 +717,9 @@ pub fn report_activity(
     };
 
     let days_active = now.saturating_sub(committee.formation_date) / 86_400;
-    let decisions_per_month = if days_active > 0 {
-        ((committee.performance_metrics.total_decisions as u64 * 30) / days_active) as u32
-    } else {
-        0
-    };
+    let decisions_per_month = ((committee.performance_metrics.total_decisions as u64 * 30)
+        .checked_div(days_active))
+    .unwrap_or(0) as u32;
     let execution_rate = if committee.performance_metrics.total_decisions > 0 {
         ((committee.performance_metrics.decisions_executed as i128 * APPROVAL_RATING_BPS as i128)
             / committee.performance_metrics.total_decisions as i128) as u32
@@ -968,10 +966,10 @@ fn verify_committee_authority(
                     return Ok(());
                 }
             }
-            (Authority::Veto(config), CommitteeAction::Veto(action)) => {
-                if contains_string(&config.proposal_types, &action.proposal_type) {
-                    return Ok(());
-                }
+            (Authority::Veto(config), CommitteeAction::Veto(action))
+                if contains_string(&config.proposal_types, &action.proposal_type) =>
+            {
+                return Ok(());
             }
             _ => {}
         }
