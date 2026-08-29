@@ -1,4 +1,9 @@
 #![no_std]
+// The `#[cfg_attr(test, derive(soroban_sdk::testutils::arbitrary::Arbitrary))]`
+// on `ContractError` expands to `std::thread_local!` / `std::cell::Cell` paths,
+// so the test build of this no_std crate must link `std`.
+#[cfg(test)]
+extern crate std;
 
 pub mod batch_settlement;
 pub mod compat;

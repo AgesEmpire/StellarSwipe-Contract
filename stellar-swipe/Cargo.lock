@@ -1718,6 +1718,7 @@ dependencies = [
 name = "trade_executor"
 version = "0.0.0"
 dependencies = [
+ "arbitrary",
  "proptest",
  "shared",
  "soroban-sdk",
