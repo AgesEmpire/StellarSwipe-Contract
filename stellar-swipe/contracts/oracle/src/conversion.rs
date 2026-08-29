@@ -1,7 +1,7 @@
 //! Price conversion system for multi-asset portfolio aggregation
 
 use crate::errors::OracleError;
-use crate::storage::get_base_currency;
+use crate::storage::{get_base_currency, get_feed_decimals, get_price, rescale_price};
 use shared::math::normalize_amount;
 use soroban_sdk::{contracttype, vec, Env, Map, Vec};
 use stellar_swipe_common::{Asset, AssetPair};
@@ -39,6 +39,18 @@ pub fn normalize_price(price: i128, from_decimals: u32) -> Option<i128> {
     shared::math::normalize_amount(price, from_decimals, 7)
 }
 
+/// Read the live price for `pair` rescaled to canonical 7-decimal precision.
+///
+/// Mirrors the `get_normalized_price` contract entrypoint: the raw stored feed
+/// price is rescaled from its configured native decimals (defaulting to 7 when
+/// unconfigured) to the canonical precision so that feeds stored with
+/// different native precisions produce deterministic results.
+fn get_normalized_price(env: &Env, pair: &AssetPair) -> Result<i128, OracleError> {
+    let raw_price = get_price(env, pair)?;
+    let from_decimals = get_feed_decimals(env, pair).unwrap_or(7);
+    rescale_price(raw_price, from_decimals, 7).ok_or(OracleError::ConversionOverflow)
+}
+
 /// Direct conversion: asset → base
 ///
 /// Prices are normalized to canonical 7-decimal precision before scaling so
@@ -49,7 +61,7 @@ fn convert_direct(env: &Env, amount: i128, from: &Asset, to: &Asset) -> Result<i
         base: from.clone(),
         quote: to.clone(),
     };
-    let price = crate::get_normalized_price(env.clone(), pair, 7)?;
+    let price = get_normalized_price(env, &pair)?;
 
     let product = amount
         .checked_mul(price)

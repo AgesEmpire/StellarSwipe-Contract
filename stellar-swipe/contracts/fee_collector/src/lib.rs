@@ -28,7 +28,7 @@ mod rebates;
 mod reports;
 pub use reports::{EarningsLeaderboardEntry, EarningsReport, ReportPeriod};
 
-mod storage;
+pub mod storage;
 pub use storage::BalanceMismatch;
 use storage::{
     add_daily_fee_total, add_epoch_rebate_distributed, add_to_revenue_share_pool_index, get_admin,

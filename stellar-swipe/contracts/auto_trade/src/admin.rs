@@ -34,6 +34,9 @@ pub enum AdminStorageKey {
     // Dead man's switch
     LastAdminActionAt,
     InactivityWindowSecs,
+    // Issue #992: asset registry contract used to validate asset pairs before
+    // any offer or token operation is attempted.
+    AssetRegistry,
 }
 
 pub fn init_admin(env: &Env, admin: Address) {
@@ -172,6 +175,40 @@ pub fn trigger_inactivity_pause(env: &Env, caller: &Address) -> Result<(), AutoT
     );
 
     Ok(())
+}
+
+// ── Asset registry (Issue #992) ──────────────────────────────────────────────
+
+/// Set the asset registry contract used to validate asset pairs before
+/// execution (admin only).
+///
+/// Once a registry is configured, [`crate::amm_bridge::validate_signal_pair`]
+/// rejects pairs whose assets are not both registered in the registry, pairs
+/// whose assets are identical, and pairs no enabled AMM source supports —
+/// before any external call or state mutation. See
+/// `docs/asset_pair_validation.md` for the supported-pair source and update
+/// authority.
+pub fn set_asset_registry(
+    env: &Env,
+    caller: &Address,
+    registry: Address,
+) -> Result<(), AutoTradeError> {
+    require_admin(env, caller)?;
+    env.storage()
+        .instance()
+        .set(&AdminStorageKey::AssetRegistry, &registry);
+    env.events().publish(
+        (Symbol::new(env, "asset_registry_set"), caller.clone()),
+        registry,
+    );
+    Ok(())
+}
+
+/// The configured asset registry contract, if any.
+pub fn get_asset_registry(env: &Env) -> Option<Address> {
+    env.storage()
+        .instance()
+        .get(&AdminStorageKey::AssetRegistry)
 }
 
 /// Get current operator

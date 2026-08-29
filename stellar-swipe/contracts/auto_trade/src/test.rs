@@ -9,12 +9,27 @@ use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
     Address, Env, IntoVal, Symbol, TryFromVal, Val,
 };
+use stellar_swipe_common::emergency::CAT_TRADING;
 
 fn setup_env() -> Env {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().set_timestamp(1000);
     env
+}
+
+/// `execute_trade` runs `rate_limit::check_rate_limits`; the default bridge
+/// limits reject small test amounts, so trade-execution tests configure
+/// permissive limits (no minimum amount, no cooldown).
+fn set_permissive_rate_limits(env: &Env) {
+    rate_limit::set_limits(
+        env,
+        &rate_limit::BridgeRateLimits {
+            min_transfer_amount: 0,
+            cooldown_between_transfers: 0,
+            ..Default::default()
+        },
+    );
 }
 
 fn setup_signal(_env: &Env, signal_id: u64, expiry: u64) -> storage::Signal {
@@ -232,6 +247,7 @@ fn test_execute_trade_insufficient_balance() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -259,6 +275,7 @@ fn test_execute_trade_market_full_fill() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -292,6 +309,7 @@ fn test_execute_trade_market_partial_fill() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -381,6 +399,7 @@ fn test_execute_trade_limit_filled() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -414,6 +433,7 @@ fn test_execute_trade_limit_not_filled() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -447,6 +467,7 @@ fn test_get_trade_existing() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -541,6 +562,7 @@ fn test_position_limit_allows_first_trade() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -572,6 +594,7 @@ fn test_get_user_positions() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -837,6 +860,7 @@ fn test_get_trade_history_paginated() {
 
     // Setup (max_position_pct: 100 so multiple buys in same asset pass risk checks)
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         risk::set_risk_config(
@@ -903,6 +927,7 @@ fn test_get_portfolio() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()

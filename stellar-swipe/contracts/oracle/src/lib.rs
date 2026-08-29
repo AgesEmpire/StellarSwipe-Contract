@@ -173,8 +173,13 @@ impl OracleContract {
         if price <= 0 {
             return Err(OracleError::InvalidAsset);
         }
-        // #755: single-update deviation circuit breaker check.
-        price_cb::check_and_trip(&env, &pair, price)?;
+        // #755: single-update deviation circuit breaker check. A deviating
+        // update trips the breaker and is rejected (not stored); the call
+        // returns Ok so the trip flag persists (an error return would roll
+        // back the storage write).
+        if price_cb::check_and_trip(&env, &pair, price)? {
+            return Ok(());
+        }
         storage::set_price(&env, &pair, price);
         storage::add_available_pair(&env, pair.clone());
         history::store_price(&env, &pair, price);
@@ -779,12 +784,26 @@ impl OracleContract {
     ) -> Result<(i128, u32), OracleError> {
         // #755: reject price reads while the single-update deviation breaker is tripped.
         price_cb::guard_tripped(&env, &pair)?;
+
+        // Aggregate over the multi-source `PriceMap` feed (Issue #864). When no
+        // source has submitted quotes yet, fall back to the packed single-source
+        // feed written by `set_price` so both price paths are readable.
         let key = StorageKey::PriceMap(pair.clone());
-        let prices: Vec<PriceData> = env
+        let mut prices: Vec<PriceData> = env
             .storage()
             .temporary()
             .get(&key)
-            .ok_or(OracleError::PriceNotFound)?;
+            .unwrap_or(Vec::new(&env));
+        if prices.is_empty() {
+            let feed = storage::get_feed(&env, &pair)?;
+            prices.push_back(PriceData {
+                asset_pair: pair.clone(),
+                price: feed.price,
+                timestamp: feed.timestamp,
+                source: env.current_contract_address(),
+                confidence: 100,
+            });
+        }
 
         let current_time = env.ledger().timestamp();
         let window = staleness::get_staleness_window(&env, &pair);

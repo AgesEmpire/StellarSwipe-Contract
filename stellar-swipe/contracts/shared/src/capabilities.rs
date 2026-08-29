@@ -174,7 +174,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (Env, Address, Address) {
+    fn setup() -> (Env, Address, Address, Address) {
         let env = Env::default();
         let contract_id = env.register(TestCaps, ());
         let admin = Address::generate(&env);
@@ -182,13 +182,12 @@ mod tests {
         env.as_contract(&contract_id, || {
             TestCaps::init(env.clone(), admin.clone());
         });
-        (env, admin, user)
+        (env, contract_id, admin, user)
     }
 
     #[test]
     fn admin_has_all_caps_by_default() {
-        let (env, admin, _user) = setup();
-        let contract_id = env.register(TestCaps, ());
+        let (env, contract_id, admin, _user) = setup();
         env.as_contract(&contract_id, || {
             assert!(has_capability(&env, &admin, Capability::Pause));
             assert!(has_capability(&env, &admin, Capability::Upgrade));
@@ -200,8 +199,7 @@ mod tests {
 
     #[test]
     fn user_lacks_capabilities_by_default() {
-        let (env, _admin, user) = setup();
-        let contract_id = env.register(TestCaps, ());
+        let (env, contract_id, _admin, user) = setup();
         env.as_contract(&contract_id, || {
             assert!(!has_capability(&env, &user, Capability::Pause));
             assert!(!has_capability(&env, &user, Capability::Upgrade));
@@ -210,8 +208,7 @@ mod tests {
 
     #[test]
     fn grant_and_revoke() {
-        let (env, admin, user) = setup();
-        let contract_id = env.register(TestCaps, ());
+        let (env, contract_id, admin, user) = setup();
         env.as_contract(&contract_id, || {
             grant_capability(&env, &admin, &user, Capability::Pause);
             assert!(has_capability(&env, &user, Capability::Pause));
@@ -224,8 +221,7 @@ mod tests {
 
     #[test]
     fn require_capability_works() {
-        let (env, admin, user) = setup();
-        let contract_id = env.register(TestCaps, ());
+        let (env, contract_id, admin, user) = setup();
         env.as_contract(&contract_id, || {
             assert!(require_capability(&env, &admin, Capability::Pause).is_ok());
             assert_eq!(

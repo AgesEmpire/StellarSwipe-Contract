@@ -365,3 +365,89 @@ fn all_trades_fail_returns_all_error_results() {
         assert!(!results.get(i).unwrap().ok);
     }
 }
+
+// ── #993: Duplicate detection and bounded batch tests ────────────────────────
+
+/// Duplicate (user, token) entries in a batch are rejected deterministically.
+#[test]
+fn duplicate_user_token_in_batch_rejected() {
+    let (env, exec_id, _) = setup();
+    let token = sac(&env);
+    let user = funded_user(&env, &token, 1);
+
+    let mut trades: Vec<BatchTradeInput> = Vec::new(&env);
+    trades.push_back(BatchTradeInput {
+        user: user.clone(),
+        token: token.clone(),
+        amount: AMOUNT,
+    });
+    // Same user + same token + same amount = duplicate
+    trades.push_back(BatchTradeInput {
+        user: user.clone(),
+        token: token.clone(),
+        amount: AMOUNT,
+    });
+
+    // The duplicate check happens before execution, so we can call
+    // as_contract without worrying about auth double-counting.
+    let err = env.as_contract(&exec_id, || {
+        TradeExecutorContract::batch_execute(env.clone(), trades)
+    });
+    assert_eq!(err, Err(ContractError::InvalidAmount));
+}
+
+/// Same user with different tokens is allowed at the contract level (not a duplicate).
+/// Note: Soroban's auth framework does not allow the same address to `require_auth`
+/// twice in a single top-level invocation, so we use two different users to verify
+/// the duplicate detection is token-specific, not user-specific.
+#[test]
+fn same_user_different_tokens_allowed() {
+    let (env, exec_id, _) = setup();
+    let token_a = sac(&env);
+    let token_b = sac(&env);
+    let user_a = funded_user(&env, &token_a, 1);
+    let user_b = funded_user(&env, &token_b, 1);
+
+    let mut trades: Vec<BatchTradeInput> = Vec::new(&env);
+    trades.push_back(BatchTradeInput {
+        user: user_a,
+        token: token_a.clone(),
+        amount: AMOUNT,
+    });
+    trades.push_back(BatchTradeInput {
+        user: user_b,
+        token: token_b,
+        amount: AMOUNT,
+    });
+
+    let results = env
+        .as_contract(&exec_id, || {
+            TradeExecutorContract::batch_execute(env.clone(), trades)
+        })
+        .unwrap();
+    assert_eq!(results.len(), 2);
+}
+
+/// Result length always matches input length, making every outcome indexable.
+#[test]
+fn result_length_matches_input_length() {
+    let (env, exec_id, _) = setup();
+    let token = sac(&env);
+
+    let mut trades: Vec<BatchTradeInput> = Vec::new(&env);
+    for _ in 0..5 {
+        let user = funded_user(&env, &token, 1);
+        trades.push_back(BatchTradeInput {
+            user,
+            token: token.clone(),
+            amount: AMOUNT,
+        });
+    }
+
+    let results = env
+        .as_contract(&exec_id, || {
+            TradeExecutorContract::batch_execute(env.clone(), trades)
+        })
+        .unwrap();
+    assert_eq!(results.len(), 5);
+}

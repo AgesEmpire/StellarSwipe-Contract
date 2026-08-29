@@ -7,10 +7,12 @@
   "StorageKey": [
     "Admin",
     "AppealWindowSecs",
+    "EmergencyCooldownSecs",
     "EmergencyMultiSigConfig",
     "EmergencyRequest",
     "GovernanceAddress",
     "LargeWithdrawalRequestedAt",
+    "LastEmergencyUnstakeAt",
     "LastStakeLedger",
     "LockMultiplierTiers",
     "MaxUnstakeQueueSize",
