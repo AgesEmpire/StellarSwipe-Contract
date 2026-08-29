@@ -178,11 +178,9 @@ pub fn get_provider_churn_risk(
 
     // Component 3: performance trend decline score (0–100).
     let overall_rate = stats.map(|s| s.success_rate).unwrap_or(0);
-    let recent_rate = if recent_closed > 0 {
-        (recent_successful * 10_000) / recent_closed
-    } else {
-        overall_rate
-    };
+    let recent_rate = (recent_successful * 10_000)
+        .checked_div(recent_closed)
+        .unwrap_or(overall_rate);
     let perf_trend_score = perf_decline_score(recent_rate, overall_rate);
 
     // Composite: 40/30/30 weighting (sum of weights == 100).
@@ -454,17 +452,20 @@ mod tests {
             assert_eq!(get_churn_threshold(&env), 34);
 
             let mut signals: Map<u64, Signal> = Map::new(&env);
-            for i in 0..2u64 {
+            // 1 recent signal vs 10 prior → freq score = (10-1)*100/10 = 90
+            // → composite = 90*40/100 = 36, a solid Medium tier.
+            for i in 0..1u64 {
                 signals.set(i, base_signal(&env, i, &provider, recent));
             }
-            for i in 2..8u64 {
+            for i in 1..11u64 {
                 signals.set(i, base_signal(&env, i, &provider, older));
             }
 
-            let stats = perf(8, 7_000);
+            let stats = perf(11, 7_000);
             let score = get_provider_churn_risk(&env, &provider, &signals, Some(&stats));
-            // Medium risk → composite >= 34; event should have been emitted (checked by level)
-            assert!(score.composite_score >= 34);
+            // Medium risk with a lowered threshold → event should have been emitted.
+            assert_eq!(score.composite_score, 36);
+            assert_eq!(score.level, ChurnRiskLevel::Medium);
         });
     }
 

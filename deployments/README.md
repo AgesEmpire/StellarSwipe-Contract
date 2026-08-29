@@ -57,3 +57,35 @@ Run it directly with:
 ```sh
 python3 stellar-swipe/scripts/validate_deployment_manifest.py deployments/testnet.manifest.json
 ```
+
+## Contract registry (Issue #881)
+
+`deployments/registry.json` is the canonical, versioned answer to "which
+contract is deployed at which address, on which network". It complements the
+manifests above: a manifest describes what a release *should* contain, the
+registry records what is actually live.
+
+Each network entry carries its passphrase, RPC URL, the manifest it was
+validated against, a `deployed_at` timestamp, and one `{ address, version }`
+entry per contract. `address` is `null` until that contract has been deployed.
+
+Read it through `scripts/deployment_registry.ts` rather than parsing it by hand,
+so a missing deployment fails loudly instead of yielding `null` downstream:
+
+```sh
+cd scripts
+npx tsx deployment_registry.ts list testnet          # all contracts on a network
+npx tsx deployment_registry.ts get testnet stake_vault   # one address, exits non-zero if undeployed
+```
+
+From TypeScript:
+
+```ts
+import { loadRegistry, getContractId } from "./deployment_registry.ts";
+
+const stakeVault = getContractId(loadRegistry(), "testnet", "stake_vault");
+```
+
+`recordDeployment(network, contract, address)` writes a freshly deployed address
+back into the registry and stamps `deployed_at`, so deploy scripts keep the file
+current instead of leaving addresses scattered across per-run state files.

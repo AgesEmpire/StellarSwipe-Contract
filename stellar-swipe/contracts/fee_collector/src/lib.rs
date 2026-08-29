@@ -8,16 +8,19 @@ mod fee_cache;
 use events::{
     emit_effective_multiplier_changed, emit_error_reported, emit_fee_collected, emit_fee_forecast,
     emit_fee_rate_updated, emit_fees_claimed, emit_fees_claimed_converted,
-    emit_first_trade_fee_waived, emit_network_condition_updated, emit_payout_currency_set,
+    emit_first_trade_fee_waived, emit_insurance_payout, emit_insurance_payout_cap_updated,
+    emit_network_condition_updated, emit_payout_currency_set, emit_rebate_cap_applied,
     emit_referral_fee_paid, emit_referral_fee_share_updated, emit_referral_registered,
-    emit_retry_attempted, emit_treasury_withdrawal, emit_volume_discount_config_updated,
-    emit_waterfall_distribution, emit_withdrawal_queued, EvtEffectiveMultiplierChanged,
-    EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed,
-    EvtNetworkConditionUpdated, EvtRetryAttempted, EvtTreasuryWithdrawal, EvtWithdrawalQueued,
+    emit_retry_attempted, emit_snapshot_recorded, emit_treasury_withdrawal,
+    emit_volume_discount_config_updated, emit_waterfall_distribution, emit_withdrawal_queued,
+    EvtEffectiveMultiplierChanged, EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated,
+    EvtFeesClaimed, EvtInsurancePayout, EvtNetworkConditionUpdated, EvtRebateCapApplied,
+    EvtRetryAttempted, EvtSnapshotRecorded, EvtTreasuryWithdrawal, EvtWithdrawalQueued,
 };
 pub use events::{
     EffectiveMultiplierChanged, FeeRateUpdated, FeesBurned, FeesClaimed, FirstTradeFeeWaived,
-    TreasuryWithdrawal, WithdrawalQueued,
+    InsurancePayout, InsurancePayoutCapUpdated, SnapshotRecorded, TreasuryWithdrawal,
+    WithdrawalQueued,
 };
 
 mod rebates;
@@ -25,30 +28,38 @@ mod rebates;
 mod reports;
 pub use reports::{EarningsLeaderboardEntry, EarningsReport, ReportPeriod};
 
-mod storage;
+pub mod storage;
 pub use storage::BalanceMismatch;
 use storage::{
-    add_daily_fee_total, get_admin, get_burn_rate, get_congestion_config, get_congestion_signal,
-    get_daily_fee_total, get_failed_fee_collection, get_fee_optimization_config, get_fee_rate,
-    get_forecast_config, get_last_error_report, get_last_forecast_day, get_monthly_trade_volume,
+    add_daily_fee_total, add_epoch_rebate_distributed, add_to_revenue_share_pool_index, get_admin,
+    get_burn_rate, get_congestion_config, get_congestion_signal, get_daily_fee_total,
+    get_epoch_rebate_distributed, get_failed_fee_collection, get_fee_optimization_config,
+    get_fee_rate, get_fee_snapshot, get_forecast_config, get_last_error_report,
+    get_last_forecast_day, get_max_rebate_bps, get_monthly_trade_volume,
     get_network_condition_score, get_oracle_contract, get_pending_fees,
     get_provider_payout_currency, get_queued_withdrawal, get_referral_fee_share_bps, get_referrer,
-    get_treasury_balance, get_volume_discount_config, get_waterfall_config, has_traded,
-    is_authorized_caller, is_initialized, remove_authorized_caller, remove_failed_fee_collection,
+    get_revenue_share_pool_index, get_treasury_balance, get_volume_discount_config,
+    get_waterfall_config, has_traded, is_authorized_caller, is_initialized,
+    remove_authorized_caller, remove_failed_fee_collection, remove_from_revenue_share_pool_index,
     remove_monthly_trade_volume, remove_provider_payout_currency, remove_queued_withdrawal,
     set_admin, set_authorized_caller, set_burn_rate as set_burn_rate_storage,
     set_congestion_config, set_congestion_signal, set_failed_fee_collection,
-    set_fee_optimization_config, set_fee_rate as set_fee_rate_storage, set_forecast_config_storage,
-    set_has_traded, set_initialized, set_last_error_report, set_last_forecast_day,
+    set_fee_optimization_config, set_fee_rate as set_fee_rate_storage, set_fee_snapshot,
+    set_forecast_config_storage, set_has_traded, set_initialized, set_last_error_report,
+    set_last_forecast_day, set_max_rebate_bps as set_max_rebate_bps_storage,
     set_monthly_trade_volume, set_network_condition_score,
     set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
     set_provider_payout_currency, set_queued_withdrawal, set_referral_fee_share_bps, set_referrer,
     set_treasury_balance, set_volume_discount_config_storage,
     set_waterfall_config as set_waterfall_config_storage, CongestionConfig, CongestionSignal,
-    ErrorReport, FailedFeeCollection, FeeOptimizationConfig, ForecastConfigData,
-    MonthlyTradeVolume, QueuedWithdrawal, StorageKey, VolumeDiscountConfig, VolumeTier,
-    WaterfallConfig, WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS, MAX_FEE_RATE_BPS,
-    MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
+    ErrorReport, FailedFeeCollection, FeeOptimizationConfig, FeeSnapshot, ForecastConfigData,
+    MonthlyTradeVolume, QueuedWithdrawal, SnapshotEntry, StorageKey, VolumeDiscountConfig,
+    VolumeTier, WaterfallConfig, WaterfallTier, WaterfallTierResult, MAX_BURN_RATE_BPS,
+    MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS, SECONDS_PER_DAY_FC,
+};
+pub use storage::{
+    get_insurance_balance, get_insurance_payout_cap, is_insurance_claim_processed,
+    set_insurance_balance, set_insurance_claim_processed, set_insurance_payout_cap,
 };
 
 use soroban_sdk::{
@@ -58,6 +69,9 @@ use soroban_sdk::{
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use shared::pausable;
+use shared::reentrancy::{self, ReentrancyError};
+use stellar_swipe_common::health::{health_uninitialized, HealthStatus};
+use stellar_swipe_common::token_metadata::{validate as validate_token_metadata, TokenMetadata};
 use stellar_swipe_common::Asset;
 use stellar_swipe_common::SECONDS_PER_DAY;
 
@@ -191,12 +205,6 @@ impl FeeCollector {
         }
         let admin = get_admin(&env);
         admin.require_auth();
-        pausable::set_paused(&env, true);
-        Ok(())
-    }
-
-    /// Resume fund-moving operations. Admin auth required.
-    pub fn unpause(env: Env) -> Result<(), ContractError> {
 
         let current_version = shared::version::get_contract_version(&env);
         shared::version::guard_upgrade(current_version, new_version)
@@ -206,6 +214,36 @@ impl FeeCollector {
         shared::version::set_contract_version(&env, new_version);
         shared::version::emit_contract_upgraded(&env, current_version, new_version);
         Ok(())
+    }
+
+    /// Admin-only: pause fund-moving operations.
+    pub fn pause(env: Env) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        pausable::set_paused(&env, true);
+        Ok(())
+    }
+
+    /// Resume fund-moving operations. Admin auth required.
+    pub fn unpause(env: Env) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        pausable::set_paused(&env, false);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        pausable::is_paused(&env)
+    }
+
+    pub fn require_not_paused(env: &Env) -> Result<(), ContractError> {
+        pausable::require_not_paused(env).map_err(|_| ContractError::ContractPaused)
     }
 
     // ── Issue #813: cross-contract authentication hardening ─────────────────
@@ -402,6 +440,8 @@ impl FeeCollector {
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
+        // Validate token metadata before allowing withdrawal.
+        Self::validate_token_metadata_for_token(&env, &token)?;
         if amount > get_treasury_balance(&env, &token) {
             return Err(ContractError::InsufficientTreasuryBalance);
         }
@@ -454,12 +494,17 @@ impl FeeCollector {
         token: Address,
         amount: i128,
     ) -> Result<(), ContractError> {
+        // Issue #859: reentrancy guard for token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
         Self::require_not_paused(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
+
+        // Validate registered token metadata before allowing withdrawal.
+        Self::validate_token_metadata_for_token(&env, &token)?;
 
         let queued = match get_queued_withdrawal(&env) {
             Some(q) if q.recipient == recipient && q.token == token && q.amount == amount => q,
@@ -505,6 +550,174 @@ impl FeeCollector {
         Ok(())
     }
 
+    // ── Issue #960: Insurance Payout Function with Cap and Audit Log ─────────
+
+    /// Admin-only: configure the maximum insurance payout cap per claim for a token.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `caller`: Admin address (must match contract admin).
+    /// - `token`: Asset token address.
+    /// - `max_cap`: Maximum amount allowed per insurance claim (must be >= 0).
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::UnauthorizedCaller`] — caller is not the admin.
+    /// - [`ContractError::InvalidAmount`] — `max_cap` < 0.
+    pub fn set_insurance_payout_cap(
+        env: Env,
+        caller: Address,
+        token: Address,
+        max_cap: i128,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        caller.require_auth();
+        let admin = get_admin(&env);
+        if caller != admin {
+            return Err(ContractError::UnauthorizedCaller);
+        }
+        if max_cap < 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let old_cap = get_insurance_payout_cap(&env, &token);
+        set_insurance_payout_cap(&env, &token, max_cap);
+        emit_insurance_payout_cap_updated(&env, &token, old_cap, max_cap, &caller);
+        Ok(())
+    }
+
+    /// Query the configured maximum insurance payout cap per claim for a token.
+    pub fn get_insurance_payout_cap(env: Env, token: Address) -> i128 {
+        get_insurance_payout_cap(&env, &token)
+    }
+
+    /// Query the current insurance fund balance for a token.
+    pub fn get_insurance_balance(env: Env, token: Address) -> i128 {
+        get_insurance_balance(&env, &token)
+    }
+
+    /// Deposit funds directly into the insurance fund.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `from`: Funding account authorizing the deposit.
+    /// - `token`: Asset token address.
+    /// - `amount`: Amount to deposit (must be > 0).
+    pub fn deposit_insurance_fund(
+        env: Env,
+        from: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        Self::require_not_paused(&env)?;
+        from.require_auth();
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
+
+        let current_bal = get_insurance_balance(&env, &token);
+        let new_bal = current_bal
+            .checked_add(amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        set_insurance_balance(&env, &token, new_bal);
+        Ok(())
+    }
+
+    /// Checks whether an insurance claim ID has already been paid out.
+    pub fn is_insurance_claim_processed(env: Env, claim_id: String) -> bool {
+        is_insurance_claim_processed(&env, &claim_id)
+    }
+
+    /// Pays out insurance funds to a provider or treasury while enforcing
+    /// the maximum payout cap per claim and emitting an audit event.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `caller`: Admin or allowlisted keeper address.
+    /// - `recipient`: Recipient provider or treasury address.
+    /// - `token`: Asset token address.
+    /// - `amount`: Payout amount (must be > 0 and <= max_cap if cap configured).
+    /// - `claim_id`: Unique identifier for the insurance claim (prevents double payout).
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::ContractPaused`] — contract is paused.
+    /// - [`ContractError::UnauthorizedCaller`] — caller is neither admin nor allowlisted caller.
+    /// - [`ContractError::InvalidAmount`] — amount <= 0.
+    /// - [`ContractError::ClaimAlreadyProcessed`] — claim_id already paid out.
+    /// - [`ContractError::PayoutExceedsCap`] — amount exceeds configured cap per claim.
+    /// - [`ContractError::InsufficientInsuranceBalance`] — insurance balance insufficient.
+    pub fn payout_insurance(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+        token: Address,
+        amount: i128,
+        claim_id: String,
+    ) -> Result<(), ContractError> {
+        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        Self::require_not_paused(&env)?;
+
+        caller.require_auth();
+        let admin = get_admin(&env);
+        if caller != admin && !is_authorized_caller(&env, &caller) {
+            return Err(ContractError::UnauthorizedCaller);
+        }
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        if is_insurance_claim_processed(&env, &claim_id) {
+            return Err(ContractError::ClaimAlreadyProcessed);
+        }
+
+        let cap = get_insurance_payout_cap(&env, &token);
+        if cap > 0 && amount > cap {
+            return Err(ContractError::PayoutExceedsCap);
+        }
+
+        let current_balance = get_insurance_balance(&env, &token);
+        if amount > current_balance {
+            return Err(ContractError::InsufficientInsuranceBalance);
+        }
+
+        let new_balance = current_balance
+            .checked_sub(amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        set_insurance_balance(&env, &token, new_balance);
+        set_insurance_claim_processed(&env, &claim_id, true);
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+
+        emit_insurance_payout(
+            &env,
+            EvtInsurancePayout {
+                recipient,
+                token,
+                amount,
+                claim_id,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
     /// Returns the current fee rate in basis points.
     pub fn fee_rate(env: Env) -> Result<u32, ContractError> {
         if !is_initialized(&env) {
@@ -514,8 +727,6 @@ impl FeeCollector {
     }
 
     /// Admin-only: update the fee rate (in basis points).
-    /// Validates: MIN_FEE_RATE_BPS <= new_rate_bps <= MAX_FEE_RATE_BPS.
-    /// Change takes effect on the next trade — no retroactive application.
     pub fn set_fee_rate(env: Env, new_rate_bps: u32) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
@@ -532,6 +743,7 @@ impl FeeCollector {
 
         let old_rate = get_fee_rate(&env);
         set_fee_rate_storage(&env, new_rate_bps);
+        storage::bump_config_version(&env);
 
         emit_fee_rate_updated(
             &env,
@@ -565,6 +777,7 @@ impl FeeCollector {
             return Err(ContractError::BurnRateTooHigh);
         }
         set_burn_rate_storage(&env, new_rate_bps);
+        storage::bump_config_version(&env);
         Ok(())
     }
 
@@ -675,6 +888,7 @@ impl FeeCollector {
             return Err(ContractError::InvalidFeeConfiguration);
         }
         set_fee_optimization_config(&env, &config);
+        storage::bump_config_version(&env);
         Ok(())
     }
 
@@ -694,6 +908,7 @@ impl FeeCollector {
         }
 
         set_network_condition_score(&env, score_bps);
+        storage::bump_config_version(&env);
         emit_network_condition_updated(
             &env,
             EvtNetworkConditionUpdated {
@@ -1055,29 +1270,77 @@ impl FeeCollector {
     /// so a valid signature cannot be replayed against a different token or
     /// redirected to a different provider (Issue #563).
     pub fn claim_fees(env: Env, provider: Address, token: Address) -> Result<i128, ContractError> {
+        // Issue #859: reentrancy guard for token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
         Self::require_not_paused(&env)?;
+        // Validate registered token metadata before allowing fee claims.
+        Self::validate_token_metadata_for_token(&env, &token)?;
         let mut auth_args: Vec<Val> = Vec::new(&env);
         auth_args.push_back(provider.clone().into_val(&env));
         auth_args.push_back(token.clone().into_val(&env));
         provider.require_auth_for_args(auth_args);
 
-        let amount = get_pending_fees(&env, &provider, &token);
+        let requested = get_pending_fees(&env, &provider, &token);
 
-        if amount > 0 {
-            // #691 – honour preferred payout currency when set and conversion succeeds.
-            let converted = if let Some(pref_token) = get_provider_payout_currency(&env, &provider)
-            {
-                if pref_token != token {
-                    Self::try_claim_in_preferred_currency(
+        if requested > 0 {
+            // ── Issue #940: Per-epoch rebate cap (duplicate: also closes #947) ──
+            // Compute capped amount: cap = epoch_fees * max_rebate_bps / 10_000.
+            // If the remaining headroom for this epoch is less than the requested
+            // amount, scale the claim down proportionally and emit RebateCapApplied.
+            // When epoch_fees is zero (epoch just started or no fees yet), bypass
+            // the cap to avoid blocking legitimate claims.
+            let epoch_day = env.ledger().timestamp() / SECONDS_PER_DAY_FC;
+            let epoch_fees = get_daily_fee_total(&env, &token, epoch_day);
+            let max_rebate_bps = get_max_rebate_bps(&env);
+
+            let amount = if epoch_fees > 0 {
+                let epoch_cap = epoch_fees
+                    .checked_mul(max_rebate_bps as i128)
+                    .and_then(|v| v.checked_div(10_000))
+                    .unwrap_or(i128::MAX);
+                let already_distributed = get_epoch_rebate_distributed(&env, &token, epoch_day);
+                let remaining_headroom = epoch_cap.saturating_sub(already_distributed);
+
+                if remaining_headroom < requested {
+                    // Cap triggered: scale down and emit event.
+                    emit_rebate_cap_applied(
                         &env,
-                        &provider,
-                        &token,
-                        amount,
-                        &pref_token,
-                    )
+                        EvtRebateCapApplied {
+                            epoch: epoch_day,
+                            requested,
+                            distributed: remaining_headroom,
+                        },
+                    );
+                    remaining_headroom
+                } else {
+                    requested
+                }
+            } else {
+                requested
+            };
+
+            // Record how much was distributed this epoch before transfer.
+            if amount > 0 && epoch_fees > 0 {
+                add_epoch_rebate_distributed(&env, &token, epoch_day, amount);
+            }
+
+            // #691 – honour preferred payout currency when set and conversion succeeds.
+            let converted = if amount > 0 {
+                if let Some(pref_token) = get_provider_payout_currency(&env, &provider) {
+                    if pref_token != token {
+                        Self::try_claim_in_preferred_currency(
+                            &env,
+                            &provider,
+                            &token,
+                            amount,
+                            &pref_token,
+                        )
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -1087,11 +1350,13 @@ impl FeeCollector {
 
             if converted.is_none() {
                 // Default: settle in source token.
-                token::Client::new(&env, &token).transfer(
-                    &env.current_contract_address(),
-                    &provider,
-                    &amount,
-                );
+                if amount > 0 {
+                    token::Client::new(&env, &token).transfer(
+                        &env.current_contract_address(),
+                        &provider,
+                        &amount,
+                    );
+                }
                 set_pending_fees(&env, &provider, &token, 0);
                 emit_fees_claimed(
                     &env,
@@ -1102,6 +1367,8 @@ impl FeeCollector {
                     },
                 );
             }
+
+            Ok(amount)
         } else {
             emit_fees_claimed(
                 &env,
@@ -1111,9 +1378,8 @@ impl FeeCollector {
                     amount: 0,
                 },
             );
+            Ok(0)
         }
-
-        Ok(amount)
     }
 
     /// Attempt to convert `source_amount` of `source_token` into `pref_token`
@@ -1245,6 +1511,32 @@ impl FeeCollector {
         Ok(())
     }
 
+    /// Admin: register a token's metadata for validation in bridge and
+    /// fee flows. Rejects tokens with invalid or ambiguous metadata.
+    pub fn register_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        symbol: String,
+        name: String,
+        decimals: u32,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        admin.require_auth();
+
+        let metadata = TokenMetadata {
+            symbol: symbol.clone(),
+            name: name.clone(),
+            decimals,
+        };
+        validate_token_metadata(&metadata).map_err(|_| ContractError::InvalidTokenMetadata)?;
+
+        storage::set_registered_token_metadata(&env, &token, &metadata);
+        Ok(())
+    }
+
     /// Calculate fee with optional protocol token discount.
     /// If the token being used matches the configured protocol token,
     /// a 50% discount is applied (fee_rate is halved).
@@ -1256,6 +1548,16 @@ impl FeeCollector {
             }
         }
         base_rate
+    }
+
+    /// Validate that a token has registered metadata and that it passes
+    /// the protocol's metadata sanity checks (decimals ≤ 18, non-empty
+    /// symbol ≤ 12 chars, non-empty name ≤ 64 chars).
+    fn validate_token_metadata_for_token(env: &Env, token: &Address) -> Result<(), ContractError> {
+        if let Some(metadata) = storage::get_registered_token_metadata(env, token) {
+            validate_token_metadata(&metadata).map_err(|_| ContractError::InvalidTokenMetadata)?;
+        }
+        Ok(())
     }
 
     // ── Issue #442: Revenue Sharing with Token Holders ──────────────
@@ -1718,5 +2020,54 @@ impl FeeCollector {
         set_referral_fee_share_bps(&env, share_bps);
         emit_referral_fee_share_updated(&env, old_bps, share_bps, &admin);
         Ok(())
+    }
+
+    // ── Issue #940: Fee Rebate Cap (duplicate: also closes #947) ────────────────
+
+    /// Returns the current maximum rebate bps setting.
+    /// Defaults to 8000 (80% of epoch fees).
+    pub fn get_max_rebate_bps(env: Env) -> u32 {
+        get_max_rebate_bps(&env)
+    }
+
+    /// Admin: configure the maximum fraction of epoch fees that may be rebated
+    /// to providers in a single epoch.
+    ///
+    /// - `bps` must be in `[0, 10_000]`.
+    /// - Default: 8000 (80%).
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not yet initialized.
+    /// - [`ContractError::Unauthorized`] — caller is not the admin.
+    /// - [`ContractError::InvalidFeeConfiguration`] — `bps` exceeds 10_000.
+    pub fn set_max_rebate_bps(env: Env, bps: u32) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        if bps > 10_000 {
+            return Err(ContractError::InvalidFeeConfiguration);
+        }
+        set_max_rebate_bps_storage(&env, bps);
+        Ok(())
+    }
+
+    // ── Issue #862: Health / Readiness ─────────────────────────────────────────
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        if !is_initialized(&env) {
+            return health_uninitialized(&env, version);
+        }
+        let admin = get_admin(&env);
+        HealthStatus {
+            is_initialized: true,
+            is_paused: pausable::is_paused(&env),
+            version,
+            admin,
+            initialized_at: 0,
+        }
     }
 }

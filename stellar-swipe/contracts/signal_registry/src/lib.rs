@@ -25,6 +25,7 @@ mod migration;
 mod ml_scoring;
 mod multisig_approvals;
 mod performance;
+mod provider_onboarding;
 mod providers;
 mod query;
 /// Contract-wide cross-contract reentrancy guard (Issue #781).
@@ -74,6 +75,7 @@ use shared::version::{
 use stellar_swipe_common::emergency::{PauseState, CAT_SIGNALS, CAT_TRADING};
 use stellar_swipe_common::rate_limit::{self as rl, ActionType as RLAction, RateLimitConfig};
 use stellar_swipe_common::SECONDS_PER_30_DAY_MONTH;
+use stellar_swipe_common::{emit_health_event, HealthStatus};
 
 use combos::{
     cancel_combo, create_combo_signal, execute_combo_signal, get_combo, get_combo_executions_pub,
@@ -97,7 +99,7 @@ pub use ml_scoring::{MLModel, SignalFeatures, SignalScore};
 use providers::VerificationEligibility;
 use reputation::{
     calculate_trust_score, get_trust_score, update_median_values, update_trust_score,
-    TrustScoreDetails, TrustScoreTier,
+    ReputationSnapshot, TrustScoreDetails, TrustScoreTier,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal, Map, String,
@@ -664,25 +666,49 @@ impl SignalRegistry {
         let signals = Self::get_signals_map(&env);
         let expired_signal_count = expiry::count_prunable_signals(&env, &signals);
         if !admin::has_admin(&env) {
-            return RegistryHealthStatus {
+            let status = RegistryHealthStatus {
                 is_initialized: false,
                 is_paused: false,
                 version,
                 admin: placeholder_admin(&env),
                 expired_signal_count,
+                initialized_at: 0,
             };
+            emit_health_event(
+                &env,
+                &HealthStatus {
+                    is_initialized: status.is_initialized,
+                    is_paused: status.is_paused,
+                    version: status.version.clone(),
+                    admin: status.admin.clone(),
+                    initialized_at: status.initialized_at,
+                },
+            );
+            return status;
         }
         let admin_addr = match get_admin(&env) {
             Ok(a) => a,
             Err(_) => placeholder_admin(&env),
         };
-        RegistryHealthStatus {
+        let status = RegistryHealthStatus {
             is_initialized: true,
             is_paused: is_trading_paused(&env),
             version,
             admin: admin_addr,
             expired_signal_count,
-        }
+            initialized_at: env.ledger().timestamp(),
+        };
+        emit_health_event(
+            &env,
+            &HealthStatus {
+                is_initialized: status.is_initialized,
+                is_paused: status.is_paused,
+                version: status.version.clone(),
+                admin: status.admin.clone(),
+                initialized_at: status.initialized_at,
+            },
+        );
+        status
     }
 
     /// Permanently remove up to `max_entries` expired signals from instance
@@ -1282,7 +1308,6 @@ impl SignalRegistry {
             submitted_at: now,
             expiry,
             status: SignalStatus::Active,
-            // Initialize performance tracking fields
             executions: 0,
             successful_executions: 0,
             total_volume: 0,
@@ -1291,7 +1316,6 @@ impl SignalRegistry {
             category: category.clone(),
             tags: unique_tags.clone(),
             risk_level,
-            // Collaboration field
             is_collaborative: false,
             rationale_hash,
             confidence: 50,
@@ -2142,6 +2166,13 @@ impl SignalRegistry {
         Ok(())
     }
 
+    /// Read-only: the total staked amount for `provider`, or `0` when not staked.
+    pub fn get_stake(env: Env, provider: Address) -> i128 {
+        stake::get_stake_info(&env, &provider)
+            .map(|info| info.amount)
+            .unwrap_or(0)
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // Issue #424: Provider Ban Mechanism
     // ═══════════════════════════════════════════════════════════════
@@ -2484,6 +2515,23 @@ impl SignalRegistry {
         } else {
             expiry::get_active_signals(&env, &signals)
         }
+    }
+
+    /// Read-only, cursor-paginated history of all signals a provider has
+    /// ever submitted. Newest-first with deterministic ordering; pages are
+    /// bounded to at most [`query::MAX_HISTORY_PAGE_SIZE`] records so large
+    /// histories do not exceed Soroban resource limits.
+    ///
+    /// See [`query::get_provider_signal_history`] for the full pagination
+    /// semantics (cursor exclusivity, clamping, out-of-range / empty pages).
+    pub fn get_provider_signal_history(
+        env: Env,
+        provider: Address,
+        cursor: Option<u64>,
+        limit: u32,
+    ) -> query::ProviderSignalHistoryPage {
+        let signals_map = Self::get_signals_map(&env);
+        query::get_provider_signal_history(&env, &signals_map, &provider, cursor, limit)
     }
 
     /* =========================
@@ -3403,6 +3451,30 @@ impl SignalRegistry {
         ))
     }
 
+    /// Cross-contract read-only reputation snapshot (issue #1027).
+    ///
+    /// Returns a stable, self-describing [`ReputationSnapshot`] for `provider`,
+    /// derived entirely from canonical contract state (provider stats, stake and
+    /// rolling reputation score) as of the current ledger timestamp. It performs
+    /// no authentication and no storage writes, so other contracts can call it
+    /// during risk assessment or incentive determination without mutating this
+    /// contract. An unknown provider yields a well-formed, zeroed snapshot with
+    /// `has_sufficient_history == false`.
+    pub fn reputation_snapshot(env: Env, provider: Address) -> ReputationSnapshot {
+        let performance =
+            Self::get_provider_stats(env.clone(), provider.clone()).unwrap_or_default();
+        let stake_info = stake::get_stake_info(&env, &provider);
+        let reputation_score = Self::get_provider_reputation_score(env.clone(), provider.clone());
+
+        reputation::build_reputation_snapshot(
+            &env,
+            &provider,
+            &performance,
+            &stake_info,
+            reputation_score,
+        )
+    }
+
     /// Update trust score for a provider (called after performance changes)
     ///
     /// This should be called when:
@@ -3617,6 +3689,12 @@ mod test_adoption;
 /// Signal categorization query tests (Issue #660).
 #[cfg(test)]
 mod test_categorization;
+/// Composite churn-risk scoring tests (Issue #944).
+#[cfg(test)]
+mod test_churn_risk;
+/// Collaborative signal reward distribution tests (Issue #957).
+#[cfg(test)]
+mod test_collaboration;
 #[cfg(test)]
 mod test_daily_signal_limit;
 #[cfg(test)]

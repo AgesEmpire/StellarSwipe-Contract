@@ -117,6 +117,44 @@ Emitted when a keeper triggers a take-profit close.
 | `take_profit_price` | `i128` | Configured threshold |
 | `current_price` | `i128` | Oracle price at trigger time |
 
+### Batch settlement (`trade_executor::batch_settlement`)
+
+Events published by the settlement module (`contracts/trade_executor/src/batch_settlement.rs`)
+under the `settle` topic prefix. Slippage bounds (Issue #991) are enforced before any
+fill is recorded, so a violating batch produces **no** event and no accounting update.
+
+#### `settle/created`
+Emitted when a settlement order is created.
+
+| Field | Type | Description |
+|---|---|---|
+| `order_id` | `u64` | Assigned settlement order ID |
+| `user` | `Address` | Order owner |
+| `requested_amount` | `i128` | Total amount requested |
+
+#### `settle/fill`
+Emitted when a batch fill is recorded. Includes both the requested and the actual
+settlement amounts so off-chain trackers can detect slippage.
+
+| Field | Type | Description |
+|---|---|---|
+| `order_id` | `u64` | Settlement order ID |
+| `fill_index` | `u32` | 1-based fill sequence number |
+| `requested_amount` | `i128` | Amount requested by the order |
+| `filled_amount` | `i128` | Actual amount settled in this batch |
+| `total_settled` | `i128` | Cumulative amount settled |
+| `remaining` | `i128` | Amount still outstanding |
+| `status` | `u32` | `SettlementStatus` discriminant (`0`=Open, `1`=PartiallyFilled, `2`=FullySettled, `3`=Failed) |
+
+#### `settle/closed`
+Emitted when an order reaches `FullySettled` or is failed via `fail_settlement_order`.
+
+| Field | Type | Description |
+|---|---|---|
+| `order_id` | `u64` | Settlement order ID |
+| `status` | `u32` | Closing `SettlementStatus` discriminant |
+| `total_settled` | `i128` | Cumulative amount settled at close |
+
 ---
 
 ## UserPortfolio (`user_portfolio`)

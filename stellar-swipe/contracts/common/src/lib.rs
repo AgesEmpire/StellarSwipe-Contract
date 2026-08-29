@@ -5,9 +5,13 @@ pub mod emit;
 /// Shared input-sanitization helper for string-based metadata fields (issue #676).
 pub mod sanitize;
 pub use sanitize::{sanitize_string, SanitizeError};
+/// Centralized asset-pair validation for trading contracts (Issue #992).
+pub mod pair_validation;
 
 #[allow(deprecated)]
 pub mod amm_bridge;
+/// Safe arithmetic guardrails for APY / reward-rate calculations (issue #1024).
+pub mod apy_math;
 pub mod assets;
 pub mod budget_regression;
 /// Checked-arithmetic wrapper for financial amounts (issue #599).
@@ -29,6 +33,8 @@ pub mod replay_protection;
 pub mod retry_backoff;
 /// Generic CRUD helpers to replace per-contract storage boilerplate (Issue #579).
 pub mod storage_crud;
+/// Token metadata and decimal validation shared by deposit/withdraw paths (Issue #880).
+pub mod token_metadata;
 pub mod ttl_manager;
 
 pub use amm_bridge::{
@@ -49,7 +55,7 @@ pub use constants::{
     STELLAR_AMOUNT_SCALE,
 };
 pub use emergency::PauseState;
-pub use health::{health_uninitialized, placeholder_admin, HealthStatus};
+pub use health::{emit_health_event, health_uninitialized, placeholder_admin, HealthStatus};
 pub use multisig::{
     approve, cancel, emit_approval_recorded, emit_proposal_approved, emit_proposal_cancelled,
     emit_proposal_created, emit_proposal_executed, emit_timelock_config_updated,
@@ -64,6 +70,10 @@ pub use oracle::{
     oracle_price_to_i128, validate_freshness, validate_oracle_price, validate_price_bounds,
     IOracleClient, MockOracleClient, OnChainOracleClient, OracleError, OraclePrice,
     MAX_ORACLE_PRICE, MIN_ORACLE_PRICE,
+};
+pub use pair_validation::{
+    asset_is_registered, route_supports_pair, validate_distinct, validate_pair_for_route,
+    validate_registered_distinct_pair, PairValidationError,
 };
 pub use perf::{
     mark_operation, op_batch_execute, op_collect_fee, op_create_signal, op_execute_trade,

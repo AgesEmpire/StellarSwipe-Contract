@@ -36,9 +36,19 @@ fn threshold_bps(env: &Env, pair: &AssetPair) -> u32 {
 /// Called before accepting a new price update.
 ///
 /// If a threshold is configured and the deviation from the previous accepted
-/// price exceeds it, the breaker is tripped and `PriceDeviationBreakerTripped`
-/// is returned so the caller rejects the update without storing it.
-pub fn check_and_trip(env: &Env, pair: &AssetPair, new_price: i128) -> Result<(), OracleError> {
+/// price exceeds it, the breaker is tripped (flag persisted + event emitted)
+/// and `Ok(true)` is returned so the caller rejects the update without storing
+/// it. The tripping call must *succeed* (return `Ok`) so the trip flag write
+/// survives: Soroban rolls back all storage writes of a contract call that
+/// returns an error, which would silently undo the trip.
+///
+/// Returns:
+/// - `Ok(true)` — the update deviated past the threshold; breaker tripped,
+///   update rejected (caller must not store the price).
+/// - `Ok(false)` — the update is acceptable and should be stored.
+/// - `Err(PriceDeviationBreakerTripped)` — the breaker is already tripped;
+///   reject the update (no writes are made in this path, so nothing reverts).
+pub fn check_and_trip(env: &Env, pair: &AssetPair, new_price: i128) -> Result<bool, OracleError> {
     // If already tripped, reject all new updates until admin resets.
     if is_tripped(env, pair) {
         return Err(OracleError::PriceDeviationBreakerTripped);
@@ -46,32 +56,35 @@ pub fn check_and_trip(env: &Env, pair: &AssetPair, new_price: i128) -> Result<()
 
     let max_bps = threshold_bps(env, pair);
     if max_bps == 0 {
-        return Ok(());
+        return Ok(false);
     }
 
     // Compare against the previous accepted price.
     let prev_price = match storage::get_price(env, pair) {
         Ok(p) if p > 0 => p,
-        _ => return Ok(()), // No prior price — first update is always accepted.
+        _ => return Ok(false), // No prior price — first update is always accepted.
     };
 
     let deviation_bps = ((new_price - prev_price).abs() * 10_000) / prev_price;
     if deviation_bps as u32 > max_bps {
-        // Trip the breaker.
-        env.storage()
-            .instance()
-            .set(&StorageKey::DeviationBreakerTripped(pair.clone()), &true);
-
-        #[allow(deprecated)]
-        env.events().publish(
-            (symbol_short!("oracle"), symbol_short!("dev_trip")),
-            (pair.clone(), prev_price, new_price, deviation_bps),
-        );
-
-        return Err(OracleError::PriceDeviationBreakerTripped);
+        trip(env, pair, prev_price, new_price, deviation_bps);
+        return Ok(true);
     }
 
-    Ok(())
+    Ok(false)
+}
+
+/// Persist the tripped flag and emit the `dev_trip` event.
+fn trip(env: &Env, pair: &AssetPair, prev_price: i128, new_price: i128, deviation_bps: i128) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::DeviationBreakerTripped(pair.clone()), &true);
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("oracle"), symbol_short!("dev_trip")),
+        (pair.clone(), prev_price, new_price, deviation_bps),
+    );
 }
 
 /// Returns `PriceDeviationBreakerTripped` if the breaker is currently tripped

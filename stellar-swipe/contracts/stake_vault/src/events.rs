@@ -194,6 +194,14 @@ pub struct EvtLockMultiplierTierUpdated {
     pub bps: u32,
 }
 
+/// Slash cooldown updated by admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtSlashCooldownUpdated {
+    pub schema_version: u32,
+    pub cooldown_ledgers: u32,
+}
+
 // ── Emergency multi-sig unstake events (issue #754) ───────────────────────────
 
 #[contracttype]
@@ -472,12 +480,17 @@ pub fn emit_lock_multiplier_tier_updated(env: &Env, weeks: u32, bps: u32) {
     );
 }
 
-pub fn emit_emergency_configured(
-    env: &Env,
-    required: u32,
-    penalty_bps: u32,
-    timeout_secs: u64,
-) {
+pub fn emit_slash_cooldown_updated(env: &Env, cooldown_ledgers: u32) {
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_STAKE_SLASH_COOLDOWN()),
+        EvtSlashCooldownUpdated {
+            schema_version: SCHEMA_VERSION,
+            cooldown_ledgers,
+        },
+    );
+}
+
+pub fn emit_emergency_configured(env: &Env, required: u32, penalty_bps: u32, timeout_secs: u64) {
     env.events().publish(
         (contract_topic(env), topics::TOPIC_STAKE_EMERGENCY_CFG()),
         EvtEmergencyConfigured {
@@ -516,10 +529,7 @@ pub fn emit_emergency_approved(env: &Env, staker: Address, signer: Address, appr
 
 pub fn emit_emergency_expired(env: &Env, staker: Address) {
     env.events().publish(
-        (
-            contract_topic(env),
-            topics::TOPIC_STAKE_EMERGENCY_EXPIRED(),
-        ),
+        (contract_topic(env), topics::TOPIC_STAKE_EMERGENCY_EXPIRED()),
         EvtEmergencyExpired {
             schema_version: SCHEMA_VERSION,
             staker,

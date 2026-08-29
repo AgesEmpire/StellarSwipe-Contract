@@ -192,6 +192,23 @@
       "AppealAlreadySubmitted": 1603,
       "AppealNotPending": 1604,
       "AppealWindowNotElapsed": 1605
+    },
+    "ProviderOnboardingError": {
+      "NotConfigured": 1700,
+      "EmptyProviderId": 1701,
+      "ProviderIdTooLong": 1702,
+      "MetadataUriTooLong": 1703,
+      "CollateralBelowMinimum": 1704,
+      "FeeBelowMinimum": 1705,
+      "InvalidAmount": 1706,
+      "DuplicateApplication": 1707,
+      "ApplicationNotFound": 1708,
+      "InvalidStateTransition": 1709,
+      "AlreadyFinalized": 1710,
+      "NothingToRefund": 1711,
+      "ArithmeticError": 1712,
+      "Unauthorized": 1713,
+      "InvalidConfig": 1714
     }
   }
 }

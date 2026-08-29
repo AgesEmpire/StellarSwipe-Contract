@@ -1,7 +1,11 @@
 #![no_std]
 
+use shared::reentrancy;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+};
+use stellar_swipe_common::token_metadata::{
+    validate as validate_token_metadata, TokenMetadata, TokenMetadataError,
 };
 use stellar_swipe_common::SECONDS_PER_DAY;
 
@@ -13,23 +17,38 @@ pub use validators::{ValidatorApproval, ValidatorApprovalKind, ValidatorSet};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum BridgeError {
+    /// `initialize()` was called on a bridge contract that already has an admin set.
     AlreadyInitialized = 1,
+    /// Transfer, fee, or threshold amount is zero, negative, or otherwise out of range.
     InvalidAmount = 2,
+    /// Validator set passed to `initialize`/updates is empty or fails threshold checks.
     InvalidValidatorSet = 3,
+    /// Caller is not a member of the active validator set for this bridge.
     UnauthorizedValidator = 4,
+    /// No transfer exists for the given transfer id.
     TransferNotFound = 5,
+    /// Transfer has already been executed; cannot be executed a second time.
     TransferAlreadyExecuted = 6,
+    /// Source-chain transaction hash has already been used for a lock/burn (replay attempt).
     ReplayDetected = 7,
+    /// This validator has already submitted a signature for this transfer.
     SignatureAlreadyUsed = 8,
+    /// Fewer validator approvals have been collected than the required threshold.
     NotEnoughValidatorApprovals = 9,
+    /// Transfer would push the rolling 24h volume past the configured daily limit.
     DailyLimitExceeded = 10,
+    /// Single transfer amount exceeds the configured per-transfer maximum.
     MaxTransferExceeded = 11,
+    /// Caller's wrapped-asset balance is lower than the amount requested to burn/withdraw.
     InsufficientWrappedBalance = 12,
+    /// Burn/unlock withdrawal was requested before its mandatory delay window elapsed.
     WithdrawalNotReady = 13,
+    /// Requested operation is not valid for the transfer's current status.
     InvalidOperation = 14,
     /// Withdrawal exceeds the dynamic limit derived from available liquidity buffer.
     /// Distinct from DailyLimitExceeded (static anti-spam) so callers can differentiate.
     DynamicLiquidityLimitExceeded = 15,
+    /// Validator approval threshold is zero, exceeds validator count, or otherwise invalid.
     InvalidThreshold = 16,
     /// Destination chain is not on the admin-managed allowlist (Issue #669).
     UnsupportedDestinationChain = 17,
@@ -37,18 +56,77 @@ pub enum BridgeError {
     OutOfOrderNonce = 18,
     /// Message nonce was already confirmed; duplicate delivery rejected (Issue #668).
     DuplicateNonce = 19,
-    /// Message was already consumed on this deployment — replay blocked (Issue #988).
-    MessageAlreadyConsumed = 20,
-    /// Withdrawal exceeds the per-route message cap (Issue #989).
-    PerRouteLimitExceeded = 21,
-    /// Aggregate withdrawal volume within the route window exceeded (Issue #989).
-    AggregateWindowLimitExceeded = 22,
-    /// Caller lacks authority to change withdrawal route limits (Issue #989).
-    LimitChangeUnauthorized = 23,
-    /// Transfer is in a permanently failed state and cannot be retried (Issue #990).
-    TransferPermanentlyFailed = 24,
-    /// Transfer is not in a retryable state (Issue #990).
-    TransferNotRetryable = 25,
+    /// The bridge is paused (governance-driven emergency pause). See Issue #865.
+    ContractPaused = 20,
+    /// Token metadata (decimals, symbol, or name) is invalid or missing.
+    InvalidTokenMetadata = 21,
+}
+
+impl BridgeError {
+    /// Short, human-readable description of when this error is returned.
+    ///
+    /// Intended for logs/operator tooling; not part of the on-chain XDR spec.
+    pub fn message(&self) -> &'static str {
+        match self {
+            BridgeError::AlreadyInitialized => {
+                "bridge contract has already been initialized with an admin"
+            }
+            BridgeError::InvalidAmount => "amount must be a positive value within allowed bounds",
+            BridgeError::InvalidValidatorSet => {
+                "validator set is empty or fails minimum threshold requirements"
+            }
+            BridgeError::UnauthorizedValidator => {
+                "caller is not a member of the active validator set"
+            }
+            BridgeError::TransferNotFound => "no transfer exists for the given transfer id",
+            BridgeError::TransferAlreadyExecuted => {
+                "transfer has already been executed and cannot run again"
+            }
+            BridgeError::ReplayDetected => {
+                "source-chain transaction hash was already used for a transfer"
+            }
+            BridgeError::SignatureAlreadyUsed => {
+                "this validator has already signed off on this transfer"
+            }
+            BridgeError::NotEnoughValidatorApprovals => {
+                "not enough validator approvals collected yet to meet the threshold"
+            }
+            BridgeError::DailyLimitExceeded => {
+                "transfer would exceed the configured rolling daily volume limit"
+            }
+            BridgeError::MaxTransferExceeded => {
+                "transfer amount exceeds the configured per-transfer maximum"
+            }
+            BridgeError::InsufficientWrappedBalance => {
+                "caller's wrapped-asset balance is too low for this burn/withdrawal"
+            }
+            BridgeError::WithdrawalNotReady => {
+                "withdrawal was requested before its mandatory delay window elapsed"
+            }
+            BridgeError::InvalidOperation => {
+                "requested operation is not valid for the transfer's current status"
+            }
+            BridgeError::DynamicLiquidityLimitExceeded => {
+                "withdrawal exceeds the dynamic limit derived from the liquidity buffer"
+            }
+            BridgeError::InvalidThreshold => {
+                "validator approval threshold is zero, too high, or otherwise invalid"
+            }
+            BridgeError::UnsupportedDestinationChain => {
+                "destination chain is not on the admin-managed allowlist"
+            }
+            BridgeError::OutOfOrderNonce => {
+                "message nonce is out of order; earlier messages must be confirmed first"
+            }
+            BridgeError::DuplicateNonce => {
+                "message nonce was already confirmed; duplicate delivery rejected"
+            }
+            BridgeError::ContractPaused => "bridge is paused (governance-driven emergency pause)",
+            BridgeError::InvalidTokenMetadata => {
+                "token metadata (decimals, symbol, or name) is invalid or missing"
+            }
+        }
+    }
 }
 
 #[contracttype]
@@ -174,14 +252,11 @@ pub enum DataKey {
     ReserveThreshold,
     /// Admin-managed set of supported destination chain IDs (Issue #669).
     SupportedChains,
-    /// Unique deployment identifier for cross-deployment replay protection (Issue #988).
-    DeploymentId,
-    /// Consumed message hash: (deployment_id, source_chain, source_tx_hash, source_nonce) -> true.
-    ConsumedMessage(String),
-    /// Per-route withdrawal config keyed by route identifier (Issue #989).
-    WithdrawalRouteConfig(ChainId, ChainId, String),
-    /// Rolling withdrawal window for a route (Issue #989).
-    WithdrawalWindow(ChainId, ChainId, String),
+    /// Issue #865: global pause flag set via governance-driven propagation.
+    Paused,
+    /// Issue #865: central governance contract address authorized to call
+    /// `apply_governance_pause`.
+    GovernanceAddress,
 }
 
 const DAY_SECONDS: u64 = 86_400;
@@ -273,6 +348,22 @@ impl BridgeContract {
             admin.require_auth();
         }
 
+        // Validate token metadata before accepting registration.
+        let metadata = TokenMetadata {
+            symbol: source_asset.clone(),
+            name: source_asset.clone(),
+            decimals,
+        };
+        validate_token_metadata(&metadata).map_err(|_| BridgeError::InvalidTokenMetadata)?;
+
+        let wrapped_metadata = TokenMetadata {
+            symbol: wrapped_asset.clone(),
+            name: wrapped_asset.clone(),
+            decimals,
+        };
+        validate_token_metadata(&wrapped_metadata)
+            .map_err(|_| BridgeError::InvalidTokenMetadata)?;
+
         let asset = WrappedAsset {
             source_chain,
             source_asset,
@@ -306,6 +397,9 @@ impl BridgeContract {
         source_nonce: u64,
         destination_recipient: String,
     ) -> Result<u64, BridgeError> {
+        if is_paused(&env) {
+            return Err(BridgeError::ContractPaused);
+        }
         if !cfg!(test) {
             user.require_auth();
         }
@@ -431,6 +525,11 @@ impl BridgeContract {
         admin: Address,
         transfer_id: u64,
     ) -> Result<(), BridgeError> {
+        // Issue #859: Reentrancy guard for cross-contract state transitions.
+        reentrancy::require_not_locked(&env).map_err(|_| BridgeError::InvalidOperation)?;
+        if is_paused(&env) {
+            return Err(BridgeError::ContractPaused);
+        }
         require_admin(&env, &admin)?;
         if !cfg!(test) {
             admin.require_auth();
@@ -508,6 +607,9 @@ impl BridgeContract {
         amount: i128,
         destination_recipient: String,
     ) -> Result<u64, BridgeError> {
+        if is_paused(&env) {
+            return Err(BridgeError::ContractPaused);
+        }
         if !cfg!(test) {
             user.require_auth();
         }
@@ -612,6 +714,9 @@ impl BridgeContract {
         admin: Address,
         transfer_id: u64,
     ) -> Result<(), BridgeError> {
+        if is_paused(&env) {
+            return Err(BridgeError::ContractPaused);
+        }
         let config = require_admin(&env, &admin)?;
         if !cfg!(test) {
             admin.require_auth();
@@ -829,7 +934,64 @@ impl BridgeContract {
 
     /// Read-only health for ops / frontends.
     pub fn health_check(env: Env) -> stellar_swipe_common::HealthStatus {
-        crate::governance::bridge_health_check(&env)
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        let config: Option<BridgeConfig> = env.storage().instance().get(&DataKey::Config);
+        match config {
+            Some(cfg) => {
+                let status = stellar_swipe_common::HealthStatus {
+                    is_initialized: true,
+                    is_paused: is_paused(&env),
+                    version,
+                    admin: cfg.admin,
+                    initialized_at: env.ledger().timestamp(),
+                };
+                stellar_swipe_common::emit_health_event(&env, &status);
+                status
+            }
+            None => crate::governance::bridge_health_check(&env),
+        }
+    }
+
+    // ── Issue #865: governance-driven pause propagation ────────────────────────
+
+    /// Set the central governance contract address authorized to call
+    /// `apply_governance_pause`. Admin only.
+    pub fn set_governance(
+        env: Env,
+        admin: Address,
+        governance: Address,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceAddress, &governance);
+        Ok(())
+    }
+
+    /// Read-only: the configured governance contract address, if any.
+    pub fn get_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::GovernanceAddress)
+    }
+
+    /// Called by the configured governance contract to propagate a pause/unpause.
+    /// Rejects new lock-mint/burn-unlock transfers and their execution while paused.
+    pub fn apply_governance_pause(env: Env, paused: bool) -> Result<(), BridgeError> {
+        let governance: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceAddress)
+            .ok_or(BridgeError::UnauthorizedValidator)?;
+        governance.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        Ok(())
+    }
+
+    /// Read-only: true when a governance-driven emergency pause is active.
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
     }
 
     // ── #613 Dynamic liquidity rate-limit ──────────────────────────────────────
@@ -1148,6 +1310,14 @@ fn require_admin(env: &Env, admin: &Address) -> Result<BridgeConfig, BridgeError
         return Err(BridgeError::UnauthorizedValidator);
     }
     Ok(config)
+}
+
+/// Issue #865: true when a governance-driven emergency pause is active.
+fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
 }
 
 fn get_transfer(env: &Env, transfer_id: u64) -> Result<BridgeTransfer, BridgeError> {
@@ -1659,6 +1829,32 @@ mod test {
             );
             assert_eq!(result, Err(BridgeError::DynamicLiquidityLimitExceeded));
         });
+    }
+
+    #[test]
+    fn error_messages_are_non_empty_and_distinct() {
+        let samples = [
+            BridgeError::AlreadyInitialized,
+            BridgeError::InvalidAmount,
+            BridgeError::TransferNotFound,
+            BridgeError::ReplayDetected,
+            BridgeError::DynamicLiquidityLimitExceeded,
+            BridgeError::UnsupportedDestinationChain,
+        ];
+        for err in samples.iter() {
+            assert!(!err.message().is_empty());
+        }
+        for i in 0..samples.len() {
+            for j in (i + 1)..samples.len() {
+                assert_ne!(
+                    samples[i].message(),
+                    samples[j].message(),
+                    "expected distinct messages for {:?} and {:?}",
+                    samples[i],
+                    samples[j]
+                );
+            }
+        }
     }
 
     #[test]

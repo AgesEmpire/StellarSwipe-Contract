@@ -1340,7 +1340,7 @@ fn reputation_config_can_be_updated_by_admin() {
         default_tier: ReputationTier::Bronze,
     };
     let result = client.update_reputation_config(&admin, &updated);
-    assert_eq!(result.decay_enabled, false);
+    assert!(!result.decay_enabled);
 
     // Verify it's stored
     let config = client.reputation_config();
@@ -3013,4 +3013,351 @@ fn reclaim_expired_proposal_removes_entry_and_is_callable_by_anyone() {
         i += 1;
     }
     assert!(!found);
+}
+
+#[test]
+fn error_messages_are_non_empty_and_distinct() {
+    // A representative sample of raw variants plus at least one alias const
+    // (Issue #883). Aliases resolve to their target variant's value, so
+    // `ContractPaused` and `Unauthorized` intentionally share a message —
+    // see `GovernanceError::message()`'s doc comment for why.
+    let samples = [
+        GovernanceError::NotInitialized,
+        GovernanceError::Unauthorized,
+        GovernanceError::ProposalNotFound,
+        GovernanceError::VotingEnded,
+        GovernanceError::BudgetExceeded,
+        GovernanceError::ContractPaused, // alias const → Unauthorized
+    ];
+    for err in samples.iter() {
+        assert!(!err.message().is_empty());
+    }
+    assert_eq!(
+        GovernanceError::Unauthorized.message(),
+        GovernanceError::ContractPaused.message(),
+        "alias consts share their target variant's runtime value and message"
+    );
+
+    let distinct = [
+        GovernanceError::NotInitialized,
+        GovernanceError::Unauthorized,
+        GovernanceError::ProposalNotFound,
+        GovernanceError::VotingEnded,
+        GovernanceError::BudgetExceeded,
+    ];
+    for i in 0..distinct.len() {
+        for j in (i + 1)..distinct.len() {
+            assert_ne!(
+                distinct[i].message(),
+                distinct[j].message(),
+                "expected distinct messages for {:?} and {:?}",
+                distinct[i],
+                distinct[j]
+            );
+        }
+    }
+}
+
+// ── Issue #998: vote accounting resistant to duplicate participation ────────
+
+#[test]
+fn duplicate_vote_on_proposal_is_rejected_and_tally_unchanged() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "dedup")),
+        &String::from_str(&env, "Dedup"),
+        &String::from_str(&env, "A voter may not be counted twice"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+
+    env.ledger().set_timestamp(70);
+    client.cast_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+
+    let after_first = client.proposal(&proposal_id);
+    assert_eq!(after_first.votes_for, 120_000_000);
+    assert_eq!(after_first.voter_list.len(), 1);
+
+    // Repeated submission attempt (e.g. a client retry) must be rejected
+    // without mutating the tally.
+    let result = client.try_cast_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::AlreadyVoted)));
+
+    // A duplicate attempt casting the *opposite* choice must also be
+    // rejected — the recorded participation, not just the chosen side,
+    // is what's checked.
+    let opposite = client.try_cast_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::Against,
+    );
+    assert_eq!(opposite, Err(Ok(GovernanceError::AlreadyVoted)));
+
+    let after_retries = client.proposal(&proposal_id);
+    assert_eq!(after_retries.votes_for, 120_000_000, "tally must be unchanged");
+    assert_eq!(after_retries.votes_against, 0, "tally must be unchanged");
+    assert_eq!(
+        after_retries.voter_list.len(),
+        1,
+        "exactly one participation record per voter"
+    );
+}
+
+#[test]
+fn late_vote_on_proposal_is_rejected_with_no_tally_change() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "late")),
+        &String::from_str(&env, "Late"),
+        &String::from_str(&env, "Votes after voting_ends must be rejected"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+
+    // voting_ends = voting_delay(60) + voting_period(7d) = 604_860.
+    env.ledger().set_timestamp(604_860);
+    let result = client.try_cast_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::VotingEnded)));
+
+    let proposal = client.proposal(&proposal_id);
+    assert_eq!(proposal.votes_for, 0);
+    assert_eq!(proposal.votes_against, 0);
+    assert_eq!(proposal.votes_abstain, 0);
+    assert_eq!(proposal.voter_list.len(), 0);
+}
+
+#[test]
+fn delegation_change_after_snapshot_does_not_alter_counted_or_future_votes() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let delegator = recipients.community_rewards.clone();
+    let delegate = recipients.public_sale.clone();
+    client.stake(&delegator, &100_000_000i128);
+    client.stake(&delegate, &40_000_000i128);
+
+    // Snapshot taken here: delegator's own power (100_000_000) and
+    // delegate's own power (40_000_000) — no delegation active yet.
+    let proposal_id = client.create_proposal(
+        &delegate,
+        &ProposalType::SignalProposal(String::from_str(&env, "deleg")),
+        &String::from_str(&env, "Delegation"),
+        &String::from_str(
+            &env,
+            "Delegation changes after snapshot must not alter counted votes",
+        ),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+
+    // Delegate voting power *after* the proposal (and its snapshot) was
+    // created — this must not retroactively inflate the delegate's weight
+    // on this proposal, nor strip the delegator's own frozen weight.
+    client.delegate_voting_power(&delegator, &delegate);
+
+    env.ledger().set_timestamp(70);
+
+    // The delegate votes with only their pre-delegation snapshotted power,
+    // not the live effective power (which now also includes the delegated
+    // 100_000_000).
+    client.cast_vote(&proposal_id, &delegate, &GovernanceVoteType::For);
+    let after_delegate_vote = client.proposal(&proposal_id);
+    assert_eq!(
+        after_delegate_vote.votes_for, 40_000_000,
+        "delegate must be counted with their snapshotted power only, \
+         not power delegated after proposal creation"
+    );
+
+    // The delegator can still cast their own frozen vote on this proposal —
+    // an active delegation at *vote time* does not retroactively erase the
+    // snapshot recorded at proposal creation.
+    client.cast_vote(&proposal_id, &delegator, &GovernanceVoteType::Against);
+    let after_both_votes = client.proposal(&proposal_id);
+    assert_eq!(after_both_votes.votes_for, 40_000_000);
+    assert_eq!(
+        after_both_votes.votes_against, 100_000_000,
+        "delegator's own snapshotted power must still be usable"
+    );
+    assert_eq!(after_both_votes.voter_list.len(), 2);
+}
+
+#[test]
+fn reputation_weighted_vote_duplicate_is_rejected_and_tally_unchanged() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &50_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "rep-dedup")),
+        &String::from_str(&env, "Rep dedup"),
+        &String::from_str(&env, "Reputation-weighted votes must dedup too"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+
+    env.ledger().set_timestamp(70);
+    client.cast_reputation_weighted_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    let after_first = client.proposal(&proposal_id);
+    assert_eq!(after_first.votes_for, 50_000_000);
+
+    let result = client.try_cast_reputation_weighted_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::AlreadyVoted)));
+
+    let after_retry = client.proposal(&proposal_id);
+    assert_eq!(after_retry.votes_for, 50_000_000, "tally must be unchanged");
+    assert_eq!(after_retry.voter_list.len(), 1);
+}
+
+#[test]
+fn reputation_weighted_vote_after_voting_ends_is_rejected() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &50_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "rep-late")),
+        &String::from_str(&env, "Rep late"),
+        &String::from_str(
+            &env,
+            "Reputation-weighted votes must respect the voting window",
+        ),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+
+    // Past voting_ends (604_860): must be rejected, not silently accepted.
+    env.ledger().set_timestamp(604_860);
+    let result = client.try_cast_reputation_weighted_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::VotingEnded)));
+
+    let proposal = client.proposal(&proposal_id);
+    assert_eq!(proposal.votes_for, 0);
+    assert_eq!(proposal.voter_list.len(), 0);
+}
+
+#[test]
+fn reputation_weighted_vote_on_cancelled_proposal_is_rejected() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    client.stake(&recipients.community_rewards, &50_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "rep-cancel")),
+        &String::from_str(&env, "Rep cancel"),
+        &String::from_str(
+            &env,
+            "Reputation-weighted votes must not land on inactive proposals",
+        ),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+
+    // Proposer cancels while still Pending (before the voting window ends).
+    client.cancel_proposal(&proposal_id, &recipients.community_rewards);
+
+    env.ledger().set_timestamp(70);
+    let result = client.try_cast_reputation_weighted_vote(
+        &proposal_id,
+        &recipients.community_rewards,
+        &GovernanceVoteType::For,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::ProposalNotActive)));
+
+    let proposal = client.proposal(&proposal_id);
+    assert_eq!(proposal.votes_for, 0);
+    assert_eq!(proposal.voter_list.len(), 0);
+}
+
+#[test]
+fn reputation_weighted_vote_uses_snapshotted_power_not_live_delegation() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let delegator = recipients.community_rewards.clone();
+    let delegate = recipients.public_sale.clone();
+    client.stake(&delegator, &100_000_000i128);
+    client.stake(&delegate, &40_000_000i128);
+
+    // Snapshot taken at creation: delegate's own power is 40_000_000, with
+    // no delegation active yet.
+    let proposal_id = client.create_proposal(
+        &delegate,
+        &ProposalType::SignalProposal(String::from_str(&env, "rep-snapshot")),
+        &String::from_str(&env, "Rep snapshot"),
+        &String::from_str(
+            &env,
+            "Reputation-weighted votes must use the frozen snapshot",
+        ),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+
+    // Delegating *after* the snapshot must not let the delegate inflate
+    // their counted weight on this proposal by picking up live power.
+    client.delegate_voting_power(&delegator, &delegate);
+
+    env.ledger().set_timestamp(70);
+    client.cast_reputation_weighted_vote(&proposal_id, &delegate, &GovernanceVoteType::For);
+
+    let proposal = client.proposal(&proposal_id);
+    assert_eq!(
+        proposal.votes_for, 40_000_000,
+        "reputation-weighted vote must use the pre-delegation snapshot, \
+         not the live effective power (which now includes the delegated \
+         100_000_000)"
+    );
 }

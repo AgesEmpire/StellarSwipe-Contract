@@ -23,27 +23,47 @@ pub struct NetworkErrorDetail {
 }
 
 #[contracterror]
+#[cfg_attr(test, derive(soroban_sdk::testutils::arbitrary::Arbitrary))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ContractError {
+    /// Contract function was called before `initialize()` set up the admin/config.
     NotInitialized = 1,
+    /// Caller already holds the maximum number of allowed open positions.
     PositionLimitReached = 2,
+    /// Caller's balance is lower than the amount required for this trade.
     InsufficientBalance = 3,
+    /// Amount is zero, negative, or otherwise outside allowed bounds.
     InvalidAmount = 4,
+    /// Re-entrant call into a state-mutating function was detected and rejected.
     ReentrancyDetected = 5,
+    /// Caller is not authorized to perform this action.
     Unauthorized = 6,
+    /// No trade exists for the given trade id.
     TradeNotFound = 7,
+    /// Executed price would deviate from the reference price by more than the allowed slippage.
     SlippageExceeded = 8,
+    /// Requested position size exceeds the maximum allowed percentage of the portfolio.
     PositionPctTooHigh = 9,
+    /// Oracle price for this asset is older than the allowed staleness window.
     OraclePriceStale = 10,
+    /// No oracle price is currently available for this asset.
     OracleUnavailable = 11,
+    /// Trade would push the rolling daily volume past the configured limit.
     DailyVolumeLimitExceeded = 12,
+    /// Oracle address is not on the admin-managed whitelist.
     OracleNotWhitelisted = 13,
+    /// Cannot remove the last remaining whitelisted oracle (would leave none configured).
     CannotRemoveLastOracle = 14,
+    /// Trade would push open interest past the configured maximum.
     OpenInterestLimitReached = 15,
+    /// No DCA (dollar-cost-averaging) plan exists for the given id.
     DCAPlanNotFound = 16,
+    /// A DCA plan with this id/configuration already exists.
     DCAPlanAlreadyExists = 17,
+    /// The trade signal referenced by this action has expired.
     SignalExpired = 18,
+    /// The next scheduled interval for this recurring action has not been reached yet.
     IntervalNotDue = 19,
     /// Transient: the network is congested. Caller should read `NetworkErrorDetail`
     /// via [`crate::TradeExecutorContract::get_network_error_detail`] and retry
@@ -79,6 +99,123 @@ pub enum ContractError {
     /// nonce/tx_hash has closed. See the replay-protection audit
     /// (Issue: nonce replay attack prevention).
     TradeExpired = 33,
+    /// The contract is paused (governance-driven emergency pause). See Issue #865.
+    ContractPaused = 34,
+    /// One or both assets in the pair are not registered in the asset registry
+    /// (Issue #992).
+    AssetNotRegistered = 35,
+    /// Both assets of the pair are identical; distinct assets are required (Issue #992).
+    IdenticalAssets = 36,
+    /// The selected route does not support the requested asset pair (Issue #992).
+    UnsupportedPair = 37,
+    /// No asset registry is configured, so the pair cannot be validated (Issue #992).
+    AssetRegistryNotConfigured = 38,
+}
+
+impl ContractError {
+    /// Short, human-readable description of when this error is returned.
+    pub fn message(&self) -> &'static str {
+        match self {
+            ContractError::NotInitialized => {
+                "contract has not been initialized yet; call initialize() first"
+            }
+            ContractError::PositionLimitReached => {
+                "caller already holds the maximum number of allowed open positions"
+            }
+            ContractError::InsufficientBalance => {
+                "caller's balance is lower than the amount required for this trade"
+            }
+            ContractError::InvalidAmount => "amount is zero, negative, or outside allowed bounds",
+            ContractError::ReentrancyDetected => "re-entrant call was detected and rejected",
+            ContractError::Unauthorized => "caller is not authorized to perform this action",
+            ContractError::TradeNotFound => "no trade exists for the given trade id",
+            ContractError::SlippageExceeded => {
+                "executed price deviates from the reference price by more than allowed slippage"
+            }
+            ContractError::PositionPctTooHigh => {
+                "requested position size exceeds the maximum allowed portfolio percentage"
+            }
+            ContractError::OraclePriceStale => {
+                "oracle price for this asset is older than the allowed staleness window"
+            }
+            ContractError::OracleUnavailable => "no oracle price is currently available",
+            ContractError::DailyVolumeLimitExceeded => {
+                "trade would exceed the configured rolling daily volume limit"
+            }
+            ContractError::OracleNotWhitelisted => {
+                "oracle address is not on the admin-managed whitelist"
+            }
+            ContractError::CannotRemoveLastOracle => {
+                "cannot remove the last remaining whitelisted oracle"
+            }
+            ContractError::OpenInterestLimitReached => {
+                "trade would push open interest past the configured maximum"
+            }
+            ContractError::DCAPlanNotFound => "no DCA plan exists for the given id",
+            ContractError::DCAPlanAlreadyExists => {
+                "a DCA plan with this id/configuration already exists"
+            }
+            ContractError::SignalExpired => {
+                "the trade signal referenced by this action has expired"
+            }
+            ContractError::IntervalNotDue => {
+                "the next scheduled interval for this recurring action has not been reached yet"
+            }
+            ContractError::NetworkCongestion => {
+                "network is congested; check retry_after_ledger via get_network_error_detail"
+            }
+            ContractError::InsufficientLiquidity => {
+                "SDEX pair has zero or insufficient liquidity for this swap"
+            }
+            ContractError::CircuitBreakerActive => {
+                "circuit breaker is active and blocking this operation"
+            }
+            ContractError::FeatureDisabled => {
+                "requested feature is administratively disabled via the feature flag registry"
+            }
+            ContractError::ReplayDetected => {
+                "replayed transaction detected (nonce mismatch, duplicate hash, or expired)"
+            }
+            ContractError::BelowMinimumTradeSize => {
+                "trade amount is below the configured per-asset minimum"
+            }
+            ContractError::GracePeriodExpired => {
+                "grace period to cancel this queued trade has already elapsed"
+            }
+            ContractError::QueuedTradeNotFound => "the queued trade was not found",
+            ContractError::NotTradeOwner => "caller is not the owner of this trade",
+            ContractError::MaxRetriesExceeded => {
+                "queued trade exceeded the maximum retry limit and moved to the dead-letter queue"
+            }
+            ContractError::ConfirmationDepthNotReached => {
+                "trade executed but the confirmation depth has not yet been reached"
+            }
+            ContractError::TooManyOpenPositions => {
+                "caller already holds the maximum number of concurrent open positions"
+            }
+            ContractError::NonceAlreadyUsed => {
+                "submitted nonce has already been committed by a previous trade"
+            }
+            ContractError::TradeExpired => {
+                "trade's expiry_ts has passed; the replay-protection window has closed"
+            }
+            ContractError::ContractPaused => {
+                "contract is paused (governance-driven emergency pause)"
+            }
+            ContractError::AssetNotRegistered => {
+                "one or both assets in the pair are not registered in the asset registry"
+            }
+            ContractError::IdenticalAssets => {
+                "both assets of the pair are identical; distinct assets are required"
+            }
+            ContractError::UnsupportedPair => {
+                "the selected route does not support the requested asset pair"
+            }
+            ContractError::AssetRegistryNotConfigured => {
+                "no asset registry is configured; cannot validate the asset pair"
+            }
+        }
+    }
 }
 
 /// Populated when [`ContractError::InsufficientLiquidity`] is returned.

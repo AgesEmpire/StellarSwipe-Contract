@@ -2,11 +2,16 @@
 
 pub mod emergency_unstake;
 pub mod events;
+/// Deterministic fee accrual accumulator (Issue #1016).
+pub mod fee_accrual;
 pub mod migration;
+pub mod reward_vault;
+pub mod slash_strategy;
+pub mod storage_version;
 
 use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
 use migration::{MigrationKey, StakeInfoV2};
-use shared::{initializable, multisig, pausable};
+use shared::{initializable, multisig, pausable, reentrancy};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
     IntoVal, String, Symbol, Val, Vec,
@@ -138,6 +143,13 @@ const LARGE_WITHDRAWAL_THRESHOLD: i128 = 500_000_000;
 /// Bounds instance storage growth and per-call compute cost of `queue_unstake`.
 const DEFAULT_MAX_UNSTAKE_QUEUE_SIZE: u32 = 200;
 
+/// Maximum number of items permitted in a batch operation (e.g. batch_slash_stake, batch_resolve_appeal).
+const MAX_BATCH_SIZE: u32 = 100;
+
+/// Default cooldown window in ledgers between slash events for the same
+/// provider.  Approx. 8 minutes on Stellar mainnet (~5 s per ledger).
+const DEFAULT_SLASH_COOLDOWN_LEDGERS: u32 = 100;
+
 pub const GOLD_TIER_STAKE: i128 = 1_000_000_000;
 pub const SILVER_TIER_STAKE: i128 = GOLD_TIER_STAKE / 2;
 pub const BRONZE_TIER_STAKE: i128 = GOLD_TIER_STAKE / 10;
@@ -157,7 +169,11 @@ fn stake_tier_for_amount(amount: i128) -> u32 {
 /// Validates slash tier basis points (issue #816): each value must be within
 /// `[0, 10_000]` and severity must be non-decreasing (minor <= major <= critical)
 /// so a "worse" violation can never slash a smaller fraction than a lesser one.
-fn validate_slash_tiers(minor_bps: u32, major_bps: u32, critical_bps: u32) -> Result<(), StakeVaultError> {
+fn validate_slash_tiers(
+    minor_bps: u32,
+    major_bps: u32,
+    critical_bps: u32,
+) -> Result<(), StakeVaultError> {
     if minor_bps > 10_000 || major_bps > 10_000 || critical_bps > 10_000 {
         return Err(StakeVaultError::InvalidSlashTier);
     }
@@ -242,12 +258,25 @@ pub enum StorageKey {
     EmergencyMultiSigConfig,
     /// Per-staker pending emergency unstake request (approvals accumulate here).
     EmergencyRequest(Address),
+    // ── Issue #1026: emergency withdrawal cooldown ─────────────────────────────
+    /// Admin-configurable minimum interval (seconds) between two completed
+    /// emergency unstakes for the same account. `0` (or unset) disables it.
+    EmergencyCooldownSecs,
+    /// Ledger timestamp at which `staker`'s most recent emergency unstake
+    /// executed. Absent until the account completes its first emergency unstake.
+    LastEmergencyUnstakeAt(Address),
     // ── Issue #689: Slash appeal ─────────────────────────────────────────────────
     SlashCounter,
     SlashRecord(u64),
     SlashAppeal(u64),
     SlashedFundsHeld(u64),
     AppealWindowSecs,
+    // ── Slash cooldown (issue #816) ──────────────────────────────────────────
+    /// Ledger sequence of the most recent slash event for a provider
+    /// (stored as `ledger + 1`, so 0 means "never slashed").
+    LastSlashLedger(Address),
+    /// Admin-configurable cooldown (in ledgers) between slash events.
+    SlashCooldownLedgers,
     // ── Issue #816: configurable withdrawal cooldown ───────────────────────────
     /// Admin-configurable large-withdrawal time-lock duration (seconds).
     /// Falls back to `LARGE_WITHDRAWAL_TIMELOCK_SECS` when unset.
@@ -257,16 +286,24 @@ pub enum StorageKey {
     /// (in whole weeks) to a voting-power multiplier (basis points).
     /// Falls back to the built-in default tiers when unset.
     LockMultiplierTiers,
+    /// Issue #865: central governance contract address authorized to call
+    /// `apply_governance_pause`.
+    GovernanceAddress,
 }
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum StakeVaultError {
+    /// Contract function was called before `initialize()` set up the admin/config.
     NotInitialized = 1,
+    /// Caller is not authorized to perform this action (not the admin/owner/staker).
     Unauthorized = 2,
+    /// Caller has no active stake recorded in the vault.
     NoStake = 3,
+    /// Stake is still within its lock period and cannot be unstaked yet.
     StakeLocked = 4,
+    /// Re-entrant call into a state-mutating function was detected and rejected.
     ReentrancyDetected = 5,
     /// Provider stake is below minimum and grace period has expired.
     StakeBelowMinimum = 6,
@@ -310,14 +347,22 @@ pub enum StakeVaultError {
     /// The privileged action requires multi-sig approval; use propose/approve/execute.
     RequiresMultisig = 25,
     // ── Issue #689: Slash appeal ─────────────────────────────────────────────────
+    /// Appeal window duration configured is zero or otherwise invalid.
     InvalidAppealWindow = 26,
+    /// Appeal window for this slash has already elapsed; appeal can no longer be filed.
     AppealWindowClosed = 27,
+    /// No slash record exists for the given id.
     SlashNotFound = 28,
+    /// An appeal has already been filed for this slash.
     AppealAlreadyExists = 29,
+    /// This appeal has already been resolved (approved or rejected).
     AppealAlreadyResolved = 30,
     // ── Rate limiting & validation ───────────────────────────────────────────────
+    /// Caller has exceeded the allowed rate of stake/unstake operations.
     RateLimitExceeded = 31,
+    /// Amount is zero, negative, or otherwise outside allowed bounds.
     InvalidAmount = 32,
+    /// Partial unstake would leave a remaining stake below the minimum threshold.
     RemainingStakeBelowMinimum = 33,
     // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
     /// `upgrade()` was called with a version that is not strictly greater
@@ -327,6 +372,132 @@ pub enum StakeVaultError {
     /// `set_lock_multiplier_tier` was called with `weeks == 0` or a `bps`
     /// value outside `[BPS_DENOMINATOR, MAX_LOCK_MULTIPLIER_BPS]`.
     InvalidLockMultiplierTier = 35,
+    // ── Issue #883: error taxonomy consolidation ──────────────────────────────
+    /// `queue_unstake` was called while the unstake queue is already at
+    /// `MaxUnstakeQueueSize`; distinct from `QueueEmpty` (processing an empty
+    /// queue). Previously referenced without a backing variant — added here.
+    QueueFull = 36,
+    /// Slash tier severity order is invalid (minor > major or major > critical).
+    InvalidSlashTierOrder = 37,
+    /// Withdrawal cooldown duration exceeds maximum allowed limit.
+    InvalidCooldown = 38,
+    /// Batch size is 0 or exceeds MAX_BATCH_SIZE.
+    BatchSizeInvalid = 39,
+    /// Lengths of parallel batch parameter arrays do not match.
+    BatchLengthMismatch = 40,
+    // ── Slash cooldown ────────────────────────────────────────────────────────
+    /// A slash was attempted within the cooldown window after a prior slash.
+    SlashCooldownActive = 41,
+    // ── Issue #1026: emergency withdrawal cooldown ────────────────────────────
+    /// An emergency unstake request was made before the per-account cooldown
+    /// window following the previous emergency unstake had elapsed.
+    EmergencyCooldownActive = 42,
+}
+
+impl StakeVaultError {
+    /// Short, human-readable description of when this error is returned.
+    pub fn message(&self) -> &'static str {
+        match self {
+            StakeVaultError::NotInitialized => {
+                "vault has not been initialized yet; call initialize() first"
+            }
+            StakeVaultError::Unauthorized => "caller is not authorized to perform this action",
+            StakeVaultError::NoStake => "caller has no active stake in the vault",
+            StakeVaultError::StakeLocked => "stake is still within its lock period",
+            StakeVaultError::ReentrancyDetected => "re-entrant call was detected and rejected",
+            StakeVaultError::StakeBelowMinimum => {
+                "stake is below the minimum and its grace period has expired"
+            }
+            StakeVaultError::ContractPaused => {
+                "contract is paused due to suspicious activity or admin action"
+            }
+            StakeVaultError::TimelockRequired => {
+                "large withdrawal requires a pending time-lock request first"
+            }
+            StakeVaultError::TimelockNotElapsed => "time-lock period has not yet elapsed",
+            StakeVaultError::FlashLoanDetected => {
+                "stake and unstake in the same ledger is not allowed (flash-loan pattern)"
+            }
+            StakeVaultError::InvalidSlashTier => "slash tier percentage would exceed 100% of stake",
+            StakeVaultError::StakeDurationNotElapsed => {
+                "voting power is locked until the minimum stake duration elapses"
+            }
+            StakeVaultError::NoDelegatedStake => {
+                "no delegated stake found for this delegator/provider pair"
+            }
+            StakeVaultError::UnstakeAlreadyQueued => {
+                "caller already has a pending unstake request in the queue"
+            }
+            StakeVaultError::NoUnstakeQueued => "no unstake request found for this user",
+            StakeVaultError::QueueEmpty => "unstake queue is empty",
+            StakeVaultError::EmergencyNotConfigured => {
+                "emergency unstake is not configured (no multi-sig config set)"
+            }
+            StakeVaultError::EmergencyRequestAlreadyExists => {
+                "a pending emergency request already exists for this staker"
+            }
+            StakeVaultError::EmergencyRequestNotFound => {
+                "no emergency request found for this staker"
+            }
+            StakeVaultError::EmergencyRequestExpired => {
+                "emergency request expired without sufficient approvals"
+            }
+            StakeVaultError::EmergencyRequestNotExpired => {
+                "request has not yet expired and cannot be discarded"
+            }
+            StakeVaultError::AlreadyApproved => "this signer has already approved this request",
+            StakeVaultError::InvalidEmergencyPenalty => "penalty basis points exceed 100%",
+            StakeVaultError::InvalidMultiSigConfig => {
+                "multi-sig required count is 0 or exceeds the number of admins"
+            }
+            StakeVaultError::RequiresMultisig => {
+                "this privileged action requires multi-sig approval (propose/approve/execute)"
+            }
+            StakeVaultError::InvalidAppealWindow => {
+                "appeal window duration is zero or otherwise invalid"
+            }
+            StakeVaultError::AppealWindowClosed => {
+                "appeal window for this slash has already elapsed"
+            }
+            StakeVaultError::SlashNotFound => "no slash record exists for the given id",
+            StakeVaultError::AppealAlreadyExists => {
+                "an appeal has already been filed for this slash"
+            }
+            StakeVaultError::AppealAlreadyResolved => "this appeal has already been resolved",
+            StakeVaultError::RateLimitExceeded => {
+                "caller has exceeded the allowed rate of stake/unstake operations"
+            }
+            StakeVaultError::InvalidAmount => "amount is zero, negative, or otherwise out of range",
+            StakeVaultError::RemainingStakeBelowMinimum => {
+                "partial unstake would leave a remaining stake below the minimum threshold"
+            }
+            StakeVaultError::IncompatibleContractVersion => {
+                "upgrade() version is not strictly greater than the currently stored version"
+            }
+            StakeVaultError::InvalidLockMultiplierTier => {
+                "lock multiplier tier has weeks == 0 or a bps value out of allowed range"
+            }
+            StakeVaultError::QueueFull => {
+                "unstake queue is at MaxUnstakeQueueSize; wait for entries to process"
+            }
+            StakeVaultError::InvalidSlashTierOrder => {
+                "slash tiers must be non-decreasing: minor <= major <= critical"
+            }
+            StakeVaultError::InvalidCooldown => {
+                "withdrawal cooldown exceeds maximum allowed duration"
+            }
+            StakeVaultError::BatchSizeInvalid => "batch is empty or exceeds maximum batch size",
+            StakeVaultError::BatchLengthMismatch => {
+                "batch parameter arrays have mismatched lengths"
+            }
+            StakeVaultError::SlashCooldownActive => {
+                "slash cooldown is active; wait for the cooldown window to expire"
+            }
+            StakeVaultError::EmergencyCooldownActive => {
+                "emergency withdrawal cooldown is active for this account; wait for it to elapse"
+            }
+        }
+    }
 }
 
 /// A pending unstake request held in the FIFO queue (issue #663).
@@ -369,6 +540,8 @@ pub struct SlashRecord {
     pub slashed_at: u64,
     /// Textual reason passed in to slash_stake.
     pub reason: Symbol,
+    /// Ledger sequence when the cooldown expires (0 if no cooldown configured).
+    pub cooldown_expires_at: u32,
 }
 
 /// Mutable appeal record created when a provider calls `appeal_slash`.
@@ -401,6 +574,7 @@ mod action {
     pub const CONFIGURE_SLASH_TIERS: u8 = 4;
     pub const SET_APPEAL_WINDOW: u8 = 5;
     pub const SET_WITHDRAWAL_COOLDOWN: u8 = 6;
+    pub const RESOLVE_APPEAL: u8 = 7;
 }
 
 fn encode_action(env: &Env, tag: u8, data: &[u8]) -> Bytes {
@@ -469,6 +643,8 @@ impl StakeVaultContract {
             .set(&pausable::PausableKey::Paused, &false);
         initializable::mark_initialized(&env);
         shared::version::set_contract_version(&env, shared::version::STAKE_VAULT_VERSION);
+        // Issue #1023: initialise storage layout version.
+        storage_version::init_storage_version(&env);
     }
 
     // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
@@ -553,7 +729,68 @@ impl StakeVaultContract {
         pausable::is_paused(&env)
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────────
+    // ── Issue #865: governance-driven pause propagation ────────────────────────
+
+    /// Set the central governance contract address authorized to call
+    /// `apply_governance_pause`. Admin only.
+    pub fn set_governance(
+        env: Env,
+        admin: Address,
+        governance: Address,
+    ) -> Result<(), StakeVaultError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(StakeVaultError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::GovernanceAddress, &governance);
+        Ok(())
+    }
+
+    /// Read-only: the configured governance contract address, if any.
+    pub fn get_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::GovernanceAddress)
+    }
+
+    /// Called by the configured governance contract to propagate a pause/unpause
+    /// (Issue #865). Bypasses the multi-sig requirement enforced on `pause`/`unpause`
+    /// since this is a trusted, governance-initiated emergency action.
+    pub fn apply_governance_pause(env: Env, paused: bool) -> Result<(), StakeVaultError> {
+        let governance: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GovernanceAddress)
+            .ok_or(StakeVaultError::Unauthorized)?;
+        governance.require_auth();
+        pausable::set_paused(&env, paused);
+        Ok(())
+    }
+
+    /// Read-only health probe for monitoring and front-ends (no auth). Issue #865.
+    pub fn health_check(env: Env) -> stellar_swipe_common::HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        let admin: Option<Address> = env.storage().instance().get(&StorageKey::Admin);
+        let Some(admin) = admin else {
+            return stellar_swipe_common::health_uninitialized(&env, version);
+        };
+        let status = stellar_swipe_common::HealthStatus {
+            is_initialized: true,
+            is_paused: pausable::is_paused(&env),
+            version,
+            admin,
+            initialized_at: env.ledger().timestamp(),
+        };
+        stellar_swipe_common::emit_health_event(&env, &status);
+        status
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────
 
     fn require_not_paused(env: &Env) -> Result<(), StakeVaultError> {
         pausable::require_not_paused(env).map_err(|_| StakeVaultError::ContractPaused)
@@ -566,6 +803,8 @@ impl StakeVaultContract {
     /// Records the current ledger sequence to detect same-ledger withdraw
     /// attempts (flash loan pattern).
     pub fn deposit_stake(env: Env, staker: Address, amount: i128) -> Result<(), StakeVaultError> {
+        // Issue #859: Reentrancy guard for cross-contract token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| StakeVaultError::ReentrancyDetected)?;
         staker.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -972,6 +1211,18 @@ impl StakeVaultContract {
                 env.storage()
                     .instance()
                     .set(&StorageKey::WithdrawalCooldownSecs, &cooldown);
+            }
+            action::RESOLVE_APPEAL => {
+                // Payload: [tag][slash_id: 8-byte LE][uphold: 1 byte]
+                let mut buf = [0u8; 8];
+                let mut i = 0;
+                while i < 8 {
+                    buf[i] = payload.get(1 + i as u32).unwrap_or(0);
+                    i += 1;
+                }
+                let slash_id = u64::from_le_bytes(buf);
+                let uphold = payload.get(9).unwrap_or(0) == 1;
+                Self::do_resolve_appeal(&env, slash_id, uphold)?;
             }
             _ => return Err(StakeVaultError::Unauthorized),
         }
@@ -1561,6 +1812,38 @@ impl StakeVaultContract {
             .get(&StorageKey::Admin)
             .ok_or(StakeVaultError::NotInitialized)?;
         admin.require_auth();
+        Self::set_slash_tiers(&env, minor_bps, major_bps, critical_bps)
+    }
+
+    /// Governance-driven slash-tier configuration (Issue #governance_slash).
+    ///
+    /// Allows the configured governance contract (`set_governance`) to update
+    /// slash severity percentages without requiring the admin/multi-sig path.
+    pub fn governance_configure_slash_tiers(
+        env: Env,
+        governance: Address,
+        minor_bps: u32,
+        major_bps: u32,
+        critical_bps: u32,
+    ) -> Result<(), StakeVaultError> {
+        let stored_governance: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GovernanceAddress)
+            .ok_or(StakeVaultError::Unauthorized)?;
+        if governance != stored_governance {
+            return Err(StakeVaultError::Unauthorized);
+        }
+        governance.require_auth();
+        Self::set_slash_tiers(&env, minor_bps, major_bps, critical_bps)
+    }
+
+    fn set_slash_tiers(
+        env: &Env,
+        minor_bps: u32,
+        major_bps: u32,
+        critical_bps: u32,
+    ) -> Result<(), StakeVaultError> {
         validate_slash_tiers(minor_bps, major_bps, critical_bps)?;
         let cfg = SlashTierConfig {
             minor_bps,
@@ -1570,7 +1853,7 @@ impl StakeVaultContract {
         env.storage()
             .instance()
             .set(&StorageKey::SlashTierConfig, &cfg);
-        events::emit_slash_tiers_updated(&env, minor_bps, major_bps, critical_bps);
+        events::emit_slash_tiers_updated(env, minor_bps, major_bps, critical_bps);
         Ok(())
     }
 
@@ -1593,6 +1876,8 @@ impl StakeVaultContract {
         severity: SlashSeverity,
         reason: Symbol,
     ) -> Result<i128, StakeVaultError> {
+        // Issue #859: Reentrancy guard for cross-contract token transfer.
+        reentrancy::require_not_locked(&env).map_err(|_| StakeVaultError::ReentrancyDetected)?;
         caller.require_auth();
         Self::require_signal_registry(&env, &caller)?;
         Self::do_slash(&env, &provider, severity, reason)
@@ -1677,6 +1962,28 @@ impl StakeVaultContract {
             .instance()
             .get(&StorageKey::StakeToken)
             .ok_or(StakeVaultError::NotInitialized)?;
+
+        // ── Slash cooldown check ──────────────────────────────────────────────
+        let current_ledger = env.ledger().sequence();
+        // Per-provider cooldown (issue #816): stored as `ledger + 1` so that 0
+        // unambiguously means "never slashed" (the default ledger sequence in
+        // tests is 0, which would otherwise collide with the sentinel and
+        // silently disable the cooldown).
+        let last_slash_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::LastSlashLedger(provider.clone()))
+            .unwrap_or(0);
+        let cooldown: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SlashCooldownLedgers)
+            .unwrap_or(DEFAULT_SLASH_COOLDOWN_LEDGERS);
+        if last_slash_ledger > 0
+            && current_ledger.saturating_sub(last_slash_ledger.saturating_sub(1)) < cooldown
+        {
+            return Err(StakeVaultError::SlashCooldownActive);
+        }
 
         let cfg: SlashTierConfig = env
             .storage()
@@ -1779,10 +2086,22 @@ impl StakeVaultContract {
             slash_amount,
             slashed_at: env.ledger().timestamp(),
             reason: reason.clone(),
+            cooldown_expires_at: if cooldown > 0 {
+                current_ledger.saturating_add(cooldown)
+            } else {
+                0
+            },
         };
         env.storage()
             .persistent()
             .set(&StorageKey::SlashRecord(slash_id), &record);
+
+        // ── Record last slash ledger for cooldown enforcement ──────────────────
+        // Store `ledger + 1` per provider; see the cooldown check above.
+        env.storage().instance().set(
+            &StorageKey::LastSlashLedger(provider.clone()),
+            &current_ledger.saturating_add(1),
+        );
 
         // ── Hold slashed funds pending appeal resolution (issue #689) ──────────
         // Tokens remain in the vault's custody and are NOT burned until the
@@ -1815,6 +2134,27 @@ impl StakeVaultContract {
         );
 
         Ok(slash_amount)
+    }
+
+    // ── Slash cooldown (issue #816) ────────────────────────────────────────────
+
+    /// Admin: configure the cooldown window (in ledgers) between slash events.
+    /// Set to 0 to disable the cooldown entirely.
+    pub fn set_slash_cooldown(env: Env, ledgers: u32) {
+        let admin: Address = env.storage().instance().get(&StorageKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::SlashCooldownLedgers, &ledgers);
+        events::emit_slash_cooldown_updated(&env, ledgers);
+    }
+
+    /// Returns the configured slash cooldown window in ledgers (default: 100).
+    pub fn get_slash_cooldown(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::SlashCooldownLedgers)
+            .unwrap_or(DEFAULT_SLASH_COOLDOWN_LEDGERS)
     }
 
     // ── Issue #689: Slash appeal window ────────────────────────────────────────
@@ -1992,101 +2332,6 @@ impl StakeVaultContract {
         Ok(processed_count)
     }
 
-    /// Core appeal-resolution logic shared by [`Self::resolve_appeal`] and
-    /// [`Self::batch_resolve_appeal`]. Admin authorization is the
-    /// responsibility of the entry point — this assumes the caller is
-    /// already validated.
-    fn do_resolve_appeal(env: &Env, slash_id: u64, uphold: bool) -> Result<(), StakeVaultError> {
-        // Load slash record.
-        let record: SlashRecord = env
-            .storage()
-            .persistent()
-            .get(&StorageKey::SlashRecord(slash_id))
-            .ok_or(StakeVaultError::SlashNotFound)?;
-
-        // Load appeal record.
-        let mut appeal: SlashAppeal = env
-            .storage()
-            .persistent()
-            .get(&StorageKey::SlashAppeal(slash_id))
-            .ok_or(StakeVaultError::SlashNotFound)?;
-
-        if appeal.status != AppealStatus::Pending {
-            return Err(StakeVaultError::AppealAlreadyResolved);
-        }
-
-        // Retrieve held funds (only present when an appeal window is configured
-        // and the slash_stake did not burn immediately).
-        let held: i128 = env
-            .storage()
-            .persistent()
-            .get(&StorageKey::SlashedFundsHeld(slash_id))
-            .unwrap_or(0);
-
-        let token: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::StakeToken)
-            .ok_or(StakeVaultError::NotInitialized)?;
-
-        if uphold {
-            appeal.status = AppealStatus::Upheld;
-            // Slash confirmed — burn the held funds now.
-            if held > 0 {
-                env.storage()
-                    .persistent()
-                    .remove(&StorageKey::SlashedFundsHeld(slash_id));
-                token::Client::new(&env, &token).burn(&env.current_contract_address(), &held);
-            }
-        } else {
-            // Reversed — tokens are still in the vault; credit provider's stake.
-            appeal.status = AppealStatus::Reversed;
-
-            let amount_to_restore = if held > 0 { held } else { record.slash_amount };
-
-            let mut stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
-                .storage()
-                .persistent()
-                .get(&MigrationKey::StakesV2)
-                .unwrap_or_else(|| soroban_sdk::Map::new(&env));
-
-            let current_info = stakes.get(record.provider.clone()).unwrap_or(StakeInfoV2 {
-                balance: 0,
-                locked_until: 0,
-                last_updated: 0,
-            });
-
-            let restored_balance = current_info.balance.saturating_add(amount_to_restore);
-            let now = env.ledger().timestamp();
-
-            stakes.set(
-                record.provider.clone(),
-                StakeInfoV2 {
-                    balance: restored_balance,
-                    locked_until: current_info.locked_until,
-                    last_updated: now,
-                },
-            );
-            env.storage()
-                .persistent()
-                .set(&MigrationKey::StakesV2, &stakes);
-
-            if held > 0 {
-                env.storage()
-                    .persistent()
-                    .remove(&StorageKey::SlashedFundsHeld(slash_id));
-            }
-        }
-
-        env.storage()
-            .persistent()
-            .set(&StorageKey::SlashAppeal(slash_id), &appeal);
-
-        events::emit_appeal_resolved(&env, slash_id, uphold, record.provider);
-
-        Ok(())
-    }
-
     /// Returns the [`SlashRecord`] for the given `slash_id`, or `None`.
     pub fn get_slash_record(env: Env, slash_id: u64) -> Option<SlashRecord> {
         env.storage()
@@ -2172,6 +2417,28 @@ impl StakeVaultContract {
     /// Returns the pending emergency request for `staker`, if any.
     pub fn get_emergency_request(env: Env, staker: Address) -> Option<EmergencyRequest> {
         emergency_unstake::get_emergency_request(&env, &staker)
+    }
+
+    // ── Issue #1026: emergency withdrawal cooldown ────────────────────────────
+
+    /// Admin: set the per-account cooldown (seconds) enforced between two
+    /// completed emergency unstakes. `0` disables the cooldown.
+    ///
+    /// While a staker is inside this window, `request_emergency_unstake` fails
+    /// with `EmergencyCooldownActive`.
+    pub fn set_emergency_cooldown(
+        env: Env,
+        caller: Address,
+        cooldown_secs: u64,
+    ) -> Result<(), StakeVaultError> {
+        caller.require_auth();
+        emergency_unstake::set_cooldown(&env, &caller, cooldown_secs)
+    }
+
+    /// Seconds still remaining on `staker`'s emergency-withdrawal cooldown.
+    /// Returns `0` when the account may submit a new emergency request now.
+    pub fn emergency_cooldown_remaining(env: Env, staker: Address) -> u64 {
+        emergency_unstake::get_cooldown_remaining(&env, &staker)
     }
 
     // ── Stake delegation (issue #688) ──────────────────────────────────────────
@@ -2468,6 +2735,183 @@ impl StakeVaultContract {
             .get(&StorageKey::UnstakeQueueHead)
             .unwrap_or(0);
         Some(ticket.saturating_sub(head))
+    }
+
+    // ── Issue #1020 + #1022: Reward vault (batch claim, multi-asset) ──────────
+
+    /// Admin: register a reward asset token so the vault accepts deposits in it.
+    pub fn add_reward_asset(env: Env, asset: Address) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        reward_vault::add_supported_asset(&env, asset);
+        Ok(())
+    }
+
+    /// Returns all registered reward asset addresses.
+    pub fn get_reward_assets(env: Env) -> Vec<Address> {
+        reward_vault::get_supported_assets(&env)
+    }
+
+    /// Deposit `amount` of `asset` as a reward bucket for `provider` in `epoch`.
+    ///
+    /// The asset must be registered via `add_reward_asset` first.
+    /// Tokens are transferred from `depositor` into the contract.
+    pub fn deposit_reward(
+        env: Env,
+        depositor: Address,
+        provider: Address,
+        asset: Address,
+        amount: i128,
+        epoch: u64,
+    ) -> Result<u64, StakeVaultError> {
+        depositor.require_auth();
+        Self::require_not_paused(&env)?;
+        reward_vault::deposit_reward(&env, &depositor, provider, asset, amount, epoch)
+            .map_err(|e| match e {
+                reward_vault::RewardVaultError::UnsupportedAsset => StakeVaultError::Unauthorized,
+                reward_vault::RewardVaultError::InvalidAmount => StakeVaultError::InvalidAmount,
+                reward_vault::RewardVaultError::BatchSizeInvalid => {
+                    StakeVaultError::BatchSizeInvalid
+                }
+            })
+    }
+
+    /// Provider: claim rewards from a batch of bucket IDs in a single call.
+    ///
+    /// Buckets already claimed are silently skipped (idempotence).
+    /// Returns per-asset totals transferred.
+    pub fn batch_claim_rewards(
+        env: Env,
+        provider: Address,
+        bucket_ids: Vec<u64>,
+    ) -> Result<Vec<(Address, i128)>, StakeVaultError> {
+        provider.require_auth();
+        Self::require_not_paused(&env)?;
+        reward_vault::batch_claim_rewards(&env, &provider, bucket_ids).map_err(|e| match e {
+            reward_vault::RewardVaultError::BatchSizeInvalid => StakeVaultError::BatchSizeInvalid,
+            _ => StakeVaultError::InvalidAmount,
+        })
+    }
+
+    /// Returns the claimable reward balance for `provider` in `asset`.
+    pub fn get_provider_reward_balance(env: Env, provider: Address, asset: Address) -> i128 {
+        reward_vault::get_provider_reward_balance(&env, &provider, &asset)
+    }
+
+    /// Returns the total deposited amount for `asset` across all providers.
+    pub fn get_asset_total_deposited(env: Env, asset: Address) -> i128 {
+        reward_vault::get_asset_total_deposited(&env, &asset)
+    }
+
+    // ── Issue #1021: Slash strategy policy thresholds ─────────────────────────
+
+    /// Admin: set (or update) the slash strategy config for `strategy_name`.
+    ///
+    /// Validates that bps values are in `[0, 10_000]`, severity order is
+    /// non-decreasing, and `risk_window_secs > 0`.
+    pub fn set_slash_strategy(
+        env: Env,
+        strategy_name: Symbol,
+        minor_bps: u32,
+        major_bps: u32,
+        critical_bps: u32,
+        risk_window_secs: u64,
+        penalty_window_secs: u64,
+    ) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        let cfg = slash_strategy::SlashStrategyConfig {
+            minor_bps,
+            major_bps,
+            critical_bps,
+            risk_window_secs,
+            penalty_window_secs,
+        };
+        slash_strategy::set_slash_strategy(&env, strategy_name, cfg).map_err(|e| match e {
+            slash_strategy::SlashStrategyError::BpsOutOfRange => StakeVaultError::InvalidSlashTier,
+            slash_strategy::SlashStrategyError::InvalidSeverityOrder => {
+                StakeVaultError::InvalidSlashTierOrder
+            }
+            slash_strategy::SlashStrategyError::InvalidRiskWindow => {
+                StakeVaultError::InvalidCooldown
+            }
+            slash_strategy::SlashStrategyError::StrategyNotFound => StakeVaultError::Unauthorized,
+        })
+    }
+
+    /// Returns the slash strategy config for `strategy_name`, or `None`.
+    pub fn get_slash_strategy(
+        env: Env,
+        strategy_name: Symbol,
+    ) -> Option<slash_strategy::SlashStrategyConfig> {
+        slash_strategy::get_slash_strategy(&env, strategy_name)
+    }
+
+    /// Returns all registered strategy names.
+    pub fn list_slash_strategies(env: Env) -> Vec<Symbol> {
+        slash_strategy::list_slash_strategies(&env)
+    }
+
+    // ── Issue #1023: Storage layout migration guard ───────────────────────────
+
+    /// Returns the current on-chain storage layout version.
+    pub fn get_storage_layout_version(env: Env) -> Option<u32> {
+        storage_version::get_layout_version(&env)
+    }
+
+    /// Admin: upgrade the contract WASM with storage layout compatibility check.
+    ///
+    /// In addition to the existing code-version guard, this validates that the
+    /// on-chain storage layout version is `next_layout_version - 1` (sequential
+    /// migration only) and that all `required_storage_keys` are present in
+    /// persistent storage before the upgrade is accepted.
+    ///
+    /// On success the layout version is bumped and a `stgver` event is emitted.
+    pub fn upgrade_with_migration_guard(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+        next_layout_version: u32,
+        required_storage_keys: Vec<Symbol>,
+    ) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+
+        // Code-version guard (existing behaviour).
+        let current_version = shared::version::get_contract_version(&env);
+        shared::version::guard_upgrade(current_version, new_version)
+            .map_err(|_| StakeVaultError::IncompatibleContractVersion)?;
+
+        // Storage layout compatibility guard (#1023).
+        storage_version::guard_storage_upgrade(&env, next_layout_version, &required_storage_keys)
+            .map_err(|e| match e {
+                storage_version::StorageVersionError::IncompatibleLayoutVersion => {
+                    StakeVaultError::IncompatibleContractVersion
+                }
+                storage_version::StorageVersionError::MissingRequiredKey => {
+                    StakeVaultError::NotInitialized
+                }
+                storage_version::StorageVersionError::NotInitialized => {
+                    StakeVaultError::NotInitialized
+                }
+            })?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        shared::version::set_contract_version(&env, new_version);
+        shared::version::emit_contract_upgraded(&env, current_version, new_version);
+        Ok(())
     }
 }
 

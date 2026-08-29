@@ -11,6 +11,7 @@ use crate::{
     sdex::{self, execute_sdex_swap},
     OrderType, ReplayParams, TradeExecutorContract, TradeExecutorContractClient,
 };
+use shared::asset_registry::AssetRegistryContract;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short,
     testutils::{Address as _, Events, Ledger as _},
@@ -767,8 +768,17 @@ pub struct MockSdexRouter;
 
 #[contractimpl]
 impl MockSdexRouter {
-    pub fn get_best_ask(_env: Env, _from_token: Address, _to_token: Address) -> (i128, i128) {
-        (0, 10_000_000_000i128)
+    pub fn get_best_ask(env: Env, _from_token: Address, _to_token: Address) -> (i128, i128) {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("ask"))
+            .unwrap_or((0, 10_000_000_000i128))
+    }
+
+    pub fn set_best_ask(env: Env, price: i128, qty: i128) {
+        env.storage()
+            .instance()
+            .set(&symbol_short!("ask"), &(price, qty));
     }
 
     pub fn set_amount_out(env: Env, out: i128) {
@@ -882,6 +892,208 @@ fn swap_with_slippage_reverts_when_exceeded() {
         execute_sdex_swap(&env, &router_id, &token_a, &token_b, 1_000_000, min)
     });
     assert_eq!(err, Err(ContractError::SlippageExceeded));
+}
+
+// ── Asset-pair validation tests (Issue #992) ─────────────────────────────────
+
+/// Register an asset registry preloaded with the given SAC addresses.
+fn setup_registry_with(env: &Env, assets: &[&Address]) -> Address {
+    let admin = Address::generate(env);
+    let registry_id = env.register(AssetRegistryContract, ());
+    let client = shared::asset_registry::AssetRegistryContractClient::new(env, &registry_id);
+    client.initialize(&admin);
+    for asset in assets {
+        client.register_asset(
+            &admin,
+            asset,
+            &soroban_sdk::String::from_str(env, "TOK"),
+            &7u32,
+            &None,
+        );
+    }
+    registry_id
+}
+
+#[test]
+fn asset_registry_configuration_roundtrip() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let exec_id = env.register(TradeExecutorContract, ());
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    exec.initialize(&admin);
+
+    let registry = Address::generate(&env);
+    assert_eq!(exec.get_asset_registry(), None);
+    exec.set_asset_registry(&registry);
+    assert_eq!(exec.get_asset_registry(), Some(registry));
+}
+
+#[test]
+fn swap_rejects_unregistered_asset_when_registry_configured() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (exec_id, _router_id, token_a, token_b) = setup_executor_with_router(&env);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+
+    // token_b is not registered → pair unsupported before any token operation.
+    let registry = setup_registry_with(&env, &[&token_a]);
+    exec.set_asset_registry(&registry);
+
+    let err = exec.try_swap(&token_a, &token_b, &1_000_000, &400_000);
+    assert_eq!(err, Err(Ok(ContractError::AssetNotRegistered)));
+}
+
+#[test]
+fn swap_rejects_identical_pair_when_registry_configured() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (exec_id, _router_id, token_a, _token_b) = setup_executor_with_router(&env);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+
+    let registry = setup_registry_with(&env, &[&token_a]);
+    exec.set_asset_registry(&registry);
+
+    let err = exec.try_swap(&token_a, &token_a, &1_000_000, &400_000);
+    assert_eq!(err, Err(Ok(ContractError::IdenticalAssets)));
+}
+
+#[test]
+fn swap_rejects_route_that_does_not_support_pair() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (exec_id, _router_id, token_a, token_b) = setup_executor_with_router(&env);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+
+    let registry = setup_registry_with(&env, &[&token_a, &token_b]);
+    exec.set_asset_registry(&registry);
+
+    // Default mock ask is (0, …) → the route does not support the pair.
+    let err = exec.try_swap(&token_a, &token_b, &1_000_000, &400_000);
+    assert_eq!(err, Err(Ok(ContractError::UnsupportedPair)));
+}
+
+#[test]
+fn stale_route_configuration_rejects_pair_after_quote_removed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (exec_id, router_id, token_a, token_b) = setup_executor_with_router(&env);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    let router = MockSdexRouterClient::new(&env, &router_id);
+
+    let registry = setup_registry_with(&env, &[&token_a, &token_b]);
+    exec.set_asset_registry(&registry);
+
+    // Route quotes the pair → swap succeeds.
+    router.set_best_ask(&100i128, &10_000_000i128);
+    router.set_amount_out(&500_000);
+    assert_eq!(exec.swap(&token_a, &token_b, &1_000_000, &400_000), 500_000);
+
+    // Route stops quoting the pair (stale config) → rejected up front.
+    router.set_best_ask(&0i128, &0i128);
+    let err = exec.try_swap(&token_a, &token_b, &1_000_000, &400_000);
+    assert_eq!(err, Err(Ok(ContractError::UnsupportedPair)));
+}
+
+#[test]
+fn swap_accepts_registered_distinct_supported_pair() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (exec_id, router_id, token_a, token_b) = setup_executor_with_router(&env);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    let router = MockSdexRouterClient::new(&env, &router_id);
+
+    let registry = setup_registry_with(&env, &[&token_a, &token_b]);
+    exec.set_asset_registry(&registry);
+
+    router.set_best_ask(&100i128, &10_000_000i128);
+    router.set_amount_out(&500_000);
+    assert_eq!(exec.swap(&token_a, &token_b, &1_000_000, &400_000), 500_000);
+}
+
+#[test]
+fn swap_accepts_reversed_pair_when_route_supports_direction() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (exec_id, router_id, token_a, token_b) = setup_executor_with_router(&env);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    let router = MockSdexRouterClient::new(&env, &router_id);
+
+    let registry = setup_registry_with(&env, &[&token_a, &token_b]);
+    exec.set_asset_registry(&registry);
+
+    router.set_best_ask(&100i128, &10_000_000i128);
+    router.set_amount_out(&500_000);
+    // Reversed direction: registration is symmetric and the mock quotes any
+    // direction, so the swap proceeds once funding is in place.
+    StellarAssetClient::new(&env, &token_a).mint(&router_id, &10_000_000_000);
+    StellarAssetClient::new(&env, &token_b).mint(&exec_id, &1_000_000_000);
+    assert_eq!(exec.swap(&token_b, &token_a, &1_000_000, &400_000), 500_000);
+}
+
+#[test]
+fn registry_change_blocks_previously_valid_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (exec_id, router_id, token_a, token_b) = setup_executor_with_router(&env);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+    let router = MockSdexRouterClient::new(&env, &router_id);
+    router.set_best_ask(&100i128, &10_000_000i128);
+    router.set_amount_out(&500_000);
+
+    // Registry A has both assets → swap succeeds.
+    let registry_a = setup_registry_with(&env, &[&token_a, &token_b]);
+    exec.set_asset_registry(&registry_a);
+    assert_eq!(exec.swap(&token_a, &token_b, &1_000_000, &400_000), 500_000);
+
+    // Registry change: point at a registry missing token_b → rejected next call.
+    let registry_b = setup_registry_with(&env, &[&token_a]);
+    exec.set_asset_registry(&registry_b);
+    let err = exec.try_swap(&token_a, &token_b, &1_000_000, &400_000);
+    assert_eq!(err, Err(Ok(ContractError::AssetNotRegistered)));
+}
+
+#[test]
+fn cancel_copy_trade_rejects_unregistered_pair() {
+    let (env, exec_id, portfolio_id, user, token_a, token_b, _) = setup_cancel(1_000_000);
+    let exec = TradeExecutorContractClient::new(&env, &exec_id);
+
+    MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position_with_entry_price(
+        &user,
+        &1u64,
+        &10_000_000i128,
+    );
+
+    // token_b is not registered → the exit swap is rejected up front.
+    let registry = setup_registry_with(&env, &[&token_a]);
+    exec.set_asset_registry(&registry);
+
+    let err = env.as_contract(&exec_id, || {
+        TradeExecutorContract::cancel_copy_trade(
+            env.clone(),
+            user.clone(),
+            user.clone(),
+            1u64,
+            token_a.clone(),
+            token_b.clone(),
+            1_000_000,
+            900_000,
+            10_000_000,
+            ReplayParams {
+                nonce: 1,
+                tx_hash: test_tx_hash(&env, 0),
+                expiry_ts: far_future(&env),
+            },
+        )
+    });
+    assert_eq!(err, Err(ContractError::AssetNotRegistered));
 }
 
 // ── cancel_copy_trade tests ───────────────────────────────────────────────────
@@ -1976,4 +2188,30 @@ fn count_never_goes_negative_on_close() {
         },
     );
     assert_eq!(exec.get_user_position_count(&user), 0);
+}
+
+#[test]
+fn error_messages_are_non_empty_and_distinct() {
+    let samples = [
+        ContractError::NotInitialized,
+        ContractError::InsufficientBalance,
+        ContractError::SlippageExceeded,
+        ContractError::PositionLimitReached,
+        ContractError::TooManyOpenPositions,
+        ContractError::ReplayDetected,
+    ];
+    for err in samples.iter() {
+        assert!(!err.message().is_empty());
+    }
+    for i in 0..samples.len() {
+        for j in (i + 1)..samples.len() {
+            assert_ne!(
+                samples[i].message(),
+                samples[j].message(),
+                "expected distinct messages for {:?} and {:?}",
+                samples[i],
+                samples[j]
+            );
+        }
+    }
 }
