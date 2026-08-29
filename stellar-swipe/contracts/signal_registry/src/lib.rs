@@ -7,6 +7,7 @@ static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
 mod admin;
 mod analytics;
 mod categories;
+pub mod reward_ledger;
 mod churn_risk;
 mod cohort_retention;
 mod collaboration;
@@ -3634,6 +3635,51 @@ impl SignalRegistry {
             total_providers,
             estimated_rent_xlm,
         }
+    }
+
+    // ── Issue #1038: Claimable rewards emission ledger tie-in ─────────────────────
+
+    /// Admin: open a new reward window anchored to the current ledger sequence.
+    ///
+    /// All claims within this epoch use `anchor_ledger` as their snapshot
+    /// reference, ensuring stable, reproducible eligibility calculations.
+    pub fn open_reward_window(
+        env: Env,
+        caller: Address,
+        window_duration_ledgers: u32,
+        total_pool: i128,
+    ) -> Result<reward_ledger::RewardWindow, AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        Ok(reward_ledger::open_reward_window(&env, window_duration_ledgers, total_pool))
+    }
+
+    /// Returns the currently active reward window, if any.
+    pub fn get_reward_window(env: Env) -> Option<reward_ledger::RewardWindow> {
+        reward_ledger::get_active_window(&env)
+    }
+
+    /// Provider: claim rewards for the active window.
+    ///
+    /// Eligibility is validated against the window's `anchor_ledger` snapshot.
+    /// Emits `reward_claimed` with the anchor ledger for auditability.
+    pub fn claim_ledger_rewards(
+        env: Env,
+        provider: Address,
+        amount: i128,
+    ) -> Result<reward_ledger::ClaimRecord, AdminError> {
+        provider.require_auth();
+        reward_ledger::record_claim(&env, &provider, amount)
+            .map_err(|_| AdminError::InvalidParameter)
+    }
+
+    /// Returns the claim record for `provider` in `epoch_id`, if any.
+    pub fn get_reward_claim_record(
+        env: Env,
+        provider: Address,
+        epoch_id: u64,
+    ) -> Option<reward_ledger::ClaimRecord> {
+        reward_ledger::get_claim_record(&env, &provider, epoch_id)
     }
 }
 
