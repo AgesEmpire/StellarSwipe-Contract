@@ -13,6 +13,7 @@ mod portfolio_tests;
 mod position_tags;
 mod preferences;
 mod queries;
+mod risk_metrics;
 mod storage;
 mod subscriptions;
 mod watchlist;
@@ -28,6 +29,7 @@ pub use preferences::{
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
+use stellar_swipe_common::health::{health_uninitialized, HealthStatus};
 use storage::DataKey;
 
 /// Compute the Herfindahl-Hirschman Index (HHI) concentration score for a user's open
@@ -199,6 +201,13 @@ pub struct TradeHistoryEntry {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeHistoryPage {
+    pub entries: Vec<TradeHistoryEntry>,
+    pub next_cursor: Option<u32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortfolioPosition {
     pub position_id: u64,
     pub position: Position,
@@ -210,6 +219,30 @@ pub struct Portfolio {
     pub open_positions: Vec<PortfolioPosition>,
     pub closed_positions: Vec<PortfolioPosition>,
     pub closed_position_ids: Vec<u64>,
+}
+
+/// Complete portfolio state export for off-chain analytics, dashboards, and indexers.
+/// All fields are read-only snapshots derived from existing on-chain state.
+/// Consumers can rely on this stable format without reverse-engineering storage keys.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortfolioExport {
+    /// Sum of all realized P&L from closed positions.
+    pub realized_pnl: i128,
+    /// Unrealized P&L from open positions (`None` when oracle is unavailable).
+    pub unrealized_pnl: Option<i128>,
+    /// Total P&L (realized + unrealized, when available).
+    pub total_pnl: i128,
+    /// Return on investment in basis points (total_pnl * 10_000 / total_invested).
+    pub roi_bps: i32,
+    /// Number of currently open positions.
+    pub open_position_count: u32,
+    /// Number of closed positions.
+    pub closed_position_count: u32,
+    /// Number of portfolio snapshots recorded for this user.
+    pub snapshot_count: u32,
+    /// Current open positions with full state.
+    pub open_positions: Vec<PortfolioPosition>,
 }
 
 soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
@@ -838,6 +871,15 @@ impl UserPortfolio {
         queries::get_trade_history(&env, user, cursor, limit)
     }
 
+    pub fn get_trade_history_page(
+        env: Env,
+        user: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> TradeHistoryPage {
+        queries::get_trade_history_page(&env, user, cursor, limit)
+    }
+
     /// Provider sets per-day fee token + amount for their premium feed (XLM or USDC, etc.).
     pub fn set_provider_subscription_terms(
         env: Env,
@@ -1186,6 +1228,69 @@ impl UserPortfolio {
         result
     }
 
+    // ── Portfolio export for off-chain analytics ───────────────────────────────
+
+    /// Read-only export of the user's full portfolio state for off-chain analytics,
+    /// dashboards, and indexers. Returns a stable `PortfolioExport` struct that
+    /// bundles P&L, position counts, open positions, and metadata in one call.
+    ///
+    /// This is a compose query — it calls `get_pnl`, reads position indexes, and
+    /// counts snapshots — but performs no writes. The returned format is documented
+    /// and guaranteed stable within the same major contract version.
+    pub fn export_portfolio(env: Env, user: Address) -> PortfolioExport {
+        let pnl = queries::compute_get_pnl(&env, user.clone());
+
+        let open_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserOpenPositions(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut open_positions = Vec::new(&env);
+        for i in 0..open_ids.len() {
+            let Some(position_id) = open_ids.get(i) else {
+                continue;
+            };
+            let Some(position) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Position>(&DataKey::Position(position_id))
+            else {
+                continue;
+            };
+            if position.status == PositionStatus::Open {
+                open_positions.push_back(PortfolioPosition {
+                    position_id,
+                    position,
+                });
+            }
+        }
+
+        let closed_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserClosedPositions(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let snapshot_count: u32 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::UserSnapshotTimestamps(user))
+            .map(|v| v.len() as u32)
+            .unwrap_or(0);
+
+        PortfolioExport {
+            realized_pnl: pnl.realized_pnl,
+            unrealized_pnl: pnl.unrealized_pnl,
+            total_pnl: pnl.total_pnl,
+            roi_bps: pnl.roi_bps,
+            open_position_count: open_positions.len() as u32,
+            closed_position_count: closed_ids.len() as u32,
+            snapshot_count,
+            open_positions,
+        }
+    }
+
     // ── Portfolio concentration risk (Issue #684) ──────────────────────────────
 
     /// Admin: set the Herfindahl concentration score threshold (0–10 000 basis points).
@@ -1342,6 +1447,28 @@ impl UserPortfolio {
             count += 1;
         }
         result
+    }
+
+    // ── Issue #862: Health / Readiness ───────────────────────────────────────
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        if !env.storage().instance().has(&DataKey::Initialized) {
+            return health_uninitialized(&env, version);
+        }
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| stellar_swipe_common::health::placeholder_admin(&env));
+        HealthStatus {
+            is_initialized: true,
+            is_paused: false,
+            version,
+            admin,
+            initialized_at: env.ledger().timestamp(),
+        }
     }
 
     fn require_admin(env: &Env) {
@@ -2715,9 +2842,7 @@ mod exposure_cap_tests {
         let user = Address::generate(&env);
 
         // Set cap of 5_000 for asset 1.
-        client
-            .set_asset_exposure_cap(&user, &1u32, &5_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &5_000i128);
 
         // Trade 3_000 — within cap.
         let result = client.try_open_position_with_cap_check(&user, &1u32, &100i128, &3_000i128);
@@ -2734,9 +2859,7 @@ mod exposure_cap_tests {
         let client = UserPortfolioClient::new(&env, &contract_id);
         let user = Address::generate(&env);
 
-        client
-            .set_asset_exposure_cap(&user, &1u32, &2_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &2_000i128);
 
         // 3_000 > 2_000 cap → must be rejected.
         let result = client.try_open_position_with_cap_check(&user, &1u32, &100i128, &3_000i128);
@@ -2765,15 +2888,11 @@ mod exposure_cap_tests {
         let client = UserPortfolioClient::new(&env, &contract_id);
         let user = Address::generate(&env);
 
-        client
-            .set_asset_exposure_cap(&user, &1u32, &1_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &1_000i128);
         assert_eq!(client.get_asset_exposure_cap(&user, &1u32), Some(1_000));
 
         // Raise the cap.
-        client
-            .set_asset_exposure_cap(&user, &1u32, &5_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &5_000i128);
         assert_eq!(client.get_asset_exposure_cap(&user, &1u32), Some(5_000));
 
         // Remove the cap entirely.

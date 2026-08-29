@@ -149,19 +149,30 @@ fn remove_active(env: &Env, id: u64) {
 
 // ── Condition evaluation ──────────────────────────────────────────────────────
 
-/// Returns the current price for `asset_id` from the risk module's price store.
-fn current_price(env: &Env, asset_id: u32) -> i128 {
-    use crate::risk::RiskDataKey;
-    env.storage()
-        .persistent()
-        .get(&RiskDataKey::AssetPrice(asset_id))
-        .unwrap_or(0)
+/// Returns the current price for `asset_id` from the risk module's price
+/// store, or `None` when no price has ever been recorded for this asset.
+///
+/// This goes through `risk::get_asset_price`, the same read path used by the
+/// rest of the auto-trade contract, so it reflects the price actually
+/// written by `risk::set_asset_price` (temporary storage) via oracle pushes
+/// and manual price updates. Previously this read directly from a different
+/// storage durability tier (`persistent`) than production ever wrote to
+/// (`temporary`), so in real usage a price was never found here and this
+/// silently defaulted to `0` — see `eval_condition` for why that is unsafe.
+fn current_price(env: &Env, asset_id: u32) -> Option<i128> {
+    crate::risk::get_asset_price(env, asset_id)
 }
 
 fn eval_condition(env: &Env, cond: &Condition, order: &ConditionalOrder) -> bool {
     match cond {
         Condition::Price(asset_id, direction, threshold) => {
-            let price = current_price(env, *asset_id);
+            // Missing price data must never be treated as `0` — a `Below`
+            // condition would then trigger immediately for any positive
+            // threshold, firing the order on garbage data instead of a real
+            // price. Fail safe: no price means the condition is not met.
+            let Some(price) = current_price(env, *asset_id) else {
+                return false;
+            };
             match direction {
                 PriceDirection::Above => price >= *threshold,
                 PriceDirection::Below => price <= *threshold,
@@ -169,7 +180,9 @@ fn eval_condition(env: &Env, cond: &Condition, order: &ConditionalOrder) -> bool
         }
         Condition::TimeAfter(after_ts) => env.ledger().timestamp() >= *after_ts,
         Condition::PriceDropRebound(asset_id, drop_bps, rebound_bps) => {
-            let price = current_price(env, *asset_id);
+            let Some(price) = current_price(env, *asset_id) else {
+                return false;
+            };
             let ref_price = order.reference_price;
             if ref_price == 0 {
                 return false;
@@ -185,7 +198,9 @@ fn eval_condition(env: &Env, cond: &Condition, order: &ConditionalOrder) -> bool
             price >= rebound_threshold
         }
         Condition::VolatilityBreakout(asset_id, threshold_bps) => {
-            let price = current_price(env, *asset_id);
+            let Some(price) = current_price(env, *asset_id) else {
+                return false;
+            };
             let ref_price = order.reference_price;
             if ref_price == 0 {
                 return false;
@@ -245,7 +260,10 @@ pub fn create_conditional_order(
     }
 
     let now = env.ledger().timestamp();
-    let ref_price = current_price(env, asset_id);
+    // 0 is the existing "no reference price" sentinel used by the
+    // PriceDropRebound / VolatilityBreakout checks above, so a missing price
+    // here correctly disables those checks rather than seeding them with 0.
+    let ref_price = current_price(env, asset_id).unwrap_or(0);
     let id = next_id(env);
 
     let order = ConditionalOrder {
@@ -339,10 +357,13 @@ pub fn check_and_trigger(env: &Env) -> Vec<u64> {
             continue;
         }
 
-        // Update trough for rebound tracking
-        let price = current_price(env, order.asset_id);
-        if price > 0 && (order.trough_price == 0 || price < order.trough_price) {
-            order.trough_price = price;
+        // Update trough for rebound tracking. No price available (asset was
+        // never priced, or the price expired) means there is nothing to
+        // record — leave the existing trough untouched.
+        if let Some(price) = current_price(env, order.asset_id) {
+            if price > 0 && (order.trough_price == 0 || price < order.trough_price) {
+                order.trough_price = price;
+            }
         }
 
         if all_triggered(env, &order) {
@@ -396,7 +417,6 @@ pub fn mark_executed(env: &Env, id: u64) -> Result<(), AutoTradeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::risk::RiskDataKey;
     use crate::{AutoTradeContract, AutoTradeContractClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger as _},
@@ -425,11 +445,13 @@ mod tests {
         keeper
     }
 
+    /// Seeds a price via the same path production code uses
+    /// (`risk::set_asset_price`), so these tests exercise the real read/write
+    /// path instead of poking storage that `current_price` never actually
+    /// reads in production.
     fn seed_price(env: &Env, contract: &Address, asset_id: u32, price: i128) {
         env.as_contract(contract, || {
-            env.storage()
-                .persistent()
-                .set(&RiskDataKey::AssetPrice(asset_id), &price);
+            crate::risk::set_asset_price(env, asset_id, price);
         });
     }
 
@@ -561,6 +583,46 @@ mod tests {
         let triggered = client.check_and_trigger_conditionals(&keeper);
         assert_eq!(triggered.len(), 1);
         assert_eq!(triggered.get(0).unwrap(), id);
+    }
+
+    /// Missing price data (asset never priced by any oracle/whitelisted
+    /// source) must never be silently treated as price `0`. A `Below`
+    /// condition would otherwise be satisfied by any positive threshold and
+    /// fire an order against garbage data instead of a real price.
+    ///
+    /// Guards against the bug where `current_price` read from a storage
+    /// durability tier (`persistent`) that production price updates
+    /// (`risk::set_asset_price`) never actually write to (`temporary`) — so
+    /// in real usage a price was never found and defaulted to `0`.
+    #[test]
+    fn test_price_condition_does_not_trigger_on_missing_price() {
+        let (env, contract, client) = setup();
+        let keeper = setup_keeper(&env, &contract);
+        let user = Address::generate(&env);
+
+        // No seed_price call for asset 2 — its price has never been recorded.
+        let conditions = simple_price_condition(&env, 2, PriceDirection::Below, 90_000);
+        let id = client.create_conditional_order(
+            &user,
+            &2,
+            &ConditionalSide::Sell,
+            &500,
+            &0,
+            &conditions,
+            &LogicOp::And,
+            &3_600,
+        );
+
+        let triggered = client.check_and_trigger_conditionals(&keeper);
+        assert_eq!(
+            triggered.len(),
+            0,
+            "an order must not trigger on an asset with no recorded price"
+        );
+        assert_eq!(
+            client.get_conditional_order(&id).status,
+            ConditionalStatus::Pending
+        );
     }
 
     #[test]

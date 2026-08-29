@@ -7,13 +7,78 @@ use crate::categories::{RiskLevel, SignalCategory};
 use crate::contests;
 use crate::errors::AdminError;
 use crate::events::{
-    emit_migration_progress, emit_migration_verification_failed, emit_migration_verified,
+    emit_migration_layout_rejected, emit_migration_progress, emit_migration_verification_failed,
+    emit_migration_verified,
 };
 use crate::types::{MigrationProgress, Signal, SignalAction, SignalStatus, SignalV1};
 use crate::StorageKey;
 use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 
 const MAX_MIGRATION_BATCH: u32 = 256;
+
+// ═══════════════════════════════════════════════════════════════════
+// Issue #812: storage layout migration guards
+// ═══════════════════════════════════════════════════════════════════
+//
+// `migrate_signals_v1_to_v2` assumes a specific on-chain storage shape: a
+// `SignalsV1` map of legacy `SignalV1` records being drained into a
+// `Signals` map of current `Signal` (v2) records. That assumption is only
+// safe to act on when the contract's recorded schema version actually says
+// "pre-migration v1 layout". Running the migration logic against any other
+// schema (e.g. a hypothetical future v3 layout that reuses these storage
+// keys differently) could silently corrupt state. `verify_storage_layout`
+// is called as the very first step of `migrate_signals_v1_to_v2`, before
+// any storage is read for mutation, and produces a deterministic,
+// auditable error (`AdminError::IncompatibleStorageLayout` + an emitted
+// event) instead of proceeding when the layout doesn't match.
+
+/// Schema version for the legacy `SignalV1` layout (pre-migration).
+pub const SIGNAL_SCHEMA_V1: u32 = 1;
+/// Schema version for the current `Signal` (v2) layout.
+pub const SIGNAL_SCHEMA_V2: u32 = 2;
+
+/// Read the on-chain storage schema version.
+///
+/// Defaults to [`SIGNAL_SCHEMA_V1`] when unset: contracts deployed before
+/// this guard existed never wrote this key, and — being pre-migration —
+/// that is in fact their real schema. Freshly-initialized contracts set
+/// this explicitly to [`SIGNAL_SCHEMA_V2`] in `initialize()` since they
+/// start with no legacy `SignalsV1` rows at all.
+pub fn get_schema_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::SchemaVersion)
+        .unwrap_or(SIGNAL_SCHEMA_V1)
+}
+
+pub fn set_schema_version(env: &Env, version: u32) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::SchemaVersion, &version);
+}
+
+/// Guard checked before any migration logic runs (Issue #812).
+///
+/// Returns `Ok(())` when the stored schema version is a layout this
+/// migration code understands:
+/// - [`SIGNAL_SCHEMA_V1`] — the expected pre-migration layout; the caller
+///   proceeds with the actual v1→v2 migration.
+/// - [`SIGNAL_SCHEMA_V2`] — already fully migrated; the caller's subsequent
+///   scan finds no v1 rows and is a safe, idempotent no-op.
+///
+/// Any other value — storage corruption, or a schema this migration code
+/// predates (e.g. a future v3) — is rejected deterministically with
+/// [`AdminError::IncompatibleStorageLayout`] and an audit event, without
+/// touching any migration state.
+pub fn verify_storage_layout(env: &Env) -> Result<(), AdminError> {
+    let version = get_schema_version(env);
+    if version == SIGNAL_SCHEMA_V1 || version == SIGNAL_SCHEMA_V2 {
+        Ok(())
+    } else {
+        emit_migration_layout_rejected(env, version);
+        Err(AdminError::IncompatibleStorageLayout)
+    }
+}
 
 fn v1_to_v2(_env: &Env, v1: &SignalV1) -> Signal {
     let rationale_hash = v1.rationale.clone();
@@ -247,6 +312,10 @@ pub fn migrate_signals_v1_to_v2(
     _admin: &Address,
     batch_size: u32,
 ) -> Result<(), AdminError> {
+    // Issue #812: storage layout check runs before any migration logic —
+    // including before the batch_size validation below — touches state.
+    verify_storage_layout(env)?;
+
     if batch_size == 0 || batch_size > MAX_MIGRATION_BATCH {
         return Err(AdminError::InvalidParameter);
     }
@@ -326,6 +395,11 @@ pub fn migrate_signals_v1_to_v2(
     if scan_to >= max_id {
         if count_v1_keys(&v1, counter) == 0 {
             set_migration_cursor(env, max_id.saturating_add(1));
+
+            // Issue #812: v1 is now fully drained — advance the recorded
+            // schema version so a future migration call takes the
+            // already-migrated (no-op) path via `verify_storage_layout`.
+            set_schema_version(env, SIGNAL_SCHEMA_V2);
 
             // Post-migration invariant verification (issue #597): v1 for this
             // scope is now fully drained, so reconcile the pre-migration
@@ -499,6 +573,118 @@ mod migration_invariant_tests {
                 verification.post.total_volume_sum - verification.pre.total_volume_sum,
                 999_999
             );
+        });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Issue #812: storage layout migration guard regression tests
+// ═══════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod storage_layout_guard_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn with_contract<R>(f: impl FnOnce(&Env) -> R) -> R {
+        let env = Env::default();
+        env.mock_all_auths();
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || f(&env))
+    }
+
+    /// A legacy (pre-guard) deployment never wrote `SchemaVersion`, so it
+    /// defaults to `SIGNAL_SCHEMA_V1` — the guard must accept this and let
+    /// migration proceed normally.
+    #[test]
+    fn migration_succeeds_with_default_legacy_schema_version() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+            test_seed_v1_signals(env, 5);
+
+            assert_eq!(get_schema_version(env), SIGNAL_SCHEMA_V1);
+            assert!(migrate_signals_v1_to_v2(env, &admin, 10).is_ok());
+
+            // Fully drained in one batch -> schema advances to v2.
+            assert_eq!(get_schema_version(env), SIGNAL_SCHEMA_V2);
+        });
+    }
+
+    /// A contract already fully migrated (schema == v2) takes the no-op
+    /// path — the guard does not reject it, and re-running is safe.
+    #[test]
+    fn migration_is_noop_when_already_at_current_schema() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+            set_schema_version(env, SIGNAL_SCHEMA_V2);
+
+            assert!(migrate_signals_v1_to_v2(env, &admin, 10).is_ok());
+            assert_eq!(get_schema_version(env), SIGNAL_SCHEMA_V2);
+        });
+    }
+
+    /// An unrecognized schema version — simulating storage corruption or a
+    /// future incompatible layout this migration code predates — must be
+    /// rejected deterministically, before any migration state is touched.
+    #[test]
+    fn migration_rejects_incompatible_schema_version() {
+        with_contract(|env| {
+            let admin = Address::generate(env);
+            test_seed_v1_signals(env, 5);
+            // Simulate an incompatible/unknown on-chain schema.
+            set_schema_version(env, 99);
+
+            let result = migrate_signals_v1_to_v2(env, &admin, 10);
+            assert_eq!(result, Err(AdminError::IncompatibleStorageLayout));
+
+            // No migration state was touched: cursor still at the seeded
+            // default, v1 map still fully populated, v2 map still empty.
+            let v1: Map<u64, SignalV1> = env
+                .storage()
+                .instance()
+                .get(&StorageKey::SignalsV1)
+                .unwrap();
+            assert_eq!(v1.len(), 5);
+            let v2: Map<u64, Signal> = env.storage().instance().get(&StorageKey::Signals).unwrap();
+            assert_eq!(v2.len(), 0);
+            assert_eq!(get_schema_version(env), 99);
+        });
+    }
+
+    /// `verify_storage_layout` is a pure precondition check independent of
+    /// any contract state beyond the schema version key itself.
+    #[test]
+    fn verify_storage_layout_accepts_known_versions_only() {
+        with_contract(|env| {
+            set_schema_version(env, SIGNAL_SCHEMA_V1);
+            assert!(verify_storage_layout(env).is_ok());
+
+            set_schema_version(env, SIGNAL_SCHEMA_V2);
+            assert!(verify_storage_layout(env).is_ok());
+
+            set_schema_version(env, 42);
+            assert_eq!(
+                verify_storage_layout(env),
+                Err(AdminError::IncompatibleStorageLayout)
+            );
+        });
+    }
+
+    /// `initialize()` sets a fresh contract's schema straight to v2 (it has
+    /// no legacy v1 rows to migrate), so migration is a safe no-op even
+    /// though `SignalsV1`/`Signals` were never seeded.
+    #[test]
+    fn fresh_initialize_sets_current_schema_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let cid = env.register(crate::SignalRegistry, ());
+        let client = crate::SignalRegistryClient::new(&env, &cid);
+        client.initialize(&admin);
+
+        env.as_contract(&cid, || {
+            assert_eq!(get_schema_version(&env), SIGNAL_SCHEMA_V2);
         });
     }
 }

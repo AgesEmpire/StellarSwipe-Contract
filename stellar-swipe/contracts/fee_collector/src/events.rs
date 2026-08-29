@@ -3,6 +3,14 @@ use shared::errors::{ErrorCategory, RecoveryStrategy};
 use soroban_sdk::{contractevent, Address, Env, String, Symbol, Vec};
 
 #[contractevent]
+pub struct SnapshotRecorded {
+    pub ledger: u64,
+    pub timestamp: u64,
+    pub total_amount: i128,
+    pub entry_count: u32,
+}
+
+#[contractevent]
 pub struct WithdrawalQueued {
     pub recipient: Address,
     pub token: Address,
@@ -282,6 +290,28 @@ pub fn emit_payout_currency_set(env: &Env, provider: &Address, preferred_token: 
     );
 }
 
+// ── #813: Authorized-caller allowlist events ────────────────────────────────
+
+pub fn emit_caller_authorized(env: &Env, caller: &Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "caller_authorized"),
+        ),
+        caller.clone(),
+    );
+}
+
+pub fn emit_caller_revoked(env: &Env, caller: &Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "caller_revoked"),
+        ),
+        caller.clone(),
+    );
+}
+
 // ── Referral events ─────────────────────────────────────────────────────────
 
 pub fn emit_referral_registered(env: &Env, referrer: &Address, referee: &Address) {
@@ -401,5 +431,103 @@ pub fn emit_effective_multiplier_changed(env: &Env, evt: EvtEffectiveMultiplierC
             Symbol::new(env, "multiplier_changed"),
         ),
         (evt.old_multiplier_bps, evt.new_multiplier_bps),
+    );
+}
+
+// ── Issue #814: Snapshot Recorded event ──────────────────────────────
+
+pub struct EvtSnapshotRecorded {
+    pub ledger: u64,
+    pub timestamp: u64,
+    pub total_amount: i128,
+    pub entry_count: u32,
+}
+
+pub fn emit_snapshot_recorded(env: &Env, evt: EvtSnapshotRecorded) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "snapshot_recorded"),
+        ),
+        (evt.ledger, evt.timestamp, evt.total_amount, evt.entry_count),
+    );
+}
+
+// ── Issue #960: Insurance Payout & Cap events ────────────────────────────────
+
+#[contractevent]
+pub struct InsurancePayout {
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub claim_id: String,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+pub struct InsurancePayoutCapUpdated {
+    pub token: Address,
+    pub old_cap: i128,
+    pub new_cap: i128,
+    pub updated_by: Address,
+}
+
+pub struct EvtInsurancePayout {
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub claim_id: String,
+    pub timestamp: u64,
+}
+
+pub fn emit_insurance_payout(env: &Env, evt: EvtInsurancePayout) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "insurance_payout"),
+        ),
+        (
+            evt.recipient,
+            evt.token,
+            evt.amount,
+            evt.claim_id,
+            evt.timestamp,
+        ),
+    );
+}
+
+pub fn emit_insurance_payout_cap_updated(
+    env: &Env,
+    token: &Address,
+    old_cap: i128,
+    new_cap: i128,
+    updated_by: &Address,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "ins_cap_updated"),
+        ),
+        (token.clone(), old_cap, new_cap, updated_by.clone()),
+    );
+}
+
+// ── Issue #940: Rebate Cap Applied event (duplicate: also closes #947) ──────
+
+/// Emitted when the per-epoch rebate cap is triggered and provider claims
+/// are scaled down proportionally.
+pub struct EvtRebateCapApplied {
+    pub epoch: u64,
+    pub requested: i128,
+    pub distributed: i128,
+}
+
+pub fn emit_rebate_cap_applied(env: &Env, evt: EvtRebateCapApplied) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "rebate_cap_applied"),
+        ),
+        (evt.epoch, evt.requested, evt.distributed),
     );
 }

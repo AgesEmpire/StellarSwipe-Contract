@@ -19,6 +19,7 @@ stellar_swipe_common = { path = "../common" }
 trade_executor = { path = "../trade_executor" }
 user_portfolio = { path = "../user_portfolio" }
 fee_collector = { path = "../fee_collector" }
+shared = { path = "../shared" }
 proptest = { version = "1", default-features = false, features = ["std"] }
 
 [[test]]
@@ -46,8 +47,16 @@ name = "test_arithmetic_invariants"
 path = "tests/integration/test_arithmetic_invariants.rs"
 
 [[test]]
+name = "test_stake_vault_invariants"
+path = "tests/integration/test_stake_vault_invariants.rs"
+
+[[test]]
 name = "test_signal_registry_reentrancy"
 path = "tests/integration/test_signal_registry_reentrancy.rs"
+
+[[test]]
+name = "test_fee_distribution_end_to_end"
+path = "tests/integration/test_fee_distribution_end_to_end.rs"
 
 [lints]
 workspace = true

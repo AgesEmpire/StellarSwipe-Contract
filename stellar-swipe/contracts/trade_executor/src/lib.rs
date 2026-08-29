@@ -1,5 +1,12 @@
 #![no_std]
+// The `#[cfg_attr(test, derive(soroban_sdk::testutils::arbitrary::Arbitrary))]`
+// on `ContractError` expands to `std::thread_local!` / `std::cell::Cell` paths,
+// so the test build of this no_std crate must link `std`.
+#[cfg(test)]
+extern crate std;
 
+pub mod batch_settlement;
+pub mod compat;
 pub mod dca;
 mod errors;
 pub mod feature_flags;
@@ -24,6 +31,7 @@ use soroban_sdk::{
     Val, Vec,
 };
 
+use stellar_swipe_common::pair_validation::{self, PairValidationError};
 use stellar_swipe_common::replay_protection::{
     purge_expired_nonces as replay_purge_expired_nonces, verify_and_commit, ReplayError,
 };
@@ -108,6 +116,21 @@ pub enum StorageKey {
     /// Next trade receipt ID counter.
     NextTradeReceiptId,
     ConfirmationDepth,
+    /// Issue #865: global pause flag set via governance-driven propagation.
+    Paused,
+    /// Issue #865: central governance contract address authorized to call
+    /// `apply_governance_pause`.
+    GovernanceAddress,
+    /// Issue #959: per-user partial fill record keyed by (user, trade_id).
+    /// Stores a `PartialFillRecord` when the SDEX only fills part of the requested amount.
+    PartialFillRecord(Address, u64),
+    /// Callback context stored before the SDEX routing call, consumed on
+    /// settlement (`accept_settlement_callback`) to atomically claim the trade.
+    CallbackContext(u64),
+    /// Issue #992: asset registry contract used to validate asset pairs before
+    /// any swap/offer is attempted. When set, pairs must be registered and
+    /// distinct, and the configured route must support them.
+    AssetRegistry,
 }
 
 /// Temporary-storage key for the reentrancy lock on `execute_copy_trade`.
@@ -117,6 +140,31 @@ pub const CIRCUIT_BREAKER_DURATION_LEDGERS: u32 = 720;
 /// Denominator used to convert `entry_price * amount` into `to_token` units.
 /// Entry prices are expected to be in 7‑decimal format (e.g. 10_000_000 = 1.0).
 const ENTRY_PRICE_DENOMINATOR: i128 = 10_000_000;
+
+/// Recorded when the SDEX only partially matches a copy-trade offer (Issue #959).
+/// Persisted in instance storage under `StorageKey::PartialFillRecord(user, trade_id)`
+/// so the frontend / keeper can inspect the shortfall without re-parsing events.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialFillRecord {
+    /// Amount originally submitted to the SDEX.
+    pub requested_amount: i128,
+    /// Amount actually received from the SDEX.
+    pub filled_amount: i128,
+    /// Unfilled remainder (`requested_amount - filled_amount`).
+    pub remaining_amount: i128,
+    /// Ledger sequence at which the partial fill was detected.
+    pub detected_at_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallbackContext {
+    pub executor: Address,
+    pub route: BytesN<32>,
+    pub from_asset: Address,
+    pub to_asset: Address,
+}
 
 /// A trade queued for execution, subject to a configurable grace period.
 #[contracttype]
@@ -316,6 +364,14 @@ fn require_admin(env: &Env) -> Result<Address, ContractError> {
     oracle::require_admin(env)
 }
 
+/// Issue #865: true when a governance-driven emergency pause is active.
+fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&StorageKey::Paused)
+        .unwrap_or(false)
+}
+
 /// Map a low-level [`ReplayError`] onto the contract's public error surface so
 /// callers can distinguish "already used" from "expired" (Issue: nonce replay
 /// attack prevention audit).
@@ -324,6 +380,46 @@ fn map_replay_error(err: ReplayError) -> ContractError {
         ReplayError::Expired => ContractError::TradeExpired,
         ReplayError::InvalidNonce | ReplayError::DuplicateTx => ContractError::NonceAlreadyUsed,
     }
+}
+
+/// Map a [`PairValidationError`] onto the contract's public error surface (Issue #992).
+fn map_pair_error(err: PairValidationError) -> ContractError {
+    match err {
+        PairValidationError::RegistryNotConfigured => ContractError::AssetRegistryNotConfigured,
+        PairValidationError::BaseAssetNotRegistered
+        | PairValidationError::QuoteAssetNotRegistered => ContractError::AssetNotRegistered,
+        PairValidationError::IdenticalAssets => ContractError::IdenticalAssets,
+        PairValidationError::RouteNotConfigured => ContractError::NotInitialized,
+        PairValidationError::RouteUnsupported => ContractError::UnsupportedPair,
+    }
+}
+
+/// Issue #992: reject unsupported asset pairs before any external call or
+/// state mutation.
+///
+/// Enforced only when an asset registry is configured (see
+/// [`Self::set_asset_registry`]). Contracts that never had a registry
+/// configured keep their previous behavior; admins enable enforcement simply
+/// by configuring one. When enforced, the pair must be registered and
+/// distinct, and the configured route (`router`) must support it.
+fn validate_pair_before_swap(
+    env: &Env,
+    registry: Option<&Address>,
+    router: &Address,
+    from_token: &Address,
+    to_token: &Address,
+) -> Result<(), ContractError> {
+    if let Some(registry) = registry {
+        pair_validation::validate_pair_for_route(
+            env,
+            Some(registry),
+            Some(router),
+            from_token,
+            to_token,
+        )
+        .map_err(map_pair_error)?;
+    }
+    Ok(())
 }
 
 fn get_confirmation_depth(env: &Env) -> u32 {
@@ -419,6 +515,28 @@ fn market_circuit_breaker_active(env: &Env) -> bool {
     }
 
     true
+}
+
+/// Read-only counterpart of [`market_circuit_breaker_active`]: reports whether the
+/// breaker is currently tripped without performing the auto-reset write when its
+/// duration has elapsed. Used by the simulation entrypoint (Issue #863) so a
+/// dry-run never mutates storage.
+fn market_circuit_breaker_active_readonly(env: &Env) -> bool {
+    let active = env
+        .storage()
+        .instance()
+        .get(&StorageKey::CircuitBreakerActive)
+        .unwrap_or(false);
+    if !active {
+        return false;
+    }
+
+    let activated_ledger = env
+        .storage()
+        .instance()
+        .get(&StorageKey::CircuitBreakerLedger)
+        .unwrap_or(env.ledger().sequence());
+    env.ledger().sequence().saturating_sub(activated_ledger) < CIRCUIT_BREAKER_DURATION_LEDGERS
 }
 
 fn open_interest_for_pair(env: &Env, pair: &Address) -> i128 {
@@ -577,6 +695,175 @@ fn record_trade_receipt(env: &Env, user: &Address, token: &Address, amount: i128
     );
 
     receipt_id
+}
+
+// ── Issue #863: read-only trade simulation ───────────────────────────────────
+
+/// Per-check validation outcomes surfaced by [`simulate_market_copy_trade`].
+/// Evaluated in the same order the corresponding gates run in
+/// `execute_market_copy_trade`, so a caller can tell exactly which check(s)
+/// would reject the trade.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulationValidations {
+    pub min_trade_size_ok: bool,
+    pub circuit_breaker_ok: bool,
+    pub open_interest_ok: bool,
+    pub daily_volume_ok: bool,
+    pub position_cap_ok: bool,
+    pub position_pct_ok: bool,
+    pub balance_ok: bool,
+}
+
+/// Result of a dry-run trade simulation. Read-only: computing it never writes
+/// storage, requires no auth, and performs no cross-contract mutation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulationResult {
+    /// True only if every check in `validations` passed.
+    pub would_succeed: bool,
+    /// Effective trade amount after resolving `portfolio_pct_bps` (or the explicit amount
+    /// unchanged when no percentage was requested).
+    pub effective_amount: i128,
+    /// Fee that would be charged in `token` for this trade.
+    pub estimated_fee: i128,
+    /// True when the user has enough balance for `effective_amount` alone but not for
+    /// `effective_amount + estimated_fee`, mirroring the fee-fallback path taken by
+    /// `execute_market_copy_trade` (the fee would be deducted from trade proceeds instead).
+    pub fee_paid_from_received: bool,
+    /// The user's current balance of `token`.
+    pub available_balance: i128,
+    /// The balance that would be required for the trade to succeed without the fallback.
+    pub required_balance: i128,
+    pub validations: SimulationValidations,
+    /// The first failing check, in the same evaluation order as `execute_market_copy_trade`.
+    /// `None` when `would_succeed` is true. Stores the `ContractError` discriminant as `u32`
+    /// (cast from `ContractError as u32`) because `contracterror` enums cannot be embedded
+    /// directly in a `contracttype` struct.
+    pub failure_reason: Option<u32>,
+}
+
+/// Dry-run a market copy trade. Mirrors the validation gate order in
+/// `execute_market_copy_trade` using only reads, so simulation and execution stay
+/// in lock-step.
+///
+/// Not replayed here: the final per-user position-limit check against the
+/// configured `UserPortfolio` contract (`validate_and_record`) is inherently
+/// mutating on that contract (it atomically records the position alongside
+/// validating it), so it cannot be dry-run from this contract. It is still
+/// enforced for real at execution time.
+fn simulate_market_copy_trade(
+    env: &Env,
+    user: Address,
+    token: Address,
+    amount: i128,
+    portfolio_pct_bps: Option<u32>,
+) -> SimulationResult {
+    let mut failure_reason: Option<u32> = None;
+    let fail = |reason: ContractError, failure_reason: &mut Option<u32>| {
+        if failure_reason.is_none() {
+            *failure_reason = Some(reason as u32);
+        }
+    };
+
+    if amount <= 0 {
+        fail(ContractError::InvalidAmount, &mut failure_reason);
+    }
+
+    let min_trade_size_ok = amount >= effective_min_trade_size(env, &token);
+    if !min_trade_size_ok {
+        fail(ContractError::BelowMinimumTradeSize, &mut failure_reason);
+    }
+
+    let circuit_breaker_ok = !market_circuit_breaker_active_readonly(env);
+    if !circuit_breaker_ok {
+        fail(ContractError::CircuitBreakerActive, &mut failure_reason);
+    }
+
+    let open_interest_ok = check_open_interest_limit(env, &token, amount).is_ok();
+    if !open_interest_ok {
+        fail(ContractError::OpenInterestLimitReached, &mut failure_reason);
+    }
+
+    let daily_limit: i128 = env
+        .storage()
+        .instance()
+        .get(&StorageKey::DailyVolumeLimit)
+        .unwrap_or(0i128);
+    let daily_volume_ok = if daily_limit > 0 {
+        let today: u64 = env.ledger().timestamp() / 86_400;
+        let day_key = StorageKey::DailyVolumeDay(user.clone());
+        let vol_key = StorageKey::DailyVolume(user.clone());
+        let stored_day: u64 = env.storage().persistent().get(&day_key).unwrap_or(0u64);
+        let current_vol: i128 = if stored_day == today {
+            env.storage().persistent().get(&vol_key).unwrap_or(0i128)
+        } else {
+            0i128
+        };
+        current_vol.checked_add(amount).unwrap_or(i128::MAX) <= daily_limit
+    } else {
+        true
+    };
+    if !daily_volume_ok {
+        fail(ContractError::DailyVolumeLimitExceeded, &mut failure_reason);
+    }
+
+    let exempt = {
+        let key = StorageKey::PositionLimitExempt(user.clone());
+        env.storage().instance().get(&key).unwrap_or(false)
+    };
+    let position_cap_ok = check_position_cap(env, &user, exempt).is_ok();
+    if !position_cap_ok {
+        fail(ContractError::TooManyOpenPositions, &mut failure_reason);
+    }
+
+    let position_pct_ok = portfolio_pct_bps
+        .map(|pct| pct <= risk_gates::MAX_POSITION_PCT_BPS)
+        .unwrap_or(true);
+    if !position_pct_ok {
+        fail(ContractError::PositionPctTooHigh, &mut failure_reason);
+    }
+
+    let oracle: Option<Address> = env.storage().instance().get(&Symbol::new(env, ORACLE_KEY));
+    let effective_amount = if position_pct_ok {
+        resolve_trade_amount(env, &user, &token, amount, portfolio_pct_bps, oracle)
+            .unwrap_or(amount)
+    } else {
+        amount
+    };
+
+    let available_balance = soroban_sdk::token::Client::new(env, &token).balance(&user);
+    let fee = effective_estimated_fee(env);
+    let (balance_ok, fee_paid_from_received, required_balance) =
+        match check_user_balance(env, &user, &token, effective_amount, fee) {
+            Ok(()) => (true, false, effective_amount.saturating_add(fee)),
+            Err(_) => match check_user_balance(env, &user, &token, effective_amount, 0) {
+                Ok(()) => (true, true, effective_amount),
+                Err(detail) => (false, false, detail.required),
+            },
+        };
+    if !balance_ok {
+        fail(ContractError::InsufficientBalance, &mut failure_reason);
+    }
+
+    SimulationResult {
+        would_succeed: failure_reason.is_none(),
+        effective_amount,
+        estimated_fee: fee,
+        fee_paid_from_received,
+        available_balance,
+        required_balance,
+        validations: SimulationValidations {
+            min_trade_size_ok,
+            circuit_breaker_ok,
+            open_interest_ok,
+            daily_volume_ok,
+            position_cap_ok,
+            position_pct_ok,
+            balance_ok,
+        },
+        failure_reason,
+    }
 }
 
 fn execute_market_copy_trade(
@@ -972,6 +1259,57 @@ fn grace_period_elapsed(env: &Env, queued_at_ledger: u32) -> bool {
 
 #[contractimpl]
 impl TradeExecutorContract {
+    pub fn expect_settlement_callback(
+        env: Env,
+        trade_id: u64,
+        executor: Address,
+        route: BytesN<32>,
+        from_asset: Address,
+        to_asset: Address,
+    ) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        let key = StorageKey::CallbackContext(trade_id);
+        if env.storage().instance().has(&key) {
+            return Err(ContractError::ReplayDetected);
+        }
+        env.storage().instance().set(
+            &key,
+            &CallbackContext {
+                executor,
+                route,
+                from_asset,
+                to_asset,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn accept_settlement_callback(
+        env: Env,
+        caller: Address,
+        trade_id: u64,
+        route: BytesN<32>,
+        from_asset: Address,
+        to_asset: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let key = StorageKey::CallbackContext(trade_id);
+        let expected: CallbackContext = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(ContractError::TradeNotFound)?;
+        if expected.executor != caller
+            || expected.route != route
+            || expected.from_asset != from_asset
+            || expected.to_asset != to_asset
+        {
+            return Err(ContractError::Unauthorized);
+        }
+        env.storage().instance().remove(&key);
+        Ok(())
+    }
+
     /// # Summary
     /// One-time contract initialization. Stores the admin address.
     ///
@@ -1040,6 +1378,58 @@ impl TradeExecutorContract {
             panic!("already initialized");
         }
         env.storage().instance().set(&StorageKey::Admin, &admin);
+    }
+
+    // ── Issue #865: governance-driven pause propagation ────────────────────────
+
+    /// Set the central governance contract address authorized to call
+    /// `apply_governance_pause`. Admin only.
+    pub fn set_governance(env: Env, governance: Address) -> Result<(), ContractError> {
+        require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::GovernanceAddress, &governance);
+        Ok(())
+    }
+
+    /// Read-only: the configured governance contract address, if any.
+    pub fn get_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::GovernanceAddress)
+    }
+
+    /// Called by the configured governance contract to propagate a pause/unpause.
+    pub fn apply_governance_pause(env: Env, paused: bool) -> Result<(), ContractError> {
+        let governance: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GovernanceAddress)
+            .ok_or(ContractError::Unauthorized)?;
+        governance.require_auth();
+        env.storage().instance().set(&StorageKey::Paused, &paused);
+        Ok(())
+    }
+
+    /// Read-only: true when a governance-driven emergency pause is active.
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
+    }
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> stellar_swipe_common::HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        let admin: Option<Address> = env.storage().instance().get(&StorageKey::Admin);
+        let Some(admin) = admin else {
+            return stellar_swipe_common::health_uninitialized(&env, version);
+        };
+        let status = stellar_swipe_common::HealthStatus {
+            is_initialized: true,
+            is_paused: is_paused(&env),
+            version,
+            admin,
+            initialized_at: env.ledger().timestamp(),
+        };
+        stellar_swipe_common::emit_health_event(&env, &status);
+        status
     }
 
     /// # Summary
@@ -1342,6 +1732,9 @@ impl TradeExecutorContract {
         tx_hash: Bytes,
         expiry_ts: u64,
     ) -> Result<(), ContractError> {
+        if is_paused(&env) {
+            return Err(ContractError::ContractPaused);
+        }
         verify_and_commit(&env, &user, nonce, tx_hash, expiry_ts).map_err(map_replay_error)?;
         feature_flags::require_feature_enabled(&env, feature_flags::FEAT_COPY_TRADE)?;
         match order_type {
@@ -1391,6 +1784,25 @@ impl TradeExecutorContract {
         }
     }
 
+    /// Dry-run a market copy trade without submitting it. Returns the expected
+    /// effective amount, fee, and a breakdown of which validation gates would
+    /// pass or fail — without requiring auth, writing any storage, or mutating
+    /// any cross-contract state. Issue #863.
+    ///
+    /// Runs the same checks, in the same order, as the `OrderType::Market` path
+    /// of [`Self::execute_copy_trade`] (excluding the final mutating position-limit
+    /// call to the `UserPortfolio` contract, which cannot be dry-run — see
+    /// [`SimulationResult`]).
+    pub fn simulate_copy_trade(
+        env: Env,
+        user: Address,
+        token: Address,
+        amount: i128,
+        portfolio_pct_bps: Option<u32>,
+    ) -> SimulationResult {
+        simulate_market_copy_trade(&env, user, token, amount, portfolio_pct_bps)
+    }
+
     /// Admin/keeper maintenance call: reclaim persistent storage held by
     /// replay-protection tx-hash entries that are past their `expiry_ts`.
     ///
@@ -1420,6 +1832,34 @@ impl TradeExecutorContract {
 
     pub fn get_sdex_router(env: Env) -> Option<Address> {
         env.storage().instance().get(&StorageKey::SdexRouter)
+    }
+
+    // ── Asset registry configuration (Issue #992) ────────────────────────────
+
+    /// Set the asset registry contract used to validate asset pairs before any
+    /// swap or token operation. Admin only.
+    ///
+    /// Once a registry is configured, [`Self::swap`], [`Self::swap_with_slippage`]
+    /// and [`Self::cancel_copy_trade`] reject pairs whose assets are not both
+    /// registered in the registry, pairs whose assets are identical, and pairs
+    /// the configured SDEX route does not support — before any external call or
+    /// state mutation. See `docs/asset_pair_validation.md` for the supported-pair
+    /// source and update authority.
+    pub fn set_asset_registry(env: Env, registry: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::AssetRegistry, &registry);
+    }
+
+    /// The configured asset registry contract, if any.
+    pub fn get_asset_registry(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::AssetRegistry)
     }
 
     /// Admin/keeper-facing price cache used to decide when pending limit orders
@@ -1768,6 +2208,9 @@ impl TradeExecutorContract {
     /// - [`ContractError::NotInitialized`] — SDEX router not configured.
     /// - [`ContractError::InvalidAmount`] — amount <= 0 or min_received < 0.
     /// - [`ContractError::SlippageExceeded`] — actual received < min_received.
+    /// - [`ContractError::AssetNotRegistered`] — an asset is not in the configured registry.
+    /// - [`ContractError::IdenticalAssets`] — both tokens are the same asset.
+    /// - [`ContractError::UnsupportedPair`] — the configured route does not support the pair.
     ///
     /// # Example
     /// ```rust,ignore
@@ -1785,6 +2228,8 @@ impl TradeExecutorContract {
             .instance()
             .get(&StorageKey::SdexRouter)
             .ok_or(ContractError::NotInitialized)?;
+        let registry: Option<Address> = env.storage().instance().get(&StorageKey::AssetRegistry);
+        validate_pair_before_swap(&env, registry.as_ref(), &router, &from_token, &to_token)?;
         execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received)
     }
 
@@ -1872,6 +2317,9 @@ impl TradeExecutorContract {
             .instance()
             .get(&StorageKey::SdexRouter)
             .ok_or(ContractError::NotInitialized)?;
+
+        let registry: Option<Address> = env.storage().instance().get(&StorageKey::AssetRegistry);
+        validate_pair_before_swap(&env, registry.as_ref(), &router, &from_token, &to_token)?;
 
         let exit_price =
             execute_sdex_swap(&env, &router, &from_token, &to_token, amount, min_received)?;
@@ -2273,6 +2721,105 @@ impl TradeExecutorContract {
     /// Return `true` when the named flag is enabled (or not set — flags default to enabled).
     pub fn is_feature_enabled(env: Env, name: String) -> bool {
         feature_flags::is_flag_enabled(&env, &name)
+    }
+
+    // ── Partial fill handling (Issue #959) ────────────────────────────────────
+
+    /// Report a partial fill for a pending copy-trade.
+    ///
+    /// Called by a keeper / off-chain executor once the SDEX path-payment or
+    /// offer response is known.  When `filled_amount < requested_amount`, the
+    /// contract:
+    ///
+    /// 1. Validates inputs (amounts non-negative, filled ≤ requested, trade exists).
+    /// 2. Records a [`PartialFillRecord`] in instance storage so the frontend
+    ///    can surface the shortfall without re-scanning events.
+    /// 3. Updates the pending-trade status to [`wire::TradeStatus::PartiallyFilled`].
+    /// 4. Emits a [`shared::events::EvtPartialFill`] event containing
+    ///    `requested_amount`, `filled_amount`, and `remaining_amount`.
+    ///
+    /// A 100 % fill (`filled_amount == requested_amount`) is accepted as a no-op
+    /// (no partial-fill event is emitted) so callers can always report the SDEX
+    /// result without needing to pre-check.
+    ///
+    /// # Errors
+    /// - [`ContractError::Unauthorized`] — `caller` is not the contract admin.
+    /// - [`ContractError::InvalidAmount`] — amounts are negative or filled > requested.
+    /// - [`ContractError::TradeNotFound`] — no pending trade matches the given IDs.
+    pub fn record_partial_fill(
+        env: Env,
+        caller: Address,
+        user: Address,
+        trade_id: u64,
+        requested_amount: i128,
+        filled_amount: i128,
+    ) -> Result<(), ContractError> {
+        // Validate amounts before auth so InvalidAmount is always the first
+        // error surface for malformed inputs, regardless of caller identity.
+        if requested_amount < 0 || filled_amount < 0 || filled_amount > requested_amount {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        caller.require_auth();
+        require_admin(&env)?;
+
+        let mut order: wire::TradeOrder = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingTradeConfirmation)
+            .ok_or(ContractError::TradeNotFound)?;
+
+        if order.trade_id != trade_id || order.user != user {
+            return Err(ContractError::TradeNotFound);
+        }
+
+        // 100 % fill: no partial-fill record or event needed.
+        if filled_amount == requested_amount {
+            return Ok(());
+        }
+
+        let remaining_amount = requested_amount
+            .checked_sub(filled_amount)
+            .unwrap_or(requested_amount);
+
+        let record = PartialFillRecord {
+            requested_amount,
+            filled_amount,
+            remaining_amount,
+            detected_at_ledger: env.ledger().sequence(),
+        };
+        env.storage().instance().set(
+            &StorageKey::PartialFillRecord(user.clone(), trade_id),
+            &record,
+        );
+
+        order.status = wire::TradeStatus::PartiallyFilled;
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingTradeConfirmation, &order);
+
+        shared::events::emit_partial_fill(
+            &env,
+            shared::events::EvtPartialFill {
+                schema_version: shared::events::SCHEMA_VERSION,
+                user,
+                trade_id,
+                requested_amount,
+                filled_amount,
+                remaining_amount,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Return the [`PartialFillRecord`] for `(user, trade_id)`, if any.
+    ///
+    /// Returns `None` when the trade was fully filled or no partial-fill was reported.
+    pub fn get_partial_fill(env: Env, user: Address, trade_id: u64) -> Option<PartialFillRecord> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::PartialFillRecord(user, trade_id))
     }
 }
 

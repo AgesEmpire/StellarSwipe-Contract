@@ -400,9 +400,26 @@ pub fn emit_migration_verification_failed(
         .publish(topics, (verification.pre, verification.post));
 }
 
+/// Issue #812: a migration was rejected before any migration logic ran
+/// because the on-chain storage schema version did not match what the
+/// migration code expects as a precondition. Emitted for auditability —
+/// no state is mutated when this fires.
+pub fn emit_migration_layout_rejected(env: &Env, found_schema_version: u32) {
+    let topics = (Symbol::new(env, "migration_layout_rejected"),);
+    env.events().publish(topics, found_schema_version);
+}
+
 pub fn emit_signal_orphaned(env: &Env, signal_id: u64, reason: String) {
     let topics = (Symbol::new(env, "signal_orphaned"),);
     env.events().publish(topics, (signal_id, reason));
+}
+
+/// Issue #948: emitted when a caller invokes an entry point kept only for
+/// backward compatibility, so indexers/integrators can see legacy usage and
+/// migrate to `replacement` before the shim is ever removed.
+pub fn emit_deprecated_entry_point_used(env: &Env, entry_point: Symbol, replacement: Symbol) {
+    let topics = (Symbol::new(env, "deprecated_entry_point_used"),);
+    env.events().publish(topics, (entry_point, replacement));
 }
 
 /// Emitted when a provider cancels a signal after the minimum lifetime has elapsed (issue #687).

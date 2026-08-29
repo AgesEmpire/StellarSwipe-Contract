@@ -1340,7 +1340,7 @@ fn reputation_config_can_be_updated_by_admin() {
         default_tier: ReputationTier::Bronze,
     };
     let result = client.update_reputation_config(&admin, &updated);
-    assert_eq!(result.decay_enabled, false);
+    assert!(!result.decay_enabled);
 
     // Verify it's stored
     let config = client.reputation_config();
@@ -3013,4 +3013,47 @@ fn reclaim_expired_proposal_removes_entry_and_is_callable_by_anyone() {
         i += 1;
     }
     assert!(!found);
+}
+
+#[test]
+fn error_messages_are_non_empty_and_distinct() {
+    // A representative sample of raw variants plus at least one alias const
+    // (Issue #883). Aliases resolve to their target variant's value, so
+    // `ContractPaused` and `Unauthorized` intentionally share a message —
+    // see `GovernanceError::message()`'s doc comment for why.
+    let samples = [
+        GovernanceError::NotInitialized,
+        GovernanceError::Unauthorized,
+        GovernanceError::ProposalNotFound,
+        GovernanceError::VotingEnded,
+        GovernanceError::BudgetExceeded,
+        GovernanceError::ContractPaused, // alias const → Unauthorized
+    ];
+    for err in samples.iter() {
+        assert!(!err.message().is_empty());
+    }
+    assert_eq!(
+        GovernanceError::Unauthorized.message(),
+        GovernanceError::ContractPaused.message(),
+        "alias consts share their target variant's runtime value and message"
+    );
+
+    let distinct = [
+        GovernanceError::NotInitialized,
+        GovernanceError::Unauthorized,
+        GovernanceError::ProposalNotFound,
+        GovernanceError::VotingEnded,
+        GovernanceError::BudgetExceeded,
+    ];
+    for i in 0..distinct.len() {
+        for j in (i + 1)..distinct.len() {
+            assert_ne!(
+                distinct[i].message(),
+                distinct[j].message(),
+                "expected distinct messages for {:?} and {:?}",
+                distinct[i],
+                distinct[j]
+            );
+        }
+    }
 }

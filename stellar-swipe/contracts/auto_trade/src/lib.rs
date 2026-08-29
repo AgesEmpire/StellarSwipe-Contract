@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 mod admin;
 mod advanced_risk;
@@ -19,6 +21,7 @@ mod drawdown;
 mod errors;
 mod escrow;
 mod exit_strategy;
+pub mod governance;
 mod history;
 mod iceberg;
 pub mod keeper;
@@ -42,7 +45,9 @@ pub mod rate_limit;
 mod referral;
 mod risk;
 mod risk_parity;
+pub mod rollback;
 mod sdex;
+pub mod signal_ordering;
 #[cfg(feature = "testutils")]
 pub mod smart_routing;
 #[cfg(not(feature = "testutils"))]
@@ -258,6 +263,45 @@ impl AutoTradeContract {
     /// Nothing. Panics if already initialized.
     pub fn initialize(env: Env, admin: Address) {
         admin::init_admin(&env, admin);
+        shared::version::set_contract_version(&env, shared::version::AUTO_TRADE_VERSION);
+    }
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+
+    /// Returns this contract's stored version. Cross-contract callers can use
+    /// this to enforce a minimum compatible version before invoking this
+    /// contract (see `shared::version::validate_callee_version`).
+    pub fn get_contract_version(env: Env) -> u32 {
+        shared::version::get_contract_version(&env)
+    }
+
+    /// Admin-only: replace this contract's executable with `new_wasm_hash`
+    /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
+    /// `new_version` as the contract's version.
+    ///
+    /// `new_version` must be strictly greater than the currently stored
+    /// version, rejecting accidental or malicious downgrades.
+    ///
+    /// # Errors
+    /// - [`AutoTradeError::Unauthorized`] — caller is not the admin.
+    /// - [`AutoTradeError::IncompatibleContractVersion`] — `new_version` is
+    ///   not strictly greater than the currently stored version.
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), AutoTradeError> {
+        admin::require_admin(&env, &caller)?;
+
+        let current_version = shared::version::get_contract_version(&env);
+        shared::version::guard_upgrade(current_version, new_version)
+            .map_err(|_| AutoTradeError::IncompatibleContractVersion)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        shared::version::set_contract_version(&env, new_version);
+        shared::version::emit_contract_upgraded(&env, current_version, new_version);
+        Ok(())
     }
 
     /// Pause a category (admin or guardian)
@@ -336,6 +380,30 @@ impl AutoTradeContract {
     /// Get the currently configured oracle contract address.
     pub fn get_oracle_address(env: Env) -> Option<Address> {
         oracle::get_oracle_address(&env)
+    }
+
+    // ── Issue #992: asset-pair validation configuration ──────────────────────
+
+    /// Set the asset registry contract used to validate asset pairs before any
+    /// execution (admin only).
+    ///
+    /// Once a registry is configured, signals with a bound token pair are
+    /// rejected when either asset is not registered, when both assets are
+    /// identical, or when no enabled AMM source supports the pair — before any
+    /// offer or token operation is attempted. See
+    /// `docs/asset_pair_validation.md` for the supported-pair source and update
+    /// authority.
+    pub fn set_asset_registry(
+        env: Env,
+        caller: Address,
+        registry: Address,
+    ) -> Result<(), AutoTradeError> {
+        admin::set_asset_registry(&env, &caller, registry)
+    }
+
+    /// The configured asset registry contract, if any.
+    pub fn get_asset_registry(env: Env) -> Option<Address> {
+        admin::get_asset_registry(&env)
     }
 
     /// Admin override for the oracle circuit breaker.
@@ -615,6 +683,10 @@ impl AutoTradeContract {
         if env.ledger().timestamp() > signal.expiry {
             return Err(AutoTradeError::SignalExpired);
         }
+
+        // Issue #992: reject unsupported asset pairs before any external call
+        // or state mutation (enforced when an asset registry is configured).
+        amm_bridge::validate_signal_pair(&env, signal_id)?;
 
         if !auth::is_authorized(&env, &user, amount) {
             return Err(AutoTradeError::Unauthorized);
@@ -2093,13 +2165,14 @@ impl AutoTradeContract {
     }
 }
 
-// Disabled: test.rs has pre-existing corruption (unclosed delimiters).
-// #[cfg(test)]
-// mod test;
+#[cfg(test)]
+mod test;
 #[cfg(test)]
 mod test_admin_transfer;
 #[cfg(test)]
 mod test_dead_mans_switch;
+#[cfg(test)]
+mod test_governance;
 mod test_oracle_whitelist;
 
 // ── Oracle integration tests ─────────────────────────────────────────────────

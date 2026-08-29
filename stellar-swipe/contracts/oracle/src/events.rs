@@ -65,6 +65,13 @@ pub fn emit_min_source_count_updated(env: &Env, old_count: u32, new_count: u32) 
     );
 }
 
+pub fn emit_min_confidence_updated(env: &Env, old_min_confidence: u32, new_min_confidence: u32) {
+    env.events().publish(
+        (Symbol::new(env, "min_confidence_updated"),),
+        (old_min_confidence, new_min_confidence),
+    );
+}
+
 pub fn emit_guardian_set(env: &Env, guardian: Address) {
     env.events()
         .publish((Symbol::new(env, "guardian_set"),), guardian);

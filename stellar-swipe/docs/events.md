@@ -117,6 +117,44 @@ Emitted when a keeper triggers a take-profit close.
 | `take_profit_price` | `i128` | Configured threshold |
 | `current_price` | `i128` | Oracle price at trigger time |
 
+### Batch settlement (`trade_executor::batch_settlement`)
+
+Events published by the settlement module (`contracts/trade_executor/src/batch_settlement.rs`)
+under the `settle` topic prefix. Slippage bounds (Issue #991) are enforced before any
+fill is recorded, so a violating batch produces **no** event and no accounting update.
+
+#### `settle/created`
+Emitted when a settlement order is created.
+
+| Field | Type | Description |
+|---|---|---|
+| `order_id` | `u64` | Assigned settlement order ID |
+| `user` | `Address` | Order owner |
+| `requested_amount` | `i128` | Total amount requested |
+
+#### `settle/fill`
+Emitted when a batch fill is recorded. Includes both the requested and the actual
+settlement amounts so off-chain trackers can detect slippage.
+
+| Field | Type | Description |
+|---|---|---|
+| `order_id` | `u64` | Settlement order ID |
+| `fill_index` | `u32` | 1-based fill sequence number |
+| `requested_amount` | `i128` | Amount requested by the order |
+| `filled_amount` | `i128` | Actual amount settled in this batch |
+| `total_settled` | `i128` | Cumulative amount settled |
+| `remaining` | `i128` | Amount still outstanding |
+| `status` | `u32` | `SettlementStatus` discriminant (`0`=Open, `1`=PartiallyFilled, `2`=FullySettled, `3`=Failed) |
+
+#### `settle/closed`
+Emitted when an order reaches `FullySettled` or is failed via `fail_settlement_order`.
+
+| Field | Type | Description |
+|---|---|---|
+| `order_id` | `u64` | Settlement order ID |
+| `status` | `u32` | Closing `SettlementStatus` discriminant |
+| `total_settled` | `i128` | Cumulative amount settled at close |
+
 ---
 
 ## UserPortfolio (`user_portfolio`)
@@ -213,4 +251,180 @@ Emitted when vested tokens are released to a beneficiary.
 | Field | Type | Description |
 |---|---|---|
 | `beneficiary` | `Address` | Vesting recipient |
+
+---
+
+## StakeVault (`stake_vault`)
+
+Structs and emit helpers live in `contracts/stake_vault/src/events.rs`. Event-name
+topics come from `contracts/shared/src/event_topics.rs` (issue #585).
+
+### `tier_up` / `tier_dn`
+Emitted when a provider's stake balance crosses a Bronze/Silver/Gold tier boundary.
+
+| Field | Type | Description |
+|---|---|---|
+| `provider` | `Address` | Staker whose tier changed |
+| `old_tier` | `u32` | Previous tier (0=none, 1=Bronze, 2=Silver, 3=Gold) |
+| `new_tier` | `u32` | New tier |
+| `stake_balance` | `i128` | Balance after the change |
+| `upgraded` | `bool` | `true` if the tier increased |
+
+### `mindur`
+Emitted when admin updates the minimum stake duration lock (voting power eligibility).
+
+| Field | Type | Description |
+|---|---|---|
+| `duration_secs` | `u64` | New minimum lock duration, in seconds |
+
+### `blwmin`
+Emitted the first time a provider's stake drops below the configured minimum.
+
+| Field | Type | Description |
+|---|---|---|
+| `provider` | `Address` | Provider below minimum |
+| `current_stake` | `i128` | Current stake balance |
+| `minimum` | `i128` | Configured minimum stake |
+
+### `wdcool` (issue #816)
+Emitted when admin (or an executed multisig proposal) updates the large-withdrawal cooldown.
+
+| Field | Type | Description |
+|---|---|---|
+| `cooldown_secs` | `u64` | New cooldown duration, in seconds (bounded to `[0, 2_592_000]`) |
+
+### `wdreq`
+Emitted when a staker initiates a time-locked large-withdrawal request.
+
+| Field | Type | Description |
+|---|---|---|
+| `staker` | `Address` | Requesting staker |
+| `balance` | `i128` | Balance at request time |
+| `unlock_at` | `u64` | Timestamp at which the withdrawal becomes actionable |
+
+### `flashln`
+Emitted when a same-ledger stake+unstake pattern is detected and blocked.
+
+| Field | Type | Description |
+|---|---|---|
+| `staker` | `Address` | Address that triggered the pattern |
+| `balance` | `i128` | Balance at detection time |
+| `ledger_seq` | `u32` | Ledger sequence number |
+
+### `slashcfg` (issue #816)
+Emitted when admin (or an executed multisig proposal) reconfigures slash tier percentages.
+Tiers must satisfy `minor_bps <= major_bps <= critical_bps <= 10_000`.
+
+| Field | Type | Description |
+|---|---|---|
+| `minor_bps` | `u32` | Minor-severity slash percentage (basis points) |
+| `major_bps` | `u32` | Major-severity slash percentage |
+| `critical_bps` | `u32` | Critical-severity slash percentage |
+
+### `prtunstk`
+Emitted on a partial unstake (withdrawal that leaves a remaining staked balance).
+
+| Field | Type | Description |
+|---|---|---|
+| `staker` | `Address` | Staker |
+| `amount` | `i128` | Amount withdrawn |
+| `remaining` | `i128` | Balance remaining after withdrawal |
+
+### `slashed`
+Emitted when a provider's stake (own + delegated) is slashed.
+
+| Field | Type | Description |
+|---|---|---|
+| `provider` | `Address` | Slashed provider |
+| `severity` | `u32` | Severity tier (0=Minor, 1=Major, 2=Critical) |
+| `slash_amount` | `i128` | Total amount slashed (own + delegated), minimum 1 stroop |
+| `slash_id` | `u64` | Unique monotonic slash identifier |
+| `reason` | `Symbol` | Caller-supplied reason code |
+
+### `apwindow`
+Emitted when admin updates the slash appeal window.
+
+| Field | Type | Description |
+|---|---|---|
+| `window_secs` | `u64` | New appeal window, in seconds (0 disables appeals) |
+
+### `appealed`
+Emitted when a provider submits an appeal against a slash.
+
+| Field | Type | Description |
+|---|---|---|
+| `appellant` | `Address` | Provider filing the appeal (must be the slashed provider) |
+| `slash_id` | `u64` | Slash being appealed |
+| `evidence_uri` | `String` | Off-chain evidence URI |
+
+### `apresolv`
+Emitted when admin resolves a pending appeal.
+
+| Field | Type | Description |
+|---|---|---|
+| `slash_id` | `u64` | Slash being resolved |
+| `uphold` | `bool` | `true` = slash stands (funds burned); `false` = reversed (funds restored) |
+| `provider` | `Address` | The slashed provider |
+
+### `delegate`
+Emitted when a delegator stakes on behalf of a provider.
+
+| Field | Type | Description |
+|---|---|---|
+| `delegator` | `Address` | Delegator |
+| `provider` | `Address` | Provider receiving delegated stake |
+| `amount` | `i128` | Amount delegated |
+
+### `ustkqueu`
+Emitted when a staker's unstake request is placed in the FIFO settlement queue.
+
+| Field | Type | Description |
+|---|---|---|
+| `staker` | `Address` | Staker |
+| `ticket` | `u64` | Assigned queue ticket |
+| `queue_position` | `u64` | Zero-based position at enqueue time |
+
+### `ustkproc`
+Emitted per staker when `process_unstake_queue` successfully settles their request.
+
+| Field | Type | Description |
+|---|---|---|
+| `staker` | `Address` | Staker |
+| `ticket` | `u64` | Queue ticket processed |
+| `amount` | `i128` | Amount withdrawn |
+
+### `batchslh` (issue #815)
+Emitted once per `batch_slash_stake` call, summarizing the run. Each successfully
+slashed provider also still emits its own `slashed` event for per-provider audit trails.
+
+| Field | Type | Description |
+|---|---|---|
+| `processed_count` | `u32` | Number of providers successfully slashed |
+| `total_slashed` | `i128` | Sum of amounts slashed across the batch |
+
+### `batchapl` (issue #815)
+Emitted once per `batch_resolve_appeal` call, summarizing the run. Each resolved
+appeal also still emits its own `apresolv` event.
+
+| Field | Type | Description |
+|---|---|---|
+| `processed_count` | `u32` | Number of appeals successfully resolved |
+
+### Emergency multi-sig unstake (issue #754): `emgcfg` / `emgreq` / `emgappr` / `emgexp` / `emgexec`
+
+| Topic | Fields |
+|---|---|
+| `emgcfg` | `required: u32`, `penalty_bps: u32`, `timeout_secs: u64` |
+| `emgreq` | `staker: Address` |
+| `emgappr` | `staker: Address`, `signer: Address`, `approvals_count: u32` |
+| `emgexp` | `staker: Address` |
+| `emgexec` | `staker: Address`, `gross: i128`, `penalty: i128`, `net: i128` |
 | `amount` | `i128` | Amount released |
+
+### `lockmult` (issue #787)
+Emitted when admin sets or updates a lock-duration voting-power multiplier tier.
+
+| Field | Type | Description |
+|---|---|---|
+| `weeks` | `u32` | Minimum remaining lock duration (in whole weeks) this tier applies to |
+| `bps` | `u32` | Voting-power multiplier in basis points (`10_000` = 1x) |

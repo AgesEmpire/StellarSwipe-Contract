@@ -25,6 +25,7 @@ mod migration;
 mod ml_scoring;
 mod multisig_approvals;
 mod performance;
+mod provider_onboarding;
 mod providers;
 mod query;
 /// Contract-wide cross-contract reentrancy guard (Issue #781).
@@ -67,10 +68,14 @@ use admin::{
     get_admin, get_admin_config, init_admin, is_trading_paused,
     require_not_paused_legacy as require_not_paused,
 };
-use shared::version::{set_contract_version, SIGNAL_REGISTRY_VERSION};
+use shared::version::{
+    emit_contract_upgraded, get_contract_version as shared_get_contract_version, guard_upgrade,
+    set_contract_version, SIGNAL_REGISTRY_VERSION,
+};
 use stellar_swipe_common::emergency::{PauseState, CAT_SIGNALS, CAT_TRADING};
 use stellar_swipe_common::rate_limit::{self as rl, ActionType as RLAction, RateLimitConfig};
 use stellar_swipe_common::SECONDS_PER_30_DAY_MONTH;
+use stellar_swipe_common::{emit_health_event, HealthStatus};
 
 use combos::{
     cancel_combo, create_combo_signal, execute_combo_signal, get_combo, get_combo_executions_pub,
@@ -97,8 +102,8 @@ use reputation::{
     TrustScoreDetails, TrustScoreTier,
 };
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, Env, IntoVal, Map, String, Symbol, Val,
-    Vec,
+    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal, Map, String,
+    Symbol, Val, Vec,
 };
 use stellar_swipe_common::placeholder_admin;
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
@@ -142,6 +147,10 @@ pub enum StorageKey {
     MigrationPreSnapshot,
     /// Result of reconciling the pre-migration snapshot against migrated v2 data (issue #597).
     MigrationVerification,
+    /// Issue #812: on-chain storage schema version. Checked by
+    /// `migration::verify_storage_layout` before any migration logic runs.
+    /// See [`migration::SIGNAL_SCHEMA_V1`] / [`migration::SIGNAL_SCHEMA_V2`].
+    SchemaVersion,
     ProviderStats,
     /// Per-provider stake balances for trust and submission gates.
     ProviderStakes,
@@ -214,6 +223,52 @@ impl SignalRegistry {
     pub fn initialize(env: Env, admin: Address) -> Result<(), AdminError> {
         init_admin(&env, admin)?;
         set_contract_version(&env, SIGNAL_REGISTRY_VERSION);
+        // Issue #812: a freshly-deployed contract has no legacy `SignalsV1`
+        // rows (new signals are written directly in the current `Signal`
+        // (v2) shape), so it starts at the current schema version. Contracts
+        // upgraded in place from before this guard existed never call
+        // `initialize` again; for them `migration::get_schema_version`
+        // defaults to `SIGNAL_SCHEMA_V1`, which is what they actually are.
+        migration::set_schema_version(&env, migration::SIGNAL_SCHEMA_V2);
+        Ok(())
+    }
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+
+    /// Returns this contract's stored version. Cross-contract callers can use
+    /// this to enforce a minimum compatible version before invoking this
+    /// contract (see `shared::version::validate_callee_version`).
+    pub fn get_contract_version(env: Env) -> u32 {
+        shared_get_contract_version(&env)
+    }
+
+    /// Admin-only: replace this contract's executable with `new_wasm_hash`
+    /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
+    /// `new_version` as the contract's version.
+    ///
+    /// `new_version` must be strictly greater than the currently stored
+    /// version, rejecting accidental or malicious downgrades.
+    ///
+    /// # Errors
+    /// - [`AdminError::Unauthorized`] — caller is not the admin.
+    /// - [`AdminError::IncompatibleContractVersion`] — `new_version` is not
+    ///   strictly greater than the currently stored version.
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), AdminError> {
+        admin::require_admin(&env, &caller)?;
+        caller.require_auth();
+
+        let current_version = shared_get_contract_version(&env);
+        guard_upgrade(current_version, new_version)
+            .map_err(|_| AdminError::IncompatibleContractVersion)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        set_contract_version(&env, new_version);
+        emit_contract_upgraded(&env, current_version, new_version);
         Ok(())
     }
 
@@ -611,25 +666,49 @@ impl SignalRegistry {
         let signals = Self::get_signals_map(&env);
         let expired_signal_count = expiry::count_prunable_signals(&env, &signals);
         if !admin::has_admin(&env) {
-            return RegistryHealthStatus {
+            let status = RegistryHealthStatus {
                 is_initialized: false,
                 is_paused: false,
                 version,
                 admin: placeholder_admin(&env),
                 expired_signal_count,
+                initialized_at: 0,
             };
+            emit_health_event(
+                &env,
+                &HealthStatus {
+                    is_initialized: status.is_initialized,
+                    is_paused: status.is_paused,
+                    version: status.version.clone(),
+                    admin: status.admin.clone(),
+                    initialized_at: status.initialized_at,
+                },
+            );
+            return status;
         }
         let admin_addr = match get_admin(&env) {
             Ok(a) => a,
             Err(_) => placeholder_admin(&env),
         };
-        RegistryHealthStatus {
+        let status = RegistryHealthStatus {
             is_initialized: true,
             is_paused: is_trading_paused(&env),
             version,
             admin: admin_addr,
             expired_signal_count,
-        }
+            initialized_at: env.ledger().timestamp(),
+        };
+        emit_health_event(
+            &env,
+            &HealthStatus {
+                is_initialized: status.is_initialized,
+                is_paused: status.is_paused,
+                version: status.version.clone(),
+                admin: status.admin.clone(),
+                initialized_at: status.initialized_at,
+            },
+        );
+        status
     }
 
     /// Permanently remove up to `max_entries` expired signals from instance
@@ -1229,7 +1308,6 @@ impl SignalRegistry {
             submitted_at: now,
             expiry,
             status: SignalStatus::Active,
-            // Initialize performance tracking fields
             executions: 0,
             successful_executions: 0,
             total_volume: 0,
@@ -1238,7 +1316,6 @@ impl SignalRegistry {
             category: category.clone(),
             tags: unique_tags.clone(),
             risk_level,
-            // Collaboration field
             is_collaborative: false,
             rationale_hash,
             confidence: 50,
@@ -2089,6 +2166,13 @@ impl SignalRegistry {
         Ok(())
     }
 
+    /// Read-only: the total staked amount for `provider`, or `0` when not staked.
+    pub fn get_stake(env: Env, provider: Address) -> i128 {
+        stake::get_stake_info(&env, &provider)
+            .map(|info| info.amount)
+            .unwrap_or(0)
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // Issue #424: Provider Ban Mechanism
     // ═══════════════════════════════════════════════════════════════
@@ -2431,6 +2515,23 @@ impl SignalRegistry {
         } else {
             expiry::get_active_signals(&env, &signals)
         }
+    }
+
+    /// Read-only, cursor-paginated history of all signals a provider has
+    /// ever submitted. Newest-first with deterministic ordering; pages are
+    /// bounded to at most [`query::MAX_HISTORY_PAGE_SIZE`] records so large
+    /// histories do not exceed Soroban resource limits.
+    ///
+    /// See [`query::get_provider_signal_history`] for the full pagination
+    /// semantics (cursor exclusivity, clamping, out-of-range / empty pages).
+    pub fn get_provider_signal_history(
+        env: Env,
+        provider: Address,
+        cursor: Option<u64>,
+        limit: u32,
+    ) -> query::ProviderSignalHistoryPage {
+        let signals_map = Self::get_signals_map(&env);
+        query::get_provider_signal_history(&env, &signals_map, &provider, cursor, limit)
     }
 
     /* =========================
@@ -3564,6 +3665,12 @@ mod test_adoption;
 /// Signal categorization query tests (Issue #660).
 #[cfg(test)]
 mod test_categorization;
+/// Composite churn-risk scoring tests (Issue #944).
+#[cfg(test)]
+mod test_churn_risk;
+/// Collaborative signal reward distribution tests (Issue #957).
+#[cfg(test)]
+mod test_collaboration;
 #[cfg(test)]
 mod test_daily_signal_limit;
 #[cfg(test)]

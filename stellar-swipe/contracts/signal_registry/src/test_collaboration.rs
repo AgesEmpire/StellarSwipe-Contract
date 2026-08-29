@@ -1,45 +1,79 @@
 #![cfg(test)]
+use crate::types::SignalOutcome;
 use crate::{SignalRegistry, SignalRegistryClient};
-use soroban_sdk::{testutils::Address as _, Address, Env, String, Vec};
-use crate::categories::{RiskLevel, SignalCategory};
-use crate::types::SignalAction;
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env, String, Vec,
+};
+
+fn setup() -> (Env, Address, SignalRegistryClient<'static>) {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    (env, admin, client)
+}
+
+/// Creates a collaborative signal, has every co-author approve it, then
+/// advances past expiry and runs cleanup so the signal leaves `Active` and
+/// `record_signal_outcome` can be called.
+fn create_approved_and_closed_signal(
+    env: &Env,
+    client: &SignalRegistryClient,
+    primary: &Address,
+    co_authors: &Vec<Address>,
+    contribution_pcts: &Vec<u32>,
+) -> u64 {
+    let expiry = env.ledger().timestamp() + 86400;
+    let signal_id = client.create_collaborative_signal(
+        primary,
+        co_authors,
+        contribution_pcts,
+        &String::from_str(env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &1_000_000,
+        &String::from_str(env, "Bullish signal"),
+        &expiry,
+    );
+
+    for co_author in co_authors.iter() {
+        client.approve_collaborative_signal(&signal_id, &co_author);
+    }
+
+    env.ledger().set_timestamp(expiry + 1);
+    client.cleanup_expired_signals(&100);
+    signal_id
+}
 
 #[test]
 fn test_create_collaborative_signal() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, SignalRegistry);
-    let client = SignalRegistryClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
+    let (env, _admin, client) = setup();
     let primary = Address::generate(&env);
     let co_author1 = Address::generate(&env);
     let co_author2 = Address::generate(&env);
 
-    client.initialize(&admin);
-
     let mut co_authors = Vec::new(&env);
-    co_authors.push_back(co_author1.clone());
-    co_authors.push_back(co_author2.clone());
+    co_authors.push_back(co_author1);
+    co_authors.push_back(co_author2);
 
     let mut contribution_pcts = Vec::new(&env);
     contribution_pcts.push_back(6000); // Primary: 60%
     contribution_pcts.push_back(2500); // Co-author1: 25%
     contribution_pcts.push_back(1500); // Co-author2: 15%
 
+    let expiry = env.ledger().timestamp() + 86400;
     let signal_id = client.create_collaborative_signal(
         &primary,
         &co_authors,
         &contribution_pcts,
         &String::from_str(&env, "XLM/USDC"),
-        &SignalAction::Buy,
-        &1000000,
+        &crate::types::SignalAction::Buy,
+        &1_000_000,
         &String::from_str(&env, "Bullish signal"),
-        &(env.ledger().timestamp() + 86400),
-        &SignalCategory::SWING,
-        &Vec::new(&env),
-        &RiskLevel::Medium,
+        &expiry,
     );
 
     assert!(signal_id > 0);
@@ -48,17 +82,9 @@ fn test_create_collaborative_signal() {
 
 #[test]
 fn test_approve_collaborative_signal() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, SignalRegistry);
-    let client = SignalRegistryClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
+    let (env, _admin, client) = setup();
     let primary = Address::generate(&env);
     let co_author = Address::generate(&env);
-
-    client.initialize(&admin);
 
     let mut co_authors = Vec::new(&env);
     co_authors.push_back(co_author.clone());
@@ -67,18 +93,16 @@ fn test_approve_collaborative_signal() {
     contribution_pcts.push_back(6000);
     contribution_pcts.push_back(4000);
 
+    let expiry = env.ledger().timestamp() + 86400;
     let signal_id = client.create_collaborative_signal(
         &primary,
         &co_authors,
         &contribution_pcts,
         &String::from_str(&env, "XLM/USDC"),
-        &SignalAction::Buy,
-        &1000000,
+        &crate::types::SignalAction::Buy,
+        &1_000_000,
         &String::from_str(&env, "Bullish signal"),
-        &(env.ledger().timestamp() + 86400),
-        &SignalCategory::SWING,
-        &Vec::new(&env),
-        &RiskLevel::Medium,
+        &expiry,
     );
 
     client.approve_collaborative_signal(&signal_id, &co_author);
@@ -88,19 +112,10 @@ fn test_approve_collaborative_signal() {
 }
 
 #[test]
-#[should_panic(expected = "InvalidParameter")]
 fn test_invalid_contribution_percentages() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, SignalRegistry);
-    let client = SignalRegistryClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
+    let (env, _admin, client) = setup();
     let primary = Address::generate(&env);
     let co_author = Address::generate(&env);
-
-    client.initialize(&admin);
 
     let mut co_authors = Vec::new(&env);
     co_authors.push_back(co_author);
@@ -109,94 +124,126 @@ fn test_invalid_contribution_percentages() {
     contribution_pcts.push_back(6000);
     contribution_pcts.push_back(3000); // Total = 9000, not 10000
 
-    client.create_collaborative_signal(
+    let expiry = env.ledger().timestamp() + 86400;
+    let result = client.try_create_collaborative_signal(
         &primary,
         &co_authors,
         &contribution_pcts,
         &String::from_str(&env, "XLM/USDC"),
-        &SignalAction::Buy,
-        &1000000,
+        &crate::types::SignalAction::Buy,
+        &1_000_000,
         &String::from_str(&env, "Bullish signal"),
-        &(env.ledger().timestamp() + 86400),
-        &SignalCategory::SWING,
-        &Vec::new(&env),
-        &RiskLevel::Medium,
+        &expiry,
     );
+    assert!(result.is_err());
 }
 
 #[test]
-fn test_collaborative_reward_distribution_equal() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, SignalRegistry);
-    let client = SignalRegistryClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
+fn test_reward_distribution_single_contributor() {
+    let (env, admin, client) = setup();
+    let executor = Address::generate(&env);
+    client.set_trade_executor(&admin, &executor);
+
+    let primary = Address::generate(&env);
+    let co_authors = Vec::new(&env);
+    let mut pcts = Vec::new(&env);
+    pcts.push_back(10000); // Primary: 100%
+
+    let signal_id = create_approved_and_closed_signal(&env, &client, &primary, &co_authors, &pcts);
+
+    client.record_signal_outcome(&executor, &signal_id, &SignalOutcome::Profit, &1000, &500);
+
+    assert_eq!(client.claim_pending_rewards(&primary), (1000, 500));
+}
+
+#[test]
+fn test_reward_distribution_two_equal_contributors() {
+    let (env, admin, client) = setup();
+    let executor = Address::generate(&env);
+    client.set_trade_executor(&admin, &executor);
+
+    let primary = Address::generate(&env);
+    let co_author = Address::generate(&env);
+    let mut co_authors = Vec::new(&env);
+    co_authors.push_back(co_author.clone());
+    let mut pcts = Vec::new(&env);
+    pcts.push_back(5000);
+    pcts.push_back(5000);
+
+    let signal_id = create_approved_and_closed_signal(&env, &client, &primary, &co_authors, &pcts);
+
+    client.record_signal_outcome(&executor, &signal_id, &SignalOutcome::Profit, &1000, &500);
+
+    assert_eq!(client.claim_pending_rewards(&primary), (500, 250));
+    assert_eq!(client.claim_pending_rewards(&co_author), (500, 250));
+}
+
+#[test]
+fn test_reward_distribution_three_unequal_contributors() {
+    let (env, admin, client) = setup();
+    let executor = Address::generate(&env);
+    client.set_trade_executor(&admin, &executor);
+
     let primary = Address::generate(&env);
     let co_author1 = Address::generate(&env);
     let co_author2 = Address::generate(&env);
-    client.initialize(&admin);
-
-    // Create collaborative signal with 60/25/15
     let mut co_authors = Vec::new(&env);
     co_authors.push_back(co_author1.clone());
     co_authors.push_back(co_author2.clone());
     let mut pcts = Vec::new(&env);
-    pcts.push_back(6000);
-    pcts.push_back(2500);
-    pcts.push_back(1500);
+    pcts.push_back(6000); // Primary: 60%
+    pcts.push_back(2500); // Co-author1: 25%
+    pcts.push_back(1500); // Co-author2: 15%
 
-    let signal_id = client.create_collaborative_signal(
-        &primary,
-        &co_authors,
-        &pcts,
-        &String::from_str(&env, "XLM/USDC"),
-        &SignalAction::Buy,
-        &1000000,
-        &String::from_str(&env, "Bullish signal"),
-        &(env.ledger().timestamp() + 86400),
-        &SignalCategory::SWING,
-        &Vec::new(&env),
-        &RiskLevel::Medium,
-    );
+    let signal_id = create_approved_and_closed_signal(&env, &client, &primary, &co_authors, &pcts);
 
-    // Approve co-authors
-    client.approve_collaborative_signal(&signal_id, &co_author1);
-    client.approve_collaborative_signal(&signal_id, &co_author2);
+    client.record_signal_outcome(&executor, &signal_id, &SignalOutcome::Profit, &1000, &500);
 
-    // Simulate closing the signal (must be non-active)
-    // In a real test you'd also need to record a trade execution or manually set status.
-    // For simplicity, we can directly call record_signal_outcome after setting status to Closed.
-    // We'll assume the contract provides a way to close it (e.g., expiry or admin action).
-    // For this test, we can manually mutate the signal status via a helper or use expiry.
-    // Let's use the existing cleanup_expired_signals or just trust that the signal is now closed.
+    let (primary_fee, primary_roi) = client.claim_pending_rewards(&primary);
+    let (c1_fee, c1_roi) = client.claim_pending_rewards(&co_author1);
+    let (c2_fee, c2_roi) = client.claim_pending_rewards(&co_author2);
 
-    // Record outcome with total_fee = 1000, total_roi = 500
-    // The TradeExecutor must be set first.
+    assert_eq!((primary_fee, primary_roi), (600, 300));
+    assert_eq!((c1_fee, c1_roi), (250, 125));
+    assert_eq!((c2_fee, c2_roi), (150, 75));
+
+    // No dust loss: shares must sum back to the totals passed in.
+    assert_eq!(primary_fee + c1_fee + c2_fee, 1000);
+    assert_eq!(primary_roi + c1_roi + c2_roi, 500);
+}
+
+#[test]
+fn test_reward_distribution_rounding_remainder_goes_to_last_contributor() {
+    let (env, admin, client) = setup();
     let executor = Address::generate(&env);
-    client.set_trade_executor(&admin, &executor); // admin sets it
-    // Also need to set the caller as executor (mock all auths)
-    // Since we have mock_all_auths, we can call with executor as caller.
-    client.record_signal_outcome(
-        &signal_id,
-        &SignalOutcome::Win,
-        &1000,
-        &500,
-    );
+    client.set_trade_executor(&admin, &executor);
 
-    // Check pending rewards
-    let pending_primary = client.get_pending_rewards(&primary);
-    assert_eq!(pending_primary.fee, 600);
-    assert_eq!(pending_primary.roi, 300);
+    let primary = Address::generate(&env);
+    let co_author1 = Address::generate(&env);
+    let co_author2 = Address::generate(&env);
+    let mut co_authors = Vec::new(&env);
+    co_authors.push_back(co_author1.clone());
+    co_authors.push_back(co_author2.clone());
+    let mut pcts = Vec::new(&env);
+    // 1/3 splits do not divide evenly into an indivisible fee amount.
+    pcts.push_back(3334);
+    pcts.push_back(3333);
+    pcts.push_back(3333);
 
-    let pending_c1 = client.get_pending_rewards(&co_author1);
-    assert_eq!(pending_c1.fee, 250);
-    assert_eq!(pending_c1.roi, 125);
+    let signal_id = create_approved_and_closed_signal(&env, &client, &primary, &co_authors, &pcts);
 
-    let pending_c2 = client.get_pending_rewards(&co_author2);
-    assert_eq!(pending_c2.fee, 150);
-    assert_eq!(pending_c2.roi, 75);
+    // total_fee = 100 is not evenly divisible by these basis-point shares.
+    client.record_signal_outcome(&executor, &signal_id, &SignalOutcome::Profit, &100, &10);
 
-    // Verify sum
-    assert_eq!(pending_primary.fee + pending_c1.fee + pending_c2.fee, 1000);
-    assert_eq!(pending_primary.roi + pending_c1.roi + pending_c2.roi, 500);
+    let (primary_fee, primary_roi) = client.claim_pending_rewards(&primary);
+    let (c1_fee, c1_roi) = client.claim_pending_rewards(&co_author1);
+    let (c2_fee, c2_roi) = client.claim_pending_rewards(&co_author2);
+
+    // Floor division: 100 * 3334 / 10000 = 33, 100 * 3333 / 10000 = 33 (x2).
+    // The last contributor absorbs the 1-unit remainder so the sum is exact.
+    assert_eq!(primary_fee, 33);
+    assert_eq!(c1_fee, 33);
+    assert_eq!(c2_fee, 34);
+    assert_eq!(primary_fee + c1_fee + c2_fee, 100);
+    assert_eq!(primary_roi + c1_roi + c2_roi, 10);
 }
