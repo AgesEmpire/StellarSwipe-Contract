@@ -168,154 +168,165 @@ pub fn get_onboarding_record(env: &Env, provider: &Address) -> Option<Onboarding
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::Env;
+    use soroban_sdk::{contract, testutils::Address as _, Env};
 
-    fn env() -> Env {
-        Env::default()
+    #[contract]
+    struct TestContract;
+
+    fn env() -> (Env, Address) {
+        let e = Env::default();
+        e.mock_all_auths();
+        let cid = e.register(TestContract, ());
+        (e, cid)
     }
 
     // ── register ──────────────────────────────────────────────────────────
 
     #[test]
     fn register_sets_pending_status() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
-        e.mock_all_auths();
-        register_provider(&e, &provider);
-        let rec = get_onboarding_record(&e, &provider).unwrap();
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        let rec = e
+            .as_contract(&cid, || get_onboarding_record(&e, &provider))
+            .unwrap();
         assert_eq!(rec.status, OnboardingStatus::Pending);
     }
 
     #[test]
     #[should_panic(expected = "provider already registered")]
     fn register_twice_panics() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
-        e.mock_all_auths();
-        register_provider(&e, &provider);
-        register_provider(&e, &provider);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider));
     }
 
     // ── approve ───────────────────────────────────────────────────────────
 
     #[test]
     fn approve_pending_provider_succeeds() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.mock_all_auths();
-        register_provider(&e, &provider);
-        approve_provider(&e, &gov, &provider);
-        let rec = get_onboarding_record(&e, &provider).unwrap();
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
+        let rec = e
+            .as_contract(&cid, || get_onboarding_record(&e, &provider))
+            .unwrap();
         assert_eq!(rec.status, OnboardingStatus::Approved);
     }
 
     #[test]
     #[should_panic(expected = "provider is not pending")]
     fn approve_already_approved_panics() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.mock_all_auths();
-        register_provider(&e, &provider);
-        approve_provider(&e, &gov, &provider);
-        approve_provider(&e, &gov, &provider);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
     }
 
     // ── reject ────────────────────────────────────────────────────────────
 
     #[test]
     fn reject_pending_provider_succeeds() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.mock_all_auths();
-        register_provider(&e, &provider);
-        reject_provider(&e, &gov, &provider);
-        let rec = get_onboarding_record(&e, &provider).unwrap();
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || reject_provider(&e, &gov, &provider));
+        let rec = e
+            .as_contract(&cid, || get_onboarding_record(&e, &provider))
+            .unwrap();
         assert_eq!(rec.status, OnboardingStatus::Rejected);
     }
 
     #[test]
     #[should_panic(expected = "provider is not pending")]
     fn reject_approved_provider_panics() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.mock_all_auths();
-        register_provider(&e, &provider);
-        approve_provider(&e, &gov, &provider);
-        reject_provider(&e, &gov, &provider);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
+        e.as_contract(&cid, || reject_provider(&e, &gov, &provider));
     }
 
     // ── re-verification ───────────────────────────────────────────────────
 
     #[test]
     fn rejected_provider_can_request_reverification() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.mock_all_auths();
-        register_provider(&e, &provider);
-        reject_provider(&e, &gov, &provider);
-        request_reverification(&e, &provider);
-        let rec = get_onboarding_record(&e, &provider).unwrap();
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || reject_provider(&e, &gov, &provider));
+        e.as_contract(&cid, || request_reverification(&e, &provider));
+        let rec = e
+            .as_contract(&cid, || get_onboarding_record(&e, &provider))
+            .unwrap();
         assert_eq!(rec.status, OnboardingStatus::Pending);
     }
 
     #[test]
     #[should_panic(expected = "provider is not rejected")]
     fn reverification_on_pending_panics() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
-        e.mock_all_auths();
-        register_provider(&e, &provider);
-        request_reverification(&e, &provider);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || request_reverification(&e, &provider));
     }
 
     #[test]
     #[should_panic(expected = "provider is not rejected")]
     fn reverification_on_approved_panics() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.mock_all_auths();
-        register_provider(&e, &provider);
-        approve_provider(&e, &gov, &provider);
-        request_reverification(&e, &provider);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
+        e.as_contract(&cid, || request_reverification(&e, &provider));
     }
 
     // ── full lifecycle ────────────────────────────────────────────────────
 
     #[test]
     fn full_lifecycle_register_reject_reverify_approve() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.mock_all_auths();
 
-        register_provider(&e, &provider);
+        e.as_contract(&cid, || register_provider(&e, &provider));
         assert_eq!(
-            get_onboarding_record(&e, &provider).unwrap().status,
+            e.as_contract(&cid, || get_onboarding_record(&e, &provider))
+                .unwrap()
+                .status,
             OnboardingStatus::Pending
         );
 
-        reject_provider(&e, &gov, &provider);
+        e.as_contract(&cid, || reject_provider(&e, &gov, &provider));
         assert_eq!(
-            get_onboarding_record(&e, &provider).unwrap().status,
+            e.as_contract(&cid, || get_onboarding_record(&e, &provider))
+                .unwrap()
+                .status,
             OnboardingStatus::Rejected
         );
 
-        request_reverification(&e, &provider);
+        e.as_contract(&cid, || request_reverification(&e, &provider));
         assert_eq!(
-            get_onboarding_record(&e, &provider).unwrap().status,
+            e.as_contract(&cid, || get_onboarding_record(&e, &provider))
+                .unwrap()
+                .status,
             OnboardingStatus::Pending
         );
 
-        approve_provider(&e, &gov, &provider);
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
         assert_eq!(
-            get_onboarding_record(&e, &provider).unwrap().status,
+            e.as_contract(&cid, || get_onboarding_record(&e, &provider))
+                .unwrap()
+                .status,
             OnboardingStatus::Approved
         );
     }
@@ -325,17 +336,18 @@ mod tests {
     #[test]
     #[should_panic(expected = "provider not found")]
     fn approve_unknown_provider_panics() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.mock_all_auths();
-        approve_provider(&e, &gov, &provider);
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
     }
 
     #[test]
     fn get_record_returns_none_for_unknown_provider() {
-        let e = env();
+        let (e, cid) = env();
         let provider = Address::generate(&e);
-        assert!(get_onboarding_record(&e, &provider).is_none());
+        assert!(e
+            .as_contract(&cid, || get_onboarding_record(&e, &provider))
+            .is_none());
     }
 }

@@ -170,18 +170,26 @@ mod compat_tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, testutils::Events, Env};
 
+    fn with_contract<R>(f: impl FnOnce(&Env) -> R) -> R {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register(crate::TradeExecutorContract, ());
+        env.as_contract(&cid, || f(&env))
+    }
+
     // ── emit_deprecation_warning ────────────────────────────────────────────
 
     #[test]
     fn deprecation_event_is_published() {
-        let env = Env::default();
-        let old = symbol_short!("old_fn");
-        let new = symbol_short!("new_fn");
+        with_contract(|env| {
+            let old = symbol_short!("old_fn");
+            let new = symbol_short!("new_fn");
 
-        emit_deprecation_warning(&env, old.clone(), new.clone(), 2);
+            emit_deprecation_warning(env, old.clone(), new.clone(), 2);
 
-        let events = env.events().all();
-        assert_eq!(events.len(), 1, "expected exactly one deprecation event");
+            let events = env.events().all();
+            assert_eq!(events.len(), 1, "expected exactly one deprecation event");
+        });
     }
 
     // ── DeprecationNotice ───────────────────────────────────────────────────
@@ -207,31 +215,31 @@ mod compat_tests {
 
     #[test]
     fn fetch_receipt_returns_none_for_unknown_id_and_emits_warning() {
-        let env = Env::default();
+        with_contract(|env| {
+            #[allow(deprecated)]
+            let result = fetch_receipt(env, 99_999);
 
-        #[allow(deprecated)]
-        let result = fetch_receipt(&env, 99_999);
+            assert!(result.is_none());
 
-        assert!(result.is_none());
-
-        let events = env.events().all();
-        assert!(!events.is_empty(), "deprecation event expected");
+            let events = env.events().all();
+            assert!(!events.is_empty(), "deprecation event expected");
+        });
     }
 
     // ── ping shim ───────────────────────────────────────────────────────────
 
     #[test]
     fn ping_returns_false_when_contract_not_initialized_and_emits_warning() {
-        let env = Env::default();
+        with_contract(|env| {
+            #[allow(deprecated)]
+            let alive = ping(env);
 
-        #[allow(deprecated)]
-        let alive = ping(&env);
+            // Contract not initialized — health_check returns is_initialized = false.
+            assert!(!alive);
 
-        // Contract not initialized — health_check returns is_initialized = false.
-        assert!(!alive);
-
-        let events = env.events().all();
-        assert!(!events.is_empty(), "deprecation event expected");
+            let events = env.events().all();
+            assert!(!events.is_empty(), "deprecation event expected");
+        });
     }
 
     // ── dry_run shim ────────────────────────────────────────────────────────
@@ -240,17 +248,20 @@ mod compat_tests {
     fn dry_run_shim_emits_deprecation_and_returns_result() {
         let env = Env::default();
         env.mock_all_auths();
-
+        let cid = env.register(crate::TradeExecutorContract, ());
         let user = soroban_sdk::Address::generate(&env);
-        let token = soroban_sdk::Address::generate(&env);
+        let issuer = soroban_sdk::Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(issuer).address();
 
-        #[allow(deprecated)]
-        let result = dry_run(&env, user, token, 0, None);
+        env.as_contract(&cid, || {
+            #[allow(deprecated)]
+            let result = dry_run(&env, user, token, 0, None);
 
-        // Amount is 0 → would_succeed = false (invalid amount gate).
-        assert!(!result.would_succeed);
+            // Amount is 0 → would_succeed = false (invalid amount gate).
+            assert!(!result.would_succeed);
 
-        let events = env.events().all();
-        assert!(!events.is_empty(), "deprecation event expected");
+            let events = env.events().all();
+            assert!(!events.is_empty(), "deprecation event expected");
+        });
     }
 }

@@ -2782,7 +2782,7 @@ fn deposit_stake_budget_regression() {
     let staker = Address::generate(&env);
     let amount: i128 = 1_000_000;
 
-    StellarAssetClient::new(&env, &token).mint(&vault_id, &amount);
+    StellarAssetClient::new(&env, &token).mint(&staker, &amount);
 
     env.budget().reset_tracker();
     StakeVaultContractClient::new(&env, &vault_id).deposit_stake(&staker, &amount);

@@ -279,10 +279,11 @@ mod tests {
         let (env, id) = setup();
         let c = TestPausableClient::new(&env, &id);
         c.pause();
-        let before = env.events().all().len();
+        // Each top-level invocation clears the event buffer at its start, so
+        // everything observed after `unpause` belongs to that invocation.
         c.unpause();
         assert!(
-            env.events().all().len() > before,
+            !env.events().all().is_empty(),
             "unpause must emit an event"
         );
     }

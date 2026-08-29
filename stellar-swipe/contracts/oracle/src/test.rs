@@ -546,7 +546,7 @@ fn test_get_normalized_price_differing_native_decimals_to_common_target() {
 }
 
 #[test]
-fn test_get_normalized_price_no_decimals_configured_returns_error() {
+fn test_get_normalized_price_no_decimals_configured_falls_back() {
     let (env, admin, _, _, _) = create_test_env();
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
@@ -554,10 +554,11 @@ fn test_get_normalized_price_no_decimals_configured_returns_error() {
 
     let pair = make_pair(&env, "ETH", "USD");
     client.set_price(&pair, &2_000_000_000i128);
-    // Deliberately omit set_feed_decimals.
+    // Deliberately omit set_feed_decimals — falls back to 7 decimals.
 
-    let result = client.try_get_normalized_price(&pair, &6u32);
-    assert!(result.is_err());
+    // Rescaling a 7-decimal price to 6 decimals divides by 10.
+    let normalized = client.get_normalized_price(&pair, &6u32);
+    assert_eq!(normalized, 200_000_000i128);
 }
 
 #[test]

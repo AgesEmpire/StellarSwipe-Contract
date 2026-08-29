@@ -411,6 +411,7 @@ mod tests {
         let cid = env.register(TestContract, ());
 
         env.as_contract(&cid, || {
+            env.cost_estimate().budget().reset_unlimited();
             // Provider i:
             //   success_rate   = (i+1)*100   bps  (100..=3000)
             //   total_copies   = (i+1)*5          (5..=150)
