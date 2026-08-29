@@ -360,4 +360,24 @@ impl AutoTradeError {
     /// `upgrade()` was called with a version that is not strictly greater
     /// than the currently stored contract version.
     pub const IncompatibleContractVersion: AutoTradeError = AutoTradeError::SystemError;
+
+    // ── Issue #992: asset-pair validation ────────────────────────────────────
+    // Same 50-variant cap constraint as above: these reuse existing
+    // discriminants under clearer names. See `message()` on the underlying
+    // variants for the human-readable description.
+    /// One or both assets of the pair are not registered in the asset registry.
+    pub const AssetNotRegistered: AutoTradeError = AutoTradeError::SystemError;
+    /// Both assets of the pair are identical (distinct assets are required).
+    pub const IdenticalAssetPair: AutoTradeError = AutoTradeError::SystemError;
+    /// No asset registry is configured, so the pair cannot be validated.
+    pub const AssetRegistryNotConfigured: AutoTradeError = AutoTradeError::SystemError;
+    /// No AMM route is configured for the requested asset pair.
+    pub const RouteNotConfigured: AutoTradeError = AutoTradeError::RoutingPlanNotFound;
+    /// No enabled AMM route supports the requested asset pair.
+    pub const UnsupportedAssetPair: AutoTradeError = AutoTradeError::RoutingPlanNotFound;
+
+    // ── Per-signal execution rate limit ──────────────────────────────────────
+    /// A trade for this (user, signal) was executed too recently; retry after
+    /// the per-signal rate-limit window has elapsed.
+    pub const ExecutionRateLimited: AutoTradeError = AutoTradeError::RateLimited;
 }

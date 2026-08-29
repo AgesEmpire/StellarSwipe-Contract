@@ -9,7 +9,17 @@
 //! - `update_asset(admin, asset, symbol, decimals, issuer)` — admin-only, updates existing metadata
 //! - `get_asset_metadata(asset)` — read-only, returns metadata for a given asset contract address
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
+use soroban_sdk::{contracterror, contracttype, Address, Env, String};
+
+// The `#[contract]` implementation of the registry is intentionally gated
+// behind `test` / the `testutils` feature so its exported WASM entrypoints
+// (`initialize`, `register_asset`, …) are **not** linked into every contract
+// that depends on the `shared` library crate. Because `shared` is a plain
+// `lib`, an always-compiled `#[contractimpl]` would export those symbols into
+// each downstream contract's WASM binary, colliding with the contract's own
+// `initialize` at link time. The `AssetMetadata` type (and error enum) are kept
+// available in production so call sites can deserialize registry responses
+// cross-contract via `try_invoke_contract`.
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
@@ -38,8 +48,10 @@ pub struct AssetMetadata {
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
+#[cfg(any(test, feature = "testutils"))]
 #[contracttype]
 #[derive(Clone)]
+#[allow(dead_code)]
 enum AssetRegistryStorage {
     Admin,
     Metadata(Address),
@@ -47,9 +59,16 @@ enum AssetRegistryStorage {
 
 // ── Contract ─────────────────────────────────────────────────────────────────
 
+// The `contract`/`contractimpl` macros are only needed where the registry
+// contract is compiled (tests/`testutils`); import them here, gated to match.
+#[cfg(any(test, feature = "testutils"))]
+use soroban_sdk::{contract, contractimpl};
+
+#[cfg(any(test, feature = "testutils"))]
 #[contract]
 pub struct AssetRegistryContract;
 
+#[cfg(any(test, feature = "testutils"))]
 #[contractimpl]
 impl AssetRegistryContract {
     // ── Initialization ────────────────────────────────────────────────────────
