@@ -575,7 +575,7 @@ mod tests {
             let list = get_all_trust_scores(&env);
             assert_eq!(list.len(), 1);
             assert_eq!(list.get(0).unwrap().0, provider);
-            assert_eq!(list.get(0).unwrap().1.has_sufficient_history, true);
+            assert!(list.get(0).unwrap().1.has_sufficient_history);
         });
     }
 }

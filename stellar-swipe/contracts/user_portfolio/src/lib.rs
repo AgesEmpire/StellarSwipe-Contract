@@ -872,7 +872,10 @@ impl UserPortfolio {
     }
 
     pub fn get_trade_history_page(
-        env: Env, user: Address, cursor: Option<u32>, limit: u32,
+        env: Env,
+        user: Address,
+        cursor: Option<u32>,
+        limit: u32,
     ) -> TradeHistoryPage {
         queries::get_trade_history_page(&env, user, cursor, limit)
     }

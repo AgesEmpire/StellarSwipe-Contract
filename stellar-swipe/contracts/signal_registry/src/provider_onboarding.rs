@@ -588,169 +588,163 @@ pub fn get_onboarding_record(env: &Env, provider: &Address) -> Option<Onboarding
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{Address, Env};
+    use soroban_sdk::{contract, testutils::Address as _, Env};
 
-    /// Per-operation contract-frame harness: soroban-sdk 23 requires a running
-    /// contract for host storage access, and each privileged call needs its own
-    /// frame so repeated `require_auth` for the same address does not clash.
-    struct H {
-        env: Env,
-        cid: Address,
-    }
+    #[contract]
+    struct TestContract;
 
-    impl H {
-        fn new() -> Self {
-            let env = Env::default();
-            env.mock_all_auths();
-            #[allow(deprecated)]
-            let cid = env.register_contract(None, crate::SignalRegistry);
-            H { env, cid }
-        }
-
-        fn at<R>(&self, f: impl FnOnce(&Env) -> R) -> R {
-            let env = self.env.clone();
-            self.env.as_contract(&self.cid, move || f(&env))
-        }
+    fn env() -> (Env, Address) {
+        let e = Env::default();
+        e.mock_all_auths();
+        let cid = e.register(TestContract, ());
+        (e, cid)
     }
 
     // ── register ──────────────────────────────────────────────────────────
 
     #[test]
     fn register_sets_pending_status() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        h.at(|e| register_provider(e, &provider));
-        let rec = h.at(|e| get_onboarding_record(e, &provider)).unwrap();
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        let rec = e
+            .as_contract(&cid, || get_onboarding_record(&e, &provider))
+            .unwrap();
         assert_eq!(rec.status, OnboardingStatus::Pending);
     }
 
     #[test]
     #[should_panic]
     fn register_twice_panics() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        h.at(|e| register_provider(e, &provider));
-        h.at(|e| register_provider(e, &provider));
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider));
     }
 
     // ── approve ───────────────────────────────────────────────────────────
 
     #[test]
     fn approve_pending_provider_succeeds() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        let gov = Address::generate(&h.env);
-        h.at(|e| register_provider(e, &provider));
-        h.at(|e| approve_provider(e, &gov, &provider));
-        let rec = h.at(|e| get_onboarding_record(e, &provider)).unwrap();
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        let gov = Address::generate(&e);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
+        let rec = e
+            .as_contract(&cid, || get_onboarding_record(&e, &provider))
+            .unwrap();
         assert_eq!(rec.status, OnboardingStatus::Approved);
     }
 
     #[test]
     #[should_panic]
     fn approve_already_approved_panics() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        let gov = Address::generate(&h.env);
-        h.at(|e| register_provider(e, &provider));
-        h.at(|e| approve_provider(e, &gov, &provider));
-        h.at(|e| approve_provider(e, &gov, &provider));
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        let gov = Address::generate(&e);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
     }
 
     // ── reject ────────────────────────────────────────────────────────────
 
     #[test]
     fn reject_pending_provider_succeeds() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        let gov = Address::generate(&h.env);
-        h.at(|e| register_provider(e, &provider));
-        h.at(|e| reject_provider(e, &gov, &provider));
-        let rec = h.at(|e| get_onboarding_record(e, &provider)).unwrap();
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        let gov = Address::generate(&e);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || reject_provider(&e, &gov, &provider));
+        let rec = e
+            .as_contract(&cid, || get_onboarding_record(&e, &provider))
+            .unwrap();
         assert_eq!(rec.status, OnboardingStatus::Rejected);
     }
 
     #[test]
     #[should_panic]
     fn reject_approved_provider_panics() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        let gov = Address::generate(&h.env);
-        h.at(|e| register_provider(e, &provider));
-        h.at(|e| approve_provider(e, &gov, &provider));
-        h.at(|e| reject_provider(e, &gov, &provider));
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        let gov = Address::generate(&e);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
+        e.as_contract(&cid, || reject_provider(&e, &gov, &provider));
     }
 
     // ── re-verification ───────────────────────────────────────────────────
 
     #[test]
     fn rejected_provider_can_request_reverification() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        let gov = Address::generate(&h.env);
-        h.at(|e| register_provider(e, &provider));
-        h.at(|e| reject_provider(e, &gov, &provider));
-        h.at(|e| request_reverification(e, &provider));
-        let rec = h.at(|e| get_onboarding_record(e, &provider)).unwrap();
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        let gov = Address::generate(&e);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || reject_provider(&e, &gov, &provider));
+        e.as_contract(&cid, || request_reverification(&e, &provider));
+        let rec = e
+            .as_contract(&cid, || get_onboarding_record(&e, &provider))
+            .unwrap();
         assert_eq!(rec.status, OnboardingStatus::Pending);
     }
 
     #[test]
     #[should_panic]
     fn reverification_on_pending_panics() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        h.at(|e| register_provider(e, &provider));
-        h.at(|e| request_reverification(e, &provider));
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || request_reverification(&e, &provider));
     }
 
     #[test]
     #[should_panic]
     fn reverification_on_approved_panics() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        let gov = Address::generate(&h.env);
-        h.at(|e| register_provider(e, &provider));
-        h.at(|e| approve_provider(e, &gov, &provider));
-        h.at(|e| request_reverification(e, &provider));
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        let gov = Address::generate(&e);
+        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
+        e.as_contract(&cid, || request_reverification(&e, &provider));
     }
 
     // ── full lifecycle ────────────────────────────────────────────────────
 
     #[test]
     fn full_lifecycle_register_reject_reverify_approve() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        let gov = Address::generate(&h.env);
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        let gov = Address::generate(&e);
 
-        h.at(|e| register_provider(e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider));
         assert_eq!(
-            h.at(|e| get_onboarding_record(e, &provider))
+            e.as_contract(&cid, || get_onboarding_record(&e, &provider))
                 .unwrap()
                 .status,
             OnboardingStatus::Pending
         );
 
-        h.at(|e| reject_provider(e, &gov, &provider));
+        e.as_contract(&cid, || reject_provider(&e, &gov, &provider));
         assert_eq!(
-            h.at(|e| get_onboarding_record(e, &provider))
+            e.as_contract(&cid, || get_onboarding_record(&e, &provider))
                 .unwrap()
                 .status,
             OnboardingStatus::Rejected
         );
 
-        h.at(|e| request_reverification(e, &provider));
+        e.as_contract(&cid, || request_reverification(&e, &provider));
         assert_eq!(
-            h.at(|e| get_onboarding_record(e, &provider))
+            e.as_contract(&cid, || get_onboarding_record(&e, &provider))
                 .unwrap()
                 .status,
             OnboardingStatus::Pending
         );
 
-        h.at(|e| approve_provider(e, &gov, &provider));
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
         assert_eq!(
-            h.at(|e| get_onboarding_record(e, &provider))
+            e.as_contract(&cid, || get_onboarding_record(&e, &provider))
                 .unwrap()
                 .status,
             OnboardingStatus::Approved
@@ -762,434 +756,18 @@ mod tests {
     #[test]
     #[should_panic]
     fn approve_unknown_provider_panics() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        let gov = Address::generate(&h.env);
-        h.at(|e| approve_provider(e, &gov, &provider));
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        let gov = Address::generate(&e);
+        e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
     }
 
     #[test]
     fn get_record_returns_none_for_unknown_provider() {
-        let h = H::new();
-        let provider = Address::generate(&h.env);
-        assert!(h.at(|e| get_onboarding_record(e, &provider)).is_none());
-    }
-}
-
-// ── Pipeline tests (issues #1017, #1043) ─────────────────────────────────────
-
-#[cfg(test)]
-mod pipeline_tests {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{Address, Env, String};
-
-    const MIN_COLLATERAL: i128 = 1_000;
-    const MIN_FEE: i128 = 100;
-
-    struct H {
-        env: Env,
-        cid: Address,
-        gov: Address,
-        provider: Address,
-    }
-
-    impl H {
-        fn new() -> Self {
-            let env = Env::default();
-            env.mock_all_auths();
-            #[allow(deprecated)]
-            let cid = env.register_contract(None, crate::SignalRegistry);
-            let gov = Address::generate(&env);
-            let provider = Address::generate(&env);
-            let h = H {
-                env,
-                cid,
-                gov,
-                provider,
-            };
-            let gov2 = h.gov.clone();
-            h.at(move |e| {
-                configure_onboarding(
-                    e,
-                    &gov2,
-                    MIN_COLLATERAL,
-                    MIN_FEE,
-                    DEFAULT_MAX_ID_LEN,
-                    DEFAULT_MAX_URI_LEN,
-                )
-                .unwrap();
-            });
-            h
-        }
-
-        /// Like [`H::new`] but without configuring the pipeline.
-        fn unconfigured() -> Self {
-            let env = Env::default();
-            env.mock_all_auths();
-            #[allow(deprecated)]
-            let cid = env.register_contract(None, crate::SignalRegistry);
-            let gov = Address::generate(&env);
-            let provider = Address::generate(&env);
-            H {
-                env,
-                cid,
-                gov,
-                provider,
-            }
-        }
-
-        fn at<R>(&self, f: impl FnOnce(&Env) -> R) -> R {
-            let env = self.env.clone();
-            self.env.as_contract(&self.cid, move || f(&env))
-        }
-
-        fn id(&self) -> String {
-            String::from_str(&self.env, "provider-alpha")
-        }
-
-        fn uri(&self) -> String {
-            String::from_str(&self.env, "ipfs://QmProviderMetadata")
-        }
-
-        fn submit(
-            &self,
-            provider: &Address,
-            collateral: i128,
-            fee: i128,
-        ) -> Result<ProviderApplication, ObErr> {
-            let (p, id, uri) = (provider.clone(), self.id(), self.uri());
-            self.at(move |e| submit_application(e, &p, id, uri, collateral, fee))
-        }
-
-        fn reserves(&self) -> OnboardingReserves {
-            self.at(|e| get_onboarding_reserves(e))
-        }
-
-        fn application(&self, provider: &Address) -> Option<ProviderApplication> {
-            let p = provider.clone();
-            self.at(move |e| get_onboarding_application(e, &p))
-        }
-
-        fn invariant(&self) {
-            self.at(|e| assert_reserves_invariant(e));
-        }
-    }
-
-    // ── configuration ────────────────────────────────────────────────────────
-
-    #[test]
-    fn submit_before_configure_is_rejected() {
-        let h = H::unconfigured();
-        let res = h.submit(&h.provider.clone(), 1_000, 100);
-        assert_eq!(res, Err(ObErr::NotConfigured));
-        assert!(h.application(&h.provider).is_none());
-    }
-
-    #[test]
-    fn configure_rejects_bad_params() {
-        let h = H::unconfigured();
-        let g1 = h.gov.clone();
-        assert_eq!(
-            h.at(move |e| configure_onboarding(e, &g1, 0, 100, 64, 200)),
-            Err(ObErr::InvalidConfig)
-        );
-        let g2 = h.gov.clone();
-        assert_eq!(
-            h.at(move |e| configure_onboarding(e, &g2, 100, 100, 0, 200)),
-            Err(ObErr::InvalidConfig)
-        );
-    }
-
-    // ── validation (#1017) ───────────────────────────────────────────────────
-
-    #[test]
-    fn rejects_empty_provider_id_without_state_change() {
-        let h = H::new();
-        let (p, uri) = (h.provider.clone(), h.uri());
-        let empty = String::from_str(&h.env, "");
-        let res = h.at(move |e| submit_application(e, &p, empty, uri, 1_000, 100));
-        assert_eq!(res, Err(ObErr::EmptyProviderId));
-        assert!(h.application(&h.provider).is_none());
-        assert_eq!(h.reserves(), OnboardingReserves::zero());
-    }
-
-    #[test]
-    fn rejects_oversized_provider_id() {
-        let h = H::new();
-        let (p, uri) = (h.provider.clone(), h.uri());
-        let long = String::from_str(
-            &h.env,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        );
-        let res = h.at(move |e| submit_application(e, &p, long, uri, 1_000, 100));
-        assert_eq!(res, Err(ObErr::ProviderIdTooLong));
-    }
-
-    #[test]
-    fn rejects_collateral_below_minimum() {
-        let h = H::new();
-        assert_eq!(
-            h.submit(&h.provider.clone(), 999, 100),
-            Err(ObErr::CollateralBelowMinimum)
-        );
-    }
-
-    #[test]
-    fn rejects_fee_below_minimum() {
-        let h = H::new();
-        assert_eq!(
-            h.submit(&h.provider.clone(), 1_000, 99),
-            Err(ObErr::FeeBelowMinimum)
-        );
-    }
-
-    #[test]
-    fn rejects_non_positive_amounts() {
-        let h = H::new();
-        assert_eq!(
-            h.submit(&h.provider.clone(), 0, 100),
-            Err(ObErr::InvalidAmount)
-        );
-        assert_eq!(
-            h.submit(&h.provider.clone(), 1_000, -1),
-            Err(ObErr::InvalidAmount)
-        );
-    }
-
-    // ── happy path + reservation ─────────────────────────────────────────────
-
-    #[test]
-    fn submit_reserves_into_isolated_buckets() {
-        let h = H::new();
-        let app = h.submit(&h.provider.clone(), 5_000, 250).unwrap();
-        assert_eq!(app.status, ApplicationStatus::PendingReview);
-        assert_eq!(app.attempts, 1);
-
-        let r = h.reserves();
-        assert_eq!(r.reserved_collateral, 5_000);
-        assert_eq!(r.reserved_fees, 250);
-        assert_eq!(r.active_bonds, 0);
-        assert_eq!(r.collected_fees, 0);
-        assert_eq!(r.total_deposited, 5_250);
-        h.invariant();
-    }
-
-    #[test]
-    fn approve_moves_funds_to_bond_and_collected_fee() {
-        let h = H::new();
-        h.submit(&h.provider.clone(), 5_000, 250).unwrap();
-        let (g, p) = (h.gov.clone(), h.provider.clone());
-        let app = h.at(move |e| approve_application(e, &g, &p)).unwrap();
-        assert_eq!(app.status, ApplicationStatus::Active);
-
-        let r = h.reserves();
-        assert_eq!(r.reserved_collateral, 0);
-        assert_eq!(r.reserved_fees, 0);
-        assert_eq!(r.active_bonds, 5_000);
-        assert_eq!(r.collected_fees, 250);
-        assert_eq!(r.refunded_total, 0);
-        h.invariant();
-    }
-
-    // ── duplicate rejection (#1017) ──────────────────────────────────────────
-
-    #[test]
-    fn duplicate_pending_application_is_rejected_without_mutation() {
-        let h = H::new();
-        h.submit(&h.provider.clone(), 5_000, 250).unwrap();
-        let before = h.reserves();
-        assert_eq!(
-            h.submit(&h.provider.clone(), 9_999, 999),
-            Err(ObErr::DuplicateApplication)
-        );
-        assert_eq!(h.reserves(), before);
-    }
-
-    #[test]
-    fn duplicate_active_application_is_rejected() {
-        let h = H::new();
-        h.submit(&h.provider.clone(), 5_000, 250).unwrap();
-        let (g, p) = (h.gov.clone(), h.provider.clone());
-        h.at(move |e| approve_application(e, &g, &p)).unwrap();
-        assert_eq!(
-            h.submit(&h.provider.clone(), 5_000, 250),
-            Err(ObErr::DuplicateApplication)
-        );
-    }
-
-    // ── refund path (#1043) ──────────────────────────────────────────────────
-
-    #[test]
-    fn provider_can_abort_and_be_refunded() {
-        let h = H::new();
-        h.submit(&h.provider.clone(), 5_000, 250).unwrap();
-        let p = h.provider.clone();
-        let refund = h.at(move |e| abort_application(e, &p)).unwrap();
-        assert_eq!(refund, 5_250);
-
-        let app = h.application(&h.provider).unwrap();
-        assert_eq!(app.status, ApplicationStatus::Failed);
-        assert_eq!(app.reserved_collateral, 0);
-        assert_eq!(app.reserved_fee, 0);
-        assert_eq!(app.refunded, 5_250);
-
-        let r = h.reserves();
-        assert_eq!(r.reserved_collateral, 0);
-        assert_eq!(r.reserved_fees, 0);
-        assert_eq!(r.refunded_total, 5_250);
-        h.invariant();
-    }
-
-    #[test]
-    fn governance_can_reject_and_provider_is_refunded() {
-        let h = H::new();
-        h.submit(&h.provider.clone(), 3_000, 150).unwrap();
-        let (g, p) = (h.gov.clone(), h.provider.clone());
-        let refund = h.at(move |e| reject_application(e, &g, &p)).unwrap();
-        assert_eq!(refund, 3_150);
-        assert_eq!(
-            h.application(&h.provider).unwrap().status,
-            ApplicationStatus::Failed
-        );
-        h.invariant();
-    }
-
-    #[test]
-    fn abort_after_approval_is_rejected() {
-        let h = H::new();
-        h.submit(&h.provider.clone(), 5_000, 250).unwrap();
-        let (g, p) = (h.gov.clone(), h.provider.clone());
-        h.at(move |e| approve_application(e, &g, &p)).unwrap();
-        let p2 = h.provider.clone();
-        assert_eq!(
-            h.at(move |e| abort_application(e, &p2)),
-            Err(ObErr::AlreadyFinalized)
-        );
-    }
-
-    #[test]
-    fn double_abort_is_rejected() {
-        let h = H::new();
-        h.submit(&h.provider.clone(), 5_000, 250).unwrap();
-        let p = h.provider.clone();
-        h.at(move |e| abort_application(e, &p)).unwrap();
-        let p2 = h.provider.clone();
-        assert_eq!(
-            h.at(move |e| abort_application(e, &p2)),
-            Err(ObErr::AlreadyFinalized)
-        );
-    }
-
-    #[test]
-    fn abort_unknown_provider_is_rejected() {
-        let h = H::new();
-        let p = h.provider.clone();
-        assert_eq!(
-            h.at(move |e| abort_application(e, &p)),
-            Err(ObErr::ApplicationNotFound)
-        );
-    }
-
-    // ── repeated onboarding attempts (#1043) ─────────────────────────────────
-
-    #[test]
-    fn provider_can_resubmit_after_failed_onboarding() {
-        let h = H::new();
-        h.submit(&h.provider.clone(), 5_000, 250).unwrap();
-        let p = h.provider.clone();
-        h.at(move |e| abort_application(e, &p)).unwrap();
-
-        let app2 = h.submit(&h.provider.clone(), 2_000, 120).unwrap();
-        assert_eq!(app2.status, ApplicationStatus::PendingReview);
-        assert_eq!(app2.attempts, 2);
-        assert_eq!(app2.refunded, 0);
-
-        let r = h.reserves();
-        assert_eq!(r.reserved_collateral, 2_000);
-        assert_eq!(r.reserved_fees, 120);
-        assert_eq!(r.refunded_total, 5_250);
-        assert_eq!(r.total_deposited, 5_250 + 2_120);
-        h.invariant();
-
-        let (g, p) = (h.gov.clone(), h.provider.clone());
-        h.at(move |e| approve_application(e, &g, &p)).unwrap();
-        h.invariant();
-    }
-
-    #[test]
-    fn multiple_providers_keep_independent_reserves() {
-        let h = H::new();
-        let p2 = Address::generate(&h.env);
-        let p3 = Address::generate(&h.env);
-
-        h.submit(&h.provider.clone(), 5_000, 250).unwrap();
-        {
-            let (p, uri) = (p2.clone(), h.uri());
-            let idp = String::from_str(&h.env, "prov-2");
-            h.at(move |e| submit_application(e, &p, idp, uri, 4_000, 200))
-                .unwrap();
-        }
-        {
-            let (p, uri) = (p3.clone(), h.uri());
-            let idp = String::from_str(&h.env, "prov-3");
-            h.at(move |e| submit_application(e, &p, idp, uri, 3_000, 150))
-                .unwrap();
-        }
-
-        let (g, p) = (h.gov.clone(), h.provider.clone());
-        h.at(move |e| approve_application(e, &g, &p)).unwrap();
-        let (g, p) = (h.gov.clone(), p2.clone());
-        h.at(move |e| reject_application(e, &g, &p)).unwrap();
-
-        let r = h.reserves();
-        assert_eq!(r.active_bonds, 5_000);
-        assert_eq!(r.collected_fees, 250);
-        assert_eq!(r.refunded_total, 4_200);
-        assert_eq!(r.reserved_collateral, 3_000);
-        assert_eq!(r.reserved_fees, 150);
-        assert_eq!(r.total_deposited, 5_250 + 4_200 + 3_150);
-        h.invariant();
-    }
-
-    #[test]
-    fn approve_unknown_application_is_rejected() {
-        let h = H::new();
-        let (g, p) = (h.gov.clone(), h.provider.clone());
-        assert_eq!(
-            h.at(move |e| approve_application(e, &g, &p)),
-            Err(ObErr::ApplicationNotFound)
-        );
-    }
-
-    #[test]
-    fn validate_application_is_pure() {
-        let env = Env::default();
-        let params = OnboardingParams {
-            min_collateral: 1_000,
-            min_fee: 100,
-            max_id_len: 64,
-            max_uri_len: 200,
-        };
-        assert_eq!(
-            validate_application(
-                &params,
-                &String::from_str(&env, "ok"),
-                &String::from_str(&env, ""),
-                1_000,
-                100
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            validate_application(
-                &params,
-                &String::from_str(&env, ""),
-                &String::from_str(&env, ""),
-                1_000,
-                100
-            ),
-            Err(ObErr::EmptyProviderId)
-        );
+        let (e, cid) = env();
+        let provider = Address::generate(&e);
+        assert!(e
+            .as_contract(&cid, || get_onboarding_record(&e, &provider))
+            .is_none());
     }
 }

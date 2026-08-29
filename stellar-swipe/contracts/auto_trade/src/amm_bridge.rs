@@ -7,6 +7,7 @@ use stellar_swipe_common::amm_bridge::{
     min_amount_out_with_slippage, plan_multi_source_route, rank_quotes_by_price, AmmQuote,
     AmmRoutePlan, AmmSourceConfig, AmmSourceKind, FN_GET_BEST_ASK,
 };
+use stellar_swipe_common::pair_validation::{self, PairValidationError};
 
 use crate::errors::AutoTradeError;
 use crate::sdex::{execute_market_order, ExecutionResult};
@@ -196,10 +197,67 @@ pub fn plan_amm_route(
     }
     plan_multi_source_route(env, &quotes, amount, signal.price, max_slippage_bps)
         .map_err(map_bridge_error)
-        .map(|plan| {
-            emit_route_planned(env, signal.signal_id, &plan);
-            plan
-        })
+        .inspect(|plan| emit_route_planned(env, signal.signal_id, plan))
+}
+
+/// Map a [`PairValidationError`] onto the contract's public error surface (Issue #992).
+fn map_pair_error(err: PairValidationError) -> AutoTradeError {
+    match err {
+        PairValidationError::RegistryNotConfigured => AutoTradeError::AssetRegistryNotConfigured,
+        PairValidationError::BaseAssetNotRegistered
+        | PairValidationError::QuoteAssetNotRegistered => AutoTradeError::AssetNotRegistered,
+        PairValidationError::IdenticalAssets => AutoTradeError::IdenticalAssetPair,
+        PairValidationError::RouteNotConfigured => AutoTradeError::RouteNotConfigured,
+        PairValidationError::RouteUnsupported => AutoTradeError::UnsupportedAssetPair,
+    }
+}
+
+/// Issue #992: reject unsupported asset pairs before any external call or
+/// state mutation.
+///
+/// Enforced only when an asset registry is configured **and** the signal has a
+/// token pair bound via [`set_signal_token_pair`] (the legacy u32-asset-id
+/// signal path has no token pair to validate). When enforced:
+/// - both assets must be registered in the asset registry and distinct;
+/// - at least one **enabled** AMM source must support the pair.
+///
+/// If no enabled sources are registered the pair is rejected with
+/// [`AutoTradeError::RouteNotConfigured`]; if sources exist but none quote the
+/// pair, it is rejected with [`AutoTradeError::UnsupportedAssetPair`].
+pub fn validate_signal_pair(env: &Env, signal_id: u64) -> Result<(), AutoTradeError> {
+    let Some(registry) = crate::admin::get_asset_registry(env) else {
+        return Ok(());
+    };
+    let Some(pair) = get_signal_token_pair(env, signal_id) else {
+        return Ok(());
+    };
+
+    pair_validation::validate_registered_distinct_pair(
+        env,
+        &registry,
+        &pair.from_token,
+        &pair.to_token,
+    )
+    .map_err(map_pair_error)?;
+
+    let mut route_configured = false;
+    for src in get_amm_sources(env).iter() {
+        if !src.enabled {
+            continue;
+        }
+        route_configured = true;
+        if pair_validation::route_supports_pair(env, &src.router, &pair.from_token, &pair.to_token)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+
+    if route_configured {
+        Err(AutoTradeError::UnsupportedAssetPair)
+    } else {
+        Err(AutoTradeError::RouteNotConfigured)
+    }
 }
 
 fn map_bridge_error(err: stellar_swipe_common::amm_bridge::AmmBridgeError) -> AutoTradeError {
@@ -291,12 +349,9 @@ fn execute_segment(
 }
 
 fn find_source_config(env: &Env, kind: AmmSourceKind, source_id: u32) -> Option<AmmSourceConfig> {
-    for src in get_amm_sources(env).iter() {
-        if src.kind == kind && src.source_id == source_id && src.enabled {
-            return Some(src);
-        }
-    }
-    None
+    get_amm_sources(env)
+        .iter()
+        .find(|src| src.kind == kind && src.source_id == source_id && src.enabled)
 }
 
 fn invoke_router_swap(
@@ -339,6 +394,10 @@ pub fn execute_swap_with_fallback(
     if amount <= 0 {
         return Err(AutoTradeError::InvalidAmount);
     }
+
+    // Issue #992: reject unsupported asset pairs before any routing, external
+    // call, or state mutation.
+    validate_signal_pair(env, signal.signal_id)?;
 
     match smart_routing::execute_best_route(env, signal, amount, max_slippage_bps) {
         Ok(result) => return Ok(result),

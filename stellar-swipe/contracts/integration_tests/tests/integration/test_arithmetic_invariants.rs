@@ -36,6 +36,7 @@ extern crate std;
 
 use proptest::prelude::*;
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{Address as _, Ledger},
     token::StellarAssetClient,
     Address, Env, String,
@@ -43,6 +44,18 @@ use soroban_sdk::{
 use stellar_swipe_common::Asset;
 
 use fee_collector::{fee_amount_floor, FeeCollector, FeeCollectorClient};
+
+// ── Mock oracle ───────────────────────────────────────────────────────────────
+// Soroban `#[contract]` mocks must be declared at item scope (not inside a test
+// function) for the `contractimpl` client macros to resolve.
+#[contract]
+struct MockOracle;
+#[contractimpl]
+impl MockOracle {
+    pub fn convert_to_base(_env: Env, amount: i128, _asset: Asset) -> i128 {
+        amount
+    }
+}
 
 // ── Fee Splitting Invariants ─────────────────────────────────────────────────────
 
@@ -425,15 +438,6 @@ fn test_fee_collection_end_to_end_invariants() {
     client.set_burn_rate(&1_000u32); // 10%
     client.set_revenue_share_rate_bps(&0u32); // Disable for simplicity
 
-    // Mock oracle
-    #[contract]
-    struct MockOracle;
-    #[contractimpl]
-    impl MockOracle {
-        pub fn convert_to_base(_env: Env, amount: i128, _asset: Asset) -> i128 {
-            amount
-        }
-    }
     let oracle_id = env.register(MockOracle, ());
     client.set_oracle_contract(&oracle_id);
 

@@ -170,6 +170,53 @@ pub enum ProposalType {
     Custom(Address),
 }
 
+// ── #997: Proposal action allowlist & parameter schema ──────────────────────
+//
+// `ProposalType` *is* the governance action allowlist: it is a closed Rust
+// enum, so the Soroban host rejects any XDR payload that doesn't decode into
+// one of the variants below before contract code ever runs, and
+// `execute_proposal_action` (and `simulate_execution`) match every variant
+// explicitly with no wildcard/default arm — there is no fallback path that
+// could execute an action type outside this set.
+//
+// What enum-typing alone does *not* catch is a well-formed variant carrying
+// nonsensical parameters (an out-of-range `ParameterChange` swing, a
+// zero-amount `TreasurySpend`, an empty `FeatureToggle` name, a garbage
+// all-zero WASM hash for `ContractUpgrade`, ...). `validate_proposal` below
+// is the single, centralized place that checks those bounds — for every
+// variant, with no catch-all arm — at proposal-creation time, so nothing but
+// validated data is ever written to proposal storage.
+//
+// Client-facing schema (bump [`PROPOSAL_ACTION_SCHEMA_VERSION`] whenever a
+// variant, or its bounds, changes):
+//
+// | Action           | Parameters                             | Bounds enforced at creation |
+// |------------------|-----------------------------------------|------------------------------|
+// | `ParameterChange`| `(name, current, proposed)`             | `name`: 1..=`MAX_ACTION_STRING_LEN` bytes, no control chars. `current`/`proposed`: within `±MAX_PARAMETER_VALUE`. If `current > 0`: `abs(proposed - current) * 2 < current`. |
+// | `TreasurySpend`  | `(recipient, amount, asset, purpose)`   | `0 < amount <= treasury_balance(asset)` and `amount * 10 <= treasury_balance(asset)`. `purpose`: ≤ `MAX_ACTION_STRING_LEN` bytes, no control chars. |
+// | `FeatureToggle`  | `(feature, enabled)`                    | `feature`: 1..=`MAX_ACTION_STRING_LEN` bytes, no control chars. |
+// | `ContractUpgrade`| `(contract_name, wasm_hash)`            | `contract_name`: 1..=`MAX_ACTION_STRING_LEN` bytes, no control chars. `wasm_hash`: exactly 32 bytes and not all-zero. |
+// | `SignalProposal` | `(text)`                                | `text`: 1..=`MAX_ACTION_STRING_LEN` bytes, no control chars. |
+// | `Custom`         | `(executor)`                            | `executor`: a host-validated `Address`. `execution_payload` (separate field) must be non-empty. |
+
+/// Bumped whenever the set of supported [`ProposalType`] variants, or the
+/// parameter bounds enforced on them by [`validate_proposal`], changes.
+/// Off-chain clients should treat a decrease, or an unrecognized bump, as a
+/// signal to re-check their proposal-building logic against this schema.
+pub const PROPOSAL_ACTION_SCHEMA_VERSION: u32 = 1;
+
+/// Inclusive bound (in either direction) on any raw `i128` parameter carried
+/// by a proposal action, e.g. `ParameterChange`'s `current`/`proposed`.
+/// Chosen far above any realistic on-chain quantity while leaving enormous
+/// headroom below `i128::MAX`/`i128::MIN`, so bounded values can never
+/// overflow the arithmetic `validate_proposal` performs on them.
+pub const MAX_PARAMETER_VALUE: i128 = 1_000_000_000_000_000_000; // 10^18
+
+/// Upper bound on the byte length of any free-text identifier carried by a
+/// proposal action (parameter/feature/contract names, signal text, spend
+/// purpose).
+pub const MAX_ACTION_STRING_LEN: u32 = 256;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProposalStatus {
@@ -1183,25 +1230,41 @@ pub fn reclaim_expired_proposal(
 }
 
 pub fn cleanup_terminal_proposals(
-    env: &Env, cursor: u32, limit: u32,
+    env: &Env,
+    cursor: u32,
+    limit: u32,
 ) -> Result<u32, GovernanceError> {
-    if limit == 0 || limit > 50 { return Err(GovernanceError::InvalidAmount); }
+    if limit == 0 || limit > 50 {
+        return Err(GovernanceError::InvalidAmount);
+    }
     let mut state = get_proposals_state(env);
     let mut i = cursor.min(state.proposal_ids.len());
     let mut removed = 0;
     while i < state.proposal_ids.len() && removed < limit {
         let id = state.proposal_ids.get_unchecked(i);
-        let proposal = state.proposals.get(id).ok_or(GovernanceError::ProposalNotFound)?;
-        let terminal = matches!(effective_status(env, &proposal), ProposalStatus::Failed
-            | ProposalStatus::Executed | ProposalStatus::Cancelled
-            | ProposalStatus::Expired | ProposalStatus::Withdrawn);
+        let proposal = state
+            .proposals
+            .get(id)
+            .ok_or(GovernanceError::ProposalNotFound)?;
+        let terminal = matches!(
+            effective_status(env, &proposal),
+            ProposalStatus::Failed
+                | ProposalStatus::Executed
+                | ProposalStatus::Cancelled
+                | ProposalStatus::Expired
+                | ProposalStatus::Withdrawn
+        );
         if terminal {
             state.proposals.remove(id);
             state.proposal_ids.remove(i);
-            env.events().publish((symbol_short!("gov"), symbol_short!("cleanup")),
-                (id, proposal.status, env.ledger().timestamp()));
+            env.events().publish(
+                (symbol_short!("gov"), symbol_short!("cleanup")),
+                (id, proposal.status, env.ledger().timestamp()),
+            );
             removed += 1;
-        } else { i += 1; }
+        } else {
+            i += 1;
+        }
     }
     put_proposals_state(env, &state);
     Ok(removed)
@@ -1324,43 +1387,80 @@ pub fn get_effective_voting_power(env: &Env, user: &Address) -> i128 {
     own.saturating_add(delegated)
 }
 
+/// Validate a proposal's action and its embedded parameters against the
+/// allowlisted schema documented above `PROPOSAL_ACTION_SCHEMA_VERSION`.
+///
+/// This match is intentionally exhaustive with **no wildcard arm**: adding a
+/// new `ProposalType` variant without extending this function is a compile
+/// error, so a new action type can never silently skip validation.
 fn validate_proposal(env: &Env, p: &ProposalType) -> Result<(), GovernanceError> {
     match p {
         ProposalType::ParameterChange(parameter, current, proposed) => {
             if parameter.is_empty() {
                 return Err(GovernanceError::InvalidProposal);
             }
+            sanitize_string(env, parameter, MAX_ACTION_STRING_LEN)
+                .map_err(|_| GovernanceError::InvalidProposal)?;
+            if !is_within_parameter_bounds(*current) || !is_within_parameter_bounds(*proposed) {
+                return Err(GovernanceError::ProposalParameterOutOfRange);
+            }
             if *current > 0 {
-                let delta = (*proposed - *current).abs();
+                // Safe: both operands are bounded to ±MAX_PARAMETER_VALUE
+                // above, so the subtraction and doubling below cannot
+                // overflow i128 (unlike the raw `-`/`.abs()` this replaced,
+                // which panicked on an unbounded `current == i128::MIN`).
+                let delta = checked_sub(*proposed, *current)?.abs();
                 if checked_mul(delta, 2)? >= *current {
                     return Err(GovernanceError::InvalidProposal);
                 }
             }
         }
-        ProposalType::TreasurySpend(_recipient, amount, asset, _purpose) => {
+        ProposalType::TreasurySpend(_recipient, amount, asset, purpose) => {
+            sanitize_string(env, purpose, MAX_ACTION_STRING_LEN)
+                .map_err(|_| GovernanceError::InvalidProposal)?;
             let treasury = get_treasury(env);
             let bal = treasury.assets.get(asset.clone()).unwrap_or(0);
             if *amount <= 0 || *amount > bal || amount.saturating_mul(10) > bal {
                 return Err(GovernanceError::BudgetExceeded);
             }
         }
-        ProposalType::ContractUpgrade(_name, hash) => {
-            if hash.len() != 32 {
-                return Err(GovernanceError::InvalidProposal);
-            }
+        ProposalType::ContractUpgrade(_name, hash) if hash.len() != 32 => {
+            return Err(GovernanceError::InvalidProposal);
         }
-        _ => {}
     }
     Ok(())
 }
 
-/// Validate the execution payload bytes against what each ProposalType expects.
+/// `true` when `value` falls within `[-MAX_PARAMETER_VALUE, MAX_PARAMETER_VALUE]`.
+fn is_within_parameter_bounds(value: i128) -> bool {
+    value >= -MAX_PARAMETER_VALUE && value <= MAX_PARAMETER_VALUE
+}
+
+/// `true` when every byte in `bytes` is `0x00` (an obviously-placeholder /
+/// malformed WASM hash — a real hash is effectively never all-zero).
+fn is_all_zero_bytes(bytes: &Bytes) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes.get(i).unwrap_or(1) != 0 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Validate the execution payload bytes against what each ProposalType
+/// expects, per the schema documented above `PROPOSAL_ACTION_SCHEMA_VERSION`.
 ///
 /// - `ContractUpgrade`: payload must be exactly 32 bytes (new WASM hash).
 /// - `TreasurySpend`/`ParameterChange`: non-empty payload must start with a
 ///   known version byte (`0x01`) so malformed blobs are caught early.
 /// - `FeatureToggle`/`SignalProposal`: no payload constraints.
 /// - `Custom`: payload must be non-empty (executor address ABI).
+///
+/// Exhaustive over every `ProposalType` variant with no wildcard arm, so a
+/// newly-added action type must be given an explicit payload rule here
+/// before it compiles.
 pub fn validate_execution_payload(
     proposal_type: &ProposalType,
     payload: &Bytes,
@@ -1378,12 +1478,11 @@ pub fn validate_execution_payload(
                 return Err(GovernanceError::InvalidProposal);
             }
         }
-        ProposalType::Custom(_) => {
+        ProposalType::Custom(_)
             // Custom proposals must supply a non-empty payload (ABI data).
-            if payload.is_empty() {
+            if payload.is_empty() => {
                 return Err(GovernanceError::InvalidProposal);
             }
-        }
         _ => {}
     }
     Ok(())

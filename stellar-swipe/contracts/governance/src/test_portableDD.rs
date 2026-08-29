@@ -267,6 +267,262 @@ fn proposal_treasury_spend_bad_version_prefix_rejected() {
     assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
 }
 
+// ── Issue #997: Governance proposal action allowlist & parameter validation ──
+//
+// `ProposalType` is the allowlist itself (a closed Rust enum — an XDR
+// payload that doesn't decode into one of its variants is rejected by the
+// Soroban host before `create_proposal` ever runs, so there is no on-chain
+// way to exercise an "unknown action" case). These tests instead cover what
+// `validate_proposal` newly enforces on top of that: malformed and
+// boundary-value parameters within each *known* action type must be
+// rejected at creation time, and never make it into proposal storage.
+
+#[test]
+fn proposal_parameter_change_within_bounds_accepted() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    let proposer = Address::generate(&env);
+    stake_for_proposals(&env, &id, &proposer, 10_000i128);
+
+    // current == proposed == MAX_PARAMETER_VALUE is the top boundary of the
+    // allowed range and should still be accepted (delta is 0).
+    let boundary = crate::proposals::MAX_PARAMETER_VALUE;
+    let result = client.try_create_proposal(
+        &proposer,
+        &ProposalType::ParameterChange(String::from_str(&env, "quorum_threshold"), boundary, boundary),
+        &String::from_str(&env, "Tweak param"),
+        &String::from_str(&env, "boundary value parameter change"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    assert!(
+        matches!(result, Ok(Ok(_))),
+        "expected Ok(Ok), got {result:?}"
+    );
+}
+
+#[test]
+fn proposal_parameter_change_above_max_value_rejected() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    let proposer = Address::generate(&env);
+    stake_for_proposals(&env, &id, &proposer, 10_000i128);
+
+    // One past the top of the allowed range must be rejected, not silently
+    // stored — regardless of how implausible the arithmetic overflow risk
+    // this bound also protects against.
+    let over_max = crate::proposals::MAX_PARAMETER_VALUE + 1;
+    let result = client.try_create_proposal(
+        &proposer,
+        &ProposalType::ParameterChange(String::from_str(&env, "quorum_threshold"), 0, over_max),
+        &String::from_str(&env, "Tweak param"),
+        &String::from_str(&env, "out of range parameter change"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    assert_eq!(
+        result,
+        Err(Ok(GovernanceError::ProposalParameterOutOfRange))
+    );
+}
+
+#[test]
+fn proposal_parameter_change_current_below_min_value_rejected() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    let proposer = Address::generate(&env);
+    stake_for_proposals(&env, &id, &proposer, 10_000i128);
+
+    // Regression guard: `current == i128::MIN` used to overflow the
+    // `(*proposed - *current).abs()` delta computation (panicking instead of
+    // returning an error). Bounding `current` first must reject this
+    // cleanly with no panic.
+    let result = client.try_create_proposal(
+        &proposer,
+        &ProposalType::ParameterChange(String::from_str(&env, "quorum_threshold"), i128::MIN, 0),
+        &String::from_str(&env, "Tweak param"),
+        &String::from_str(&env, "malformed parameter change"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    assert_eq!(
+        result,
+        Err(Ok(GovernanceError::ProposalParameterOutOfRange))
+    );
+}
+
+#[test]
+fn proposal_parameter_change_empty_name_rejected() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    let proposer = Address::generate(&env);
+    stake_for_proposals(&env, &id, &proposer, 10_000i128);
+
+    let result = client.try_create_proposal(
+        &proposer,
+        &ProposalType::ParameterChange(String::from_str(&env, ""), 100, 110),
+        &String::from_str(&env, "Tweak param"),
+        &String::from_str(&env, "empty parameter name"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
+}
+
+#[test]
+fn proposal_feature_toggle_empty_name_rejected() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    let proposer = Address::generate(&env);
+    stake_for_proposals(&env, &id, &proposer, 10_000i128);
+
+    let result = client.try_create_proposal(
+        &proposer,
+        &ProposalType::FeatureToggle(String::from_str(&env, ""), true),
+        &String::from_str(&env, "Toggle feature"),
+        &String::from_str(&env, "empty feature name"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
+}
+
+#[test]
+fn proposal_feature_toggle_valid_name_accepted() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    let proposer = Address::generate(&env);
+    stake_for_proposals(&env, &id, &proposer, 10_000i128);
+
+    let result = client.try_create_proposal(
+        &proposer,
+        &ProposalType::FeatureToggle(String::from_str(&env, "new_signal_ui"), true),
+        &String::from_str(&env, "Toggle feature"),
+        &String::from_str(&env, "enable new signal UI"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    assert!(
+        matches!(result, Ok(Ok(_))),
+        "expected Ok(Ok), got {result:?}"
+    );
+}
+
+#[test]
+fn proposal_signal_proposal_empty_text_rejected() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    let proposer = Address::generate(&env);
+    stake_for_proposals(&env, &id, &proposer, 10_000i128);
+
+    let result = client.try_create_proposal(
+        &proposer,
+        &ProposalType::SignalProposal(String::from_str(&env, "")),
+        &String::from_str(&env, "Signal"),
+        &String::from_str(&env, "empty signal text"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
+}
+
+#[test]
+fn proposal_contract_upgrade_all_zero_hash_rejected() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    let proposer = Address::generate(&env);
+    stake_for_proposals(&env, &id, &proposer, 10_000i128);
+
+    // Right length (32 bytes) but obviously a placeholder/garbage hash, not
+    // a real WASM hash — must be rejected rather than stored as executable.
+    let zero_hash = Bytes::from_slice(&env, &[0u8; 32]);
+    let result = client.try_create_proposal(
+        &proposer,
+        &ProposalType::ContractUpgrade(String::from_str(&env, "core"), zero_hash.clone()),
+        &String::from_str(&env, "Upgrade"),
+        &String::from_str(&env, "all-zero hash upgrade"),
+        &zero_hash,
+        &ProposalCategory::General,
+        &false,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
+}
+
+#[test]
+fn proposal_contract_upgrade_empty_contract_name_rejected() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    let proposer = Address::generate(&env);
+    stake_for_proposals(&env, &id, &proposer, 10_000i128);
+
+    let hash = make_hash(&env, 0xAB);
+    let result = client.try_create_proposal(
+        &proposer,
+        &ProposalType::ContractUpgrade(String::from_str(&env, ""), hash.clone()),
+        &String::from_str(&env, "Upgrade"),
+        &String::from_str(&env, "empty contract name"),
+        &hash,
+        &ProposalCategory::General,
+        &false,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
+}
+
+#[test]
+fn proposal_treasury_spend_purpose_with_control_char_rejected() {
+    let (env, id, admin, r) = setup();
+    let client = GovernanceContractClient::new(&env, &id);
+    init(&client, &env, &admin, &r);
+
+    let asset_key = asset(&env);
+    env.as_contract(&id, || {
+        let mut t = crate::get_treasury(&env);
+        t.assets.set(asset_key.clone(), 100_000i128);
+        crate::put_treasury(&env, &t);
+    });
+
+    let proposer = Address::generate(&env);
+    stake_for_proposals(&env, &id, &proposer, 10_000i128);
+
+    // A newline (0x0A) is a control character sanitize_string rejects.
+    let purpose = String::from_str(&env, "payment\nwith embedded control char");
+    let result = client.try_create_proposal(
+        &proposer,
+        &ProposalType::TreasurySpend(Address::generate(&env), 1_000i128, asset_key, purpose),
+        &String::from_str(&env, "Spend"),
+        &String::from_str(&env, "malformed purpose"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    assert_eq!(result, Err(Ok(GovernanceError::InvalidProposal)));
+}
+
 // ── Issue #589: Shadow-mode canary upgrade ────────────────────────────────────
 
 fn make_hash(env: &Env, byte: u8) -> Bytes {

@@ -2782,8 +2782,6 @@ fn deposit_stake_budget_regression() {
     let staker = Address::generate(&env);
     let amount: i128 = 1_000_000;
 
-    // `deposit_stake` pulls `amount` from the staker, so fund the staker (not
-    // the vault) before measuring.
     StellarAssetClient::new(&env, &token).mint(&staker, &amount);
 
     env.budget().reset_tracker();

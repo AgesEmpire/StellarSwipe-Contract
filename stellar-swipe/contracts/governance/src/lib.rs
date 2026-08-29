@@ -315,7 +315,9 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .set(&StorageKey::Initialized, &true);
-        env.storage().instance().set(&StorageKey::StorageVersion, &1u32);
+        env.storage()
+            .instance()
+            .set(&StorageKey::StorageVersion, &1u32);
         // Initialize pause state via shared::pausable (no event on init).
         env.storage()
             .instance()
@@ -754,19 +756,38 @@ impl GovernanceContract {
 
     pub fn migrate_storage(env: Env, admin: Address, from: u32) -> Result<u32, GovernanceError> {
         require_admin(&env, &admin)?;
-        let current: u32 = env.storage().instance().get(&StorageKey::StorageVersion).unwrap_or(0);
-        if current == 1 { return Ok(1); }
-        if from != 0 || current != from { return Err(GovernanceError::InvalidGovernanceConfig); }
-        env.storage().instance().set(&StorageKey::MigrationInProgress, &true);
+        let current: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StorageVersion)
+            .unwrap_or(0);
+        if current == 1 {
+            return Ok(1);
+        }
+        if from != 0 || current != from {
+            return Err(GovernanceError::InvalidGovernanceConfig);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::MigrationInProgress, &true);
         let state = proposals::get_proposals_state(&env);
-        if state.next_proposal_id == 0 { return Err(GovernanceError::InvalidProposal); }
-        env.storage().instance().set(&StorageKey::StorageVersion, &1u32);
-        env.storage().instance().remove(&StorageKey::MigrationInProgress);
+        if state.next_proposal_id == 0 {
+            return Err(GovernanceError::InvalidProposal);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::StorageVersion, &1u32);
+        env.storage()
+            .instance()
+            .remove(&StorageKey::MigrationInProgress);
         Ok(1)
     }
 
     pub fn storage_version(env: Env) -> u32 {
-        env.storage().instance().get(&StorageKey::StorageVersion).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&StorageKey::StorageVersion)
+            .unwrap_or(0)
     }
 
     pub fn cleanup_proposals(env: Env, cursor: u32, limit: u32) -> Result<u32, GovernanceError> {

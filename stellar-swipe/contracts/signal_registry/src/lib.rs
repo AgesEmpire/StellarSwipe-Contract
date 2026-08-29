@@ -2166,6 +2166,13 @@ impl SignalRegistry {
         Ok(())
     }
 
+    /// Read-only: the total staked amount for `provider`, or `0` when not staked.
+    pub fn get_stake(env: Env, provider: Address) -> i128 {
+        stake::get_stake_info(&env, &provider)
+            .map(|info| info.amount)
+            .unwrap_or(0)
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // Issue #424: Provider Ban Mechanism
     // ═══════════════════════════════════════════════════════════════

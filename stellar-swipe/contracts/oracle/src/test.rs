@@ -546,7 +546,7 @@ fn test_get_normalized_price_differing_native_decimals_to_common_target() {
 }
 
 #[test]
-fn test_get_normalized_price_no_decimals_configured_returns_error() {
+fn test_get_normalized_price_no_decimals_configured_falls_back() {
     let (env, admin, _, _, _) = create_test_env();
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
@@ -554,10 +554,11 @@ fn test_get_normalized_price_no_decimals_configured_returns_error() {
 
     let pair = make_pair(&env, "ETH", "USD");
     client.set_price(&pair, &2_000_000_000i128);
-    // Deliberately omit set_feed_decimals.
+    // Deliberately omit set_feed_decimals — falls back to 7 decimals.
 
-    let result = client.try_get_normalized_price(&pair, &6u32);
-    assert!(result.is_err());
+    // Rescaling a 7-decimal price to 6 decimals divides by 10.
+    let normalized = client.get_normalized_price(&pair, &6u32);
+    assert_eq!(normalized, 200_000_000i128);
 }
 
 #[test]
@@ -598,16 +599,14 @@ fn set_price_budget_regression() {
     client.register_oracle(&admin, &oracle1);
 
     env.budget().reset_tracker();
-    client.set_price(
-        AssetPair {
-            base: xlm_asset(&env),
-            quote: Asset {
-                code: String::from_str(&env, "USDC"),
-                issuer: Some(Address::generate(&env)),
-            },
+    let pair = AssetPair {
+        base: xlm_asset(&env),
+        quote: Asset {
+            code: String::from_str(&env, "USDC"),
+            issuer: Some(Address::generate(&env)),
         },
-        100_000_000,
-    );
+    };
+    client.set_price(&pair, &100_000_000);
     let instructions = env.budget().cpu_instruction_cost();
     measure_and_emit("oracle.set_price", 3_000_000, instructions);
 }
@@ -627,11 +626,11 @@ fn get_price_budget_regression() {
             issuer: Some(Address::generate(&env)),
         },
     };
-    client.set_price(pair.clone(), 100_000_000);
+    client.set_price(&pair, &100_000_000);
     client.submit_price(&oracle1, &100_000_000);
 
     env.budget().reset_tracker();
-    let _ = client.get_price(pair);
+    let _ = client.get_price(&pair);
     let instructions = env.budget().cpu_instruction_cost();
     measure_and_emit("oracle.get_price", 2_000_000, instructions);
 }
