@@ -258,6 +258,13 @@ pub enum StorageKey {
     EmergencyMultiSigConfig,
     /// Per-staker pending emergency unstake request (approvals accumulate here).
     EmergencyRequest(Address),
+    // ── Issue #1026: emergency withdrawal cooldown ─────────────────────────────
+    /// Admin-configurable minimum interval (seconds) between two completed
+    /// emergency unstakes for the same account. `0` (or unset) disables it.
+    EmergencyCooldownSecs,
+    /// Ledger timestamp at which `staker`'s most recent emergency unstake
+    /// executed. Absent until the account completes its first emergency unstake.
+    LastEmergencyUnstakeAt(Address),
     // ── Issue #689: Slash appeal ─────────────────────────────────────────────────
     SlashCounter,
     SlashRecord(u64),
@@ -381,6 +388,10 @@ pub enum StakeVaultError {
     // ── Slash cooldown ────────────────────────────────────────────────────────
     /// A slash was attempted within the cooldown window after a prior slash.
     SlashCooldownActive = 41,
+    // ── Issue #1026: emergency withdrawal cooldown ────────────────────────────
+    /// An emergency unstake request was made before the per-account cooldown
+    /// window following the previous emergency unstake had elapsed.
+    EmergencyCooldownActive = 42,
 }
 
 impl StakeVaultError {
@@ -481,6 +492,9 @@ impl StakeVaultError {
             }
             StakeVaultError::SlashCooldownActive => {
                 "slash cooldown is active; wait for the cooldown window to expire"
+            }
+            StakeVaultError::EmergencyCooldownActive => {
+                "emergency withdrawal cooldown is active for this account; wait for it to elapse"
             }
         }
     }
@@ -2403,6 +2417,28 @@ impl StakeVaultContract {
     /// Returns the pending emergency request for `staker`, if any.
     pub fn get_emergency_request(env: Env, staker: Address) -> Option<EmergencyRequest> {
         emergency_unstake::get_emergency_request(&env, &staker)
+    }
+
+    // ── Issue #1026: emergency withdrawal cooldown ────────────────────────────
+
+    /// Admin: set the per-account cooldown (seconds) enforced between two
+    /// completed emergency unstakes. `0` disables the cooldown.
+    ///
+    /// While a staker is inside this window, `request_emergency_unstake` fails
+    /// with `EmergencyCooldownActive`.
+    pub fn set_emergency_cooldown(
+        env: Env,
+        caller: Address,
+        cooldown_secs: u64,
+    ) -> Result<(), StakeVaultError> {
+        caller.require_auth();
+        emergency_unstake::set_cooldown(&env, &caller, cooldown_secs)
+    }
+
+    /// Seconds still remaining on `staker`'s emergency-withdrawal cooldown.
+    /// Returns `0` when the account may submit a new emergency request now.
+    pub fn emergency_cooldown_remaining(env: Env, staker: Address) -> u64 {
+        emergency_unstake::get_cooldown_remaining(&env, &staker)
     }
 
     // ── Stake delegation (issue #688) ──────────────────────────────────────────

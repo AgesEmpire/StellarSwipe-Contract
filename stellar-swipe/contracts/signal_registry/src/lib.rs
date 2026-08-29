@@ -99,7 +99,7 @@ pub use ml_scoring::{MLModel, SignalFeatures, SignalScore};
 use providers::VerificationEligibility;
 use reputation::{
     calculate_trust_score, get_trust_score, update_median_values, update_trust_score,
-    TrustScoreDetails, TrustScoreTier,
+    ReputationSnapshot, TrustScoreDetails, TrustScoreTier,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal, Map, String,
@@ -3449,6 +3449,30 @@ impl SignalRegistry {
             &performance,
             &stake_info,
         ))
+    }
+
+    /// Cross-contract read-only reputation snapshot (issue #1027).
+    ///
+    /// Returns a stable, self-describing [`ReputationSnapshot`] for `provider`,
+    /// derived entirely from canonical contract state (provider stats, stake and
+    /// rolling reputation score) as of the current ledger timestamp. It performs
+    /// no authentication and no storage writes, so other contracts can call it
+    /// during risk assessment or incentive determination without mutating this
+    /// contract. An unknown provider yields a well-formed, zeroed snapshot with
+    /// `has_sufficient_history == false`.
+    pub fn reputation_snapshot(env: Env, provider: Address) -> ReputationSnapshot {
+        let performance =
+            Self::get_provider_stats(env.clone(), provider.clone()).unwrap_or_default();
+        let stake_info = stake::get_stake_info(&env, &provider);
+        let reputation_score = Self::get_provider_reputation_score(env.clone(), provider.clone());
+
+        reputation::build_reputation_snapshot(
+            &env,
+            &provider,
+            &performance,
+            &stake_info,
+            reputation_score,
+        )
     }
 
     /// Update trust score for a provider (called after performance changes)

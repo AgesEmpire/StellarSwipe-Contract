@@ -65,6 +65,43 @@ fn remove_request(env: &Env, staker: &Address) {
         .remove(&StorageKey::EmergencyRequest(staker.clone()));
 }
 
+// ── Cooldown storage helpers (issue #1026) ─────────────────────────────────────
+
+fn get_cooldown_secs(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::EmergencyCooldownSecs)
+        .unwrap_or(0)
+}
+
+fn get_last_unstake_at(env: &Env, staker: &Address) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::LastEmergencyUnstakeAt(staker.clone()))
+}
+
+fn set_last_unstake_at(env: &Env, staker: &Address, ts: u64) {
+    env.storage()
+        .persistent()
+        .set(&StorageKey::LastEmergencyUnstakeAt(staker.clone()), &ts);
+}
+
+/// Seconds still remaining on `staker`'s emergency-withdrawal cooldown, or `0`
+/// when the account is free to submit a new request.
+fn cooldown_remaining_secs(env: &Env, staker: &Address) -> u64 {
+    let cooldown = get_cooldown_secs(env);
+    if cooldown == 0 {
+        return 0;
+    }
+    match get_last_unstake_at(env, staker) {
+        None => 0,
+        Some(last) => {
+            let ready_at = last.saturating_add(cooldown);
+            ready_at.saturating_sub(env.ledger().timestamp())
+        }
+    }
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 /// Admin: configure the multi-sig parameters for emergency unstakes.
@@ -105,13 +142,45 @@ pub fn configure(
     Ok(())
 }
 
+/// Admin: set the per-account cooldown (seconds) enforced between two completed
+/// emergency unstakes. Pass `0` to disable the cooldown. (Issue #1026.)
+pub fn set_cooldown(
+    env: &Env,
+    caller: &Address,
+    cooldown_secs: u64,
+) -> Result<(), StakeVaultError> {
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&StorageKey::Admin)
+        .ok_or(StakeVaultError::NotInitialized)?;
+    if caller != &admin {
+        return Err(StakeVaultError::Unauthorized);
+    }
+    env.storage()
+        .instance()
+        .set(&StorageKey::EmergencyCooldownSecs, &cooldown_secs);
+    Ok(())
+}
+
+/// Read the seconds still remaining on `staker`'s emergency-withdrawal cooldown.
+/// Returns `0` when the account may submit a new request immediately.
+pub fn get_cooldown_remaining(env: &Env, staker: &Address) -> u64 {
+    cooldown_remaining_secs(env, staker)
+}
+
 /// Staker: submit an emergency early-unstake request.
-/// Fails if no multi-sig is configured or a request already exists.
+/// Fails if no multi-sig is configured, a request already exists, or the
+/// per-account cooldown from a previous emergency unstake has not yet elapsed.
 pub fn request(env: &Env, staker: &Address) -> Result<(), StakeVaultError> {
     get_config(env).ok_or(StakeVaultError::EmergencyNotConfigured)?;
 
     if get_request(env, staker).is_some() {
         return Err(StakeVaultError::EmergencyRequestAlreadyExists);
+    }
+
+    if cooldown_remaining_secs(env, staker) > 0 {
+        return Err(StakeVaultError::EmergencyCooldownActive);
     }
 
     let req = EmergencyRequest {
@@ -173,6 +242,8 @@ pub fn approve(
         // Execute the early unstake with penalty.
         execute_early_unstake(env, staker, token_addr, cfg.penalty_bps)?;
         remove_request(env, staker);
+        // Start the per-account cooldown window (issue #1026).
+        set_last_unstake_at(env, staker, now);
     } else {
         save_request(env, &req);
     }
