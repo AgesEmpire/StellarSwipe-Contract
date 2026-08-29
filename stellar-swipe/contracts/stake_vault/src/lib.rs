@@ -2,6 +2,8 @@
 
 pub mod emergency_unstake;
 pub mod events;
+/// Deterministic fee accrual accumulator (Issue #1016).
+pub mod fee_accrual;
 pub mod migration;
 
 use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};

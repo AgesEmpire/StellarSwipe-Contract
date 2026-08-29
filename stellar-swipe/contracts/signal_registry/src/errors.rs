@@ -804,6 +804,97 @@ impl SignalCancelError {
     }
 }
 
+/// Errors returned by the provider onboarding pipeline (issues #1017, #1043).
+///
+/// Codes occupy the `1700` block, disjoint from every other `#[contracterror]`
+/// enum in this crate (see the discriminant-uniqueness assertion below).
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ProviderOnboardingError {
+    /// The onboarding pipeline has not been configured with parameters yet.
+    NotConfigured = 1700,
+    /// Provider identifier string is empty.
+    EmptyProviderId = 1701,
+    /// Provider identifier exceeds the configured maximum length.
+    ProviderIdTooLong = 1702,
+    /// Metadata URI exceeds the configured maximum length.
+    MetadataUriTooLong = 1703,
+    /// Posted collateral is below the configured minimum threshold.
+    CollateralBelowMinimum = 1704,
+    /// Posted onboarding fee is below the configured minimum.
+    FeeBelowMinimum = 1705,
+    /// Collateral or fee amount is zero or negative.
+    InvalidAmount = 1706,
+    /// An application for this provider already exists in a non-terminal state.
+    DuplicateApplication = 1707,
+    /// No application record exists for the given provider.
+    ApplicationNotFound = 1708,
+    /// The application is not in a state that allows this transition.
+    InvalidStateTransition = 1709,
+    /// The application has already reached a terminal state (Active / Failed).
+    AlreadyFinalized = 1710,
+    /// There are no reserved funds to refund for this application.
+    NothingToRefund = 1711,
+    /// An internal accounting operation overflowed.
+    ArithmeticError = 1712,
+    /// Caller is not authorised to perform this onboarding action.
+    Unauthorized = 1713,
+    /// Configuration parameter is zero or otherwise outside allowed bounds.
+    InvalidConfig = 1714,
+}
+
+impl ProviderOnboardingError {
+    /// Short, human-readable description of when this error is returned.
+    pub fn message(&self) -> &'static str {
+        match self {
+            ProviderOnboardingError::NotConfigured => {
+                "onboarding pipeline has not been configured with parameters"
+            }
+            ProviderOnboardingError::EmptyProviderId => "provider identifier is empty",
+            ProviderOnboardingError::ProviderIdTooLong => {
+                "provider identifier exceeds the configured maximum length"
+            }
+            ProviderOnboardingError::MetadataUriTooLong => {
+                "metadata URI exceeds the configured maximum length"
+            }
+            ProviderOnboardingError::CollateralBelowMinimum => {
+                "posted collateral is below the configured minimum threshold"
+            }
+            ProviderOnboardingError::FeeBelowMinimum => {
+                "posted onboarding fee is below the configured minimum"
+            }
+            ProviderOnboardingError::InvalidAmount => {
+                "collateral or fee amount is zero or negative"
+            }
+            ProviderOnboardingError::DuplicateApplication => {
+                "an application for this provider already exists in a non-terminal state"
+            }
+            ProviderOnboardingError::ApplicationNotFound => {
+                "no application record exists for the given provider"
+            }
+            ProviderOnboardingError::InvalidStateTransition => {
+                "the application is not in a state that allows this transition"
+            }
+            ProviderOnboardingError::AlreadyFinalized => {
+                "the application has already reached a terminal state"
+            }
+            ProviderOnboardingError::NothingToRefund => {
+                "there are no reserved funds to refund for this application"
+            }
+            ProviderOnboardingError::ArithmeticError => {
+                "an internal accounting operation overflowed"
+            }
+            ProviderOnboardingError::Unauthorized => {
+                "caller is not authorised to perform this onboarding action"
+            }
+            ProviderOnboardingError::InvalidConfig => {
+                "configuration parameter is zero or outside allowed bounds"
+            }
+        }
+    }
+}
+
 // ── Issue #782: compile-time discriminant uniqueness ───────────────────────────
 //
 // Soroban encodes every `#[contracterror]` value as a single contract-wide
@@ -986,6 +1077,22 @@ const ALL_ERROR_CODES: &[u32] = &[
     DisputeError::AppealAlreadySubmitted as u32,
     DisputeError::AppealNotPending as u32,
     DisputeError::AppealWindowNotElapsed as u32,
+    // ProviderOnboardingError (issues #1017, #1043)
+    ProviderOnboardingError::NotConfigured as u32,
+    ProviderOnboardingError::EmptyProviderId as u32,
+    ProviderOnboardingError::ProviderIdTooLong as u32,
+    ProviderOnboardingError::MetadataUriTooLong as u32,
+    ProviderOnboardingError::CollateralBelowMinimum as u32,
+    ProviderOnboardingError::FeeBelowMinimum as u32,
+    ProviderOnboardingError::InvalidAmount as u32,
+    ProviderOnboardingError::DuplicateApplication as u32,
+    ProviderOnboardingError::ApplicationNotFound as u32,
+    ProviderOnboardingError::InvalidStateTransition as u32,
+    ProviderOnboardingError::AlreadyFinalized as u32,
+    ProviderOnboardingError::NothingToRefund as u32,
+    ProviderOnboardingError::ArithmeticError as u32,
+    ProviderOnboardingError::Unauthorized as u32,
+    ProviderOnboardingError::InvalidConfig as u32,
 ];
 
 const fn has_duplicate(codes: &[u32]) -> bool {
