@@ -423,12 +423,36 @@ pub fn cast_reputation_weighted_vote(
     voter.require_auth();
 
     let mut proposal = proposals::get_proposal(env, proposal_id)?;
-    let token_power = proposals::get_effective_voting_power(env, &voter);
-    if token_power <= 0 {
-        return Err(GovernanceError::NoVotingPower);
+    let now = env.ledger().timestamp();
+
+    // Mirror the eligibility/timing gates enforced by `proposals::cast_vote`
+    // (Issue #998) — this entrypoint shares the same `proposal.voters` tally,
+    // so it must be just as resistant to duplicate participation, late votes,
+    // and votes on proposals that are no longer open.
+    if proposal.discussion_ends_at > 0 && now < proposal.discussion_ends_at {
+        return Err(GovernanceError::DiscussionPeriodActive);
+    }
+    if now < proposal.voting_starts {
+        return Err(GovernanceError::VotingNotStarted);
+    }
+    if now >= proposal.voting_ends {
+        return Err(GovernanceError::VotingEnded);
+    }
+    if proposal.status != ProposalStatus::Pending && proposal.status != ProposalStatus::Active {
+        return Err(GovernanceError::ProposalNotActive);
     }
     if proposal.voters.contains_key(voter.clone()) {
         return Err(GovernanceError::AlreadyVoted);
+    }
+
+    // Use the voting power snapshotted at proposal creation, not the voter's
+    // *current* effective power. Reading live power here would let a voter
+    // inflate their weight by delegating to themselves (or undelegating)
+    // after the proposal was created, retroactively bypassing the
+    // eligibility snapshot the token-weighted path already enforces.
+    let token_power = crate::get_vote_snapshot(env, proposal_id, &voter).unwrap_or(0);
+    if token_power <= 0 {
+        return Err(GovernanceError::NoVotingPower);
     }
 
     let reputation = get_governance_reputation(env, voter.clone());
@@ -439,7 +463,7 @@ pub fn cast_reputation_weighted_vote(
         voter: voter.clone(),
         vote_type: vote_type.clone(),
         voting_power: weighted,
-        timestamp: env.ledger().timestamp(),
+        timestamp: now,
     };
 
     proposal.voters.set(voter.clone(), vote);
@@ -452,6 +476,9 @@ pub fn cast_reputation_weighted_vote(
         VoteType::Abstain => {
             proposal.votes_abstain = proposal.votes_abstain.saturating_add(weighted)
         }
+    }
+    if proposal.status == ProposalStatus::Pending {
+        proposal.status = ProposalStatus::Active;
     }
 
     proposals::put_proposal(env, &proposal)?;
