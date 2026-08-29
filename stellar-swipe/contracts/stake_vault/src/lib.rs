@@ -5,6 +5,9 @@ pub mod events;
 /// Deterministic fee accrual accumulator (Issue #1016).
 pub mod fee_accrual;
 pub mod migration;
+pub mod reward_vault;
+pub mod slash_strategy;
+pub mod storage_version;
 
 use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
 use migration::{MigrationKey, StakeInfoV2};
@@ -626,6 +629,8 @@ impl StakeVaultContract {
             .set(&pausable::PausableKey::Paused, &false);
         initializable::mark_initialized(&env);
         shared::version::set_contract_version(&env, shared::version::STAKE_VAULT_VERSION);
+        // Issue #1023: initialise storage layout version.
+        storage_version::init_storage_version(&env);
     }
 
     // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
@@ -2694,6 +2699,183 @@ impl StakeVaultContract {
             .get(&StorageKey::UnstakeQueueHead)
             .unwrap_or(0);
         Some(ticket.saturating_sub(head))
+    }
+
+    // ── Issue #1020 + #1022: Reward vault (batch claim, multi-asset) ──────────
+
+    /// Admin: register a reward asset token so the vault accepts deposits in it.
+    pub fn add_reward_asset(env: Env, asset: Address) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        reward_vault::add_supported_asset(&env, asset);
+        Ok(())
+    }
+
+    /// Returns all registered reward asset addresses.
+    pub fn get_reward_assets(env: Env) -> Vec<Address> {
+        reward_vault::get_supported_assets(&env)
+    }
+
+    /// Deposit `amount` of `asset` as a reward bucket for `provider` in `epoch`.
+    ///
+    /// The asset must be registered via `add_reward_asset` first.
+    /// Tokens are transferred from `depositor` into the contract.
+    pub fn deposit_reward(
+        env: Env,
+        depositor: Address,
+        provider: Address,
+        asset: Address,
+        amount: i128,
+        epoch: u64,
+    ) -> Result<u64, StakeVaultError> {
+        depositor.require_auth();
+        Self::require_not_paused(&env)?;
+        reward_vault::deposit_reward(&env, &depositor, provider, asset, amount, epoch)
+            .map_err(|e| match e {
+                reward_vault::RewardVaultError::UnsupportedAsset => StakeVaultError::Unauthorized,
+                reward_vault::RewardVaultError::InvalidAmount => StakeVaultError::InvalidAmount,
+                reward_vault::RewardVaultError::BatchSizeInvalid => {
+                    StakeVaultError::BatchSizeInvalid
+                }
+            })
+    }
+
+    /// Provider: claim rewards from a batch of bucket IDs in a single call.
+    ///
+    /// Buckets already claimed are silently skipped (idempotence).
+    /// Returns per-asset totals transferred.
+    pub fn batch_claim_rewards(
+        env: Env,
+        provider: Address,
+        bucket_ids: Vec<u64>,
+    ) -> Result<Vec<(Address, i128)>, StakeVaultError> {
+        provider.require_auth();
+        Self::require_not_paused(&env)?;
+        reward_vault::batch_claim_rewards(&env, &provider, bucket_ids).map_err(|e| match e {
+            reward_vault::RewardVaultError::BatchSizeInvalid => StakeVaultError::BatchSizeInvalid,
+            _ => StakeVaultError::InvalidAmount,
+        })
+    }
+
+    /// Returns the claimable reward balance for `provider` in `asset`.
+    pub fn get_provider_reward_balance(env: Env, provider: Address, asset: Address) -> i128 {
+        reward_vault::get_provider_reward_balance(&env, &provider, &asset)
+    }
+
+    /// Returns the total deposited amount for `asset` across all providers.
+    pub fn get_asset_total_deposited(env: Env, asset: Address) -> i128 {
+        reward_vault::get_asset_total_deposited(&env, &asset)
+    }
+
+    // ── Issue #1021: Slash strategy policy thresholds ─────────────────────────
+
+    /// Admin: set (or update) the slash strategy config for `strategy_name`.
+    ///
+    /// Validates that bps values are in `[0, 10_000]`, severity order is
+    /// non-decreasing, and `risk_window_secs > 0`.
+    pub fn set_slash_strategy(
+        env: Env,
+        strategy_name: Symbol,
+        minor_bps: u32,
+        major_bps: u32,
+        critical_bps: u32,
+        risk_window_secs: u64,
+        penalty_window_secs: u64,
+    ) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        let cfg = slash_strategy::SlashStrategyConfig {
+            minor_bps,
+            major_bps,
+            critical_bps,
+            risk_window_secs,
+            penalty_window_secs,
+        };
+        slash_strategy::set_slash_strategy(&env, strategy_name, cfg).map_err(|e| match e {
+            slash_strategy::SlashStrategyError::BpsOutOfRange => StakeVaultError::InvalidSlashTier,
+            slash_strategy::SlashStrategyError::InvalidSeverityOrder => {
+                StakeVaultError::InvalidSlashTierOrder
+            }
+            slash_strategy::SlashStrategyError::InvalidRiskWindow => {
+                StakeVaultError::InvalidCooldown
+            }
+            slash_strategy::SlashStrategyError::StrategyNotFound => StakeVaultError::Unauthorized,
+        })
+    }
+
+    /// Returns the slash strategy config for `strategy_name`, or `None`.
+    pub fn get_slash_strategy(
+        env: Env,
+        strategy_name: Symbol,
+    ) -> Option<slash_strategy::SlashStrategyConfig> {
+        slash_strategy::get_slash_strategy(&env, strategy_name)
+    }
+
+    /// Returns all registered strategy names.
+    pub fn list_slash_strategies(env: Env) -> Vec<Symbol> {
+        slash_strategy::list_slash_strategies(&env)
+    }
+
+    // ── Issue #1023: Storage layout migration guard ───────────────────────────
+
+    /// Returns the current on-chain storage layout version.
+    pub fn get_storage_layout_version(env: Env) -> Option<u32> {
+        storage_version::get_layout_version(&env)
+    }
+
+    /// Admin: upgrade the contract WASM with storage layout compatibility check.
+    ///
+    /// In addition to the existing code-version guard, this validates that the
+    /// on-chain storage layout version is `next_layout_version - 1` (sequential
+    /// migration only) and that all `required_storage_keys` are present in
+    /// persistent storage before the upgrade is accepted.
+    ///
+    /// On success the layout version is bumped and a `stgver` event is emitted.
+    pub fn upgrade_with_migration_guard(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+        next_layout_version: u32,
+        required_storage_keys: Vec<Symbol>,
+    ) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+
+        // Code-version guard (existing behaviour).
+        let current_version = shared::version::get_contract_version(&env);
+        shared::version::guard_upgrade(current_version, new_version)
+            .map_err(|_| StakeVaultError::IncompatibleContractVersion)?;
+
+        // Storage layout compatibility guard (#1023).
+        storage_version::guard_storage_upgrade(&env, next_layout_version, &required_storage_keys)
+            .map_err(|e| match e {
+                storage_version::StorageVersionError::IncompatibleLayoutVersion => {
+                    StakeVaultError::IncompatibleContractVersion
+                }
+                storage_version::StorageVersionError::MissingRequiredKey => {
+                    StakeVaultError::NotInitialized
+                }
+                storage_version::StorageVersionError::NotInitialized => {
+                    StakeVaultError::NotInitialized
+                }
+            })?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        shared::version::set_contract_version(&env, new_version);
+        shared::version::emit_contract_upgraded(&env, current_version, new_version);
+        Ok(())
     }
 }
 

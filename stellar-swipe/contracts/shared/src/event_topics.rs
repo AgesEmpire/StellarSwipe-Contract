@@ -81,6 +81,19 @@ pub const TOPIC_STAKE_EMERGENCY_EXECUTED: fn() -> Symbol = || Symbol::short("emg
 pub const TOPIC_STAKE_LOCK_MULTIPLIER: fn() -> Symbol = || Symbol::short("lockmult");
 pub const TOPIC_STAKE_SLASH_COOLDOWN: fn() -> Symbol = || Symbol::short("slhcoold");
 
+// ── Reward vault sub-topics (#1020, #1022) ────────────────────────────────────
+pub const TOPIC_REWARD_CLAIMED: fn() -> Symbol = || Symbol::short("rwdclaim");
+pub const TOPIC_REWARD_BATCH_CLAIMED: fn() -> Symbol = || Symbol::short("rwdbatch");
+pub const TOPIC_REWARD_DEPOSITED: fn() -> Symbol = || Symbol::short("rwddep");
+pub const TOPIC_REWARD_ASSET_ADDED: fn() -> Symbol = || Symbol::short("rwdasset");
+
+// ── Slash strategy sub-topics (#1021) ─────────────────────────────────────────
+pub const TOPIC_SLASH_STRATEGY_SET: fn() -> Symbol = || Symbol::short("slhstrat");
+
+// ── Storage migration guard sub-topics (#1023) ────────────────────────────────
+pub const TOPIC_STORAGE_VERSION_SET: fn() -> Symbol = || Symbol::short("stgver");
+pub const TOPIC_UPGRADE_BLOCKED: fn() -> Symbol = || Symbol::short("upgblk");
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -157,5 +170,12 @@ mod tests {
         let _ = TOPIC_STAKE_EMERGENCY_EXECUTED();
         let _ = TOPIC_STAKE_LOCK_MULTIPLIER();
         let _ = TOPIC_STAKE_SLASH_COOLDOWN();
+        let _ = TOPIC_REWARD_CLAIMED();
+        let _ = TOPIC_REWARD_BATCH_CLAIMED();
+        let _ = TOPIC_REWARD_DEPOSITED();
+        let _ = TOPIC_REWARD_ASSET_ADDED();
+        let _ = TOPIC_SLASH_STRATEGY_SET();
+        let _ = TOPIC_STORAGE_VERSION_SET();
+        let _ = TOPIC_UPGRADE_BLOCKED();
     }
 }
