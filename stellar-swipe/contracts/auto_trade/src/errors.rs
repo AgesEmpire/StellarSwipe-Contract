@@ -130,6 +130,31 @@ pub enum AutoTradeError {
     LastOracleForPair = 49,
     /// Action requires the contract to be paused, but it is not.
     NotPaused = 50,
+    // ── Issue #1001: standardized token/cross-contract error mapping ─────────
+    /// A router-required allowance was insufficient or expired.
+    InsufficientAllowance = 51,
+}
+
+/// Maps the shared token/cross-contract invocation failure classification
+/// (Issue #1001) onto this contract's stable error codes. Every non-success
+/// outcome from an AMM-router invocation must flow through here rather than
+/// being treated as `Ok`.
+impl From<shared::TokenFailure> for AutoTradeError {
+    fn from(failure: shared::TokenFailure) -> Self {
+        match failure {
+            shared::TokenFailure::Unauthorized => AutoTradeError::Unauthorized,
+            shared::TokenFailure::InsufficientBalance => AutoTradeError::InsufficientBalance,
+            shared::TokenFailure::InsufficientAllowance => AutoTradeError::InsufficientAllowance,
+            // Invalid input, overflow, an unrecognized custom-token error
+            // code, and host-level aborts are all execution failures the
+            // router/token layer surfaced — `SystemError` (aliased here as
+            // `AtomicExecutionFailed`) already documents that category.
+            shared::TokenFailure::InvalidRequest
+            | shared::TokenFailure::Overflow
+            | shared::TokenFailure::OtherContractError(_)
+            | shared::TokenFailure::HostError => AutoTradeError::SystemError,
+        }
+    }
 }
 
 impl AutoTradeError {
@@ -278,6 +303,9 @@ impl AutoTradeError {
                 "cannot remove the last remaining whitelisted oracle for a pair"
             }
             AutoTradeError::NotPaused => "action requires the contract to be paused, but it is not",
+            AutoTradeError::InsufficientAllowance => {
+                "router token operation failed: insufficient or expired allowance"
+            }
         }
     }
 }

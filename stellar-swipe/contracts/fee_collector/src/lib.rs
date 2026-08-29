@@ -63,8 +63,8 @@ pub use storage::{
 };
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, String, Symbol,
-    Val, Vec,
+    contract, contractimpl, contracttype, panic_with_error, token, Address, BytesN, Env, IntoVal,
+    String, Symbol, Val, Vec,
 };
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
@@ -528,11 +528,12 @@ impl FeeCollector {
             .checked_sub(amount)
             .ok_or(ContractError::ArithmeticOverflow)?;
 
-        token::Client::new(&env, &token).transfer(
+        shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
             &env.current_contract_address(),
             &recipient,
             &amount,
-        );
+        ))
+        .map_err(ContractError::from)?;
 
         set_treasury_balance(&env, &token, new_balance);
         remove_queued_withdrawal(&env);
@@ -620,7 +621,12 @@ impl FeeCollector {
             return Err(ContractError::InvalidAmount);
         }
 
-        token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
+        shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
+            &from,
+            env.current_contract_address(),
+            &amount,
+        ))
+        .map_err(ContractError::from)?;
 
         let current_bal = get_insurance_balance(&env, &token);
         let new_bal = current_bal
@@ -698,11 +704,12 @@ impl FeeCollector {
         set_insurance_balance(&env, &token, new_balance);
         set_insurance_claim_processed(&env, &claim_id, true);
 
-        token::Client::new(&env, &token).transfer(
+        shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
             &env.current_contract_address(),
             &recipient,
             &amount,
-        );
+        ))
+        .map_err(ContractError::from)?;
 
         emit_insurance_payout(
             &env,
@@ -1117,14 +1124,22 @@ impl FeeCollector {
         }
 
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&trader, env.current_contract_address(), &fee_amount);
+        shared::token_error::map_result(token_client.try_transfer(
+            &trader,
+            env.current_contract_address(),
+            &fee_amount,
+        ))
+        .map_err(ContractError::from)?;
 
         let distributable = fee_amount
             .checked_sub(burn_amount)
             .ok_or(ContractError::ArithmeticOverflow)?;
 
         if burn_amount > 0 {
-            token_client.burn(&env.current_contract_address(), &burn_amount);
+            shared::token_error::map_result(
+                token_client.try_burn(&env.current_contract_address(), &burn_amount),
+            )
+            .map_err(ContractError::from)?;
             FeesBurned {
                 amount: burn_amount,
                 token: token.clone(),
@@ -1147,7 +1162,12 @@ impl FeeCollector {
             }
 
             if referral_amount > 0 {
-                token_client.transfer(&env.current_contract_address(), &referrer, &referral_amount);
+                shared::token_error::map_result(token_client.try_transfer(
+                    &env.current_contract_address(),
+                    &referrer,
+                    &referral_amount,
+                ))
+                .map_err(ContractError::from)?;
                 emit_referral_fee_paid(&env, &referrer, &trader, &token, referral_amount);
                 remaining_distributable = remaining_distributable.saturating_sub(referral_amount);
             }
@@ -1351,11 +1371,12 @@ impl FeeCollector {
             if converted.is_none() {
                 // Default: settle in source token.
                 if amount > 0 {
-                    token::Client::new(&env, &token).transfer(
+                    shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
                         &env.current_contract_address(),
                         &provider,
                         &amount,
-                    );
+                    ))
+                    .map_err(ContractError::from)?;
                 }
                 set_pending_fees(&env, &provider, &token, 0);
                 emit_fees_claimed(
@@ -1431,7 +1452,17 @@ impl FeeCollector {
         // Execute the conversion: zero out source pending fees and pay preferred.
         set_pending_fees(env, provider, source_token, 0);
 
-        pref_client.transfer(&env.current_contract_address(), provider, &pref_amount);
+        // Pending fees were already zeroed above, so a failed transfer here
+        // cannot be reported as a graceful `None` (that would silently drop
+        // funds the caller believes were paid out) — abort the transaction
+        // with a typed error instead of the previous opaque host trap.
+        if let Err(failure) = shared::token_error::map_result(pref_client.try_transfer(
+            &env.current_contract_address(),
+            provider,
+            &pref_amount,
+        )) {
+            panic_with_error!(env, ContractError::from(failure));
+        }
 
         emit_fees_claimed_converted(
             env,
@@ -1749,7 +1780,12 @@ impl FeeCollector {
                 continue;
             };
 
-            token_client.transfer(&env.current_contract_address(), &tier.recipient, &allocated);
+            shared::token_error::map_result(token_client.try_transfer(
+                &env.current_contract_address(),
+                &tier.recipient,
+                &allocated,
+            ))
+            .map_err(ContractError::from)?;
             remaining = remaining
                 .checked_sub(allocated)
                 .ok_or(ContractError::ArithmeticOverflow)?;

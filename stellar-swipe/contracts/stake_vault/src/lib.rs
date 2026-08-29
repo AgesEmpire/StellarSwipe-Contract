@@ -375,6 +375,19 @@ pub enum StakeVaultError {
     // ── Slash cooldown ────────────────────────────────────────────────────────
     /// A slash was attempted within the cooldown window after a prior slash.
     SlashCooldownActive = 41,
+    // ── Issue #1001: standardized token/cross-contract error mapping ─────────
+    /// The stake token rejected a transfer/burn for insufficient balance
+    /// (distinct from `NoStake`, which means no tracked stake position
+    /// exists at all).
+    InsufficientTokenBalance = 42,
+    /// The stake token rejected a transfer for insufficient/expired
+    /// allowance.
+    InsufficientTokenAllowance = 43,
+    /// A token or cross-contract invocation failed for a reason other than
+    /// authorization, balance, or allowance (arithmetic overflow, invalid
+    /// request, an unrecognized custom-token error code, or a host-level
+    /// abort). See `shared::token_error` for the classification policy.
+    TokenOperationFailed = 44,
 }
 
 impl StakeVaultError {
@@ -476,6 +489,35 @@ impl StakeVaultError {
             StakeVaultError::SlashCooldownActive => {
                 "slash cooldown is active; wait for the cooldown window to expire"
             }
+            StakeVaultError::InsufficientTokenBalance => {
+                "stake token transfer/burn failed: insufficient balance"
+            }
+            StakeVaultError::InsufficientTokenAllowance => {
+                "stake token transfer failed: insufficient or expired allowance"
+            }
+            StakeVaultError::TokenOperationFailed => {
+                "stake token or cross-contract invocation failed"
+            }
+        }
+    }
+}
+
+/// Maps the shared token/cross-contract invocation failure classification
+/// (Issue #1001) onto this contract's stable error codes. Every non-success
+/// outcome from a stake-token invocation must flow through here rather than
+/// being treated as `Ok`.
+impl From<shared::TokenFailure> for StakeVaultError {
+    fn from(failure: shared::TokenFailure) -> Self {
+        match failure {
+            shared::TokenFailure::Unauthorized => StakeVaultError::Unauthorized,
+            shared::TokenFailure::InsufficientBalance => StakeVaultError::InsufficientTokenBalance,
+            shared::TokenFailure::InsufficientAllowance => {
+                StakeVaultError::InsufficientTokenAllowance
+            }
+            shared::TokenFailure::InvalidRequest
+            | shared::TokenFailure::Overflow
+            | shared::TokenFailure::OtherContractError(_)
+            | shared::TokenFailure::HostError => StakeVaultError::TokenOperationFailed,
         }
     }
 }
@@ -860,7 +902,12 @@ impl StakeVaultContract {
         emit_provider_tier_change(&env, &staker, old_tier, new_tier, new_balance);
 
         // Transfer tokens into the vault (after state update — CEI pattern).
-        token::Client::new(&env, &token).transfer(&staker, env.current_contract_address(), &amount);
+        shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
+            &staker,
+            env.current_contract_address(),
+            &amount,
+        ))
+        .map_err(StakeVaultError::from)?;
 
         Ok(())
     }
@@ -1251,7 +1298,11 @@ impl StakeVaultContract {
                 env.storage()
                     .persistent()
                     .remove(&StorageKey::SlashedFundsHeld(slash_id));
-                token::Client::new(env, &token).burn(&env.current_contract_address(), &held);
+                shared::token_error::map_result(
+                    token::Client::new(env, &token)
+                        .try_burn(&env.current_contract_address(), &held),
+                )
+                .map_err(StakeVaultError::from)?;
             }
         } else {
             // Reversed — tokens are still in the vault; credit provider's stake.
@@ -1581,7 +1632,14 @@ impl StakeVaultContract {
         emit_provider_tier_change(env, staker, old_tier, new_tier, 0);
 
         // Cross-contract call: transfer tokens back to staker.
-        token::Client::new(env, &token).transfer(&env.current_contract_address(), staker, &amount);
+        shared::token_error::map_result(
+            token::Client::new(env, &token).try_transfer(
+                &env.current_contract_address(),
+                staker,
+                &amount,
+            ),
+        )
+        .map_err(StakeVaultError::from)?;
 
         Ok(amount)
     }
@@ -1750,7 +1808,14 @@ impl StakeVaultContract {
         events::emit_partial_unstake(env, staker.clone(), amount, remaining);
 
         // Transfer tokens back to staker (CEI: state updated before cross-contract call).
-        token::Client::new(env, &token).transfer(&env.current_contract_address(), staker, &amount);
+        shared::token_error::map_result(
+            token::Client::new(env, &token).try_transfer(
+                &env.current_contract_address(),
+                staker,
+                &amount,
+            ),
+        )
+        .map_err(StakeVaultError::from)?;
 
         Ok(amount)
     }
@@ -2077,7 +2142,11 @@ impl StakeVaultContract {
                 .set(&StorageKey::SlashedFundsHeld(slash_id), &slash_amount);
         } else {
             // No appeal window configured — burn immediately (legacy behaviour).
-            token::Client::new(&env, &token).burn(&env.current_contract_address(), &slash_amount);
+            shared::token_error::map_result(
+                token::Client::new(&env, &token)
+                    .try_burn(&env.current_contract_address(), &slash_amount),
+            )
+            .map_err(StakeVaultError::from)?;
         }
 
         // Event records severity tier, slash amount, and slash_id for audit.
@@ -2427,11 +2496,12 @@ impl StakeVaultContract {
             &new_total,
         );
 
-        token::Client::new(&env, &token).transfer(
+        shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
             &delegator,
             env.current_contract_address(),
             &amount,
-        );
+        ))
+        .map_err(StakeVaultError::from)?;
 
         events::emit_stake_delegated(&env, delegator, provider, amount);
 
