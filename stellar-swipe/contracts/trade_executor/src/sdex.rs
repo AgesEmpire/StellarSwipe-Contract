@@ -165,7 +165,10 @@ pub fn execute_sdex_swap(
         .ok_or(ContractError::InvalidAmount)?;
 
     // SEP-41: current contract authorizes router to pull `amount` of from_token.
-    from_client.approve(&this, sdex_router, &amount, &expiration);
+    shared::token_error::map_result(
+        from_client.try_approve(&this, sdex_router, &amount, &expiration),
+    )
+    .map_err(ContractError::from)?;
 
     let balance_before = to_client.balance(&this);
 
@@ -178,7 +181,13 @@ pub fn execute_sdex_swap(
     args.push_back(min_received.into_val(env));
     args.push_back(this.clone().into_val(env));
 
-    let _reported_out: i128 = env.invoke_contract(sdex_router, &swap_sym, args);
+    // Router failures (auth, its own balance/allowance checks, or a host
+    // abort) must surface as a mapped error, never as a silently-successful
+    // swap — see shared::token_error (Issue #1001).
+    let _reported_out: i128 = shared::token_error::map_result(
+        env.try_invoke_contract::<i128, soroban_sdk::Error>(sdex_router, &swap_sym, args),
+    )
+    .map_err(ContractError::from)?;
 
     let balance_after = to_client.balance(&this);
     let actual_received = balance_after.checked_sub(balance_before).unwrap_or(0);

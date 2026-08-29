@@ -51,6 +51,8 @@ pub mod pausable;
 pub mod rate_limiter;
 /// Safe arithmetic helpers for deterministic rounding and overflow safeguards (Issue #861).
 pub mod safe_math;
+/// Standardized token / cross-contract invocation failure classification (Issue #1001).
+pub mod token_error;
 #[allow(deprecated)]
 pub mod version;
 
@@ -61,6 +63,7 @@ pub use cross_contract::{
 };
 pub use errors::{ErrorCategory, RecoveryStrategy};
 pub use pausable::{is_paused, require_not_paused, set_paused, PausableKey};
+pub use token_error::TokenFailure;
 pub use version::{ContractKind, VersionError};
 
 pub use capability::{

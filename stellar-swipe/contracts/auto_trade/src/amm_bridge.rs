@@ -366,7 +366,11 @@ fn invoke_router_swap(
     let pull_from = env.current_contract_address();
     let recipient = pull_from.clone();
 
-    env.try_invoke_contract::<i128, soroban_sdk::Error>(
+    // Router failures (auth, balance/allowance the router enforces, or a
+    // host-level abort) are classified via the shared policy instead of
+    // being collapsed into one opaque code — see shared::token_error
+    // (Issue #1001). A failed swap must never be reported as successful.
+    shared::token_error::map_result(env.try_invoke_contract::<i128, soroban_sdk::Error>(
         router,
         &sym,
         (
@@ -378,9 +382,8 @@ fn invoke_router_swap(
             recipient,
         )
             .into_val(env),
-    )
-    .map_err(|_| AutoTradeError::AtomicExecutionFailed)?
-    .map_err(|_| AutoTradeError::AtomicExecutionFailed)
+    ))
+    .map_err(AutoTradeError::from)
 }
 
 /// Primary entry: smart route → AMM bridge plan → per-source fallback → SDEX stub.

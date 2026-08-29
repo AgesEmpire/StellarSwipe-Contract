@@ -74,6 +74,17 @@ pub enum ContractError {
     ClaimAlreadyProcessed = 33,
     /// Contract is currently paused (#561).
     ContractPaused = 34,
+    /// Issue #1001: a fee-token transfer failed because the payer/holder
+    /// balance was insufficient (distinct from `InsufficientTreasuryBalance`,
+    /// which is a pre-transfer accounting check).
+    InsufficientTokenBalance = 35,
+    /// Issue #1001: a fee-token transfer failed for insufficient/expired
+    /// allowance.
+    InsufficientTokenAllowance = 36,
+    /// Issue #1001: a token or cross-contract invocation failed for a
+    /// reason other than authorization, balance, or allowance. See
+    /// `shared::token_error` for the classification policy.
+    TokenOperationFailed = 37,
 }
 
 impl ContractError {
@@ -158,6 +169,35 @@ impl ContractError {
             }
             ContractError::ClaimAlreadyProcessed => "claim ID has already been paid out",
             ContractError::ContractPaused => "contract is currently paused",
+            ContractError::InsufficientTokenBalance => {
+                "fee token transfer failed: insufficient balance"
+            }
+            ContractError::InsufficientTokenAllowance => {
+                "fee token transfer failed: insufficient or expired allowance"
+            }
+            ContractError::TokenOperationFailed => {
+                "fee token or cross-contract invocation failed"
+            }
+        }
+    }
+}
+
+/// Maps the shared token/cross-contract invocation failure classification
+/// (Issue #1001) onto this contract's stable error codes. Every non-success
+/// outcome from a fee-token invocation must flow through here rather than
+/// being treated as `Ok`.
+impl From<shared::TokenFailure> for ContractError {
+    fn from(failure: shared::TokenFailure) -> Self {
+        match failure {
+            shared::TokenFailure::Unauthorized => ContractError::Unauthorized,
+            shared::TokenFailure::InsufficientBalance => ContractError::InsufficientTokenBalance,
+            shared::TokenFailure::InsufficientAllowance => {
+                ContractError::InsufficientTokenAllowance
+            }
+            shared::TokenFailure::InvalidRequest
+            | shared::TokenFailure::Overflow
+            | shared::TokenFailure::OtherContractError(_)
+            | shared::TokenFailure::HostError => ContractError::TokenOperationFailed,
         }
     }
 }

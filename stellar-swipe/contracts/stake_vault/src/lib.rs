@@ -883,7 +883,12 @@ impl StakeVaultContract {
         emit_provider_tier_change(&env, &staker, old_tier, new_tier, new_balance);
 
         // Transfer tokens into the vault (after state update — CEI pattern).
-        token::Client::new(&env, &token).transfer(&staker, env.current_contract_address(), &amount);
+        shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
+            &staker,
+            env.current_contract_address(),
+            &amount,
+        ))
+        .map_err(StakeVaultError::from)?;
 
         Ok(())
     }
@@ -1286,7 +1291,11 @@ impl StakeVaultContract {
                 env.storage()
                     .persistent()
                     .remove(&StorageKey::SlashedFundsHeld(slash_id));
-                token::Client::new(env, &token).burn(&env.current_contract_address(), &held);
+                shared::token_error::map_result(
+                    token::Client::new(env, &token)
+                        .try_burn(&env.current_contract_address(), &held),
+                )
+                .map_err(StakeVaultError::from)?;
             }
         } else {
             // Reversed — tokens are still in the vault; credit provider's stake.
@@ -1616,7 +1625,14 @@ impl StakeVaultContract {
         emit_provider_tier_change(env, staker, old_tier, new_tier, 0);
 
         // Cross-contract call: transfer tokens back to staker.
-        token::Client::new(env, &token).transfer(&env.current_contract_address(), staker, &amount);
+        shared::token_error::map_result(
+            token::Client::new(env, &token).try_transfer(
+                &env.current_contract_address(),
+                staker,
+                &amount,
+            ),
+        )
+        .map_err(StakeVaultError::from)?;
 
         Ok(amount)
     }
@@ -1785,7 +1801,14 @@ impl StakeVaultContract {
         events::emit_partial_unstake(env, staker.clone(), amount, remaining);
 
         // Transfer tokens back to staker (CEI: state updated before cross-contract call).
-        token::Client::new(env, &token).transfer(&env.current_contract_address(), staker, &amount);
+        shared::token_error::map_result(
+            token::Client::new(env, &token).try_transfer(
+                &env.current_contract_address(),
+                staker,
+                &amount,
+            ),
+        )
+        .map_err(StakeVaultError::from)?;
 
         Ok(amount)
     }
@@ -2120,7 +2143,11 @@ impl StakeVaultContract {
                 .set(&StorageKey::SlashedFundsHeld(slash_id), &slash_amount);
         } else {
             // No appeal window configured — burn immediately (legacy behaviour).
-            token::Client::new(&env, &token).burn(&env.current_contract_address(), &slash_amount);
+            shared::token_error::map_result(
+                token::Client::new(&env, &token)
+                    .try_burn(&env.current_contract_address(), &slash_amount),
+            )
+            .map_err(StakeVaultError::from)?;
         }
 
         // Event records severity tier, slash amount, and slash_id for audit.
@@ -2492,11 +2519,12 @@ impl StakeVaultContract {
             &new_total,
         );
 
-        token::Client::new(&env, &token).transfer(
+        shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
             &delegator,
             env.current_contract_address(),
             &amount,
-        );
+        ))
+        .map_err(StakeVaultError::from)?;
 
         events::emit_stake_delegated(&env, delegator, provider, amount);
 
