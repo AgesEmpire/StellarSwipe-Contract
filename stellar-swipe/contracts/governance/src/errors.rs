@@ -80,4 +80,15 @@ impl GovernanceError {
     /// passed — it can no longer be executed and must instead be reclaimed
     /// via `reclaim_expired_proposal` (Issue #796).
     pub const ProposalExpired: GovernanceError = GovernanceError::BudgetPeriodEnded;
+    /// A proposal action's numeric parameter (e.g. `ParameterChange`'s
+    /// `current`/`proposed`) falls outside `proposals::MAX_PARAMETER_VALUE`
+    /// (Issue #997).
+    pub const ProposalParameterOutOfRange: GovernanceError = GovernanceError::InvalidProposal;
+    /// The proposal's action type is not part of the governance action
+    /// allowlist (Issue #997, see `proposals::PROPOSAL_ACTION_SCHEMA_VERSION`).
+    /// In practice this can only be surfaced by off-chain tooling:
+    /// `ProposalType` is a closed Rust enum, so the Soroban host rejects any
+    /// XDR payload that doesn't decode into a known variant before contract
+    /// code — and this error — ever runs.
+    pub const UnknownProposalAction: GovernanceError = GovernanceError::InvalidProposal;
 }
