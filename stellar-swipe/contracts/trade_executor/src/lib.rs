@@ -11,6 +11,7 @@ pub mod dca;
 mod errors;
 pub mod feature_flags;
 pub mod keeper;
+pub mod leverage;
 mod oracle;
 pub mod priority;
 pub mod risk_gates;
