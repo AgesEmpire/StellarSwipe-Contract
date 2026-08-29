@@ -1980,6 +1980,26 @@ impl TradeExecutorContract {
             return Err(ContractError::InvalidAmount);
         }
 
+        // ── #993: Reject duplicate user+token entries deterministically ────
+        // This prevents the same trade from appearing twice in one batch,
+        // which would double-count volume and position changes.
+        {
+            let mut seen: soroban_sdk::Map<soroban_sdk::BytesN<32>, bool> =
+                soroban_sdk::Map::new(env);
+            for i in 0..len {
+                let trade = trades.get(i).unwrap();
+                use soroban_sdk::xdr::ToXdr;
+                let mut payload = soroban_sdk::Bytes::new(env);
+                payload.append(&trade.user.to_xdr(env));
+                payload.append(&trade.token.to_xdr(env));
+                let key_hash: soroban_sdk::BytesN<32> = env.crypto().sha256(&payload).into();
+                if let Some(true) = seen.get(key_hash.clone()) {
+                    return Err(ContractError::InvalidAmount);
+                }
+                seen.set(key_hash, true);
+            }
+        }
+
         let batch_ctx = prepare_batch_context(env)?;
         let mut results: Vec<BatchTradeResult> = Vec::new(env);
 
@@ -2011,9 +2031,6 @@ impl TradeExecutorContract {
 
         if atomic && results.iter().any(|r| !r.ok) {
             let failed = results.iter().filter(|r| !r.ok).count();
-            // Mark before panicking — see the doc comment on
-            // `batch_execute_atomic` for why this vec is never actually
-            // observed by a real caller on this path.
             let _marked = mark_atomic_rollback(env, &results);
             panic!(
                 "atomic batch rolled back: {} of {} trades failed",

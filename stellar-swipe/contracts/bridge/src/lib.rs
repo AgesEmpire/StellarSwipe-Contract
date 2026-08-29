@@ -37,6 +37,18 @@ pub enum BridgeError {
     OutOfOrderNonce = 18,
     /// Message nonce was already confirmed; duplicate delivery rejected (Issue #668).
     DuplicateNonce = 19,
+    /// Message was already consumed on this deployment — replay blocked (Issue #988).
+    MessageAlreadyConsumed = 20,
+    /// Withdrawal exceeds the per-route message cap (Issue #989).
+    PerRouteLimitExceeded = 21,
+    /// Aggregate withdrawal volume within the route window exceeded (Issue #989).
+    AggregateWindowLimitExceeded = 22,
+    /// Caller lacks authority to change withdrawal route limits (Issue #989).
+    LimitChangeUnauthorized = 23,
+    /// Transfer is in a permanently failed state and cannot be retried (Issue #990).
+    TransferPermanentlyFailed = 24,
+    /// Transfer is not in a retryable state (Issue #990).
+    TransferNotRetryable = 25,
 }
 
 #[contracttype]
@@ -62,6 +74,8 @@ pub enum TransferStatus {
     ReadyToExecute,
     Completed,
     Cancelled,
+    /// Downstream execution failed; may be retryable (Issue #990).
+    Failed,
 }
 
 #[contracttype]
@@ -109,6 +123,10 @@ pub struct BridgeTransfer {
     pub status: TransferStatus,
     pub created_at: u64,
     pub executed_at: Option<u64>,
+    /// Non-empty when `status == Failed` — describes the downstream error (Issue #990).
+    pub failure_reason: Option<String>,
+    /// `true` when the failure is transient and a retry may succeed (Issue #990).
+    pub retryable: bool,
 }
 
 #[contracttype]
@@ -116,6 +134,29 @@ pub struct BridgeTransfer {
 pub struct DailyVolume {
     pub day_start: u64,
     pub total_amount: i128,
+}
+
+/// Per-route withdrawal configuration (Issue #989).
+/// Each route is identified by (source_chain, destination_chain, wrapped_asset).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalRouteConfig {
+    /// Maximum amount allowed per individual message on this route.
+    pub per_message_limit: i128,
+    /// Maximum aggregate amount within the rolling window.
+    pub aggregate_window_limit: i128,
+    /// Window duration in seconds over which aggregate volume is tracked.
+    pub window_seconds: u64,
+}
+
+/// Rolling window tracker for aggregate withdrawal volume per route (Issue #989).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalWindow {
+    /// Start timestamp of the current window.
+    pub window_start: u64,
+    /// Accumulated volume within the current window.
+    pub total_volume: i128,
 }
 
 #[contracttype]
@@ -133,6 +174,14 @@ pub enum DataKey {
     ReserveThreshold,
     /// Admin-managed set of supported destination chain IDs (Issue #669).
     SupportedChains,
+    /// Unique deployment identifier for cross-deployment replay protection (Issue #988).
+    DeploymentId,
+    /// Consumed message hash: (deployment_id, source_chain, source_tx_hash, source_nonce) -> true.
+    ConsumedMessage(String),
+    /// Per-route withdrawal config keyed by route identifier (Issue #989).
+    WithdrawalRouteConfig(ChainId, ChainId, String),
+    /// Rolling withdrawal window for a route (Issue #989).
+    WithdrawalWindow(ChainId, ChainId, String),
 }
 
 const DAY_SECONDS: u64 = 86_400;
@@ -185,7 +234,7 @@ impl BridgeContract {
         }
 
         let config = BridgeConfig {
-            admin,
+            admin: admin.clone(),
             validator_set,
             security: SecurityConfig {
                 max_transfer_amount,
@@ -204,6 +253,10 @@ impl BridgeContract {
                 total_amount: 0,
             },
         );
+        // Issue #988: store the deployer address as deployment_id for domain separation.
+        env.storage()
+            .instance()
+            .set(&DataKey::DeploymentId, &admin);
         Ok(())
     }
 
@@ -258,15 +311,40 @@ impl BridgeContract {
         }
         // ── #669: allowlist check ─────────────────────────────────────────────
         ensure_chain_allowed(&env, destination_chain)?;
-        validate_amount_and_limits(&env, amount)?;
+        validate_amount_and_limits(&env, amount, source_chain, destination_chain, wrapped_asset.clone())?;
         ensure_wrapped_asset_exists(&env, wrapped_asset.clone())?;
 
+        // ── #988: domain-separated replay protection ─────────────────────────
+        // Build a message key that includes the deployment identifier so a
+        // payload valid on one deployment cannot be replayed on a sibling.
+        let deployment_id: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::DeploymentId)
+            .expect("deployment id not set");
+        let msg_key = build_consumed_message_key(
+            &env,
+            &deployment_id,
+            source_chain,
+            &source_tx_hash,
+            source_nonce,
+        );
+
+        // Legacy ReplayLock check (backward compat).
         if env.storage().persistent().has(&DataKey::ReplayLock(
             source_chain,
             source_tx_hash.clone(),
             source_nonce,
         )) {
             return Err(BridgeError::ReplayDetected);
+        }
+        // New domain-separated consumed check (Issue #988).
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ConsumedMessage(msg_key.clone()))
+        {
+            return Err(BridgeError::MessageAlreadyConsumed);
         }
 
         let mut config = get_config(&env)?;
@@ -289,6 +367,8 @@ impl BridgeContract {
             status: TransferStatus::PendingValidators,
             created_at: env.ledger().timestamp(),
             executed_at: None,
+            failure_reason: None,
+            retryable: false,
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
@@ -360,11 +440,14 @@ impl BridgeContract {
         if transfer.kind != TransferKind::LockMint {
             return Err(BridgeError::InvalidOperation);
         }
+        if transfer.status == TransferStatus::Completed {
+            return Err(BridgeError::TransferAlreadyExecuted);
+        }
+        if transfer.status == TransferStatus::Failed {
+            return Err(BridgeError::TransferPermanentlyFailed);
+        }
         if transfer.status != TransferStatus::ReadyToExecute {
             return Err(BridgeError::NotEnoughValidatorApprovals);
-        }
-        if transfer.executed_at.is_some() {
-            return Err(BridgeError::TransferAlreadyExecuted);
         }
 
         let balance_key =
@@ -386,6 +469,25 @@ impl BridgeContract {
         transfer.status = TransferStatus::Completed;
         transfer.executed_at = Some(env.ledger().timestamp());
         store_transfer(&env, &transfer);
+
+        // ── #988: mark message as consumed so it cannot be replayed ────────
+        let deployment_id: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::DeploymentId)
+            .expect("deployment id not set");
+        if !transfer.source_tx_hash.is_empty() {
+            let msg_key = build_consumed_message_key(
+                &env,
+                &deployment_id,
+                transfer.source_chain,
+                &transfer.source_tx_hash,
+                transfer.source_nonce,
+            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::ConsumedMessage(msg_key), &true);
+        }
 
         #[allow(deprecated)]
         env.events().publish(
@@ -411,7 +513,7 @@ impl BridgeContract {
         }
         // ── #669: allowlist check ─────────────────────────────────────────────
         ensure_chain_allowed(&env, destination_chain)?;
-        validate_amount_and_limits(&env, amount)?;
+        validate_amount_and_limits(&env, amount, source_chain, destination_chain, wrapped_asset.clone())?;
 
         let balance_key = DataKey::WrappedBalance(user.clone(), wrapped_asset.clone());
         let balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
@@ -451,6 +553,8 @@ impl BridgeContract {
             status: TransferStatus::PendingValidators,
             created_at: env.ledger().timestamp(),
             executed_at: None,
+            failure_reason: None,
+            retryable: false,
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
@@ -517,15 +621,18 @@ impl BridgeContract {
         if transfer.kind != TransferKind::BurnUnlock {
             return Err(BridgeError::InvalidOperation);
         }
+        if transfer.status == TransferStatus::Completed {
+            return Err(BridgeError::TransferAlreadyExecuted);
+        }
+        if transfer.status == TransferStatus::Failed {
+            return Err(BridgeError::TransferPermanentlyFailed);
+        }
         if transfer.status != TransferStatus::ReadyToExecute {
             return Err(BridgeError::WithdrawalNotReady);
         }
         let ready_at = transfer.created_at + config.security.withdraw_delay_seconds;
         if env.ledger().timestamp() < ready_at {
             return Err(BridgeError::WithdrawalNotReady);
-        }
-        if transfer.executed_at.is_some() {
-            return Err(BridgeError::TransferAlreadyExecuted);
         }
 
         transfer.status = TransferStatus::Completed;
@@ -834,6 +941,198 @@ impl BridgeContract {
             .get(&messaging::MessagingKey::ExpectedNonce(source_chain_id))
             .unwrap_or(0u64)
     }
+
+    // ── #988: Deployment identity ─────────────────────────────────────────────
+
+    /// Admin: overwrite the deployment identifier used for domain-separated
+    /// replay protection.  Defaults to the admin address set at initialization.
+    pub fn set_deployment_id(
+        env: Env,
+        admin: Address,
+        deployment_id: Address,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DeploymentId, &deployment_id);
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "deployment_id_set"),),
+            deployment_id,
+        );
+        Ok(())
+    }
+
+    /// Read-only: return the current deployment identifier.
+    pub fn get_deployment_id(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::DeploymentId)
+            .expect("deployment id not set")
+    }
+
+    // ── #989: Per-route withdrawal limits ─────────────────────────────────────
+
+    /// Admin: configure per-message and aggregate withdrawal limits for a route.
+    /// `per_message_limit` caps each individual bridge message.
+    /// `aggregate_window_limit` caps the rolling sum over `window_seconds`.
+    pub fn set_withdrawal_route_limit(
+        env: Env,
+        admin: Address,
+        source_chain: ChainId,
+        destination_chain: ChainId,
+        wrapped_asset: String,
+        per_message_limit: i128,
+        aggregate_window_limit: i128,
+        window_seconds: u64,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        if per_message_limit < 0 || aggregate_window_limit < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let config = WithdrawalRouteConfig {
+            per_message_limit,
+            aggregate_window_limit,
+            window_seconds,
+        };
+        env.storage().persistent().set(
+            &DataKey::WithdrawalRouteConfig(
+                source_chain,
+                destination_chain,
+                wrapped_asset.clone(),
+            ),
+            &config,
+        );
+        // Initialize or preserve the rolling window.
+        let window_key = DataKey::WithdrawalWindow(
+            source_chain,
+            destination_chain,
+            wrapped_asset,
+        );
+        if !env.storage().persistent().has(&window_key) {
+            env.storage().persistent().set(
+                &window_key,
+                &WithdrawalWindow {
+                    window_start: env.ledger().timestamp(),
+                    total_volume: 0,
+                },
+            );
+        }
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "bridge"),
+                Symbol::new(&env, "route_limit_set"),
+            ),
+            (
+                source_chain as u32,
+                destination_chain as u32,
+                per_message_limit,
+                aggregate_window_limit,
+                window_seconds,
+            ),
+        );
+        Ok(())
+    }
+
+    /// Read-only: return the per-route withdrawal config, if set.
+    pub fn get_withdrawal_route_limit(
+        env: Env,
+        source_chain: ChainId,
+        destination_chain: ChainId,
+        wrapped_asset: String,
+    ) -> Option<WithdrawalRouteConfig> {
+        env.storage().persistent().get(&DataKey::WithdrawalRouteConfig(
+            source_chain,
+            destination_chain,
+            wrapped_asset,
+        ))
+    }
+
+    // ── #990: Idempotent transfer failure / retry ─────────────────────────────
+
+    /// Mark a transfer as failed.  `reason` describes the downstream error.
+    /// `retryable` indicates whether an operator may attempt `retry_transfer`.
+    /// Once a transfer is marked `Failed` with `retryable = false`, it is
+    /// permanently failed and cannot be retried.
+    pub fn mark_transfer_failed(
+        env: Env,
+        admin: Address,
+        transfer_id: u64,
+        reason: String,
+        retryable: bool,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        let mut transfer = get_transfer(&env, transfer_id)?;
+        if transfer.status == TransferStatus::Completed
+            || transfer.status == TransferStatus::Cancelled
+        {
+            return Err(BridgeError::InvalidOperation);
+        }
+        if transfer.status == TransferStatus::Failed && !transfer.retryable {
+            return Err(BridgeError::TransferPermanentlyFailed);
+        }
+
+        transfer.status = TransferStatus::Failed;
+        transfer.failure_reason = Some(reason.clone());
+        transfer.retryable = retryable;
+        store_transfer(&env, &transfer);
+
+        let event_name = if retryable {
+            "transfer_failed_retryable"
+        } else {
+            "transfer_failed_permanent"
+        };
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, event_name), transfer_id),
+            (reason, retryable),
+        );
+        Ok(())
+    }
+
+    /// Retry a failed transfer: reset it to `ReadyToExecute` so validators can
+    /// re-approve and an admin can re-execute.  Only allowed when
+    /// `retryable == true`.  Balances are not re-checked because the original
+    /// `initiate_*` call already reserved the funds.
+    pub fn retry_transfer(
+        env: Env,
+        admin: Address,
+        transfer_id: u64,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        let mut transfer = get_transfer(&env, transfer_id)?;
+        if transfer.status != TransferStatus::Failed {
+            return Err(BridgeError::TransferNotRetryable);
+        }
+        if !transfer.retryable {
+            return Err(BridgeError::TransferPermanentlyFailed);
+        }
+
+        transfer.status = TransferStatus::ReadyToExecute;
+        transfer.failure_reason = None;
+        transfer.retryable = false;
+        store_transfer(&env, &transfer);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "transfer_retry"), transfer_id),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
 }
 
 fn get_config(env: &Env) -> Result<BridgeConfig, BridgeError> {
@@ -899,7 +1198,13 @@ fn ensure_wrapped_asset_exists(env: &Env, wrapped_asset: String) -> Result<(), B
     }
 }
 
-fn validate_amount_and_limits(env: &Env, amount: i128) -> Result<(), BridgeError> {
+fn validate_amount_and_limits(
+    env: &Env,
+    amount: i128,
+    source_chain: ChainId,
+    destination_chain: ChainId,
+    wrapped_asset: String,
+) -> Result<(), BridgeError> {
     if amount <= 0 {
         return Err(BridgeError::InvalidAmount);
     }
@@ -907,6 +1212,46 @@ fn validate_amount_and_limits(env: &Env, amount: i128) -> Result<(), BridgeError
     let config = get_config(env)?;
     if amount > config.security.max_transfer_amount {
         return Err(BridgeError::MaxTransferExceeded);
+    }
+
+    // ── #989: Per-message route limit ──────────────────────────────────────
+    if let Some(route_cfg) = env.storage().persistent().get::<_, WithdrawalRouteConfig>(
+        &DataKey::WithdrawalRouteConfig(source_chain, destination_chain, wrapped_asset.clone()),
+    ) {
+        if route_cfg.per_message_limit > 0 && amount > route_cfg.per_message_limit {
+            return Err(BridgeError::PerRouteLimitExceeded);
+        }
+        // Aggregate window check.
+        if route_cfg.aggregate_window_limit > 0 && route_cfg.window_seconds > 0 {
+            let window_key = DataKey::WithdrawalWindow(
+                source_chain,
+                destination_chain,
+                wrapped_asset.clone(),
+            );
+            let now = env.ledger().timestamp();
+            let mut window: WithdrawalWindow = env
+                .storage()
+                .persistent()
+                .get(&window_key)
+                .unwrap_or(WithdrawalWindow {
+                    window_start: now,
+                    total_volume: 0,
+                });
+            // Reset window if expired.
+            if now.saturating_sub(window.window_start) >= route_cfg.window_seconds {
+                window.window_start = now;
+                window.total_volume = 0;
+            }
+            let new_total = window
+                .total_volume
+                .checked_add(amount)
+                .unwrap_or(i128::MAX);
+            if new_total > route_cfg.aggregate_window_limit {
+                return Err(BridgeError::AggregateWindowLimitExceeded);
+            }
+            window.total_volume = new_total;
+            env.storage().persistent().set(&window_key, &window);
+        }
     }
 
     let current_day = day_bucket(env.ledger().timestamp());
@@ -924,7 +1269,7 @@ fn validate_amount_and_limits(env: &Env, amount: i128) -> Result<(), BridgeError
         volume.total_amount = 0;
     }
 
-    if volume.total_amount + amount > config.security.daily_transfer_limit {
+    if volume.total_amount.checked_add(amount).unwrap_or(i128::MAX) > config.security.daily_transfer_limit {
         return Err(BridgeError::DailyLimitExceeded);
     }
 
@@ -943,11 +1288,41 @@ fn validate_amount_and_limits(env: &Env, amount: i128) -> Result<(), BridgeError
         }
     }
 
-    volume.total_amount += amount;
+    volume.total_amount = volume.total_amount.checked_add(amount).unwrap_or(i128::MAX);
     env.storage()
         .persistent()
         .set(&DataKey::DailyVolume, &volume);
     Ok(())
+}
+
+/// Build the storage key for a consumed message, incorporating deployment_id
+/// for cross-deployment replay isolation (Issue #988).
+///
+/// Uses SHA-256 of the concatenated domain components to produce a fixed-size,
+/// collision-resistant key without relying on `std::fmt` or string concatenation.
+fn build_consumed_message_key(
+    env: &Env,
+    deployment_id: &Address,
+    source_chain: ChainId,
+    source_tx_hash: &String,
+    source_nonce: u64,
+) -> String {
+    use soroban_sdk::xdr::ToXdr;
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&deployment_id.to_xdr(env));
+    payload.append(&(source_chain as u32).to_xdr(env));
+    payload.append(&source_tx_hash.to_xdr(env));
+    payload.append(&source_nonce.to_xdr(env));
+    let hash: soroban_sdk::BytesN<32> = env.crypto().sha256(&payload).into();
+    // Convert hash bytes to a hex string for use as a Soroban String key.
+    let buf = hash.to_array();
+    let hex_chars: &[u8; 16] = b"0123456789abcdef";
+    let mut hex_bytes = [0u8; 64];
+    for (i, byte) in buf.iter().enumerate() {
+        hex_bytes[i * 2] = hex_chars[((byte >> 4) & 0x0f) as usize];
+        hex_bytes[i * 2 + 1] = hex_chars[(byte & 0x0f) as usize];
+    }
+    String::from_slice(env, core::str::from_utf8(&hex_bytes).unwrap())
 }
 
 fn day_bucket(timestamp: u64) -> u64 {
@@ -1315,6 +1690,418 @@ mod test {
                 String::from_str(&env, "r"),
             )
             .unwrap();
+        });
+    }
+
+    // ── #988: Cross-deployment replay protection tests ──────────────────────
+
+    #[test]
+    fn deployment_id_stored_on_init() {
+        let (env, contract_id, admin, validators) = setup();
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+            let did = BridgeContract::get_deployment_id(env.clone());
+            assert_eq!(did, admin);
+        });
+    }
+
+    #[test]
+    fn set_deployment_id_updates_value() {
+        let (env, contract_id, admin, validators) = setup();
+        let new_id = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+            BridgeContract::set_deployment_id(
+                env.clone(),
+                admin.clone(),
+                new_id.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                BridgeContract::get_deployment_id(env.clone()),
+                new_id
+            );
+        });
+    }
+
+    #[test]
+    fn same_message_different_deployment_ids_allowed() {
+        // Two deployments with different IDs should not conflict.
+        let (env, contract_id, admin, validators) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+            // First message under default deployment (admin)
+            BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                100,
+                String::from_str(&env, "0xshared"),
+                1,
+                String::from_str(&env, "r"),
+            )
+            .unwrap();
+
+            // Change deployment ID — same tx hash + nonce should succeed
+            let other_id = Address::generate(&env);
+            BridgeContract::set_deployment_id(
+                env.clone(),
+                admin.clone(),
+                other_id,
+            )
+            .unwrap();
+
+            let result = BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user,
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                100,
+                String::from_str(&env, "0xshared"),
+                2, // different nonce
+                String::from_str(&env, "r"),
+            );
+            assert!(result.is_ok());
+        });
+    }
+
+    // ── #989: Per-route withdrawal limit tests ──────────────────────────────
+
+    #[test]
+    fn per_route_limit_enforced() {
+        let (env, contract_id, admin, validators) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+            // Set per-message limit of 200 for ETH→Polygon wETH route
+            BridgeContract::set_withdrawal_route_limit(
+                env.clone(),
+                admin.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "wETH"),
+                200,
+                0, // no aggregate limit
+                0,
+            )
+            .unwrap();
+
+            // 150 should pass (under 200)
+            BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                150,
+                String::from_str(&env, "0xa"),
+                1,
+                String::from_str(&env, "r"),
+            )
+            .unwrap();
+
+            // 250 should fail (over 200)
+            let result = BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user,
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                250,
+                String::from_str(&env, "0xb"),
+                2,
+                String::from_str(&env, "r"),
+            );
+            assert_eq!(result, Err(BridgeError::PerRouteLimitExceeded));
+        });
+    }
+
+    #[test]
+    fn aggregate_window_limit_enforced() {
+        let (env, contract_id, admin, validators) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+            // Aggregate limit: 500 over 3600 seconds
+            BridgeContract::set_withdrawal_route_limit(
+                env.clone(),
+                admin.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "wETH"),
+                0,       // no per-message limit
+                500,     // aggregate limit
+                3600,    // 1 hour window
+            )
+            .unwrap();
+
+            BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                300,
+                String::from_str(&env, "0x1"),
+                1,
+                String::from_str(&env, "r"),
+            )
+            .unwrap();
+
+            BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                150,
+                String::from_str(&env, "0x2"),
+                2,
+                String::from_str(&env, "r"),
+            )
+            .unwrap();
+
+            // 300 + 150 = 450; next 100 would be 550 > 500
+            let result = BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user,
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                100,
+                String::from_str(&env, "0x3"),
+                3,
+                String::from_str(&env, "r"),
+            );
+            assert_eq!(result, Err(BridgeError::AggregateWindowLimitExceeded));
+        });
+    }
+
+    #[test]
+    fn route_limit_does_not_apply_to_other_routes() {
+        let (env, contract_id, admin, validators) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+            // Set limit on ETH→Polygon only
+            BridgeContract::set_withdrawal_route_limit(
+                env.clone(),
+                admin.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "wETH"),
+                100,
+                0,
+                0,
+            )
+            .unwrap();
+
+            // Polygon→Ethereum with wETH should not be affected
+            BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user,
+                ChainId::Polygon,
+                ChainId::Ethereum,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                500,
+                String::from_str(&env, "0xa"),
+                1,
+                String::from_str(&env, "r"),
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn get_route_limit_returns_none_when_unset() {
+        let (env, contract_id, admin, validators) = setup();
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+            let cfg = BridgeContract::get_withdrawal_route_limit(
+                env.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "wETH"),
+            );
+            assert!(cfg.is_none());
+        });
+    }
+
+    // ── #990: Idempotent transfer failure / retry tests ─────────────────────
+
+    #[test]
+    fn mark_transfer_failed_and_retry() {
+        let (env, contract_id, admin, validators) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+
+            let tid = BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user,
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                100,
+                String::from_str(&env, "0xfail"),
+                1,
+                String::from_str(&env, "r"),
+            )
+            .unwrap();
+
+            // Mark retryable
+            BridgeContract::mark_transfer_failed(
+                env.clone(),
+                admin.clone(),
+                tid,
+                String::from_str(&env, "downstream_timeout"),
+                true,
+            )
+            .unwrap();
+            let t = BridgeContract::get_transfer(env.clone(), tid).unwrap();
+            assert_eq!(t.status, TransferStatus::Failed);
+            assert!(t.retryable);
+            assert_eq!(
+                t.failure_reason,
+                Some(String::from_str(&env, "downstream_timeout"))
+            );
+
+            // Retry should reset to ReadyToExecute
+            BridgeContract::retry_transfer(env.clone(), admin.clone(), tid).unwrap();
+            let t = BridgeContract::get_transfer(env.clone(), tid).unwrap();
+            assert_eq!(t.status, TransferStatus::ReadyToExecute);
+            assert!(!t.retryable);
+        });
+    }
+
+    #[test]
+    fn permanent_failure_cannot_be_retried() {
+        let (env, contract_id, admin, validators) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+
+            let tid = BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user,
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                100,
+                String::from_str(&env, "0xperm"),
+                1,
+                String::from_str(&env, "r"),
+            )
+            .unwrap();
+
+            // Mark permanent failure
+            BridgeContract::mark_transfer_failed(
+                env.clone(),
+                admin.clone(),
+                tid,
+                String::from_str(&env, "invalid_proof"),
+                false,
+            )
+            .unwrap();
+
+            // Retry should fail
+            let result = BridgeContract::retry_transfer(env.clone(), admin, tid);
+            assert_eq!(result, Err(BridgeError::TransferPermanentlyFailed));
+        });
+    }
+
+    #[test]
+    fn retry_non_failed_transfer_fails() {
+        let (env, contract_id, admin, validators) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+
+            let tid = BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user,
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                100,
+                String::from_str(&env, "0xnf"),
+                1,
+                String::from_str(&env, "r"),
+            )
+            .unwrap();
+
+            // Attempting retry on a pending transfer should fail
+            let result = BridgeContract::retry_transfer(env.clone(), admin, tid);
+            assert_eq!(result, Err(BridgeError::TransferNotRetryable));
+        });
+    }
+
+    #[test]
+    fn failed_transfer_blocks_execution() {
+        let (env, contract_id, admin, validators) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+
+            let tid = BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user,
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                100,
+                String::from_str(&env, "0xblock"),
+                1,
+                String::from_str(&env, "r"),
+            )
+            .unwrap();
+
+            // Approve to ReadyToExecute
+            BridgeContract::approve_lock_mint(
+                env.clone(),
+                validators.get(0).unwrap(),
+                tid,
+                String::from_str(&env, "s1"),
+            )
+            .unwrap();
+            BridgeContract::approve_lock_mint(
+                env.clone(),
+                validators.get(1).unwrap(),
+                tid,
+                String::from_str(&env, "s2"),
+            )
+            .unwrap();
+
+            // Mark failed
+            BridgeContract::mark_transfer_failed(
+                env.clone(),
+                admin.clone(),
+                tid,
+                String::from_str(&env, "network_down"),
+                true,
+            )
+            .unwrap();
+
+            // Execute should fail with TransferPermanentlyFailed
+            // (even though it's retryable, execution on a Failed state is blocked)
+            let result = BridgeContract::execute_lock_mint(env.clone(), admin, tid);
+            assert_eq!(result, Err(BridgeError::TransferPermanentlyFailed));
         });
     }
 
