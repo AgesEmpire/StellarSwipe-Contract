@@ -2,6 +2,8 @@
 
 pub mod emergency_unstake;
 pub mod events;
+/// Deterministic fee accrual accumulator (Issue #1016).
+pub mod fee_accrual;
 pub mod migration;
 
 use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
@@ -260,8 +262,10 @@ pub enum StorageKey {
     SlashedFundsHeld(u64),
     AppealWindowSecs,
     // ── Slash cooldown (issue #816) ──────────────────────────────────────────
-    /// Ledger sequence of the most recent global slash event.
-    LastSlashLedger,
+    /// Ledger sequence of the most recent slash event **for this provider**.
+    /// Per-provider so that slashing one provider never blocks slashing an
+    /// unrelated one within the cooldown window.
+    LastSlashLedger(Address),
     /// Admin-configurable cooldown (in ledgers) between slash events.
     SlashCooldownLedgers,
     // ── Issue #816: configurable withdrawal cooldown ───────────────────────────
@@ -554,6 +558,9 @@ mod action {
     pub const CONFIGURE_SLASH_TIERS: u8 = 4;
     pub const SET_APPEAL_WINDOW: u8 = 5;
     pub const SET_WITHDRAWAL_COOLDOWN: u8 = 6;
+    /// Issue #818: resolve a slash appeal through the multi-sig flow.
+    /// Payload: `[7][slash_id: u64 LE (8 bytes)][uphold: u8]`.
+    pub const RESOLVE_APPEAL: u8 = 7;
 }
 
 fn encode_action(env: &Env, tag: u8, data: &[u8]) -> Bytes {
@@ -1188,6 +1195,17 @@ impl StakeVaultContract {
                 env.storage()
                     .instance()
                     .set(&StorageKey::WithdrawalCooldownSecs, &cooldown);
+            }
+            action::RESOLVE_APPEAL => {
+                let mut buf = [0u8; 8];
+                let mut i = 0;
+                while i < 8 {
+                    buf[i] = payload.get(1 + i as u32).unwrap_or(0);
+                    i += 1;
+                }
+                let slash_id = u64::from_le_bytes(buf);
+                let uphold = payload.get(9).unwrap_or(0) != 0;
+                Self::do_resolve_appeal(&env, slash_id, uphold)?;
             }
             _ => return Err(StakeVaultError::Unauthorized),
         }
@@ -1930,18 +1948,22 @@ impl StakeVaultContract {
 
         // ── Slash cooldown check ──────────────────────────────────────────────
         let current_ledger = env.ledger().sequence();
-        let last_slash_ledger: u32 = env
+        // `None` = never slashed. A stored `Some(0)` is a real prior slash that
+        // happened at ledger 0, so the cooldown must still apply — hence an
+        // explicit `Option` rather than an `unwrap_or(0)` + `> 0` sentinel.
+        let last_slash_ledger: Option<u32> = env
             .storage()
             .instance()
-            .get(&StorageKey::LastSlashLedger)
-            .unwrap_or(0);
+            .get(&StorageKey::LastSlashLedger(provider.clone()));
         let cooldown: u32 = env
             .storage()
             .instance()
             .get(&StorageKey::SlashCooldownLedgers)
             .unwrap_or(DEFAULT_SLASH_COOLDOWN_LEDGERS);
-        if last_slash_ledger > 0 && current_ledger.saturating_sub(last_slash_ledger) < cooldown {
-            return Err(StakeVaultError::SlashCooldownActive);
+        if let Some(last_slash_ledger) = last_slash_ledger {
+            if cooldown > 0 && current_ledger.saturating_sub(last_slash_ledger) < cooldown {
+                return Err(StakeVaultError::SlashCooldownActive);
+            }
         }
 
         let cfg: SlashTierConfig = env
@@ -2056,9 +2078,10 @@ impl StakeVaultContract {
             .set(&StorageKey::SlashRecord(slash_id), &record);
 
         // ── Record last slash ledger for cooldown enforcement ──────────────────
-        env.storage()
-            .instance()
-            .set(&StorageKey::LastSlashLedger, &current_ledger);
+        env.storage().instance().set(
+            &StorageKey::LastSlashLedger(provider.clone()),
+            &current_ledger,
+        );
 
         // ── Hold slashed funds pending appeal resolution (issue #689) ──────────
         // Tokens remain in the vault's custody and are NOT burned until the

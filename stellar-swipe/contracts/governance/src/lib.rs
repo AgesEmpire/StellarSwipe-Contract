@@ -14,6 +14,8 @@ mod shadow_mode;
 mod timelock;
 mod token;
 mod treasury;
+/// Stash-account isolation for treasury funds (Issue #1044).
+mod treasury_stash;
 mod voting;
 
 #[cfg(test)]

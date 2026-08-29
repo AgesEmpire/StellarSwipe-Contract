@@ -151,109 +151,114 @@ mod tests {
         Env,
     };
 
-    fn setup() -> (Env, Address, Address, Address) {
+    /// Run `f` inside a registered-contract context (soroban-sdk 23 requires a
+    /// running contract for host storage access). `cohort_retention` performs
+    /// no `require_auth`, so the whole test body can share one frame.
+    fn run(f: impl FnOnce(&Env, &Address, &Address, &Address)) {
         let env = Env::default();
         env.mock_all_auths();
         let provider = Address::generate(&env);
         let user1 = Address::generate(&env);
         let user2 = Address::generate(&env);
-        (env, provider, user1, user2)
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        let e2 = env.clone();
+        env.as_contract(&cid, move || f(&e2, &provider, &user1, &user2));
     }
 
     #[test]
     fn test_new_follower_joins_cohort() {
-        let (env, provider, user1, _) = setup();
-        env.ledger()
-            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 5);
+        run(|env, provider, user1, _| {
+            env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 5);
 
-        record_follow(&env, &provider, &user1);
+            record_follow(env, provider, user1);
 
-        let retention = get_cohort_retention(&env, &provider, 5);
-        assert_eq!(retention.total_followers, 1);
-        assert_eq!(retention.retention_bps_week_1, 0); // no activity yet
+            let retention = get_cohort_retention(env, provider, 5);
+            assert_eq!(retention.total_followers, 1);
+            assert_eq!(retention.retention_bps_week_1, 0); // no activity yet
+        });
     }
 
     #[test]
     fn test_activity_at_week_1_recorded() {
-        let (env, provider, user1, _) = setup();
-        env.ledger()
-            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 10);
-        record_follow(&env, &provider, &user1);
+        run(|env, provider, user1, _| {
+            env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 10);
+            record_follow(env, provider, user1);
 
-        // Advance 1 week
-        env.ledger()
-            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 11);
-        record_activity(&env, &provider, &user1);
+            // Advance 1 week
+            env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 11);
+            record_activity(env, provider, user1);
 
-        let retention = get_cohort_retention(&env, &provider, 10);
-        assert_eq!(retention.total_followers, 1);
-        assert_eq!(retention.retention_bps_week_1, 10_000); // 100 %
-        assert_eq!(retention.retention_bps_week_4, 0);
-        assert_eq!(retention.retention_bps_week_12, 0);
+            let retention = get_cohort_retention(env, provider, 10);
+            assert_eq!(retention.total_followers, 1);
+            assert_eq!(retention.retention_bps_week_1, 10_000); // 100 %
+            assert_eq!(retention.retention_bps_week_4, 0);
+            assert_eq!(retention.retention_bps_week_12, 0);
+        });
     }
 
     #[test]
     fn test_activity_at_week_12_fills_all_buckets() {
-        let (env, provider, user1, _) = setup();
-        env.ledger()
-            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 0);
-        record_follow(&env, &provider, &user1);
+        run(|env, provider, user1, _| {
+            env.ledger().with_mut(|l| l.timestamp = 0);
+            record_follow(env, provider, user1);
 
-        // Advance 12 weeks
-        env.ledger()
-            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 12);
-        record_activity(&env, &provider, &user1);
+            // Advance 12 weeks
+            env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK * 12);
+            record_activity(env, provider, user1);
 
-        let retention = get_cohort_retention(&env, &provider, 0);
-        assert_eq!(retention.retention_bps_week_1, 10_000);
-        assert_eq!(retention.retention_bps_week_4, 10_000);
-        assert_eq!(retention.retention_bps_week_12, 10_000);
+            let retention = get_cohort_retention(env, provider, 0);
+            assert_eq!(retention.retention_bps_week_1, 10_000);
+            assert_eq!(retention.retention_bps_week_4, 10_000);
+            assert_eq!(retention.retention_bps_week_12, 10_000);
+        });
     }
 
     #[test]
     fn test_multi_cohort_two_users() {
-        let (env, provider, user1, user2) = setup();
+        run(|env, provider, user1, user2| {
+            // user1 follows in week 0
+            env.ledger().with_mut(|l| l.timestamp = 0);
+            record_follow(env, provider, user1);
 
-        // user1 follows in week 0
-        env.ledger().with_mut(|l| l.timestamp = 0);
-        record_follow(&env, &provider, &user1);
+            // user2 follows in week 1
+            env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK);
+            record_follow(env, provider, user2);
 
-        // user2 follows in week 1
-        env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK);
-        record_follow(&env, &provider, &user2);
+            // user1 is active at week 1 (relative to their cohort)
+            env.ledger().with_mut(|l| l.timestamp = SECONDS_PER_WEEK + 1);
+            record_activity(env, provider, user1);
 
-        // user1 is active at week 1 (relative to their cohort)
-        env.ledger()
-            .with_mut(|l| l.timestamp = SECONDS_PER_WEEK + 1);
-        record_activity(&env, &provider, &user1);
+            // cohort 0: user1 joined, 100% at week 1
+            let c0 = get_cohort_retention(env, provider, 0);
+            assert_eq!(c0.total_followers, 1);
+            assert_eq!(c0.retention_bps_week_1, 10_000);
 
-        // cohort 0: user1 joined, 100% at week 1
-        let c0 = get_cohort_retention(&env, &provider, 0);
-        assert_eq!(c0.total_followers, 1);
-        assert_eq!(c0.retention_bps_week_1, 10_000);
-
-        // cohort 1: user2 joined, 0% activity yet
-        let c1 = get_cohort_retention(&env, &provider, 1);
-        assert_eq!(c1.total_followers, 1);
-        assert_eq!(c1.retention_bps_week_1, 0);
+            // cohort 1: user2 joined, 0% activity yet
+            let c1 = get_cohort_retention(env, provider, 1);
+            assert_eq!(c1.total_followers, 1);
+            assert_eq!(c1.retention_bps_week_1, 0);
+        });
     }
 
     #[test]
     fn test_no_double_count_follow() {
-        let (env, provider, user1, _) = setup();
-        env.ledger().with_mut(|l| l.timestamp = 0);
-        record_follow(&env, &provider, &user1);
-        record_follow(&env, &provider, &user1); // idempotent
+        run(|env, provider, user1, _| {
+            env.ledger().with_mut(|l| l.timestamp = 0);
+            record_follow(env, provider, user1);
+            record_follow(env, provider, user1); // idempotent
 
-        let retention = get_cohort_retention(&env, &provider, 0);
-        assert_eq!(retention.total_followers, 1);
+            let retention = get_cohort_retention(env, provider, 0);
+            assert_eq!(retention.total_followers, 1);
+        });
     }
 
     #[test]
     fn test_empty_cohort_returns_zero() {
-        let (env, provider, _, _) = setup();
-        let retention = get_cohort_retention(&env, &provider, 99);
-        assert_eq!(retention.total_followers, 0);
-        assert_eq!(retention.retention_bps_week_1, 0);
+        run(|env, provider, _, _| {
+            let retention = get_cohort_retention(env, provider, 99);
+            assert_eq!(retention.total_followers, 0);
+            assert_eq!(retention.retention_bps_week_1, 0);
+        });
     }
 }
