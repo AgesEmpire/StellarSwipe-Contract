@@ -16,10 +16,14 @@ pub mod assets;
 pub mod budget_regression;
 /// Checked-arithmetic wrapper for financial amounts (issue #599).
 pub mod checked_amount;
+/// Oracle price-freshness gating for collateral / health checks (Issue #1031).
+pub mod collateral_oracle;
 pub mod commit_reveal;
 pub mod constants;
 pub mod emergency;
 pub mod health;
+/// Contract-level (aggregate, per-asset) rate limiting for join operations (Issue #1030).
+pub mod join_rate_limit;
 #[allow(deprecated)]
 pub mod multisig;
 pub mod oracle;
@@ -44,6 +48,10 @@ pub use amm_bridge::{
     AmmRouteSegment, AmmSourceConfig, AmmSourceKind, BPS_DENOMINATOR, FN_GET_BEST_ASK, FN_SWAP,
 };
 pub use assets::{validate_asset_pair, Asset, AssetPair, AssetPairError};
+pub use collateral_oracle::{
+    evaluate_collateral_health, get_freshness_config, require_fresh_price, set_freshness_config,
+    CollateralError, CollateralHealth, CollateralOracleConfig, DEFAULT_MIN_COLLATERAL_RATIO_BPS,
+};
 pub use commit_reveal::{
     constant_time_eq, forfeit_expired, hash_trade_intent, reveal_and_clear, store_commitment,
     verify_commitment, CommitKey, CommitRecord, CommitRevealError,
@@ -56,6 +64,11 @@ pub use constants::{
 };
 pub use emergency::PauseState;
 pub use health::{emit_health_event, health_uninitialized, placeholder_admin, HealthStatus};
+pub use join_rate_limit::{
+    check as check_join_rate_limit, record as record_join, try_consume as try_join, JoinBucket,
+    JoinRateLimitConfig, JoinRateLimitError, DEFAULT_JOIN_WINDOW_SECS,
+    DEFAULT_MAX_JOINS_PER_WINDOW,
+};
 pub use multisig::{
     approve, cancel, emit_approval_recorded, emit_proposal_approved, emit_proposal_cancelled,
     emit_proposal_created, emit_proposal_executed, emit_timelock_config_updated,

@@ -152,6 +152,8 @@ pub enum StorageKey {
     /// Monotonic counter bumped on every fee-config write so the tx-scoped
     /// fee cache auto-misses after any rate change (issue #945).
     ConfigVersion,
+    /// #1032: Configurable protocol/provider fee split policy.
+    FeeSplitPolicy,
 }
 
 #[contracttype]
@@ -578,6 +580,26 @@ pub fn add_provider_daily_fee_shares(env: &Env, provider: &Address, day: u64, am
         crud_set(env, StorageTier::Persistent, &first_key, &day);
     }
     add_provider_total_earnings(env, provider, amount);
+}
+
+// ── #1032: Fee split policy ─────────────────────────────────────────────────
+
+pub fn get_fee_split_policy(env: &Env) -> crate::fee_split_policy::FeeSplitPolicy {
+    crud_get_or(
+        env,
+        StorageTier::Instance,
+        &StorageKey::FeeSplitPolicy,
+        crate::fee_split_policy::default_policy(),
+    )
+}
+
+pub fn set_fee_split_policy(env: &Env, policy: &crate::fee_split_policy::FeeSplitPolicy) {
+    crud_set(
+        env,
+        StorageTier::Instance,
+        &StorageKey::FeeSplitPolicy,
+        policy,
+    );
 }
 
 pub fn get_provider_earnings_first_day(env: &Env, provider: &Address) -> Option<u64> {

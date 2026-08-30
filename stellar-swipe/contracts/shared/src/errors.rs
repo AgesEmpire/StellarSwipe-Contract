@@ -1,5 +1,22 @@
 use soroban_sdk::{contracterror, contracttype, Env, String, Symbol};
 
+/// Canonical failure taxonomy shared by every contract (Issue #1033).
+///
+/// Integrators map an on-chain error code to exactly one category so frontend
+/// clients and scripts can branch on the *kind* of failure without hard-coding
+/// per-contract error numbers:
+///
+/// | Category             | Meaning                              | Typical client response          |
+/// |----------------------|--------------------------------------|----------------------------------|
+/// | `Validation`         | Malformed / out-of-range input       | Fix the request and resubmit     |
+/// | `Authorization`      | Caller lacks permission              | Re-authenticate / switch signer  |
+/// | `ExternalDependency` | A dependency (oracle, token) failed  | Retry later / check dependency   |
+/// | `Arithmetic`         | Overflow / division by zero          | Reduce amounts; report if unexpected |
+/// | `Upgrade`            | Version / migration mismatch         | Upgrade client or contract       |
+/// | `Network`            | Transient transport / gateway issue  | Backoff and retry                |
+/// | `Recovery`           | Guardian / recovery-flow failure     | Escalate to manual review        |
+/// | `CapacityLimit`      | A quota / rate / size cap was hit    | Wait for the window to reset     |
+/// | `InvariantViolation` | A protocol invariant would break     | Do not retry; report a bug       |
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -11,6 +28,55 @@ pub enum ErrorCategory {
     Upgrade = 5,
     Network = 6,
     Recovery = 7,
+    /// A quota, rate limit, batch size, or other capacity threshold was reached.
+    CapacityLimit = 8,
+    /// An operation was rejected because it would break a protocol invariant
+    /// (e.g. conservation of funds, monotonic version, terminal state).
+    InvariantViolation = 9,
+}
+
+impl ErrorCategory {
+    /// Stable lowercase slug for logs, metrics, and SDK switch statements.
+    pub fn slug(&self) -> &'static str {
+        match self {
+            ErrorCategory::Validation => "validation",
+            ErrorCategory::Authorization => "authorization",
+            ErrorCategory::ExternalDependency => "external_dependency",
+            ErrorCategory::Arithmetic => "arithmetic",
+            ErrorCategory::Upgrade => "upgrade",
+            ErrorCategory::Network => "network",
+            ErrorCategory::Recovery => "recovery",
+            ErrorCategory::CapacityLimit => "capacity_limit",
+            ErrorCategory::InvariantViolation => "invariant_violation",
+        }
+    }
+
+    /// Whether retrying the *same* request unchanged could plausibly succeed
+    /// later. `Validation`, `Authorization`, and `InvariantViolation` failures
+    /// never clear on their own.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            ErrorCategory::ExternalDependency
+                | ErrorCategory::Network
+                | ErrorCategory::CapacityLimit
+        )
+    }
+
+    /// The recovery strategy an integrator should default to for this category.
+    pub fn default_strategy(&self) -> RecoveryStrategy {
+        match self {
+            ErrorCategory::Network | ErrorCategory::ExternalDependency => RecoveryStrategy::Retry,
+            ErrorCategory::CapacityLimit => RecoveryStrategy::Defer,
+            ErrorCategory::Recovery | ErrorCategory::InvariantViolation => {
+                RecoveryStrategy::ManualReview
+            }
+            ErrorCategory::Validation
+            | ErrorCategory::Authorization
+            | ErrorCategory::Arithmetic
+            | ErrorCategory::Upgrade => RecoveryStrategy::Escalate,
+        }
+    }
 }
 
 #[contracttype]
@@ -133,6 +199,55 @@ mod tests {
         assert_eq!(meta.schema_version, 1);
         assert_eq!(meta.code, 1);
         assert!(meta.is_retryable);
+    }
+
+    #[test]
+    fn taxonomy_slugs_are_unique_and_stable() {
+        let cats = [
+            ErrorCategory::Validation,
+            ErrorCategory::Authorization,
+            ErrorCategory::ExternalDependency,
+            ErrorCategory::Arithmetic,
+            ErrorCategory::Upgrade,
+            ErrorCategory::Network,
+            ErrorCategory::Recovery,
+            ErrorCategory::CapacityLimit,
+            ErrorCategory::InvariantViolation,
+        ];
+        let mut seen: [&str; 9] = [""; 9];
+        for (i, c) in cats.iter().enumerate() {
+            let s = c.slug();
+            assert!(!s.is_empty());
+            assert!(!seen.contains(&s), "duplicate slug {s}");
+            seen[i] = s;
+        }
+        assert_eq!(ErrorCategory::CapacityLimit.slug(), "capacity_limit");
+        assert_eq!(
+            ErrorCategory::InvariantViolation.slug(),
+            "invariant_violation"
+        );
+    }
+
+    #[test]
+    fn taxonomy_transience_and_strategy() {
+        assert!(ErrorCategory::CapacityLimit.is_transient());
+        assert!(ErrorCategory::Network.is_transient());
+        assert!(!ErrorCategory::Validation.is_transient());
+        assert!(!ErrorCategory::Authorization.is_transient());
+        assert!(!ErrorCategory::InvariantViolation.is_transient());
+
+        assert_eq!(
+            ErrorCategory::CapacityLimit.default_strategy(),
+            RecoveryStrategy::Defer
+        );
+        assert_eq!(
+            ErrorCategory::InvariantViolation.default_strategy(),
+            RecoveryStrategy::ManualReview
+        );
+        assert_eq!(
+            ErrorCategory::Network.default_strategy(),
+            RecoveryStrategy::Retry
+        );
     }
 
     #[test]

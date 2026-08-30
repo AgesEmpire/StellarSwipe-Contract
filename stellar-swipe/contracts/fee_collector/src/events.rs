@@ -96,6 +96,25 @@ pub struct ReferralFeePaid {
     pub amount: i128,
 }
 
+/// #1032: emitted whenever the protocol/provider fee split policy changes.
+#[contractevent]
+pub struct FeeSplitPolicyUpdated {
+    pub old_protocol_bps: u32,
+    pub old_provider_bps: u32,
+    pub new_protocol_bps: u32,
+    pub new_provider_bps: u32,
+    pub updated_by: Address,
+}
+
+/// #1032: emitted when a gross fee is split using the active policy.
+#[contractevent]
+pub struct FeeSplitApplied {
+    pub provider: Address,
+    pub gross_amount: i128,
+    pub protocol_amount: i128,
+    pub provider_amount: i128,
+}
+
 // ── Emit helpers ──────────────────────────────────────────────────────────────
 
 pub struct EvtWithdrawalQueued {
@@ -348,6 +367,40 @@ pub fn emit_referral_fee_paid(
         referee: referee.clone(),
         token: token.clone(),
         amount,
+    }
+    .publish(env);
+}
+
+// ── #1032: Fee split policy events ──────────────────────────────────────────
+
+pub fn emit_fee_split_policy_updated(
+    env: &Env,
+    old: &crate::fee_split_policy::FeeSplitPolicy,
+    new: &crate::fee_split_policy::FeeSplitPolicy,
+    updated_by: &Address,
+) {
+    FeeSplitPolicyUpdated {
+        old_protocol_bps: old.protocol_bps,
+        old_provider_bps: old.provider_bps,
+        new_protocol_bps: new.protocol_bps,
+        new_provider_bps: new.provider_bps,
+        updated_by: updated_by.clone(),
+    }
+    .publish(env);
+}
+
+pub fn emit_fee_split_applied(
+    env: &Env,
+    provider: &Address,
+    gross_amount: i128,
+    protocol_amount: i128,
+    provider_amount: i128,
+) {
+    FeeSplitApplied {
+        provider: provider.clone(),
+        gross_amount,
+        protocol_amount,
+        provider_amount,
     }
     .publish(env);
 }
