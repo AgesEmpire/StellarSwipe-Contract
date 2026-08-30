@@ -3109,7 +3109,10 @@ fn duplicate_vote_on_proposal_is_rejected_and_tally_unchanged() {
     assert_eq!(opposite, Err(Ok(GovernanceError::AlreadyVoted)));
 
     let after_retries = client.proposal(&proposal_id);
-    assert_eq!(after_retries.votes_for, 120_000_000, "tally must be unchanged");
+    assert_eq!(
+        after_retries.votes_for, 120_000_000,
+        "tally must be unchanged"
+    );
     assert_eq!(after_retries.votes_against, 0, "tally must be unchanged");
     assert_eq!(
         after_retries.voter_list.len(),

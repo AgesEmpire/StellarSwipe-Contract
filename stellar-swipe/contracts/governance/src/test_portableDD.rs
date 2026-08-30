@@ -291,7 +291,11 @@ fn proposal_parameter_change_within_bounds_accepted() {
     let boundary = crate::proposals::MAX_PARAMETER_VALUE;
     let result = client.try_create_proposal(
         &proposer,
-        &ProposalType::ParameterChange(String::from_str(&env, "quorum_threshold"), boundary, boundary),
+        &ProposalType::ParameterChange(
+            String::from_str(&env, "quorum_threshold"),
+            boundary,
+            boundary,
+        ),
         &String::from_str(&env, "Tweak param"),
         &String::from_str(&env, "boundary value parameter change"),
         &Bytes::new(&env),

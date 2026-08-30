@@ -1424,8 +1424,38 @@ fn validate_proposal(env: &Env, p: &ProposalType) -> Result<(), GovernanceError>
                 return Err(GovernanceError::BudgetExceeded);
             }
         }
-        ProposalType::ContractUpgrade(_name, hash) if hash.len() != 32 => {
-            return Err(GovernanceError::InvalidProposal);
+        ProposalType::FeatureToggle(feature, _enabled) => {
+            if feature.is_empty() {
+                return Err(GovernanceError::InvalidProposal);
+            }
+            sanitize_string(env, feature, MAX_ACTION_STRING_LEN)
+                .map_err(|_| GovernanceError::InvalidProposal)?;
+        }
+        ProposalType::ContractUpgrade(name, hash) => {
+            if name.is_empty() {
+                return Err(GovernanceError::InvalidProposal);
+            }
+            sanitize_string(env, name, MAX_ACTION_STRING_LEN)
+                .map_err(|_| GovernanceError::InvalidProposal)?;
+            if hash.len() != 32 {
+                return Err(GovernanceError::InvalidProposal);
+            }
+            if is_all_zero_bytes(hash) {
+                return Err(GovernanceError::InvalidProposal);
+            }
+        }
+        ProposalType::SignalProposal(text) => {
+            if text.is_empty() {
+                return Err(GovernanceError::InvalidProposal);
+            }
+            sanitize_string(env, text, MAX_ACTION_STRING_LEN)
+                .map_err(|_| GovernanceError::InvalidProposal)?;
+        }
+        ProposalType::Custom(_executor) => {
+            // The executor `Address` is validated by the Soroban host at
+            // deserialization time (it cannot be malformed by construction).
+            // The remaining constraint — a non-empty ABI payload — is
+            // enforced by `validate_execution_payload`.
         }
     }
     Ok(())
