@@ -297,7 +297,11 @@ fn execute_early_unstake(
     }
 
     let gross = info.balance;
-    let penalty = core::cmp::min((gross * penalty_bps as i128) / 10_000, gross);
+    // Issue #978: checked/saturating bps math — `apply_multiplier_bps` never
+    // overflow-panics on a pathologically large `gross`; the immediately
+    // following `min(.., gross)` clamps any saturated result back down, so
+    // the penalty can never exceed the balance being unstaked.
+    let penalty = core::cmp::min(crate::apply_multiplier_bps(gross, penalty_bps), gross);
     let net = gross.saturating_sub(penalty);
 
     // Zero balance before transfer (checks-effects-interactions).

@@ -115,7 +115,7 @@ fn lock_multiplier_bps_for_remaining(tiers: &Vec<LockMultiplierTier>, remaining_
 
 /// Applies a basis-point multiplier to `balance`, saturating instead of
 /// overflowing for pathologically large inputs.
-fn apply_multiplier_bps(balance: i128, bps: u32) -> i128 {
+pub(crate) fn apply_multiplier_bps(balance: i128, bps: u32) -> i128 {
     balance
         .checked_mul(bps as i128)
         .and_then(|v| v.checked_div(BPS_DENOMINATOR))
@@ -392,6 +392,11 @@ pub enum StakeVaultError {
     /// An emergency unstake request was made before the per-account cooldown
     /// window following the previous emergency unstake had elapsed.
     EmergencyCooldownActive = 42,
+    // ── Issue #978: bounded reward/stake arithmetic ───────────────────────────
+    /// A stake, delegation, or reward amount would overflow `i128` if applied.
+    /// Rejected before any storage write or token transfer — no partial state
+    /// change occurs (unlike the previous silent-clamp-to-`i128::MAX` behavior).
+    StakeOverflow = 43,
 }
 
 impl StakeVaultError {
@@ -495,6 +500,9 @@ impl StakeVaultError {
             }
             StakeVaultError::EmergencyCooldownActive => {
                 "emergency withdrawal cooldown is active for this account; wait for it to elapse"
+            }
+            StakeVaultError::StakeOverflow => {
+                "resulting amount would overflow i128; deposit or delegation rejected"
             }
         }
     }
@@ -832,7 +840,13 @@ impl StakeVaultContract {
         });
 
         let old_tier = stake_tier_for_amount(current.balance);
-        let new_balance = current.balance.checked_add(amount).unwrap_or(i128::MAX);
+        // Issue #978: reject rather than silently saturate — clamping to
+        // `i128::MAX` here would record a balance smaller than the tokens
+        // actually transferred in below, permanently losing the difference.
+        let new_balance = current
+            .balance
+            .checked_add(amount)
+            .ok_or(StakeVaultError::StakeOverflow)?;
         let new_tier = stake_tier_for_amount(new_balance);
 
         // ── Minimum stake duration lock ───────────────────────────────────────
@@ -1523,21 +1537,12 @@ impl StakeVaultContract {
         auth_args.push_back(amount_to_withdraw.into_val(&env));
         staker.require_auth_for_args(auth_args);
 
-        // ── Reentrancy guard ──────────────────────────────────────────────────
-        let lock_key = Symbol::new(&env, EXECUTION_LOCK);
-        if env
-            .storage()
-            .temporary()
-            .get::<_, bool>(&lock_key)
-            .unwrap_or(false)
-        {
-            return Err(StakeVaultError::ReentrancyDetected);
-        }
-        env.storage().temporary().set(&lock_key, &true);
-
+        // Reentrancy guard and checks-interactions-effects ordering both live
+        // inside `do_withdraw` (issue #979) so every internal caller — this
+        // entry point and `process_unstake_queue`'s direct call — gets the
+        // same protection instead of relying on each call site to remember
+        // to take the lock itself.
         let result = Self::do_withdraw(&env, &staker);
-
-        env.storage().temporary().remove(&lock_key);
 
         if result.is_ok() {
             stellar_swipe_common::rate_limit::record_action(
@@ -1550,7 +1555,53 @@ impl StakeVaultContract {
         result
     }
 
+    /// Reentrancy-guarded wrapper around [`Self::do_withdraw_locked`].
+    ///
+    /// Centralizing the lock here (rather than in the public `withdraw_stake`
+    /// entry point) means `process_unstake_queue`'s internal call gets the
+    /// exact same protection against a malicious token re-entering the vault
+    /// mid-transfer — see the doc comment on `do_withdraw_locked` for why
+    /// that matters for issue #979.
     fn do_withdraw(env: &Env, staker: &Address) -> Result<i128, StakeVaultError> {
+        let lock_key = Symbol::new(env, EXECUTION_LOCK);
+        if env
+            .storage()
+            .temporary()
+            .get::<_, bool>(&lock_key)
+            .unwrap_or(false)
+        {
+            return Err(StakeVaultError::ReentrancyDetected);
+        }
+        env.storage().temporary().set(&lock_key, &true);
+
+        let result = Self::do_withdraw_locked(env, staker);
+
+        env.storage().temporary().remove(&lock_key);
+
+        result
+    }
+
+    /// # Checks-effects-interactions order (issue #979)
+    ///
+    /// 1. **Checks**: stake exists, unlocked, not a same-ledger flash-loan
+    ///    pattern, large-withdrawal time-lock satisfied. These are pure
+    ///    reads — no storage is mutated, so an early `Err` here always
+    ///    leaves the position untouched and immediately retryable.
+    /// 2. **Interaction**: the SEP-41 token transfer runs *before* any
+    ///    balance is zeroed or the large-withdrawal request is consumed.
+    ///    This is deliberate: `process_unstake_queue` catches a failed
+    ///    `do_withdraw` per-entry and keeps processing the rest of the queue
+    ///    rather than propagating the error as its own top-level `Result` —
+    ///    so a transfer failure here must not have already written state
+    ///    that a top-level rollback would otherwise have undone. Reentrancy
+    ///    during the transfer is blocked by the lock held in
+    ///    [`Self::do_withdraw`], not by mutating state first.
+    /// 3. **Effects**: only committed once the transfer has actually
+    ///    succeeded — balance zeroed, the large-withdrawal request (if any)
+    ///    consumed, and the tier-change event emitted. A failed transfer
+    ///    therefore rolls back to a fully consistent, retryable position
+    ///    with no persisted mutation at all.
+    fn do_withdraw_locked(env: &Env, staker: &Address) -> Result<i128, StakeVaultError> {
         let token: Address = env
             .storage()
             .instance()
@@ -1587,29 +1638,42 @@ impl StakeVaultContract {
             return Err(StakeVaultError::FlashLoanDetected);
         }
 
-        // ── Time-lock for large withdrawals ───────────────────────────────────
+        // ── Time-lock for large withdrawals (checked now, consumed only after a
+        // successful transfer — see the effects step below) ──────────────────
+        let mut large_withdrawal_key: Option<StorageKey> = None;
         if info.balance >= LARGE_WITHDRAWAL_THRESHOLD {
+            let key = StorageKey::LargeWithdrawalRequestedAt(staker.clone());
             let requested_at: u64 = env
                 .storage()
                 .persistent()
-                .get(&StorageKey::LargeWithdrawalRequestedAt(staker.clone()))
+                .get(&key)
                 .ok_or(StakeVaultError::TimelockRequired)?;
 
             if now < requested_at.saturating_add(get_withdrawal_cooldown_secs(env)) {
                 return Err(StakeVaultError::TimelockNotElapsed);
             }
-
-            // Consume the request so it can't be reused.
-            env.storage()
-                .persistent()
-                .remove(&StorageKey::LargeWithdrawalRequestedAt(staker.clone()));
+            large_withdrawal_key = Some(key);
         }
 
         let amount = info.balance;
         let old_tier = stake_tier_for_amount(info.balance);
         let new_tier = stake_tier_for_amount(0);
 
-        // Zero balance before transfer (checks-effects-interactions).
+        // ── Interaction ── transfer before any effect is persisted (see the
+        // doc comment above for why).
+        shared::token_error::map_result(
+            token::Client::new(env, &token).try_transfer(
+                &env.current_contract_address(),
+                staker,
+                &amount,
+            ),
+        )
+        .map_err(StakeVaultError::from)?;
+
+        // ── Effects ── only reached after the transfer succeeded.
+        if let Some(key) = large_withdrawal_key {
+            env.storage().persistent().remove(&key);
+        }
         stakes.set(
             staker.clone(),
             StakeInfoV2 {
@@ -1623,16 +1687,6 @@ impl StakeVaultContract {
             .set(&MigrationKey::StakesV2, &stakes);
 
         emit_provider_tier_change(env, staker, old_tier, new_tier, 0);
-
-        // Cross-contract call: transfer tokens back to staker.
-        shared::token_error::map_result(
-            token::Client::new(env, &token).try_transfer(
-                &env.current_contract_address(),
-                staker,
-                &amount,
-            ),
-        )
-        .map_err(StakeVaultError::from)?;
 
         Ok(amount)
     }
@@ -1676,21 +1730,10 @@ impl StakeVaultContract {
 
         staker.require_auth();
 
-        // Reentrancy guard.
-        let lock_key = Symbol::new(&env, EXECUTION_LOCK);
-        if env
-            .storage()
-            .temporary()
-            .get::<_, bool>(&lock_key)
-            .unwrap_or(false)
-        {
-            return Err(StakeVaultError::ReentrancyDetected);
-        }
-        env.storage().temporary().set(&lock_key, &true);
-
+        // Reentrancy guard and checks-interactions-effects ordering live
+        // inside `do_partial_unstake` — see `do_partial_unstake_locked` for
+        // why (issue #979, mirrors `do_withdraw`/`do_withdraw_locked`).
         let result = Self::do_partial_unstake(&env, &staker, amount);
-
-        env.storage().temporary().remove(&lock_key);
 
         if result.is_ok() {
             stellar_swipe_common::rate_limit::record_action(
@@ -1703,7 +1746,36 @@ impl StakeVaultContract {
         result
     }
 
+    /// Reentrancy-guarded wrapper around [`Self::do_partial_unstake_locked`].
     fn do_partial_unstake(
+        env: &Env,
+        staker: &Address,
+        amount: i128,
+    ) -> Result<i128, StakeVaultError> {
+        let lock_key = Symbol::new(env, EXECUTION_LOCK);
+        if env
+            .storage()
+            .temporary()
+            .get::<_, bool>(&lock_key)
+            .unwrap_or(false)
+        {
+            return Err(StakeVaultError::ReentrancyDetected);
+        }
+        env.storage().temporary().set(&lock_key, &true);
+
+        let result = Self::do_partial_unstake_locked(env, staker, amount);
+
+        env.storage().temporary().remove(&lock_key);
+
+        result
+    }
+
+    /// Checks-effects-interactions order mirrors [`Self::do_withdraw_locked`]
+    /// (issue #979): the token transfer (interaction) runs before the
+    /// balance is reduced or the large-withdrawal request is consumed
+    /// (effects), so a failed transfer leaves the position fully untouched
+    /// and retryable instead of silently forfeiting the withdrawn amount.
+    fn do_partial_unstake_locked(
         env: &Env,
         staker: &Address,
         amount: i128,
@@ -1749,22 +1821,22 @@ impl StakeVaultContract {
             return Err(StakeVaultError::FlashLoanDetected);
         }
 
-        // Time-lock for large partial withdrawals (threshold applies to the withdrawn amount).
+        // Time-lock for large partial withdrawals (threshold applies to the
+        // withdrawn amount). Checked now, consumed only after a successful
+        // transfer (see the effects step below).
+        let mut large_withdrawal_key: Option<StorageKey> = None;
         if amount >= LARGE_WITHDRAWAL_THRESHOLD {
+            let key = StorageKey::LargeWithdrawalRequestedAt(staker.clone());
             let requested_at: u64 = env
                 .storage()
                 .persistent()
-                .get(&StorageKey::LargeWithdrawalRequestedAt(staker.clone()))
+                .get(&key)
                 .ok_or(StakeVaultError::TimelockRequired)?;
 
             if now < requested_at.saturating_add(get_withdrawal_cooldown_secs(env)) {
                 return Err(StakeVaultError::TimelockNotElapsed);
             }
-
-            // Consume the request so it can't be reused.
-            env.storage()
-                .persistent()
-                .remove(&StorageKey::LargeWithdrawalRequestedAt(staker.clone()));
+            large_withdrawal_key = Some(key);
         }
 
         let remaining = info.balance - amount;
@@ -1782,8 +1854,23 @@ impl StakeVaultContract {
         let old_tier = stake_tier_for_amount(info.balance);
         let new_tier = stake_tier_for_amount(remaining);
 
-        // Reduce balance by the withdrawn amount; the remaining stake keeps its
-        // lock expiry — only the withdrawn fraction's unvested rewards are forfeited.
+        // ── Interaction ── transfer before any effect is persisted.
+        shared::token_error::map_result(
+            token::Client::new(env, &token).try_transfer(
+                &env.current_contract_address(),
+                staker,
+                &amount,
+            ),
+        )
+        .map_err(StakeVaultError::from)?;
+
+        // ── Effects ── only reached after the transfer succeeded. Reduce
+        // balance by the withdrawn amount; the remaining stake keeps its
+        // lock expiry — only the withdrawn fraction's unvested rewards are
+        // forfeited.
+        if let Some(key) = large_withdrawal_key {
+            env.storage().persistent().remove(&key);
+        }
         stakes.set(
             staker.clone(),
             StakeInfoV2 {
@@ -1799,16 +1886,6 @@ impl StakeVaultContract {
         emit_provider_tier_change(env, staker, old_tier, new_tier, remaining);
 
         events::emit_partial_unstake(env, staker.clone(), amount, remaining);
-
-        // Transfer tokens back to staker (CEI: state updated before cross-contract call).
-        shared::token_error::map_result(
-            token::Client::new(env, &token).try_transfer(
-                &env.current_contract_address(),
-                staker,
-                &amount,
-            ),
-        )
-        .map_err(StakeVaultError::from)?;
 
         Ok(amount)
     }
@@ -2014,10 +2091,10 @@ impl StakeVaultContract {
             .get(&StorageKey::SlashTierConfig)
             .unwrap_or_else(SlashTierConfig::default_config);
 
-        let tier_bps = match severity {
-            SlashSeverity::Minor => cfg.minor_bps as i128,
-            SlashSeverity::Major => cfg.major_bps as i128,
-            SlashSeverity::Critical => cfg.critical_bps as i128,
+        let tier_bps: u32 = match severity {
+            SlashSeverity::Minor => cfg.minor_bps,
+            SlashSeverity::Major => cfg.major_bps,
+            SlashSeverity::Critical => cfg.critical_bps,
         };
 
         let mut stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
@@ -2035,8 +2112,15 @@ impl StakeVaultContract {
         }
 
         // Compute slash on own stake; min 1 stroop if balance > 0.
+        //
+        // Issue #978: `apply_multiplier_bps` uses checked arithmetic and
+        // saturates to `i128::MAX` instead of panicking on overflow for a
+        // pathologically large `info.balance`; the immediately following
+        // `min(s, info.balance)` then clamps that saturated value back down
+        // to the actual balance, so the overflow case is still bounded
+        // correctly — a slash can never exceed the stake being slashed.
         let own_slash = if info.balance > 0 {
-            let s = core::cmp::max((info.balance * tier_bps) / BPS_DENOMINATOR, 1);
+            let s = core::cmp::max(apply_multiplier_bps(info.balance, tier_bps), 1);
             core::cmp::min(s, info.balance)
         } else {
             0
@@ -2065,7 +2149,7 @@ impl StakeVaultContract {
             if d_amount == 0 {
                 continue;
             }
-            let d_slash = core::cmp::max((d_amount * tier_bps) / BPS_DENOMINATOR, 1);
+            let d_slash = core::cmp::max(apply_multiplier_bps(d_amount, tier_bps), 1);
             let d_slash = core::cmp::min(d_slash, d_amount);
             delegated.set(delegator, d_amount.saturating_sub(d_slash));
             delegated_slash_total = delegated_slash_total.saturating_add(d_slash);
@@ -2500,8 +2584,13 @@ impl StakeVaultContract {
             .get(&StorageKey::ProviderDelegatedStakes(provider.clone()))
             .unwrap_or_else(|| soroban_sdk::Map::new(&env));
 
+        // Issue #978: reject on overflow rather than silently saturating to
+        // `i128::MAX` — a clamp here would record less than the tokens
+        // actually transferred in below, permanently losing the difference.
         let current = delegated.get(delegator.clone()).unwrap_or(0);
-        let new_amount = current.checked_add(amount).unwrap_or(i128::MAX);
+        let new_amount = current
+            .checked_add(amount)
+            .ok_or(StakeVaultError::StakeOverflow)?;
         delegated.set(delegator.clone(), new_amount);
         env.storage().persistent().set(
             &StorageKey::ProviderDelegatedStakes(provider.clone()),
@@ -2513,7 +2602,9 @@ impl StakeVaultContract {
             .persistent()
             .get(&StorageKey::ProviderTotalDelegated(provider.clone()))
             .unwrap_or(0);
-        let new_total = total_delegated.checked_add(amount).unwrap_or(i128::MAX);
+        let new_total = total_delegated
+            .checked_add(amount)
+            .ok_or(StakeVaultError::StakeOverflow)?;
         env.storage().persistent().set(
             &StorageKey::ProviderTotalDelegated(provider.clone()),
             &new_total,
@@ -2671,9 +2762,17 @@ impl StakeVaultContract {
     /// Process up to `limit` queued unstake requests in FIFO order.
     ///
     /// Requests are processed from the queue head. A request that fails (e.g.
-    /// due to a time-lock or locked stake) is left at the head; processing stops
-    /// so strict FIFO ordering is preserved. The caller should retry later once
-    /// the blocking condition is resolved.
+    /// due to a time-lock, locked stake, or a failed token transfer) is left
+    /// at the head; processing stops so strict FIFO ordering is preserved.
+    /// The caller should retry later once the blocking condition is resolved.
+    ///
+    /// This loop deliberately does not propagate a single failed `do_withdraw`
+    /// as this function's own `Err` — doing so would roll back the successful
+    /// withdrawals already processed earlier in the same call. That is only
+    /// safe because `do_withdraw` (issue #979) defers every storage mutation
+    /// until after its token transfer succeeds: a failed entry here is left
+    /// with its queue position and stake balance completely untouched, so
+    /// retrying it later is always internally consistent.
     ///
     /// Recommended invocation frequency: call at least as often as the queue
     /// approaches `MaxUnstakeQueueSize` (e.g. keyed off `unstake_queued` events

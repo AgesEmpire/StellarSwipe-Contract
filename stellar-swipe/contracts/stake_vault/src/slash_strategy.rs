@@ -147,13 +147,18 @@ pub fn compute_slash_amount(
     let cfg = get_slash_strategy(env, strategy_name)
         .ok_or(SlashStrategyError::StrategyNotFound)?;
 
-    let bps = match severity {
-        0 => cfg.minor_bps as i128,
-        1 => cfg.major_bps as i128,
-        _ => cfg.critical_bps as i128,
+    let bps: u32 = match severity {
+        0 => cfg.minor_bps,
+        1 => cfg.major_bps,
+        _ => cfg.critical_bps,
     };
 
-    let amount = (balance * bps) / 10_000;
+    // Issue #978: checked/saturating bps math instead of a raw `*` that
+    // would overflow-panic for a pathologically large `balance`. `bps` is
+    // validated to `<= 10_000` by `validate()`, so the closing `.min(balance)`
+    // always clamps a saturated intermediate result back down to a value
+    // that can never exceed the balance being slashed.
+    let amount = crate::apply_multiplier_bps(balance, bps);
     Ok(amount.max(if balance > 0 { 1 } else { 0 }).min(balance))
 }
 

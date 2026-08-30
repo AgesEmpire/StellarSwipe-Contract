@@ -959,6 +959,20 @@ impl SignalRegistry {
        INTERNAL HELPERS
     ========================== */
 
+    /// Allocates the next signal id from a persistent monotonic counter.
+    ///
+    /// # Invariant (issue #977)
+    /// `StorageKey::SignalCounter` only ever increases, and every id it has
+    /// ever produced is permanently retired — ids are never reused, even if
+    /// the corresponding record is later removed. `migrate_signals_v1_to_v2`
+    /// relies on this: it never calls `next_signal_id`, instead re-writing
+    /// each legacy `SignalV1` row into the v2 map at its *original* id, so a
+    /// migration can only collide with a freshly-created signal if the
+    /// counter were smaller than the highest legacy id — which is why the
+    /// counter itself (not the v1/v2 map lengths) is the bound the migration
+    /// scans against. A restart or replay is safe because the counter is
+    /// read fresh from persistent storage on every call; nothing in this
+    /// path is order- or session-dependent.
     fn next_signal_id(env: &Env) -> u64 {
         let mut counter: u64 = env
             .storage()

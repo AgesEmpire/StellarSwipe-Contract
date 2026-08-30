@@ -131,6 +131,48 @@ soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 #[contract]
 pub struct FeeCollector;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Authority matrix (Issue #976)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Every state-changing entry point below falls into exactly one of these
+// authority classes. `require_auth()` alone only proves the caller controls
+// the address passed as an argument — it does **not** prove that address is
+// the contract's admin, so every "Admin-only" and "Admin-or-allowlisted"
+// mutator additionally compares the authenticated address against
+// `storage::get_admin` / `storage::is_authorized_caller` before touching any
+// storage or token operation, and rejects a mismatch with
+// `ContractError::Unauthorized` / `ContractError::UnauthorizedCaller`.
+//
+// ── Admin-only (stored admin must both sign and match) ──────────────────────
+//   initialize (bootstraps the admin itself), upgrade, pause, unpause,
+//   authorize_caller, revoke_caller, set_oracle_contract, queue_withdrawal,
+//   withdraw_treasury_fees, set_insurance_payout_cap, set_fee_rate,
+//   set_burn_rate, set_congestion_config, set_fee_optimization_config,
+//   update_network_conditions, queue_failed_fee_collection,
+//   retry_failed_fee_collection, set_protocol_token, register_token,
+//   set_revenue_share_rate_bps, trigger_revenue_share_snapshot (admin +
+//   the `caller` argument must independently co-sign), set_waterfall_config,
+//   distribute_waterfall, set_volume_discount_config, set_forecast_config,
+//   trigger_fee_forecast, admin_override_referral, set_referral_fee_share,
+//   set_max_rebate_bps.
+//
+// ── Admin OR allowlisted contract caller (see authorize_caller) ─────────────
+//   set_congestion_signal, payout_insurance, record_provider_fee_share.
+//   These are entry points a trusted non-admin contract (e.g. a
+//   trade-settlement keeper) may also need to invoke; the admin is always
+//   implicitly authorized without needing to be added to the allowlist.
+//
+// ── Self-scoped (the acting party authorizes only their own state) ─────────
+//   collect_fee / batch_collect_fees (trader), claim_fees (provider,
+//   arg-scoped to (provider, token) so a signature cannot be replayed
+//   against a different token — Issue #563), deposit_insurance_fund (the
+//   depositor funds the pool with their own tokens — permissionless by
+//   design, no privileged state is touched), set_payout_currency /
+//   clear_payout_currency (provider), register_referral (referee).
+//
+// No entry point below performs a storage write or token operation before
+// its authorization check has passed.
 #[contractimpl]
 impl FeeCollector {
     /// # Summary
@@ -885,7 +927,15 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
-        admin.require_auth();
+        // Issue #976: authenticate the *stored* admin, not just whatever
+        // address the caller happened to pass in `admin` — `admin.require_auth()`
+        // alone only proves the caller controls that address, not that it is
+        // the contract's admin.
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
         if config.max_dynamic_rate_bps < MIN_FEE_RATE_BPS
             || config.max_dynamic_rate_bps > MAX_FEE_RATE_BPS
             || config.congestion_sensitivity_bps > 10_000
@@ -909,7 +959,13 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
-        admin.require_auth();
+        // Issue #976: verify `admin` is actually the stored admin — see the
+        // note in `set_fee_optimization_config`.
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
         if score_bps > 10_000 {
             return Err(ContractError::NetworkConditionInvalid);
         }
@@ -936,7 +992,13 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
-        admin.require_auth();
+        // Issue #976: verify `admin` is actually the stored admin — see the
+        // note in `set_fee_optimization_config`.
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
         set_failed_fee_collection(&env, &failed);
         Ok(())
     }
@@ -953,7 +1015,13 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
-        admin.require_auth();
+        // Issue #976: verify `admin` is actually the stored admin — see the
+        // note in `set_fee_optimization_config`.
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
 
         let failed =
             get_failed_fee_collection(&env, &id).ok_or(ContractError::FailedCollectionNotFound)?;
@@ -1555,7 +1623,16 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
-        admin.require_auth();
+        // Issue #976: verify `admin` is actually the stored admin — see the
+        // note in `set_fee_optimization_config`. Registered token metadata
+        // is later trusted by `queue_withdrawal`/`withdraw_treasury_fees`/
+        // `claim_fees`, so an unauthenticated caller being able to overwrite
+        // it would be a direct path to bypassing those checks.
+        let stored_admin = get_admin(&env);
+        stored_admin.require_auth();
+        if stored_admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
 
         let metadata = TokenMetadata {
             symbol: symbol.clone(),
