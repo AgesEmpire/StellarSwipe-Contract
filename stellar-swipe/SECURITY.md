@@ -31,6 +31,15 @@ The governance contract implements a two-layer timelock system:
 These functions previously allowed admin to directly mutate critical state.
 They now require a two-step flow: `queue_*` then `*_timelocked`.
 
+The original direct entry points still exist for backward compatibility, but
+each one now calls `require_no_timelock_bypass()`. Once an operator calls
+`enforce_admin_timelock(admin)` — a **one-way latch** with no disable function,
+intended to be switched on before a DAO token launch — every direct entry
+point below rejects the call with `GovernanceError::TimelockBypassBlocked`, so
+the `queue_*` + `*_timelocked` pair becomes the only path. Status is readable
+via `is_admin_timelock_enforced()`. Full inventory:
+`docs/governance-timelock-audit.md`.
+
 | Queue Function | Execute Function | Action | Rationale |
 |---|---|---|---|
 | `queue_set_treasury_asset` | `set_treasury_asset_timelocked` | Direct treasury balance manipulation | Prevents sudden drain/inflate of treasury |
@@ -72,6 +81,14 @@ These functions are deliberately not routed through the admin timelock.
 | `accept_key_rotation` | Only callable by the pending new admin. Inherently safe because the new admin must consent. |
 | `cancel_key_rotation` | Allows current admin to cancel a pending rotation. No state mutation beyond clearing `PendingAdmin`. |
 
+### Timelock Enforcement
+
+| Function | Rationale |
+|---|---|
+| `enforce_admin_timelock` | One-way latch that *tightens* security by disabling the category (b) direct entry points. There is deliberately no disable function, so timelocking it would only delay a purely risk-reducing change. Admin-only. |
+| `cancel_admin_action` / `cancel_queued_action` | Cancel a pending timelock action before it executes. Risk-reducing — a delay would only make a queued malicious action harder to stop. |
+| `cancel_shadow_mode` | Aborts a pending WASM-upgrade trial without promoting it. Risk-reducing. |
+
 ### Operational / Low-Risk
 
 | Function | Rationale |
@@ -104,6 +121,10 @@ All getter/query functions (e.g., `treasury`, `balance`, `proposal`, `committees
 - `cancel_admin_action` is admin-only and can cancel any pending admin action before execution.
 - The `emergency_execute` path for proposal-based timelock remains guardian-only and is
   limited to `EmergencyPause` action types with a 1-day stuck grace period.
-- The original (non-timelocked) versions of category (b) functions remain callable for
-  backward compatibility. **After this fix, front-ends and off-chain tooling should migrate
-  to the `_timelocked` variants.** The original functions will be deprecated in a future release.
+- The original (non-timelocked) versions of category (b) functions remain callable **only
+  while `enforce_admin_timelock` has not been latched on** (the default). Operators MUST call
+  `enforce_admin_timelock(admin)` as the final step of DAO hand-off; from then on the direct
+  entry points revert with `TimelockBypassBlocked` and the `queue_*` + `*_timelocked` pair is
+  the only path. Front-ends and off-chain tooling should target the `*_timelocked` variants.
+- `TimelockBypassBlocked` is an alias of `Unauthorized` (the `GovernanceError` enum is at the
+  50-variant XDR cap), so on-chain it surfaces as error code 3.
