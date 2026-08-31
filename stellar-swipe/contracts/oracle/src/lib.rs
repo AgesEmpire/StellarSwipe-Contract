@@ -10,9 +10,11 @@ mod errors;
 #[allow(deprecated)]
 mod events;
 mod external_adapter;
+mod freshness_policy;
 mod history;
 mod multi_hop;
 mod price_cb;
+mod quorum;
 mod reputation;
 mod sdex;
 // Closes #670 — per-asset update frequency SLA monitoring

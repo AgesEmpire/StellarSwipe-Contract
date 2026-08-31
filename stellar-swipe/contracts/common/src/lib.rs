@@ -34,6 +34,10 @@ pub mod perf;
 pub mod rate_limit;
 #[allow(deprecated)]
 pub mod replay_protection;
+/// Reserve health monitoring event stream (issue #1034).
+pub mod reserve_health;
+/// Soroban resource-budget regression suite for core flows (issue #985).
+pub mod resource_budget;
 pub mod retry_backoff;
 /// Generic CRUD helpers to replace per-contract storage boilerplate (Issue #579).
 pub mod storage_crud;
