@@ -3,19 +3,26 @@
 mod errors;
 pub use errors::ContractError;
 
+/// #1032: configurable protocol/provider fee split policy.
+mod fee_split_policy;
+pub use fee_split_policy::{
+    FeeSplitPolicy, BPS_TOTAL as FEE_SPLIT_BPS_TOTAL, DEFAULT_PROTOCOL_BPS, DEFAULT_PROVIDER_BPS,
+};
+
 mod events;
 mod fee_cache;
 use events::{
     emit_effective_multiplier_changed, emit_error_reported, emit_fee_collected, emit_fee_forecast,
-    emit_fee_rate_updated, emit_fees_claimed, emit_fees_claimed_converted,
-    emit_first_trade_fee_waived, emit_insurance_payout, emit_insurance_payout_cap_updated,
-    emit_network_condition_updated, emit_payout_currency_set, emit_rebate_cap_applied,
-    emit_referral_fee_paid, emit_referral_fee_share_updated, emit_referral_registered,
-    emit_retry_attempted, emit_snapshot_recorded, emit_treasury_withdrawal,
-    emit_volume_discount_config_updated, emit_waterfall_distribution, emit_withdrawal_queued,
-    EvtEffectiveMultiplierChanged, EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated,
-    EvtFeesClaimed, EvtInsurancePayout, EvtNetworkConditionUpdated, EvtRebateCapApplied,
-    EvtRetryAttempted, EvtSnapshotRecorded, EvtTreasuryWithdrawal, EvtWithdrawalQueued,
+    emit_fee_rate_updated, emit_fee_split_applied, emit_fee_split_policy_updated,
+    emit_fees_claimed, emit_fees_claimed_converted, emit_first_trade_fee_waived,
+    emit_insurance_payout, emit_insurance_payout_cap_updated, emit_network_condition_updated,
+    emit_payout_currency_set, emit_rebate_cap_applied, emit_referral_fee_paid,
+    emit_referral_fee_share_updated, emit_referral_registered, emit_retry_attempted,
+    emit_snapshot_recorded, emit_treasury_withdrawal, emit_volume_discount_config_updated,
+    emit_waterfall_distribution, emit_withdrawal_queued, EvtEffectiveMultiplierChanged,
+    EvtErrorReported, EvtFeeCollected, EvtFeeRateUpdated, EvtFeesClaimed, EvtInsurancePayout,
+    EvtNetworkConditionUpdated, EvtRebateCapApplied, EvtRetryAttempted, EvtSnapshotRecorded,
+    EvtTreasuryWithdrawal, EvtWithdrawalQueued,
 };
 pub use events::{
     EffectiveMultiplierChanged, FeeRateUpdated, FeesBurned, FeesClaimed, FirstTradeFeeWaived,
@@ -1509,6 +1516,100 @@ impl FeeCollector {
         let day = env.ledger().timestamp() / SECONDS_PER_DAY;
         storage::add_provider_daily_fee_shares(&env, &provider, day, amount);
         Ok(())
+    }
+
+    // ── Issue #1032: Configurable fee split policy ───────────────────────────
+
+    /// Returns the active protocol/provider fee split policy (default:
+    /// 30% protocol / 70% provider until an admin configures it).
+    pub fn get_fee_split_policy(env: Env) -> FeeSplitPolicy {
+        storage::get_fee_split_policy(&env)
+    }
+
+    /// Admin: replace the protocol/provider fee split policy.
+    ///
+    /// `protocol_bps + provider_bps` must equal exactly `10_000`. The previous
+    /// and new policy are recorded on the `FeeSplitPolicyUpdated` event for
+    /// audit.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::Unauthorized`] — caller is not the admin.
+    /// - [`ContractError::InvalidFeeConfiguration`] — shares do not sum to 100%.
+    pub fn set_fee_split_policy(
+        env: Env,
+        protocol_bps: u32,
+        provider_bps: u32,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+
+        let new_policy = FeeSplitPolicy {
+            protocol_bps,
+            provider_bps,
+        };
+        new_policy.validate()?;
+
+        let old_policy = storage::get_fee_split_policy(&env);
+        storage::set_fee_split_policy(&env, &new_policy);
+        emit_fee_split_policy_updated(&env, &old_policy, &new_policy, &admin);
+        Ok(())
+    }
+
+    /// Read-only: split `gross_amount` into `(protocol_amount, provider_amount)`
+    /// using the active policy, without mutating state.
+    pub fn preview_fee_split(env: Env, gross_amount: i128) -> Result<(i128, i128), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        storage::get_fee_split_policy(&env).split(gross_amount)
+    }
+
+    /// Record a provider's fee share from a *gross* fee amount, applying the
+    /// active split policy. The provider is credited the provider share in the
+    /// current day's earnings bucket; the protocol share is returned to the
+    /// caller (the settlement layer) so it can be routed to the treasury.
+    /// Returns `(protocol_amount, provider_amount)`.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::UnauthorizedCaller`] — `caller` is neither the admin
+    ///   nor on the authorized-caller allowlist.
+    /// - [`ContractError::InvalidAmount`] — `gross_amount` <= 0.
+    pub fn record_provider_gross_fee_share(
+        env: Env,
+        caller: Address,
+        provider: Address,
+        gross_amount: i128,
+    ) -> Result<(i128, i128), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        caller.require_auth();
+        if caller != get_admin(&env) && !is_authorized_caller(&env, &caller) {
+            return Err(ContractError::UnauthorizedCaller);
+        }
+        if gross_amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let (protocol_amount, provider_amount) =
+            storage::get_fee_split_policy(&env).split(gross_amount)?;
+        if provider_amount > 0 {
+            let day = env.ledger().timestamp() / SECONDS_PER_DAY;
+            storage::add_provider_daily_fee_shares(&env, &provider, day, provider_amount);
+        }
+        emit_fee_split_applied(
+            &env,
+            &provider,
+            gross_amount,
+            protocol_amount,
+            provider_amount,
+        );
+        Ok((protocol_amount, provider_amount))
     }
 
     // ── Issue #438: Protocol Token Integration ─────────────────────
