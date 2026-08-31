@@ -109,9 +109,21 @@ pub fn submit_signal(
         },
     )?;
 
-    // Generate signal ID
+    // Generate signal ID.
+    //
+    // Issue #977: `storage.len() + 1` is only collision-free when `storage`
+    // has no gaps below its length — true for a freshly-grown map, but not
+    // after a restart against migrated/imported state where ids can be
+    // sparse (e.g. ids {2,3,4} present after id 1 was removed: len() == 3,
+    // so len()+1 == 4, colliding with the existing record at id 4). Probing
+    // forward from the length-based hint for the first free id keeps this
+    // O(1) in the common contiguous case while staying collision-free for
+    // any prior state shape.
     let now = env.ledger().timestamp();
-    let next_id = storage.len() as u64 + 1;
+    let mut next_id = storage.len() as u64 + 1;
+    while storage.get(next_id).is_some() {
+        next_id = next_id.checked_add(1).expect("signal id overflow");
+    }
 
     // Set expiry (24 hours default)
     let expiry = now + 86400;
