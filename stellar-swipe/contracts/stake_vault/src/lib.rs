@@ -397,6 +397,14 @@ pub enum StakeVaultError {
     /// Rejected before any storage write or token transfer — no partial state
     /// change occurs (unlike the previous silent-clamp-to-`i128::MAX` behavior).
     StakeOverflow = 43,
+    /// Token transfer failed because the caller/contract balance was insufficient
+    /// (Issue #1001).
+    InsufficientTokenBalance = 44,
+    /// Token approval/allowance was missing or expired (Issue #1001).
+    InsufficientTokenAllowance = 45,
+    /// A token or cross-contract invocation failed for a reason other than the
+    /// specific balance/allowance cases above (Issue #1001).
+    TokenOperationFailed = 46,
 }
 
 impl StakeVaultError {
@@ -504,6 +512,37 @@ impl StakeVaultError {
             StakeVaultError::StakeOverflow => {
                 "resulting amount would overflow i128; deposit or delegation rejected"
             }
+            StakeVaultError::InsufficientTokenBalance => {
+                "token transfer failed: insufficient balance"
+            }
+            StakeVaultError::InsufficientTokenAllowance => {
+                "token transfer failed: insufficient or expired allowance"
+            }
+            StakeVaultError::TokenOperationFailed => {
+                "token or cross-contract invocation failed"
+            }
+        }
+    }
+}
+
+/// Maps the shared token/cross-contract invocation failure classification
+/// (Issue #1001) onto this contract's stable error codes. Every non-success
+/// outcome from a token invocation must flow through here rather than being
+/// treated as `Ok`.
+impl From<shared::TokenFailure> for StakeVaultError {
+    fn from(failure: shared::TokenFailure) -> Self {
+        match failure {
+            shared::TokenFailure::Unauthorized => StakeVaultError::Unauthorized,
+            shared::TokenFailure::InsufficientBalance => {
+                StakeVaultError::InsufficientTokenBalance
+            }
+            shared::TokenFailure::InsufficientAllowance => {
+                StakeVaultError::InsufficientTokenAllowance
+            }
+            shared::TokenFailure::InvalidRequest
+            | shared::TokenFailure::Overflow
+            | shared::TokenFailure::OtherContractError(_)
+            | shared::TokenFailure::HostError => StakeVaultError::TokenOperationFailed,
         }
     }
 }

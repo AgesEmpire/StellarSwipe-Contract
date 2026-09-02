@@ -110,6 +110,14 @@ pub enum ContractError {
     UnsupportedPair = 37,
     /// No asset registry is configured, so the pair cannot be validated (Issue #992).
     AssetRegistryNotConfigured = 38,
+    /// Token transfer failed because the caller/contract balance was insufficient
+    /// (Issue #1001).
+    InsufficientTokenBalance = 39,
+    /// Token approval/allowance was missing or expired (Issue #1001).
+    InsufficientTokenAllowance = 40,
+    /// A token or cross-contract invocation failed for a reason other than the
+    /// specific balance/allowance cases above (Issue #1001).
+    TokenOperationFailed = 41,
 }
 
 impl ContractError {
@@ -214,6 +222,15 @@ impl ContractError {
             ContractError::AssetRegistryNotConfigured => {
                 "no asset registry is configured; cannot validate the asset pair"
             }
+            ContractError::InsufficientTokenBalance => {
+                "token transfer failed: insufficient balance"
+            }
+            ContractError::InsufficientTokenAllowance => {
+                "token transfer failed: insufficient or expired allowance"
+            }
+            ContractError::TokenOperationFailed => {
+                "token or cross-contract invocation failed"
+            }
         }
     }
 }
@@ -227,4 +244,26 @@ pub struct InsufficientLiquidityDetail {
     pub available_liquidity: i128,
     /// Amount required for the swap.
     pub required_amount: i128,
+}
+
+/// Maps the shared token/cross-contract invocation failure classification
+/// (Issue #1001) onto this contract's stable error codes. Every non-success
+/// outcome from a token/router invocation must flow through here rather than
+/// being treated as `Ok`.
+impl From<shared::TokenFailure> for ContractError {
+    fn from(failure: shared::TokenFailure) -> Self {
+        match failure {
+            shared::TokenFailure::Unauthorized => ContractError::Unauthorized,
+            shared::TokenFailure::InsufficientBalance => {
+                ContractError::InsufficientTokenBalance
+            }
+            shared::TokenFailure::InsufficientAllowance => {
+                ContractError::InsufficientTokenAllowance
+            }
+            shared::TokenFailure::InvalidRequest
+            | shared::TokenFailure::Overflow
+            | shared::TokenFailure::OtherContractError(_)
+            | shared::TokenFailure::HostError => ContractError::TokenOperationFailed,
+        }
+    }
 }

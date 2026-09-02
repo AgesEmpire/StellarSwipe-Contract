@@ -1,4 +1,4 @@
-//! End-to-end fee distribution integration test (issue #951).
+//! End-to-end fee distribution integration test (issues #939 / #951).
 //!
 //! Exercises the full `fee_collector` distribution cycle against the real
 //! Soroban test environment (not a mock):
