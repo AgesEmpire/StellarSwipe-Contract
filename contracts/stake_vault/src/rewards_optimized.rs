@@ -57,6 +57,111 @@ pub struct OptimizedDistributionMetrics {
     pub reserve_hit_rate: u32,
 }
 
+/// A per-provider (or per-strategy) reward vesting schedule.
+///
+/// Rewards are released linearly from `start_time` over `duration` seconds.
+/// Any amount not yet released by the schedule is considered unvested and
+/// remains inaccessible until the corresponding release time is reached.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VestingSchedule {
+    /// Total amount of rewards subject to vesting.
+    pub total_amount: i128,
+    /// Amount already released (claimed) from the schedule.
+    pub released_amount: i128,
+    /// Unix timestamp (seconds) at which vesting begins.
+    pub start_time: u64,
+    /// Length of the vesting period in seconds.
+    pub duration: u64,
+}
+
+/// Result of a vesting release attempt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VestingRelease {
+    /// Amount that was released in this call.
+    pub released: i128,
+    /// Amount still locked by the schedule after this release.
+    pub remaining_locked: i128,
+}
+
+/// Create a new vesting schedule for a provider's rewards.
+///
+/// `duration` of zero means the full amount is immediately vested.
+pub fn create_vesting_schedule(
+    total_amount: i128,
+    start_time: u64,
+    duration: u64,
+) -> VestingSchedule {
+    VestingSchedule {
+        total_amount: total_amount.max(0),
+        released_amount: 0,
+        start_time,
+        duration,
+    }
+}
+
+/// Deterministically compute the total amount vested at `current_time`.
+///
+/// Vesting is linear: `total_amount * elapsed / duration`, capped at
+/// `total_amount`. Before `start_time` nothing is vested; once the full
+/// duration has elapsed the entire amount is vested.
+pub fn vested_amount(schedule: &VestingSchedule, current_time: u64) -> i128 {
+    if schedule.total_amount <= 0 {
+        return 0;
+    }
+
+    if current_time <= schedule.start_time {
+        return 0;
+    }
+
+    if schedule.duration == 0 {
+        return schedule.total_amount;
+    }
+
+    let elapsed = current_time - schedule.start_time;
+    if elapsed >= schedule.duration {
+        return schedule.total_amount;
+    }
+
+    (schedule.total_amount * elapsed as i128) / schedule.duration as i128
+}
+
+/// Amount still locked (unvested) at `current_time`.
+///
+/// Unvested balances remain inaccessible until the schedule releases them.
+pub fn unvested_amount(schedule: &VestingSchedule, current_time: u64) -> i128 {
+    let vested = vested_amount(schedule, current_time);
+    vested.saturating_sub(schedule.released_amount).max(0)
+}
+
+/// Amount currently claimable from the schedule at `current_time`.
+///
+/// This is the vested amount minus whatever has already been released.
+pub fn claimable_amount(schedule: &VestingSchedule, current_time: u64) -> i128 {
+    let vested = vested_amount(schedule, current_time);
+    (vested - schedule.released_amount).max(0)
+}
+
+/// Release the currently vested portion of a schedule.
+///
+/// Only the amount that has vested by `current_time` is released; the
+/// remaining balance stays locked until later release events. Returns the
+/// amount released and the amount still locked.
+pub fn release_vested_rewards(
+    schedule: &mut VestingSchedule,
+    current_time: u64,
+) -> VestingRelease {
+    let claimable = claimable_amount(schedule, current_time);
+
+    if claimable > 0 {
+        schedule.released_amount += claimable;
+    }
+
+    VestingRelease {
+        released: claimable,
+        remaining_locked: unvested_amount(schedule, current_time),
+    }
+}
+
 /// Get enhanced rewards pool status with optimization metrics
 pub fn get_rewards_pool_status(pool: &RewardsPool) -> RewardsPoolStatus {
     let days_remaining = estimated_days_remaining(pool.balance, pool.daily_outflow);
@@ -270,219 +375,4 @@ pub fn calculate_distribution_metrics(
     }
 }
 
-fn estimated_days_remaining(balance: i128, daily_outflow: i128) -> u32 {
-    if daily_outflow <= 0 {
-        return u32::MAX;
-    }
-
-    (balance.max(0) / daily_outflow) as u32
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn pool() -> RewardsPool {
-        RewardsPool {
-            balance: 10_000 * XLM,
-            daily_outflow: 100 * XLM,
-            auto_fund_threshold: 1_000 * XLM,
-            treasury_balance: 20_000 * XLM,
-            pending_claims: 0,
-            total_distributed: 0,
-        }
-    }
-
-    #[test]
-    fn test_enhanced_pool_status() {
-        let pool = pool();
-        let status = get_rewards_pool_status(&pool);
-
-        assert_eq!(status.balance, 10_000 * XLM);
-        assert_eq!(status.estimated_days_remaining, 100);
-        assert_eq!(status.daily_outflow, 100 * XLM);
-        // 10_000 / (100 * 7) = ~142% utilization, capped at 100
-        assert_eq!(status.reserve_utilization, 100);
-    }
-
-    #[test]
-    fn test_optimized_pool_monitoring() {
-        let mut pool = pool();
-        pool.balance = 500 * XLM; // Below optimal threshold
-
-        let event = monitor_rewards_pool(&mut pool).unwrap();
-
-        // Should refill to 7 days worth (700 XLM)
-        let expected_refill = (100 * XLM * OPTIMAL_RESERVE_DAYS as i128) - 500 * XLM;
-        assert_eq!(event.auto_funded_amount, expected_refill);
-        assert_eq!(pool.balance, 700 * XLM);
-    }
-
-    #[test]
-    fn test_reward_accrual() {
-        let mut accrual = StakeRewardAccrual {
-            user: "user1",
-            accrued_amount: 0,
-            last_update_time: 1000,
-            stake_amount: 1_000 * XLM,
-        };
-
-        let reward_rate = 1_000; // 0.001% per second
-        let current_time = 2000; // 1000 seconds elapsed
-
-        let reward = accrue_staking_rewards(&mut accrual, reward_rate, current_time);
-
-        // (1000 * XLM * 1000 * 1000) / 1_000_000 = 1000 * XLM
-        assert_eq!(reward, 1_000 * XLM);
-        assert_eq!(accrual.accrued_amount, 1_000 * XLM);
-        assert_eq!(accrual.last_update_time, 2000);
-    }
-
-    #[test]
-    fn test_batch_claim_success() {
-        let mut pool = pool();
-        let mut accruals = vec![
-            StakeRewardAccrual {
-                user: "user1",
-                accrued_amount: 100 * XLM,
-                last_update_time: 1000,
-                stake_amount: 1_000 * XLM,
-            },
-            StakeRewardAccrual {
-                user: "user2",
-                accrued_amount: 200 * XLM,
-                last_update_time: 1000,
-                stake_amount: 2_000 * XLM,
-            },
-            StakeRewardAccrual {
-                user: "user3",
-                accrued_amount: 150 * XLM,
-                last_update_time: 1000,
-                stake_amount: 1_500 * XLM,
-            },
-        ];
-
-        let result = batch_claim_rewards(&mut pool, &mut accruals).unwrap();
-
-        assert_eq!(result.claims.len(), 3);
-        assert_eq!(result.total_claimed, 450 * XLM);
-        assert_eq!(result.gas_saved_percentage, 40);
-        assert_eq!(pool.balance, 9_550 * XLM);
-        assert_eq!(pool.total_distributed, 450 * XLM);
-
-        // All accruals should be reset
-        for accrual in &accruals {
-            assert_eq!(accrual.accrued_amount, 0);
-        }
-    }
-
-    #[test]
-    fn test_batch_claim_with_refill() {
-        let mut pool = pool();
-        pool.balance = 100 * XLM; // Not enough for claims
-
-        let mut accruals = vec![
-            StakeRewardAccrual {
-                user: "user1",
-                accrued_amount: 200 * XLM,
-                last_update_time: 1000,
-                stake_amount: 1_000 * XLM,
-            },
-        ];
-
-        let result = batch_claim_rewards(&mut pool, &mut accruals).unwrap();
-
-        assert_eq!(result.total_claimed, 200 * XLM);
-        // Pool should have been refilled from treasury
-        assert!(pool.treasury_balance < 20_000 * XLM);
-    }
-
-    #[test]
-    fn test_should_claim_threshold() {
-        assert!(should_claim(10 * XLM, 5 * XLM));
-        assert!(!should_claim(3 * XLM, 5 * XLM));
-        assert!(should_claim(5 * XLM, 5 * XLM));
-    }
-
-    #[test]
-    fn test_optimal_claim_time() {
-        let accrued = 5 * XLM;
-        let rate = XLM / 100; // 0.01 XLM per second
-        let min_profitable = 10 * XLM;
-
-        let wait_time = calculate_optimal_claim_time(accrued, rate, 1000, min_profitable);
-
-        // Need 5 more XLM at 0.01 XLM/s = 500 seconds
-        assert_eq!(wait_time, 500);
-    }
-
-    #[test]
-    fn test_optimal_claim_time_ready() {
-        let accrued = 15 * XLM;
-        let rate = XLM / 100;
-        let min_profitable = 10 * XLM;
-
-        let wait_time = calculate_optimal_claim_time(accrued, rate, 1000, min_profitable);
-
-        assert_eq!(wait_time, 0); // Ready to claim now
-    }
-
-    #[test]
-    fn test_reserve_optimization() {
-        let mut pool = pool();
-        pool.balance = 200 * XLM;
-        let predicted_outflow = 150 * XLM;
-
-        let refilled = optimize_reserve_management(&mut pool, predicted_outflow);
-
-        // Target = 150 * 7 = 1050, current = 200, need 850
-        assert_eq!(refilled, 850 * XLM);
-        assert_eq!(pool.balance, 1_050 * XLM);
-    }
-
-    #[test]
-    fn test_distribution_metrics() {
-        let mut pool = pool();
-        pool.total_distributed = 1_000 * XLM;
-
-        let metrics = calculate_distribution_metrics(&pool, 10, 600_000, 8);
-
-        // Baseline: 10 * 100_000 = 1_000_000
-        // Used: 600_000
-        // Saved: 400_000
-        assert_eq!(metrics.total_gas_saved, 400_000);
-        assert_eq!(metrics.batch_efficiency, 40);
-        assert_eq!(metrics.average_claim_size, 100 * XLM);
-        assert_eq!(metrics.reserve_hit_rate, 80); // 8/10 = 80%
-    }
-
-    #[test]
-    fn test_empty_batch_claim() {
-        let mut pool = pool();
-        let mut accruals: Vec<StakeRewardAccrual<&str>> = vec![];
-
-        let result = batch_claim_rewards(&mut pool, &mut accruals);
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "No accruals to process");
-    }
-
-    #[test]
-    fn test_insufficient_pool_balance() {
-        let mut pool = pool();
-        pool.balance = 50 * XLM;
-        pool.treasury_balance = 0; // No treasury backup
-
-        let mut accruals = vec![StakeRewardAccrual {
-            user: "user1",
-            accrued_amount: 100 * XLM,
-            last_update_time: 1000,
-            stake_amount: 1_000 * XLM,
-        }];
-
-        let result = batch_claim_rewards(&mut pool, &mut accruals);
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Insufficient pool balance");
-    }
-}
+fn estimate

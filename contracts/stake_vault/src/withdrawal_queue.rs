@@ -3,6 +3,8 @@
 //! it becomes claimable, and expires if not claimed in time.
 //! Follow-up work: wire into the live stake vault entrypoints/storage and ledger clock.
 //!
+//! #1036: partial withdraw requests are validated against user-level and
+//! strategy-level minimum balance policies before any state is mutated.
 //! Deposit retry protection (#1029): deposit transitions are guarded by a
 //! per-transaction idempotency marker so a partially failed or retried write
 //! cannot duplicate balances or rewards, and always leaves a consistent state.
@@ -49,6 +51,73 @@ impl WithdrawalRequest {
     pub fn is_claimable(&self, now: u64) -> bool {
         self.status(now) == WithdrawalStatus::Active
     }
+}
+
+/// Minimum balance policies enforced on partial withdraws (#1036).
+/// `user_minimum` is the reserve the owner must keep in their position;
+/// `strategy_minimum` is the reserve the strategy must keep after the withdraw.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[contracttype]
+pub struct MinimumBalancePolicy {
+    pub user_minimum: i128,
+    pub strategy_minimum: i128,
+}
+
+impl MinimumBalancePolicy {
+    pub fn new(user_minimum: i128, strategy_minimum: i128) -> Self {
+        Self { user_minimum, strategy_minimum }
+    }
+}
+
+/// Reasons a partial withdraw request can be rejected before state mutation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[contracttype]
+pub enum WithdrawRejection {
+    NonPositiveAmount,
+    ExceedsUserBalance,
+    BelowUserMinimum,
+    BelowStrategyMinimum,
+}
+
+/// Outcome of validating a partial withdraw against the active policy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[contracttype]
+pub enum WithdrawCheck {
+    Accepted,
+    Rejected(WithdrawRejection),
+}
+
+impl WithdrawCheck {
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, WithdrawCheck::Accepted)
+    }
+}
+
+/// Validate a partial withdraw request against user-level and strategy-level
+/// minimum balance policies. Pure check: no balances are mutated here, so
+/// callers can reject invalid withdrawals before touching state.
+///
+/// `user_balance` is the owner's current position; `strategy_balance` is the
+/// strategy's current total. `amount` is the requested partial withdraw.
+pub fn check_partial_withdraw(
+    amount: i128,
+    user_balance: i128,
+    strategy_balance: i128,
+    policy: MinimumBalancePolicy,
+) -> WithdrawCheck {
+    if amount <= 0 {
+        return WithdrawCheck::Rejected(WithdrawRejection::NonPositiveAmount);
+    }
+    if amount > user_balance {
+        return WithdrawCheck::Rejected(WithdrawRejection::ExceedsUserBalance);
+    }
+    if user_balance - amount < policy.user_minimum {
+        return WithdrawCheck::Rejected(WithdrawRejection::BelowUserMinimum);
+    }
+    if strategy_balance - amount < policy.strategy_minimum {
+        return WithdrawCheck::Rejected(WithdrawRejection::BelowStrategyMinimum);
+    }
+    WithdrawCheck::Accepted
 }
 
 /// Outcome of a guarded deposit transition.
@@ -141,9 +210,6 @@ impl ProviderCapConfig {
         new_total
     }
 }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -175,6 +241,48 @@ mod test {
         let req = WithdrawalRequest::new(owner(&env), 100, 0, 1000, 500);
         assert_eq!(req.status(1600), WithdrawalStatus::Expired);
         assert!(!req.is_claimable(1600));
+    }
+
+    #[test]
+    fn accepts_withdraw_above_both_minimums() {
+        let policy = MinimumBalancePolicy::new(100, 500);
+        assert_eq!(check_partial_withdraw(200, 1000, 5000, policy), WithdrawCheck::Accepted);
+    }
+
+    #[test]
+    fn rejects_non_positive_amount() {
+        let policy = MinimumBalancePolicy::new(100, 500);
+        assert_eq!(
+            check_partial_withdraw(0, 1000, 5000, policy),
+            WithdrawCheck::Rejected(WithdrawRejection::NonPositiveAmount)
+        );
+    }
+
+    #[test]
+    fn rejects_amount_exceeding_user_balance() {
+        let policy = MinimumBalancePolicy::new(100, 500);
+        assert_eq!(
+            check_partial_withdraw(2000, 1000, 5000, policy),
+            WithdrawCheck::Rejected(WithdrawRejection::ExceedsUserBalance)
+        );
+    }
+
+    #[test]
+    fn rejects_withdraw_breaching_user_minimum() {
+        let policy = MinimumBalancePolicy::new(900, 500);
+        assert_eq!(
+            check_partial_withdraw(200, 1000, 5000, policy),
+            WithdrawCheck::Rejected(WithdrawRejection::BelowUserMinimum)
+        );
+    }
+
+    #[test]
+    fn rejects_withdraw_breaching_strategy_minimum() {
+        let policy = MinimumBalancePolicy::new(100, 4900);
+        assert_eq!(
+            check_partial_withdraw(200, 1000, 5000, policy),
+            WithdrawCheck::Rejected(WithdrawRejection::BelowStrategyMinimum)
+        );
     }
 
     #[test]
