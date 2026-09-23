@@ -23,6 +23,53 @@ pub struct RewardsPool {
     pub treasury_balance: i128,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderCapConfig {
+    pub max_provider_stake: i128,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderCapExceeded {
+    pub attempted: i128,
+    pub cap: i128,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StakeAllocated {
+    pub amount: i128,
+    pub total_stake: i128,
+}
+
+pub fn set_provider_cap(max_provider_stake: i128) -> Result<ProviderCapConfig, &'static str> {
+    if max_provider_stake <= 0 {
+        return Err("provider cap must be positive");
+    }
+
+    Ok(ProviderCapConfig {
+        max_provider_stake,
+    })
+}
+
+pub fn allocate_stake(
+    config: &ProviderCapConfig,
+    current_stake: i128,
+    amount: i128,
+) -> Result<StakeAllocated, ProviderCapExceeded> {
+    let attempted = current_stake + amount;
+
+    if attempted > config.max_provider_stake {
+        return Err(ProviderCapExceeded {
+            attempted,
+            cap: config.max_provider_stake,
+        });
+    }
+
+    Ok(StakeAllocated {
+        amount,
+        total_stake: attempted,
+    })
+}
+
 pub fn get_rewards_pool_status(pool: &RewardsPool) -> RewardsPoolStatus {
     RewardsPoolStatus {
         balance: pool.balance,
@@ -111,5 +158,49 @@ mod tests {
         assert_eq!(event.days_remaining, 0);
         assert_eq!(pool.balance, 800 * XLM);
         assert_eq!(pool.treasury_balance, 0);
+    }
+
+    #[test]
+    fn provider_cap_rejects_non_positive_values() {
+        assert_eq!(set_provider_cap(0), Err("provider cap must be positive"));
+        assert_eq!(set_provider_cap(-1), Err("provider cap must be positive"));
+        assert_eq!(
+            set_provider_cap(1_000 * XLM),
+            Ok(ProviderCapConfig {
+                max_provider_stake: 1_000 * XLM,
+            })
+        );
+    }
+
+    #[test]
+    fn allocation_over_cap_is_rejected_before_mutation() {
+        let config = set_provider_cap(1_000 * XLM).unwrap();
+        let current_stake = 900 * XLM;
+
+        let result = allocate_stake(&config, current_stake, 200 * XLM);
+
+        assert_eq!(
+            result,
+            Err(ProviderCapExceeded {
+                attempted: 1_100 * XLM,
+                cap: 1_000 * XLM,
+            })
+        );
+        assert_eq!(current_stake, 900 * XLM);
+    }
+
+    #[test]
+    fn allocation_within_cap_records_accepted_values() {
+        let config = set_provider_cap(1_000 * XLM).unwrap();
+
+        let result = allocate_stake(&config, 900 * XLM, 100 * XLM).unwrap();
+
+        assert_eq!(
+            result,
+            StakeAllocated {
+                amount: 100 * XLM,
+                total_stake: 1_000 * XLM,
+            }
+        );
     }
 }
