@@ -23,6 +23,74 @@ pub struct RewardsPool {
     pub treasury_balance: i128,
 }
 
+/// Minimum balance policies enforced on partial withdrawals.
+///
+/// `user_minimum` is the reserve that must remain in a user's account after
+/// any withdraw, while `strategy_minimum` is the reserve that must remain in
+/// the strategy position. Both are inclusive lower bounds: a withdraw that
+/// would leave a balance strictly below the relevant minimum is rejected.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MinimumBalancePolicy {
+    pub user_minimum: i128,
+    pub strategy_minimum: i128,
+}
+
+impl MinimumBalancePolicy {
+    pub fn new(user_minimum: i128, strategy_minimum: i128) -> Self {
+        Self {
+            user_minimum,
+            strategy_minimum,
+        }
+    }
+
+    /// Validate a partial withdraw before any state is mutated.
+    ///
+    /// Returns `Ok(())` when the withdraw preserves both the user-level and
+    /// strategy-level minimums, otherwise returns the offending rule so the
+    /// caller can reject the request without touching balances.
+    pub fn check_withdraw(
+        &self,
+        user_balance: i128,
+        strategy_balance: i128,
+        amount: i128,
+    ) -> Result<(), MinimumBalanceViolation> {
+        if amount <= 0 {
+            return Err(MinimumBalanceViolation::NonPositiveAmount);
+        }
+
+        if amount > user_balance {
+            return Err(MinimumBalanceViolation::InsufficientBalance);
+        }
+
+        let remaining_user = user_balance - amount;
+        if remaining_user < self.user_minimum {
+            return Err(MinimumBalanceViolation::BelowUserMinimum {
+                remaining: remaining_user,
+                minimum: self.user_minimum,
+            });
+        }
+
+        let remaining_strategy = strategy_balance - amount;
+        if remaining_strategy < self.strategy_minimum {
+            return Err(MinimumBalanceViolation::BelowStrategyMinimum {
+                remaining: remaining_strategy,
+                minimum: self.strategy_minimum,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Reason a partial withdraw was rejected by the minimum balance policy.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MinimumBalanceViolation {
+    NonPositiveAmount,
+    InsufficientBalance,
+    BelowUserMinimum { remaining: i128, minimum: i128 },
+    BelowStrategyMinimum { remaining: i128, minimum: i128 },
+}
+
 /// A time-based vesting plan for a single provider's incentive rewards.
 ///
 /// `total_amount` is the full reward allocation. `start_time` is the ledger
@@ -206,5 +274,60 @@ mod tests {
         assert_eq!(schedule.release(2_000), 500 * XLM);
         assert_eq!(schedule.released, 1_000 * XLM);
         assert_eq!(schedule.release(3_000), 0);
+    }
+
+    #[test]
+    fn withdraw_within_minimums_is_allowed() {
+        let policy = MinimumBalancePolicy::new(1_000 * XLM, 2_000 * XLM);
+
+        assert_eq!(
+            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 3_000 * XLM),
+            Ok(())
+        );
+        // Withdrawing exactly down to the minimum is permitted.
+        assert_eq!(
+            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 4_000 * XLM),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn withdraw_below_user_minimum_is_rejected() {
+        let policy = MinimumBalancePolicy::new(1_000 * XLM, 0);
+
+        assert_eq!(
+            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 4_500 * XLM),
+            Err(MinimumBalanceViolation::BelowUserMinimum {
+                remaining: 500 * XLM,
+                minimum: 1_000 * XLM,
+            })
+        );
+    }
+
+    #[test]
+    fn withdraw_below_strategy_minimum_is_rejected() {
+        let policy = MinimumBalancePolicy::new(0, 2_000 * XLM);
+
+        assert_eq!(
+            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 9_000 * XLM),
+            Err(MinimumBalanceViolation::BelowStrategyMinimum {
+                remaining: 1_000 * XLM,
+                minimum: 2_000 * XLM,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_withdraw_amounts_are_rejected() {
+        let policy = MinimumBalancePolicy::new(1_000 * XLM, 1_000 * XLM);
+
+        assert_eq!(
+            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 0),
+            Err(MinimumBalanceViolation::NonPositiveAmount)
+        );
+        assert_eq!(
+            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 6_000 * XLM),
+            Err(MinimumBalanceViolation::InsufficientBalance)
+        );
     }
 }
