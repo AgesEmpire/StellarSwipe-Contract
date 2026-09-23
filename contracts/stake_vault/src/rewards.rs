@@ -1,6 +1,15 @@
 pub const XLM: i128 = 10_000_000;
 pub const DEFAULT_AUTO_FUND_AMOUNT: i128 = 5_000 * XLM;
 
+/// Decimal precision (in base-10 digits) assumed by every amount conversion in
+/// this module. All on-chain amounts are stored as integer base units scaled by
+/// `10^EXPECTED_DECIMALS`, so a token whose contract reports a different
+/// precision cannot be mixed with these balances without silent value loss.
+pub const EXPECTED_DECIMALS: u32 = 7;
+
+/// Scale factor implied by [`EXPECTED_DECIMALS`] (`10^EXPECTED_DECIMALS`).
+pub const DECIMAL_SCALE: i128 = XLM;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RewardsPoolStatus {
     pub balance: i128,
@@ -21,6 +30,88 @@ pub struct RewardsPool {
     pub daily_outflow: i128,
     pub auto_fund_threshold: i128,
     pub treasury_balance: i128,
+}
+
+/// Metadata a token contract is expected to expose at `stake_vault` setup.
+///
+/// `address` is the token contract identifier, `decimals` its reported
+/// precision, and `is_contract` whether the address actually resolves to a
+/// deployed contract (as opposed to an account or an empty/invalid address).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenMetadata {
+    pub address: u32,
+    pub decimals: u32,
+    pub is_contract: bool,
+}
+
+/// Immutable token configuration captured at `stake_vault` initialization.
+///
+/// Once validated, the token address and its precision are frozen: there is no
+/// setter, so changing them requires a governed upgrade/redeploy rather than a
+/// runtime mutation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenConfig {
+    pub address: u32,
+    pub decimals: u32,
+}
+
+/// Validate a token contract before `stake_vault` initialization.
+///
+/// Rejects invalid/zero addresses, addresses that are not contracts, and
+/// contracts whose reported decimals differ from [`EXPECTED_DECIMALS`]. On
+/// success returns the frozen [`TokenConfig`] used for all amount conversions.
+pub fn validate_token_metadata(metadata: &TokenMetadata) -> Result<TokenConfig, &'static str> {
+    if metadata.address == 0 {
+        return Err("invalid token: address must be non-zero");
+    }
+
+    if !metadata.is_contract {
+        return Err("invalid token: address is not a contract");
+    }
+
+    if metadata.decimals != EXPECTED_DECIMALS {
+        return Err("incompatible token: decimals do not match vault precision");
+    }
+
+    Ok(TokenConfig {
+        address: metadata.address,
+        decimals: metadata.decimals,
+    })
+}
+
+/// Convert a whole-token amount into base units using checked arithmetic.
+///
+/// Rounding: this conversion is exact for whole tokens; any fractional part is
+/// truncated toward zero (integer division), never rounded up. Overflow and
+/// negative inputs are rejected rather than saturating.
+pub fn to_base_units(amount: i128, config: &TokenConfig) -> Result<i128, &'static str> {
+    if amount < 0 {
+        return Err("invalid amount: must be non-negative");
+    }
+
+    if config.decimals != EXPECTED_DECIMALS {
+        return Err("incompatible token: decimals do not match vault precision");
+    }
+
+    amount
+        .checked_mul(DECIMAL_SCALE)
+        .ok_or("amount overflow: base unit conversion failed")
+}
+
+/// Convert base units back into whole tokens using checked arithmetic.
+///
+/// Rounding: the fractional remainder is truncated toward zero, so the result
+/// is always `<=` the exact value (never rounded up).
+pub fn from_base_units(base_units: i128, config: &TokenConfig) -> Result<i128, &'static str> {
+    if base_units < 0 {
+        return Err("invalid amount: must be non-negative");
+    }
+
+    if config.decimals != EXPECTED_DECIMALS {
+        return Err("incompatible token: decimals do not match vault precision");
+    }
+
+    Ok(base_units / DECIMAL_SCALE)
 }
 
 /// Emergency pause state for risk-bearing `stake_vault` operations.
@@ -150,6 +241,14 @@ fn estimated_days_remaining(balance: i128, daily_outflow: i128) -> u32 {
 mod tests {
     use super::*;
 
+    fn valid_metadata() -> TokenMetadata {
+        TokenMetadata {
+            address: 42,
+            decimals: EXPECTED_DECIMALS,
+            is_contract: true,
+        }
+    }
+
     #[test]
     fn healthy_pool_status() {
         let mut pool = RewardsPool {
@@ -251,5 +350,88 @@ mod tests {
         // ...but the pause state itself does not gate withdrawals, which must
         // remain callable so users can always exit.
         assert!(state.paused);
+    }
+
+    #[test]
+    fn valid_token_metadata_is_accepted_and_frozen() {
+        let config = validate_token_metadata(&valid_metadata()).unwrap();
+        assert_eq!(config.address, 42);
+        assert_eq!(config.decimals, EXPECTED_DECIMALS);
+    }
+
+    #[test]
+    fn zero_address_is_rejected() {
+        let metadata = TokenMetadata {
+            address: 0,
+            ..valid_metadata()
+        };
+        assert!(validate_token_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    fn non_contract_address_is_rejected() {
+        let metadata = TokenMetadata {
+            is_contract: false,
+            ..valid_metadata()
+        };
+        assert!(validate_token_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    fn mismatched_decimals_are_rejected() {
+        let metadata = TokenMetadata {
+            decimals: EXPECTED_DECIMALS + 1,
+            ..valid_metadata()
+        };
+        assert!(validate_token_metadata(&metadata).is_err());
+
+        let metadata = TokenMetadata {
+            decimals: 0,
+            ..valid_metadata()
+        };
+        assert!(validate_token_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    fn malicious_metadata_cannot_bypass_validation() {
+        // A hostile contract may report a huge precision or claim to be a
+        // contract while pointing at a zero address; both must be rejected.
+        let metadata = TokenMetadata {
+            address: 0,
+            decimals: u32::MAX,
+            is_contract: true,
+        };
+        assert!(validate_token_metadata(&metadata).is_err());
+
+        let metadata = TokenMetadata {
+            address: 99,
+            decimals: u32::MAX,
+            is_contract: true,
+        };
+        assert!(validate_token_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    fn conversions_use_checked_arithmetic_and_truncate() {
+        let config = validate_token_metadata(&valid_metadata()).unwrap();
+
+        assert_eq!(to_base_units(3, &config), Ok(3 * XLM));
+        assert_eq!(from_base_units(3 * XLM + 1, &config), Ok(3));
+
+        // Overflow is rejected rather than wrapping/saturating.
+        assert!(to_base_units(i128::MAX, &config).is_err());
+        // Negative amounts are rejected.
+        assert!(to_base_units(-1, &config).is_err());
+        assert!(from_base_units(-1, &config).is_err());
+    }
+
+    #[test]
+    fn conversions_reject_incompatible_config() {
+        let config = TokenConfig {
+            address: 42,
+            decimals: EXPECTED_DECIMALS + 2,
+        };
+        assert!(to_base_units(1, &config).is_err());
+        assert!(from_base_units(XLM, &config).is_err());
     }
 }
