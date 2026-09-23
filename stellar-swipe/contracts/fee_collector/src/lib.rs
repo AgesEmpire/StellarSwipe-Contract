@@ -11,6 +11,13 @@ pub use fee_split_policy::{
 
 mod events;
 mod fee_cache;
+pub mod volatility;
+pub use volatility::{VolatilityBand, VolatilityBandConfig};
+
+/// Current event schema version for fee_collector events.
+/// Indexers must check this before deserialising event bodies.
+/// Bump on breaking changes (field removal, type change, rename).
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
 use events::{
     emit_effective_multiplier_changed, emit_error_reported, emit_fee_collected, emit_fee_forecast,
     emit_fee_rate_updated, emit_fee_split_applied, emit_fee_split_policy_updated,
@@ -2265,6 +2272,79 @@ impl FeeCollector {
         }
         set_max_rebate_bps_storage(&env, bps);
         Ok(())
+    }
+
+    // ── Issue: Dynamic fee bands based on volatility ────────────────────────────
+
+    /// Admin: configure volatility-threshold fee bands.
+    ///
+    /// Bands are evaluated in order; the highest matching threshold wins.
+    /// `base_fee_rate_bps` applies when no band threshold is met.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    pub fn set_volatility_bands(
+        env: Env,
+        config: VolatilityBandConfig,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        volatility::set_volatility_bands(&env, &config);
+        Ok(())
+    }
+
+    /// Returns the configured volatility band config, if any.
+    pub fn get_volatility_band_config(env: Env) -> Option<VolatilityBandConfig> {
+        volatility::get_volatility_band_config(&env)
+    }
+
+    /// Returns the fee rate (bps) selected by the current volatility signal,
+    /// or the base fee rate if no bands are configured.
+    pub fn current_volatility_fee_rate(env: Env) -> u32 {
+        volatility::fee_rate_for_current_volatility(&env)
+            .unwrap_or_else(|| get_fee_rate(&env))
+    }
+
+    // ── Issue: Batch snapshot export ─────────────────────────────────────────────
+
+    /// Read-only: export a batch snapshot of revenue share pools for the
+    /// requested token addresses. Does not mutate any state.
+    ///
+    /// Returns a `FeeSnapshot` containing one `SnapshotEntry` per token.
+    /// Suitable for analytics indexing workflows.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] — contract not initialized.
+    /// - [`ContractError::IterationLimitExceeded`] — more than `MAX_AUDIT_TOKENS` tokens requested.
+    pub fn batch_snapshot(
+        env: Env,
+        tokens: Vec<Address>,
+    ) -> Result<FeeSnapshot, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        if tokens.len() > MAX_AUDIT_TOKENS {
+            return Err(ContractError::IterationLimitExceeded);
+        }
+        let mut entries: Vec<SnapshotEntry> = Vec::new(&env);
+        let mut total: i128 = 0;
+        for token in tokens.iter() {
+            let amount = storage::get_revenue_share_pool(&env, &token);
+            total = total.saturating_add(amount);
+            entries.push_back(SnapshotEntry {
+                token: token.clone(),
+                amount,
+            });
+        }
+        Ok(FeeSnapshot {
+            ledger: env.ledger().sequence() as u64,
+            timestamp: env.ledger().timestamp(),
+            total_amount: total,
+            entries,
+        })
     }
 
     // ── Issue #862: Health / Readiness ─────────────────────────────────────────
