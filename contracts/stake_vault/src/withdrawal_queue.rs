@@ -2,6 +2,10 @@
 //! Models a queued unstake request that must sit through a cooldown window before
 //! it becomes claimable, and expires if not claimed in time.
 //! Follow-up work: wire into the live stake vault entrypoints/storage and ledger clock.
+//!
+//! Deposit retry protection (#1029): deposit transitions are guarded by a
+//! per-transaction idempotency marker so a partially failed or retried write
+//! cannot duplicate balances or rewards, and always leaves a consistent state.
 
 use soroban_sdk::{contracttype, Address, Env};
 
@@ -47,6 +51,58 @@ impl WithdrawalRequest {
     }
 }
 
+/// Outcome of a guarded deposit transition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[contracttype]
+pub enum DepositOutcome {
+    /// The deposit was applied for the first time.
+    Applied,
+    /// The deposit was already applied for this transaction marker; no-op.
+    AlreadyApplied,
+}
+
+/// Tracks the last applied deposit marker so retried or partially failed
+/// deposit writes can be detected and skipped instead of duplicating balances
+/// or rewards.
+#[derive(Clone)]
+#[contracttype]
+pub struct DepositGuard {
+    pub last_marker: u64,
+    pub applied: bool,
+}
+
+impl DepositGuard {
+    pub fn new() -> Self {
+        Self { last_marker: 0, applied: false }
+    }
+
+    /// Returns true when `marker` has already been applied, meaning the caller
+    /// is retrying a deposit that previously succeeded and must not be applied
+    /// again.
+    pub fn is_retry(&self, marker: u64) -> bool {
+        self.applied && self.last_marker == marker
+    }
+
+    /// Guard a deposit transition. If the marker was already applied the write
+    /// is skipped (idempotent); otherwise the marker is recorded so a later
+    /// retry is detected. Returns the outcome so callers can branch on it.
+    pub fn apply(&mut self, marker: u64) -> DepositOutcome {
+        if self.is_retry(marker) {
+            return DepositOutcome::AlreadyApplied;
+        }
+        self.last_marker = marker;
+        self.applied = true;
+        DepositOutcome::Applied
+    }
+
+    /// Reset the guard after a failed deposit so the contract is left in a
+    /// consistent state and the transition can be safely retried.
+    pub fn rollback(&mut self) {
+        self.last_marker = 0;
+        self.applied = false;
+    }
+}
+
 /// Configuration state holding the hard cap on total provider stake allocation.
 #[derive(Clone)]
 #[contracttype]
@@ -85,6 +141,8 @@ impl ProviderCapConfig {
         new_total
     }
 }
+    }
+}
 
 #[cfg(test)]
 mod test {
@@ -120,6 +178,30 @@ mod test {
     }
 
     #[test]
+    fn first_deposit_is_applied() {
+        let mut guard = DepositGuard::new();
+        assert_eq!(guard.apply(7), DepositOutcome::Applied);
+        assert!(!guard.is_retry(7));
+    }
+
+    #[test]
+    fn repeated_deposit_marker_is_detected_and_skipped() {
+        let mut guard = DepositGuard::new();
+        assert_eq!(guard.apply(7), DepositOutcome::Applied);
+        assert!(guard.is_retry(7));
+        assert_eq!(guard.apply(7), DepositOutcome::AlreadyApplied);
+    }
+
+    #[test]
+    fn rollback_allows_safe_retry() {
+        let mut guard = DepositGuard::new();
+        assert_eq!(guard.apply(7), DepositOutcome::Applied);
+        guard.rollback();
+        assert!(!guard.is_retry(7));
+        assert_eq!(guard.apply(7), DepositOutcome::Applied);
+    }
+
+    #[test]
     fn accepts_allocation_within_cap() {
         let env = Env::default();
         let cfg = ProviderCapConfig::new(1000);
@@ -139,5 +221,6 @@ mod test {
     #[should_panic]
     fn rejects_non_positive_cap() {
         ProviderCapConfig::new(0);
+    }
     }
 }

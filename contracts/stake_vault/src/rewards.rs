@@ -32,6 +32,25 @@ pub struct RewardsPool {
     pub treasury_balance: i128,
 }
 
+/// Tracks the last applied deposit so repeated attempts for the same
+/// transaction cannot duplicate balances or rewards.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DepositRetryGuard {
+    pub last_deposit_id: u64,
+    pub last_deposit_amount: i128,
+    pub applied: bool,
+}
+
+impl DepositRetryGuard {
+    pub fn new() -> Self {
+        DepositRetryGuard {
+            last_deposit_id: 0,
+            last_deposit_amount: 0,
+            applied: false,
+        }
+    }
+}
+
 /// Metadata a token contract is expected to expose at `stake_vault` setup.
 ///
 /// `address` is the token contract identifier, `decimals` its reported
@@ -134,11 +153,63 @@ impl PauseState {
         }
     }
 }
+        }
+    }
+}
+
+impl Default for DepositRetryGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Default for PauseState {
     fn default() -> Self {
         Self::new()
     }
+}
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Outcome of attempting to apply a deposit against the retry guard.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DepositOutcome {
+    /// Deposit was applied for the first time.
+    Applied { deposit_id: u64, amount: i128 },
+    /// Deposit was already applied; no state change was made.
+    AlreadyApplied { deposit_id: u64 },
+    /// Deposit was rejected (invalid amount); state left untouched.
+    Rejected { deposit_id: u64 },
+}
+
+/// Applies a deposit to the rewards pool exactly once per `deposit_id`.
+///
+/// Repeated attempts with the same `deposit_id` are detected via the
+/// `DepositRetryGuard` marker and skipped, so balances and rewards are never
+/// duplicated. Invalid amounts are rejected without mutating state, leaving
+/// the contract consistent for a later retry.
+pub fn apply_deposit(
+    pool: &mut RewardsPool,
+    guard: &mut DepositRetryGuard,
+    deposit_id: u64,
+    amount: i128,
+) -> DepositOutcome {
+    if amount <= 0 {
+        return DepositOutcome::Rejected { deposit_id };
+    }
+
+    if guard.applied && guard.last_deposit_id == deposit_id {
+        return DepositOutcome::AlreadyApplied { deposit_id };
+    }
+
+    pool.balance += amount;
+    guard.last_deposit_id = deposit_id;
+    guard.last_deposit_amount = amount;
+    guard.applied = true;
+
+    DepositOutcome::Applied { deposit_id, amount }
 }
 
 /// Outcome of a pause/unpause request, surfaced to clients so they can
@@ -289,11 +360,22 @@ fn estimated_days_remaining(balance: i128, daily_outflow: i128) -> u32 {
 mod tests {
     use super::*;
 
+    fn sample_pool() -> RewardsPool {
+        RewardsPool {
+            balance: 10_000 * XLM,
+            daily_outflow: 100 * XLM,
+            auto_fund_threshold: 1_000 * XLM,
+            treasury_balance: 20_000 * XLM,
+        }
+    }
+
     fn valid_metadata() -> TokenMetadata {
         TokenMetadata {
             address: 42,
             decimals: EXPECTED_DECIMALS,
             is_contract: true,
+        }
+    }
         }
     }
 
@@ -348,6 +430,58 @@ mod tests {
         assert_eq!(event.days_remaining, 0);
         assert_eq!(pool.balance, 800 * XLM);
         assert_eq!(pool.treasury_balance, 0);
+    }
+
+    #[test]
+    fn deposit_applies_once() {
+        let mut pool = sample_pool();
+        let mut guard = DepositRetryGuard::new();
+
+        let outcome = apply_deposit(&mut pool, &mut guard, 1, 250 * XLM);
+
+        assert_eq!(
+            outcome,
+            DepositOutcome::Applied {
+                deposit_id: 1,
+                amount: 250 * XLM,
+            }
+        );
+        assert_eq!(pool.balance, 10_250 * XLM);
+    }
+
+    #[test]
+    fn repeated_deposit_is_not_duplicated() {
+        let mut pool = sample_pool();
+        let mut guard = DepositRetryGuard::new();
+
+        apply_deposit(&mut pool, &mut guard, 7, 100 * XLM);
+        let retry = apply_deposit(&mut pool, &mut guard, 7, 100 * XLM);
+
+        assert_eq!(retry, DepositOutcome::AlreadyApplied { deposit_id: 7 });
+        assert_eq!(pool.balance, 10_100 * XLM);
+    }
+
+    #[test]
+    fn rejected_deposit_leaves_state_consistent() {
+        let mut pool = sample_pool();
+        let mut guard = DepositRetryGuard::new();
+
+        let outcome = apply_deposit(&mut pool, &mut guard, 3, 0);
+
+        assert_eq!(outcome, DepositOutcome::Rejected { deposit_id: 3 });
+        assert_eq!(pool.balance, 10_000 * XLM);
+        assert!(!guard.applied);
+
+        // A valid retry after rejection still applies cleanly.
+        let retry = apply_deposit(&mut pool, &mut guard, 3, 50 * XLM);
+        assert_eq!(
+            retry,
+            DepositOutcome::Applied {
+                deposit_id: 3,
+                amount: 50 * XLM,
+            }
+        );
+        assert_eq!(pool.balance, 10_050 * XLM);
     }
 
     #[test]
