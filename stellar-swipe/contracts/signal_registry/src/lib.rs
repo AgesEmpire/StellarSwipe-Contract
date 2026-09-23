@@ -6,6 +6,8 @@ static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
 
 mod admin;
 mod analytics;
+pub mod param_bounds;
+pub use param_bounds::{ParamBounds, get_param_bounds};
 mod categories;
 mod churn_risk;
 mod cohort_retention;
@@ -340,6 +342,37 @@ impl SignalRegistry {
         admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         Ok(storage_monitor::admin_cleanup_storage(&env, batch_size))
+    }
+
+    /// Admin: declare the legal [min, max] range for a named strategy parameter.
+    /// Subsequent calls to `validate_strategy_param` will enforce this range.
+    ///
+    /// # Errors
+    /// - [`AdminError::Unauthorized`] — caller is not the config admin.
+    /// - [`AdminError::InvalidParameter`] — min > max.
+    pub fn set_param_bounds(
+        env: Env,
+        caller: Address,
+        param: Symbol,
+        min: i128,
+        max: i128,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        param_bounds::set_param_bounds(&env, param, param_bounds::ParamBounds { min, max })
+    }
+
+    /// Validate `value` against the declared bounds for `param`.
+    /// Returns `Ok(())` if within range or no bounds declared.
+    ///
+    /// # Errors
+    /// - [`AdminError::InvalidParameter`] — value is outside [min, max].
+    pub fn validate_strategy_param(
+        env: Env,
+        param: Symbol,
+        value: i128,
+    ) -> Result<(), AdminError> {
+        param_bounds::validate_param(&env, param, value)
     }
 
     pub fn set_min_stake(env: Env, caller: Address, new_amount: i128) -> Result<(), AdminError> {
@@ -3634,6 +3667,8 @@ pub struct StorageStats {
 mod test;
 #[cfg(test)]
 mod test_admin_roles;
+#[cfg(test)]
+mod test_param_bounds;
 #[cfg(test)]
 mod test_admin_transfer;
 #[cfg(test)]
