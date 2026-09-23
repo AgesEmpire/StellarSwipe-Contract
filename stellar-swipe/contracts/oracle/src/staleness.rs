@@ -4,10 +4,31 @@ use stellar_swipe_common::AssetPair;
 pub const MAX_PRICE_AGE_LEDGERS: u32 = 60;
 pub const ORACLE_DEAD_THRESHOLD_LEDGERS: u32 = 1_440;
 
+/// Default freshness window (seconds) used by quote-accepting entrypoints
+/// when no per-pair override has been configured. Issue #864.
+pub const DEFAULT_STALENESS_WINDOW_SECS: u64 = 300;
+
 #[contracttype]
 #[derive(Clone)]
 enum StaleStorageKey {
     Meta(AssetPair),
+    Window(AssetPair),
+}
+
+/// Admin-configurable freshness window (seconds) for a pair. Quotes older than
+/// this are rejected before being accepted. Issue #864.
+pub fn set_staleness_window(env: &Env, pair: &AssetPair, window_secs: u64) {
+    env.storage()
+        .persistent()
+        .set(&StaleStorageKey::Window(pair.clone()), &window_secs);
+}
+
+/// Returns the configured freshness window in seconds, or the default if unset.
+pub fn get_staleness_window(env: &Env, pair: &AssetPair) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&StaleStorageKey::Window(pair.clone()))
+        .unwrap_or(DEFAULT_STALENESS_WINDOW_SECS)
 }
 
 #[contracttype]

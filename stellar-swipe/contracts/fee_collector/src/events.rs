@@ -2,6 +2,20 @@ use crate::storage::WaterfallTierResult;
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use soroban_sdk::{contractevent, Address, Env, String, Symbol, Vec};
 
+/// Current event schema version for fee_collector events.
+/// Indexers MUST check this field before deserialising event bodies.
+/// Bump on breaking changes (field removal, type change, rename).
+/// Backward-compatible additions (new optional fields, new events) keep the same version.
+pub const SCHEMA_VERSION: u32 = 1;
+
+#[contractevent]
+pub struct SnapshotRecorded {
+    pub ledger: u64,
+    pub timestamp: u64,
+    pub total_amount: i128,
+    pub entry_count: u32,
+}
+
 #[contractevent]
 pub struct WithdrawalQueued {
     pub recipient: Address,
@@ -86,6 +100,25 @@ pub struct ReferralFeePaid {
     pub referee: Address,
     pub token: Address,
     pub amount: i128,
+}
+
+/// #1032: emitted whenever the protocol/provider fee split policy changes.
+#[contractevent]
+pub struct FeeSplitPolicyUpdated {
+    pub old_protocol_bps: u32,
+    pub old_provider_bps: u32,
+    pub new_protocol_bps: u32,
+    pub new_provider_bps: u32,
+    pub updated_by: Address,
+}
+
+/// #1032: emitted when a gross fee is split using the active policy.
+#[contractevent]
+pub struct FeeSplitApplied {
+    pub provider: Address,
+    pub gross_amount: i128,
+    pub protocol_amount: i128,
+    pub provider_amount: i128,
 }
 
 // ── Emit helpers ──────────────────────────────────────────────────────────────
@@ -344,6 +377,40 @@ pub fn emit_referral_fee_paid(
     .publish(env);
 }
 
+// ── #1032: Fee split policy events ──────────────────────────────────────────
+
+pub fn emit_fee_split_policy_updated(
+    env: &Env,
+    old: &crate::fee_split_policy::FeeSplitPolicy,
+    new: &crate::fee_split_policy::FeeSplitPolicy,
+    updated_by: &Address,
+) {
+    FeeSplitPolicyUpdated {
+        old_protocol_bps: old.protocol_bps,
+        old_provider_bps: old.provider_bps,
+        new_protocol_bps: new.protocol_bps,
+        new_provider_bps: new.provider_bps,
+        updated_by: updated_by.clone(),
+    }
+    .publish(env);
+}
+
+pub fn emit_fee_split_applied(
+    env: &Env,
+    provider: &Address,
+    gross_amount: i128,
+    protocol_amount: i128,
+    provider_amount: i128,
+) {
+    FeeSplitApplied {
+        provider: provider.clone(),
+        gross_amount,
+        protocol_amount,
+        provider_amount,
+    }
+    .publish(env);
+}
+
 // ── #665: Fee Forecast event ─────────────────────────────────────────────────
 
 /// Emitted when a fee revenue forecast is computed (auto or manual trigger).
@@ -423,5 +490,103 @@ pub fn emit_effective_multiplier_changed(env: &Env, evt: EvtEffectiveMultiplierC
             Symbol::new(env, "multiplier_changed"),
         ),
         (evt.old_multiplier_bps, evt.new_multiplier_bps),
+    );
+}
+
+// ── Issue #814: Snapshot Recorded event ──────────────────────────────
+
+pub struct EvtSnapshotRecorded {
+    pub ledger: u64,
+    pub timestamp: u64,
+    pub total_amount: i128,
+    pub entry_count: u32,
+}
+
+pub fn emit_snapshot_recorded(env: &Env, evt: EvtSnapshotRecorded) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "snapshot_recorded"),
+        ),
+        (evt.ledger, evt.timestamp, evt.total_amount, evt.entry_count),
+    );
+}
+
+// ── Issue #960: Insurance Payout & Cap events ────────────────────────────────
+
+#[contractevent]
+pub struct InsurancePayout {
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub claim_id: String,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+pub struct InsurancePayoutCapUpdated {
+    pub token: Address,
+    pub old_cap: i128,
+    pub new_cap: i128,
+    pub updated_by: Address,
+}
+
+pub struct EvtInsurancePayout {
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub claim_id: String,
+    pub timestamp: u64,
+}
+
+pub fn emit_insurance_payout(env: &Env, evt: EvtInsurancePayout) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "insurance_payout"),
+        ),
+        (
+            evt.recipient,
+            evt.token,
+            evt.amount,
+            evt.claim_id,
+            evt.timestamp,
+        ),
+    );
+}
+
+pub fn emit_insurance_payout_cap_updated(
+    env: &Env,
+    token: &Address,
+    old_cap: i128,
+    new_cap: i128,
+    updated_by: &Address,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "ins_cap_updated"),
+        ),
+        (token.clone(), old_cap, new_cap, updated_by.clone()),
+    );
+}
+
+// ── Issue #940: Rebate Cap Applied event (duplicate: also closes #947) ──────
+
+/// Emitted when the per-epoch rebate cap is triggered and provider claims
+/// are scaled down proportionally.
+pub struct EvtRebateCapApplied {
+    pub epoch: u64,
+    pub requested: i128,
+    pub distributed: i128,
+}
+
+pub fn emit_rebate_cap_applied(env: &Env, evt: EvtRebateCapApplied) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_collector"),
+            Symbol::new(env, "rebate_cap_applied"),
+        ),
+        (evt.epoch, evt.requested, evt.distributed),
     );
 }

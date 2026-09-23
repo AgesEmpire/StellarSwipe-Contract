@@ -74,7 +74,11 @@ fn test_accept_with_wrong_address_auto_trade() {
 
     // Wrong address tries to accept
     let result = client.try_accept_admin_transfer(&wrong_address);
-    assert!(result.is_err(), "Wrong address cannot accept transfer");
+    assert_eq!(
+        result,
+        Err(Ok(AutoTradeError::Unauthorized)),
+        "Wrong address cannot accept transfer"
+    );
 }
 
 #[test]
@@ -96,7 +100,11 @@ fn test_cancel_admin_transfer_auto_trade() {
 
     // Accepting should now fail
     let result = client.try_accept_admin_transfer(&new_admin);
-    assert!(result.is_err(), "Cannot accept after cancellation");
+    assert_eq!(
+        result,
+        Err(Ok(AutoTradeError::PendingAdminNotFound)),
+        "Cannot accept after cancellation"
+    );
 }
 
 #[test]

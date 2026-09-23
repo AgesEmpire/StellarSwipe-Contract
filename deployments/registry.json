@@ -1,0 +1,32 @@
+{
+  "_comment": "Canonical contract address registry (Issue #881). One entry per network, generated/updated at deploy time from deployments/<network>.json and validated against deployments/<network>.manifest.json. Tooling and operators should read this file (via scripts/deployment_registry.ts) instead of grepping ad-hoc state files. 'address' is null until the contract has been deployed on that network.",
+  "schema_version": 1,
+  "networks": {
+    "testnet": {
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "rpc_url": "https://soroban-testnet.stellar.org",
+      "manifest": "deployments/testnet.manifest.json",
+      "deployed_at": null,
+      "contracts": {
+        "stake_vault": { "address": null, "version": 2 },
+        "signal_registry": { "address": null, "version": 2 },
+        "fee_collector": { "address": null, "version": 2 },
+        "user_portfolio": { "address": null, "version": 2 },
+        "trade_executor": { "address": null, "version": 1 }
+      }
+    },
+    "mainnet": {
+      "network_passphrase": "Public Global Stellar Network ; September 2015",
+      "rpc_url": "https://soroban-rpc.mainnet.stellar.gateway.fm",
+      "manifest": "deployments/mainnet.manifest.example.json",
+      "deployed_at": null,
+      "contracts": {
+        "stake_vault": { "address": null, "version": 2 },
+        "signal_registry": { "address": null, "version": 2 },
+        "fee_collector": { "address": null, "version": 2 },
+        "user_portfolio": { "address": null, "version": 2 },
+        "trade_executor": { "address": null, "version": 1 }
+      }
+    }
+  }
+}

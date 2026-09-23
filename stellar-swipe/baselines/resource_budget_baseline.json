@@ -1,0 +1,52 @@
+{
+  "_comment": "Resource budget baselines for core contract flows (issue #985). Regenerate from the RESOURCE_METRIC lines emitted by contracts/common/src/resource_budget.rs tests. Only update when a cost increase is intentional, and say why in the PR.",
+  "threshold_pct": 10,
+  "limits": {
+    "max_cpu_instructions": 100000000,
+    "max_memory_bytes": 41943040
+  },
+  "flows": {
+    "signal_registry::create_signal": {
+      "cpu_instructions": 2400000,
+      "memory_bytes": 1100000,
+      "read_entries": 3,
+      "write_entries": 2,
+      "host_calls": 24
+    },
+    "signal_registry::create_signal_rejected_invalid": {
+      "cpu_instructions": 900000,
+      "memory_bytes": 500000,
+      "read_entries": 2,
+      "write_entries": 0,
+      "host_calls": 9
+    },
+    "signal_registry::batch_100_signals": {
+      "cpu_instructions": 48000000,
+      "memory_bytes": 12000000,
+      "read_entries": 104,
+      "write_entries": 100,
+      "host_calls": 640
+    },
+    "stake_vault::stake": {
+      "cpu_instructions": 3100000,
+      "memory_bytes": 1400000,
+      "read_entries": 4,
+      "write_entries": 3,
+      "host_calls": 31
+    },
+    "stake_vault::withdraw_insufficient_balance": {
+      "cpu_instructions": 1050000,
+      "memory_bytes": 560000,
+      "read_entries": 3,
+      "write_entries": 0,
+      "host_calls": 11
+    },
+    "fee_collector::distribute_fees_50_participants": {
+      "cpu_instructions": 26000000,
+      "memory_bytes": 7500000,
+      "read_entries": 54,
+      "write_entries": 51,
+      "host_calls": 320
+    }
+  }
+}

@@ -1,0 +1,52 @@
+[package]
+name = "signal_registry-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+soroban-sdk = { version = "=23.0.0", features = ["testutils"] }
+signal_registry = { path = "..", features = ["testutils"] }
+
+# This is a detached workspace (see `[workspace]` below), so it resolves
+# dependencies independently of ../../../Cargo.lock. Left unpinned, cargo's
+# fresh resolution picks up newer soroban-* / ed25519-dalek releases whose
+# APIs have drifted apart (e.g. `soroban-ledger-snapshot` 23.5.x pulling
+# `ed25519-dalek` 3.x, whose `SigningKey::generate` bound
+# `soroban-env-host`'s `with_test_prng` doesn't satisfy — a real upstream
+# incompatibility the parent workspace never hits because its lockfile
+# predates ed25519-dalek 3.0). Pin every soroban-* crate (and the
+# ed25519-dalek it selects) to the exact versions already vetted in
+# ../../../Cargo.lock so this crate builds the same known-good graph.
+soroban-builtin-sdk-macros = "=23.0.1"
+soroban-env-common = "=23.0.1"
+soroban-env-guest = "=23.0.1"
+soroban-env-host = "=23.0.1"
+soroban-env-macros = "=23.0.1"
+soroban-ledger-snapshot = "=23.4.1"
+soroban-sdk-macros = "=23.4.1"
+soroban-spec = "=23.4.1"
+soroban-spec-rust = "=23.4.1"
+ed25519-dalek = "=2.2.0"
+
+[[bin]]
+name = "fuzz_create_signal"
+path = "fuzz_targets/fuzz_create_signal.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+# Detach from the parent `stellar-swipe` workspace: fuzz targets need
+# libfuzzer-sys / arbitrary and a nightly sanitizer build that the deployed
+# contract workspace must never depend on (see `cargo-deny` / CI in
+# `.github/workflows/ci.yml`, which only inspects `stellar-swipe/Cargo.toml`
+# members).
+[workspace]

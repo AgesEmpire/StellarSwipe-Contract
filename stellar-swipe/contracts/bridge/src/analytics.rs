@@ -354,13 +354,12 @@ fn calculate_validator_uptime(
     // Get expected number of signatures (total bridge transfers)
     let total_transfers = bridge_analytics.total_transfers;
 
-    // Uptime = signatures provided / total transfers
-    let uptime_bps = if total_transfers > 0 {
-        ((analytics.total_signatures_provided * BASIS_POINTS_DENOMINATOR as u64) / total_transfers)
-            as u32
-    } else {
-        BASIS_POINTS_DENOMINATOR // 100% if no transfers yet
-    };
+    // Uptime = signatures provided / total transfers.
+    let numerator = analytics.total_signatures_provided * BASIS_POINTS_DENOMINATOR as u64;
+    // Guard against division by zero: with no transfers yet, fall back to 100%.
+    let uptime_bps = numerator
+        .checked_div(total_transfers)
+        .unwrap_or(BASIS_POINTS_DENOMINATOR as u64) as u32;
 
     Ok(uptime_bps)
 }

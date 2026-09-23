@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, contracterror, Address, Env, Map};
+use soroban_sdk::{contracterror, contracttype, Address, Env, Map};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -122,13 +122,20 @@ pub fn execute_proposal(
     let now = env.ledger().timestamp();
 
     // Guard: timelock — proposal must be old enough
-    if now < proposal.created_at.saturating_add(PROPOSAL_TIMELOCK_SECONDS) {
+    if now
+        < proposal
+            .created_at
+            .saturating_add(PROPOSAL_TIMELOCK_SECONDS)
+    {
         return Err(GovernanceError::TimelockNotExpired);
     }
 
     // Guard: cooldown between repeated executions
     if proposal.last_executed_at > 0
-        && now < proposal.last_executed_at.saturating_add(PROPOSAL_COOLDOWN_SECONDS)
+        && now
+            < proposal
+                .last_executed_at
+                .saturating_add(PROPOSAL_COOLDOWN_SECONDS)
     {
         return Err(GovernanceError::ExecutionRateLimited);
     }

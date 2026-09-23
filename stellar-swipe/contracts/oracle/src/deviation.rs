@@ -8,12 +8,15 @@
 use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 use stellar_swipe_common::AssetPair;
 
+use crate::errors::OracleError;
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone)]
 enum DeviationKey {
     Threshold(AssetPair),
+    RejectThreshold(AssetPair),
 }
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
@@ -33,16 +36,41 @@ pub fn get_deviation_threshold(env: &Env, pair: &AssetPair) -> u32 {
         .unwrap_or(0)
 }
 
+/// Set the admin-configurable hard reject threshold in basis points. Unlike
+/// the alert threshold, exceeding this causes `check_deviation` to return
+/// `Err(OracleError::DeviationRejected)` instead of merely emitting an event.
+/// Issue #864.
+pub fn set_deviation_reject_threshold(env: &Env, pair: &AssetPair, threshold_bps: u32) {
+    env.storage()
+        .persistent()
+        .set(&DeviationKey::RejectThreshold(pair.clone()), &threshold_bps);
+}
+
+/// Get the deviation hard reject threshold in basis points. Returns 0 (disabled) if not configured.
+pub fn get_deviation_reject_threshold(env: &Env, pair: &AssetPair) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DeviationKey::RejectThreshold(pair.clone()))
+        .unwrap_or(0)
+}
+
 // ── Check & emit ──────────────────────────────────────────────────────────────
 
-/// Compute max deviation across fresh price sources and emit
-/// `price_deviation_alert` if it exceeds the configured threshold.
+/// Compute max deviation across fresh price sources, emit `price_deviation_alert`
+/// if it exceeds the configured alert threshold, and reject with
+/// `OracleError::DeviationRejected` if it exceeds the configured hard reject
+/// threshold (Issue #864).
 ///
-/// `prices` is the slice of (source, price) from all currently reporting sources.
-pub fn check_deviation(env: &Env, pair: &AssetPair, sources: &Vec<(Address, i128)>) {
+/// `sources` is the slice of (source, price) from all currently reporting sources.
+pub fn check_deviation(
+    env: &Env,
+    pair: &AssetPair,
+    sources: &Vec<(Address, i128)>,
+) -> Result<(), OracleError> {
     let threshold_bps = get_deviation_threshold(env, pair);
-    if threshold_bps == 0 || sources.is_empty() {
-        return;
+    let reject_threshold_bps = get_deviation_reject_threshold(env, pair);
+    if (threshold_bps == 0 && reject_threshold_bps == 0) || sources.is_empty() {
+        return Ok(());
     }
 
     // Find min and max price across all sources
@@ -60,11 +88,12 @@ pub fn check_deviation(env: &Env, pair: &AssetPair, sources: &Vec<(Address, i128
     }
 
     if min_price <= 0 {
-        return;
+        return Ok(());
     }
 
     let deviation_bps = ((max_price - min_price) * 10_000) / min_price;
-    if deviation_bps as u32 > threshold_bps {
+
+    if threshold_bps != 0 && deviation_bps as u32 > threshold_bps {
         // Collect offending source identifiers (all sources contributing to max deviation)
         let mut offending: Vec<Address> = Vec::new(env);
         for i in 0..sources.len() {
@@ -80,4 +109,10 @@ pub fn check_deviation(env: &Env, pair: &AssetPair, sources: &Vec<(Address, i128
             (pair.clone(), deviation_bps as u32, threshold_bps, offending),
         );
     }
+
+    if reject_threshold_bps != 0 && deviation_bps as u32 > reject_threshold_bps {
+        return Err(OracleError::DeviationRejected);
+    }
+
+    Ok(())
 }

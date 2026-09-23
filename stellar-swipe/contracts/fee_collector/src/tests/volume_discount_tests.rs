@@ -65,8 +65,8 @@ fn test_volume_discount_applies_at_exact_threshold_boundary() {
     let config = tiers(
         &env,
         &[
-            (1_000 * 10_000_000, 2),  // Bronze: $1k -> 0.02% off
-            (10_000 * 10_000_000, 5), // Silver: $10k -> 0.05% off
+            (1_000 * 10_000_000, 2),   // Bronze: $1k -> 0.02% off
+            (10_000 * 10_000_000, 5),  // Silver: $10k -> 0.05% off
             (50_000 * 10_000_000, 10), // Gold:  $50k -> 0.10% off
         ],
     );
@@ -104,7 +104,7 @@ fn test_negative_threshold_tier_rejected() {
     let config = tiers(
         &env,
         &[
-            (-1, 10),                 // implicit "always eligible" tier
+            (-1, 10), // implicit "always eligible" tier
             (10_000 * 10_000_000, 5),
             (50_000 * 10_000_000, 10),
         ],

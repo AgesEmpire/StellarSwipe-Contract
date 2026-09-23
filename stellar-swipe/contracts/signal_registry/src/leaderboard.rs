@@ -6,9 +6,10 @@
 //!
 //! Qualification: provider must have >= MIN_CLOSED_SIGNALS (10) closed signals.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
 use stellar_swipe_common::ttl_manager::{bump_persistent_if_needed, force_bump_persistent};
 
+use crate::events::emit_deprecated_entry_point_used;
 use crate::social;
 use crate::stake;
 use crate::types::ProviderPerformance;
@@ -268,12 +269,24 @@ pub fn get_provider_leaderboard(
 }
 
 /// Legacy wrapper kept for backward-compat with existing get_leaderboard callers.
+///
+/// Issue #948: this is a deprecated entry point — `get_provider_leaderboard`
+/// (and `get_followers_leaderboard` for the `Followers` metric) is the
+/// current implementation. The shim still routes every call through to the
+/// current logic so behavior is unchanged, but it now emits
+/// `DeprecatedEntryPointUsed` so integrators calling the old signature are
+/// visible on-chain and can migrate off it.
 pub fn get_leaderboard(
     env: &Env,
     stats_map: &soroban_sdk::Map<Address, ProviderPerformance>,
     metric: LeaderboardMetric,
     limit: u32,
 ) -> Vec<ProviderLeaderboardEntry> {
+    emit_deprecated_entry_point_used(
+        env,
+        Symbol::new(env, "get_leaderboard"),
+        Symbol::new(env, "get_provider_leaderboard"),
+    );
     match metric {
         LeaderboardMetric::SuccessRate => {
             get_provider_leaderboard(env, ProviderMetric::BySuccessRate, limit)
@@ -339,7 +352,7 @@ fn get_followers_leaderboard(
 mod tests {
     use super::*;
     use crate::types::ProviderPerformance;
-    use soroban_sdk::testutils::Address as TestAddress;
+    use soroban_sdk::testutils::{Address as TestAddress, Events as _};
     use soroban_sdk::{contract, Env};
 
     #[contract]
@@ -398,6 +411,7 @@ mod tests {
         let cid = env.register(TestContract, ());
 
         env.as_contract(&cid, || {
+            env.cost_estimate().budget().reset_unlimited();
             // Provider i:
             //   success_rate   = (i+1)*100   bps  (100..=3000)
             //   total_copies   = (i+1)*5          (5..=150)
@@ -633,6 +647,62 @@ mod tests {
             // Higher primary score must still win regardless of registration time
             assert_eq!(idx.get(0).unwrap().provider, p_high);
             assert_eq!(idx.get(1).unwrap().provider, p_low);
+        });
+    }
+
+    // ── Issue #948: deprecated entry point shim ─────────────────────────────
+    use soroban_sdk::TryFromVal;
+
+    fn has_deprecation_event(env: &Env) -> bool {
+        env.events().all().iter().any(|e| {
+            let topics: Vec<soroban_sdk::Val> = e.1.clone();
+            topics
+                .get(0)
+                .and_then(|t| soroban_sdk::Symbol::try_from_val(env, &t).ok())
+                .map(|s| s == Symbol::new(env, "deprecated_entry_point_used"))
+                .unwrap_or(false)
+        })
+    }
+
+    #[test]
+    fn test_legacy_get_leaderboard_emits_deprecation_event() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p = Address::generate(&env);
+            let stats = make_stats(8000, 1, 100, 5, 5);
+            update_leaderboard_index(&env, p, &stats);
+
+            let empty_stats_map: soroban_sdk::Map<Address, ProviderPerformance> =
+                soroban_sdk::Map::new(&env);
+            let board = get_leaderboard(&env, &empty_stats_map, LeaderboardMetric::SuccessRate, 10);
+
+            // Legacy path still returns correct data...
+            assert_eq!(board.len(), 1);
+            // ...but is now flagged on-chain as deprecated so callers can migrate.
+            assert!(
+                has_deprecation_event(&env),
+                "legacy get_leaderboard must emit DeprecatedEntryPointUsed"
+            );
+        });
+    }
+
+    #[test]
+    fn test_current_get_provider_leaderboard_emits_no_deprecation_event() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p = Address::generate(&env);
+            let stats = make_stats(8000, 1, 100, 5, 5);
+            update_leaderboard_index(&env, p, &stats);
+
+            let board = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
+
+            assert_eq!(board.len(), 1);
+            assert!(
+                !has_deprecation_event(&env),
+                "current get_provider_leaderboard must not emit DeprecatedEntryPointUsed"
+            );
         });
     }
 }

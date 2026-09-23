@@ -406,6 +406,14 @@ pub fn get_min_stake(env: &Env) -> i128 {
 
 /// Set trade fee in basis points
 pub fn set_trade_fee(env: &Env, caller: &Address, new_fee_bps: u32) -> Result<(), AdminError> {
+    if is_multisig_enabled(env) {
+        // Direct calls are blocked when the multisig approval workflow is
+        // active; changes must go through propose/approve/execute.
+        if !is_multisig_signer(env, caller) {
+            return Err(AdminError::Unauthorized);
+        }
+        return Err(AdminError::RequiresMultisigApproval);
+    }
     require_config_admin(env, caller)?;
     caller.require_auth();
     set_trade_fee_direct(env, caller, new_fee_bps)
@@ -530,6 +538,13 @@ pub fn pause_category(
 ) -> Result<(), AdminError> {
     if is_guardian(env, caller) {
         caller.require_auth();
+    } else if is_multisig_enabled(env) {
+        // Direct calls are blocked when the multisig approval workflow is
+        // active; changes must go through propose/approve/execute.
+        if !is_multisig_signer(env, caller) {
+            return Err(AdminError::Unauthorized);
+        }
+        return Err(AdminError::RequiresMultisigApproval);
     } else {
         require_emergency_admin(env, caller)?;
         caller.require_auth();

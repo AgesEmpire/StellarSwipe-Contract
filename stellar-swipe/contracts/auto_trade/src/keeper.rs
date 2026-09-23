@@ -134,8 +134,12 @@ mod tests {
         let (env, cid, admin) = setup();
         let keeper = Address::generate(&env);
 
+        // Admin ops each run in their own frame: two `require_auth` calls on
+        // the same address inside one frame raise "frame is already authorized".
         env.as_contract(&cid, || {
             add_keeper(&env, &admin, keeper.clone()).unwrap();
+        });
+        env.as_contract(&cid, || {
             remove_keeper(&env, &admin, &keeper).unwrap();
             let result = require_registered_keeper(&env, &keeper);
             assert_eq!(result, Err(AutoTradeError::Unauthorized));
@@ -149,6 +153,8 @@ mod tests {
 
         env.as_contract(&cid, || {
             add_keeper(&env, &admin, keeper.clone()).unwrap();
+        });
+        env.as_contract(&cid, || {
             add_keeper(&env, &admin, keeper.clone()).unwrap(); // second add is no-op
             assert_eq!(list_keepers(&env).len(), 1);
         });

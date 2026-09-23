@@ -230,7 +230,7 @@ mod proofs {
     fn single_deposit_preserves_invariant() {
         let mut vault = VaultModel::new();
         let amount: i128 = kani::any();
-        kani::assume!(amount > 0 && amount <= MAX_AMOUNT);
+        kani::assume(amount > 0 && amount <= MAX_AMOUNT);
 
         vault.deposit(0, amount);
         assert!(
@@ -244,7 +244,7 @@ mod proofs {
     fn withdraw_preserves_invariant() {
         let mut vault = VaultModel::new();
         let amount: i128 = kani::any();
-        kani::assume!(amount > 0 && amount <= MAX_AMOUNT);
+        kani::assume(amount > 0 && amount <= MAX_AMOUNT);
 
         assert!(vault.deposit(0, amount));
         assert!(vault.invariant_holds(), "after deposit");
@@ -260,8 +260,8 @@ mod proofs {
         let mut vault = VaultModel::new();
         let amount: i128 = kani::any();
         let tier_bps: i128 = kani::any();
-        kani::assume!(amount > 0 && amount <= MAX_AMOUNT);
-        kani::assume!(tier_bps >= 0 && tier_bps <= BPS_DENOMINATOR);
+        kani::assume(amount > 0 && amount <= MAX_AMOUNT);
+        kani::assume(tier_bps >= 0 && tier_bps <= BPS_DENOMINATOR);
 
         vault.deposit(0, amount);
         vault.slash(0, tier_bps);
@@ -275,9 +275,9 @@ mod proofs {
         let a0: i128 = kani::any();
         let a1: i128 = kani::any();
         let tier_bps: i128 = kani::any();
-        kani::assume!(a0 > 0 && a0 <= MAX_AMOUNT);
-        kani::assume!(a1 > 0 && a1 <= MAX_AMOUNT);
-        kani::assume!(tier_bps >= 0 && tier_bps <= BPS_DENOMINATOR);
+        kani::assume(a0 > 0 && a0 <= MAX_AMOUNT);
+        kani::assume(a1 > 0 && a1 <= MAX_AMOUNT);
+        kani::assume(tier_bps >= 0 && tier_bps <= BPS_DENOMINATOR);
 
         vault.deposit(0, a0);
         assert!(vault.invariant_holds());
@@ -301,7 +301,7 @@ mod proofs {
 
         // Seed one staker so withdraw/slash operations have something to act on.
         let seed: i128 = kani::any();
-        kani::assume!(seed > 0 && seed <= MAX_AMOUNT);
+        kani::assume(seed > 0 && seed <= MAX_AMOUNT);
         vault.deposit(0, seed);
         assert!(vault.invariant_holds(), "after seed deposit");
 
@@ -311,11 +311,11 @@ mod proofs {
             let amount: i128 = kani::any();
             let tier_bps: i128 = kani::any();
 
-            kani::assume!(idx < N_STAKERS);
-            kani::assume!(amount > 0 && amount <= MAX_AMOUNT);
-            kani::assume!(tier_bps >= 0 && tier_bps <= BPS_DENOMINATOR);
+            kani::assume(idx < N_STAKERS);
+            kani::assume(amount > 0 && amount <= MAX_AMOUNT);
+            kani::assume(tier_bps >= 0 && tier_bps <= BPS_DENOMINATOR);
             // Prevent vault_total from overflowing during the deposit path.
-            kani::assume!(vault.vault_total.checked_add(amount).is_some());
+            kani::assume(vault.vault_total.checked_add(amount).is_some());
 
             match op % 3 {
                 0 => {

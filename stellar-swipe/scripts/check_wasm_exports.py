@@ -3,7 +3,7 @@
 check_wasm_exports.py — detect breaking changes to Soroban contract ABI exports.
 
 Usage:
-    python3 scripts/check_wasm_exports.py [--wasm-dir <dir>]
+    python3 scripts/check_wasm_exports.py [--wasm-dir <dir>] [--format text|markdown]
 
     The script is run automatically in CI after the optimized WASM build step.
     It can also be run locally against any directory of *.wasm files.
@@ -186,15 +186,18 @@ def has_breaking_ack(contract_name: str) -> bool:
     return (BASELINES_DIR / f"{contract_name}.breaking.txt").exists()
 
 
-# ── Core comparison logic ──────────────────────────────────────────────────────
+# ── Core analysis ──────────────────────────────────────────────────────────────
 
-def check_contract(wasm_path: Path) -> Tuple[bool, bool]:
-    """Check one WASM file against its baseline.
+def analyze_contract(wasm_path: Path) -> dict:
+    """Analyze one WASM file against its baseline.
 
-    Returns:
-        (has_breaking_change, baseline_updated)
+    Returns a structured result dict with keys:
+        contract, status, exports, exports_count,
+        added, removed, spec_hash, baseline_spec_hash,
+        spec_changed, baseline_updated, breaking, baseline,
+        ack_file_present
     """
-    contract_name = wasm_path.stem  # e.g. "signal_registry"
+    contract_name = wasm_path.stem
     wasm_data = wasm_path.read_bytes()
 
     current_exports = sorted(extract_export_names(wasm_data))
@@ -207,114 +210,160 @@ def check_contract(wasm_path: Path) -> Tuple[bool, bool]:
     }
 
     baseline = load_baseline(contract_name)
+    ack = has_breaking_ack(contract_name)
+
     if baseline is None:
-        # First run — generate the baseline.
         save_baseline(contract_name, current)
-        print(
-            f"  [{contract_name}] No baseline found — created initial snapshot "
-            f"({len(current_exports)} exports). Commit abi-baselines/{contract_name}.json."
-        )
-        return False, True
+        return {
+            "contract": contract_name,
+            "status": "first_run",
+            "exports": current_exports,
+            "exports_count": len(current_exports),
+            "added": [],
+            "removed": [],
+            "spec_hash": current_spec_hash,
+            "baseline_spec_hash": "",
+            "spec_changed": False,
+            "baseline_updated": True,
+            "baseline": None,
+            "ack_file_present": False,
+        }
 
     baseline_exports = set(baseline.get("exports", []))
     current_exports_set = set(current_exports)
     baseline_spec_hash = baseline.get("spec_hash", "")
 
-    removed = baseline_exports - current_exports_set
-    added = current_exports_set - baseline_exports
+    removed = sorted(baseline_exports - current_exports_set)
+    added = sorted(current_exports_set - baseline_exports)
     spec_changed = (
         current_spec_hash != baseline_spec_hash
         and baseline_spec_hash != ""
         and current_spec_hash != ""
     )
-
     breaking = bool(removed) or spec_changed
 
+    baseline_updated = False
+
     if breaking:
-        if has_breaking_ack(contract_name):
-            print(
-                f"  [{contract_name}] Breaking change ACKNOWLEDGED "
-                f"(abi-baselines/{contract_name}.breaking.txt present)."
-            )
-            if removed:
-                print(f"    Removed exports: {sorted(removed)}")
-            if spec_changed:
-                print(
-                    f"    Spec hash changed: {baseline_spec_hash[:16]}... "
-                    f"→ {current_spec_hash[:16]}..."
-                )
-            # Update baseline to reflect intentional change.
+        if ack:
             save_baseline(contract_name, current)
-            return False, True
+            baseline_updated = True
+            return {
+                "contract": contract_name,
+                "status": "breaking_acknowledged",
+                "exports": current_exports,
+                "exports_count": len(current_exports),
+                "added": added,
+                "removed": removed,
+                "spec_hash": current_spec_hash,
+                "baseline_spec_hash": baseline_spec_hash,
+                "spec_changed": spec_changed,
+                "baseline_updated": True,
+                "baseline": baseline,
+                "ack_file_present": True,
+            }
         else:
-            print(f"  [{contract_name}] BREAKING CHANGE DETECTED:", file=sys.stderr)
-            if removed:
+            return {
+                "contract": contract_name,
+                "status": "breaking",
+                "exports": current_exports,
+                "exports_count": len(current_exports),
+                "added": added,
+                "removed": removed,
+                "spec_hash": current_spec_hash,
+                "baseline_spec_hash": baseline_spec_hash,
+                "spec_changed": spec_changed,
+                "baseline_updated": False,
+                "baseline": baseline,
+                "ack_file_present": False,
+            }
+
+    updated = False
+    if added:
+        save_baseline(contract_name, current)
+        updated = True
+
+    return {
+        "contract": contract_name,
+        "status": "updated" if updated else "ok",
+        "exports": current_exports,
+        "exports_count": len(current_exports),
+        "added": added,
+        "removed": [],
+        "spec_hash": current_spec_hash,
+        "baseline_spec_hash": baseline_spec_hash,
+        "spec_changed": False,
+        "baseline_updated": updated,
+        "baseline": baseline,
+        "ack_file_present": False,
+    }
+
+
+# ── Renderers ──────────────────────────────────────────────────────────────────
+
+def render_text(results: List[dict]) -> int:
+    """Print text-formatted output (original behavior). Return exit code."""
+    any_breaking = False
+    any_updated = False
+
+    for r in results:
+        s = r["status"]
+
+        if s == "first_run":
+            print(
+                f"  [{r['contract']}] No baseline found — created initial snapshot "
+                f"({r['exports_count']} exports). "
+                f"Commit abi-baselines/{r['contract']}.json."
+            )
+
+        elif s == "breaking_acknowledged":
+            print(
+                f"  [{r['contract']}] Breaking change ACKNOWLEDGED "
+                f"(abi-baselines/{r['contract']}.breaking.txt present)."
+            )
+            if r["removed"]:
+                print(f"    Removed exports: {r['removed']}")
+            if r["spec_changed"]:
                 print(
-                    f"    Removed exports (callers will break): {sorted(removed)}",
+                    f"    Spec hash changed: {r['baseline_spec_hash'][:16]}... "
+                    f"\u2192 {r['spec_hash'][:16]}..."
+                )
+
+        elif s == "breaking":
+            any_breaking = True
+            print(f"  [{r['contract']}] BREAKING CHANGE DETECTED:", file=sys.stderr)
+            if r["removed"]:
+                print(
+                    f"    Removed exports (callers will break): {r['removed']}",
                     file=sys.stderr,
                 )
-            if spec_changed:
+            if r["spec_changed"]:
                 print(
                     f"    Contract spec hash changed (parameter signatures may have "
                     f"changed):\n"
-                    f"      baseline : {baseline_spec_hash[:32]}...\n"
-                    f"      current  : {current_spec_hash[:32]}...",
+                    f"      baseline : {r['baseline_spec_hash'][:32]}...\n"
+                    f"      current  : {r['spec_hash'][:32]}...",
                     file=sys.stderr,
                 )
             print(
                 f"    To acknowledge this deliberate breaking change, create:\n"
-                f"      abi-baselines/{contract_name}.breaking.txt\n"
+                f"      abi-baselines/{r['contract']}.breaking.txt\n"
                 f"    and ensure a migration / major-version bump accompanies it.",
                 file=sys.stderr,
             )
-            return True, False
 
-    # Non-breaking — may have new exports.
-    updated = False
-    if added:
-        print(f"  [{contract_name}] New exports added: {sorted(added)} — updating baseline.")
-        save_baseline(contract_name, current)
-        updated = True
-    else:
-        print(f"  [{contract_name}] OK ({len(current_exports)} exports, spec hash matches).")
+        elif s == "updated":
+            any_updated = True
+            print(
+                f"  [{r['contract']}] New exports added: {r['added']} "
+                f"\u2014 updating baseline."
+            )
 
-    return False, updated
-
-
-# ── Entry point ────────────────────────────────────────────────────────────────
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--wasm-dir",
-        default=str(WASM_DIR_DEFAULT),
-        help="Directory containing optimized *.wasm files (default: target/wasm-optimized/)",
-    )
-    args = parser.parse_args()
-
-    wasm_dir = Path(args.wasm_dir)
-    if not wasm_dir.is_dir():
-        print(
-            f"WASM directory not found: {wasm_dir}\n"
-            f"Build the contracts first: cd stellar-swipe && ./scripts/build.sh",
-            file=sys.stderr,
-        )
-        return 1
-
-    wasm_files = sorted(wasm_dir.glob("*.wasm"))
-    if not wasm_files:
-        print(f"No *.wasm files found in {wasm_dir}", file=sys.stderr)
-        return 1
-
-    print(f"Checking {len(wasm_files)} WASM contract(s) in {wasm_dir}:")
-
-    any_breaking = False
-    any_updated = False
-
-    for wasm_path in wasm_files:
-        breaking, updated = check_contract(wasm_path)
-        any_breaking = any_breaking or breaking
-        any_updated = any_updated or updated
+        else:  # ok
+            print(
+                f"  [{r['contract']}] OK "
+                f"({r['exports_count']} exports, spec hash matches)."
+            )
 
     print()
     if any_breaking:
@@ -333,6 +382,258 @@ def main() -> int:
         return 2
 
     print("RESULT: All contract ABIs match their committed baselines.")
+    return 0
+
+
+def render_markdown(results: List[dict]) -> str:
+    """Return a markdown-formatted ABI diff report."""
+    lines = []
+    lines.append("## WASM ABI Export Diff Report")
+    lines.append("")
+
+    # Summary table
+    lines.append("| Contract | Status | Exports | Details |")
+    lines.append("|---|---|---|---|")
+
+    for r in results:
+        s = r["status"]
+        name = r["contract"]
+        count = r["exports_count"]
+
+        if s == "ok":
+            status = "OK"
+            details = "Spec hash matches baseline"
+        elif s == "first_run":
+            status = "NEW"
+            details = f"Initial snapshot created ({count} exports)"
+        elif s == "updated":
+            added = r["added"]
+            status = "UPDATED"
+            detail_parts = []
+            if added:
+                detail_parts.append(f"+{len(added)} export{'s' if len(added)>1 else ''}")
+            detail_parts.append("Baseline updated")
+            details = ", ".join(detail_parts)
+        elif s == "breaking_acknowledged":
+            status = "ACKNOWLEDGED"
+            detail_parts = []
+            if r["removed"]:
+                detail_parts.append(f"-{len(r['removed'])} export{'s' if len(r['removed'])>1 else ''}")
+            if r["spec_changed"]:
+                detail_parts.append("spec hash changed")
+            detail_parts.append("breaking.txt present")
+            details = ", ".join(detail_parts)
+        elif s == "breaking":
+            status = "**BREAKING**"
+            detail_parts = []
+            if r["removed"]:
+                detail_parts.append(f"-{len(r['removed'])} export{'s' if len(r['removed'])>1 else ''}")
+            if r["spec_changed"]:
+                detail_parts.append("spec hash changed")
+            details = ", ".join(detail_parts) if detail_parts else "ABI mismatch"
+
+        lines.append(f"| `{name}` | {status} | {count} | {details} |")
+
+    lines.append("")
+
+    # Per-contract details
+    for r in results:
+        s = r["status"]
+        name = r["contract"]
+
+        if s == "ok":
+            continue
+
+        lines.append(f"### `{name}`")
+        lines.append("")
+
+        if s == "first_run":
+            lines.append(
+                f"No baseline found — created initial snapshot "
+                f"({r['exports_count']} exports).\n"
+            )
+            lines.append(
+                f"> Commit `abi-baselines/{name}.json` to version the baseline."
+            )
+
+        elif s == "updated":
+            if r["added"]:
+                lines.append(f"**New exports added:** `{'`, `'.join(r['added'])}`")
+            lines.append("")
+            lines.append("> Baseline auto-updated. Commit the updated `abi-baselines/*.json` files.")
+
+        elif s == "breaking_acknowledged":
+            lines.append("**Breaking change ACKNOWLEDGED** (`breaking.txt` present).")
+            if r["removed"]:
+                lines.append(f"")
+                lines.append(f"- Removed exports: `{'`, `'.join(r['removed'])}`")
+            if r["spec_changed"]:
+                lines.append(f"")
+                lines.append(f"- Spec hash changed: `{r['baseline_spec_hash'][:16]}...` → `{r['spec_hash'][:16]}...`")
+            lines.append("")
+            lines.append("> Baseline updated to reflect intentional change.")
+
+        elif s == "breaking":
+            lines.append("**BREAKING CHANGE DETECTED** — review required.")
+            if r["removed"]:
+                lines.append(f"")
+                lines.append(f"- Removed exports (callers will break): `{'`, `'.join(r['removed'])}`")
+            if r["spec_changed"]:
+                lines.append(f"")
+                lines.append(
+                    f"- Contract spec hash changed (parameter signatures may have changed):\n"
+                    f"  - baseline: `{r['baseline_spec_hash'][:32]}...`\n"
+                    f"  - current:  `{r['spec_hash'][:32]}...`"
+                )
+            lines.append("")
+            lines.append(
+                "> **To acknowledge this deliberate breaking change:**\n"
+                f"> 1. Create `abi-baselines/{name}.breaking.txt` with a short reason.\n"
+                "> 2. Ensure a migration / major-version bump accompanies it.\n"
+                "> 3. Re-run CI to update the baseline."
+            )
+
+        lines.append("")
+
+    # Result line
+    any_breaking = any(r["status"] == "breaking" for r in results)
+    any_updated = any(r["status"] in ("updated", "first_run", "breaking_acknowledged") for r in results)
+
+    lines.append("---")
+    lines.append("")
+    if any_breaking:
+        lines.append(
+            "**Result: Breaking ABI changes detected without acknowledgement.**\n"
+            "Fix or acknowledge before merging (see details above)."
+        )
+    elif any_updated:
+        lines.append(
+            "**Result: Baselines updated.**\n"
+            "Commit the updated `abi-baselines/*.json` files (and any `.breaking.txt` files) "
+            "alongside this PR."
+        )
+    else:
+        lines.append(
+            "**Result: All contract ABIs match their committed baselines.**"
+        )
+
+    return "\n".join(lines)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--wasm-dir",
+        default=str(WASM_DIR_DEFAULT),
+        help="Directory containing optimized *.wasm files (default: target/wasm-optimized/)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["text", "markdown"],
+        default="text",
+        help="Output format (default: text)",
+    )
+    args = parser.parse_args()
+
+    wasm_dir = Path(args.wasm_dir)
+    if not wasm_dir.is_dir():
+        print(
+            f"WASM directory not found: {wasm_dir}\n"
+            f"Build the contracts first: cd stellar-swipe && ./scripts/build.sh",
+            file=sys.stderr,
+        )
+        return 1
+
+    wasm_files = sorted(wasm_dir.glob("*.wasm"))
+    if not wasm_files:
+        print(f"No *.wasm files found in {wasm_dir}", file=sys.stderr)
+        return 1
+
+    print(f"Checking {len(wasm_files)} WASM contract(s) in {wasm_dir}:", file=sys.stderr if args.format == "markdown" else sys.stdout)
+
+    results = []
+    for wasm_path in wasm_files:
+        result = analyze_contract(wasm_path)
+        results.append(result)
+
+    if args.format == "markdown":
+        print(render_markdown(results))
+    else:
+        for r in results:
+            s = r["status"]
+            if s == "first_run":
+                print(
+                    f"  [{r['contract']}] No baseline found — created initial snapshot "
+                    f"({r['exports_count']} exports). "
+                    f"Commit abi-baselines/{r['contract']}.json."
+                )
+            elif s == "breaking_acknowledged":
+                print(
+                    f"  [{r['contract']}] Breaking change ACKNOWLEDGED "
+                    f"(abi-baselines/{r['contract']}.breaking.txt present)."
+                )
+                if r["removed"]:
+                    print(f"    Removed exports: {r['removed']}")
+                if r["spec_changed"]:
+                    print(
+                        f"    Spec hash changed: {r['baseline_spec_hash'][:16]}... "
+                        f"\u2192 {r['spec_hash'][:16]}..."
+                    )
+            elif s == "breaking":
+                print(f"  [{r['contract']}] BREAKING CHANGE DETECTED:", file=sys.stderr)
+                if r["removed"]:
+                    print(
+                        f"    Removed exports (callers will break): {r['removed']}",
+                        file=sys.stderr,
+                    )
+                if r["spec_changed"]:
+                    print(
+                        f"    Contract spec hash changed (parameter signatures may have "
+                        f"changed):\n"
+                        f"      baseline : {r['baseline_spec_hash'][:32]}...\n"
+                        f"      current  : {r['spec_hash'][:32]}...",
+                        file=sys.stderr,
+                    )
+                print(
+                    f"    To acknowledge this deliberate breaking change, create:\n"
+                    f"      abi-baselines/{r['contract']}.breaking.txt\n"
+                    f"    and ensure a migration / major-version bump accompanies it.",
+                    file=sys.stderr,
+                )
+            elif s == "updated":
+                print(
+                    f"  [{r['contract']}] New exports added: {r['added']} "
+                    f"\u2014 updating baseline."
+                )
+            else:
+                print(
+                    f"  [{r['contract']}] OK "
+                    f"({r['exports_count']} exports, spec hash matches)."
+                )
+
+        print()
+        any_breaking = any(r["status"] == "breaking" for r in results)
+        any_updated = any(r["status"] in ("updated", "first_run", "breaking_acknowledged") for r in results)
+
+        if any_breaking:
+            print(
+                "RESULT: One or more breaking ABI changes detected without acknowledgement.\n"
+                "        See errors above. Fix or acknowledge before merging.",
+                file=sys.stderr,
+            )
+            return 1
+
+        if any_updated:
+            print(
+                "RESULT: Baselines updated for new or intentionally changed exports.\n"
+                "        Commit the updated abi-baselines/*.json files."
+            )
+            return 2
+
+        print("RESULT: All contract ABIs match their committed baselines.")
+
     return 0
 
 

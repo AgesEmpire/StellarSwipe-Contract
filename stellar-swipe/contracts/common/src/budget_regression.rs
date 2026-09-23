@@ -30,6 +30,17 @@ pub fn assert_within_budget(name: &str, baseline: u64, actual: u64) {
     );
 }
 
+/// Emits a `BUDGET_METRIC` line consumed by `scripts/check_budget_baseline.py`
+/// and asserts the cost is within [`REGRESSION_THRESHOLD_PCT`] of `baseline`.
+pub fn measure_and_emit(name: &str, baseline: u64, actual: u64) {
+    #[cfg(test)]
+    {
+        extern crate std;
+        std::println!("BUDGET_METRIC: {}={}", name, actual);
+    }
+    assert_within_budget(name, baseline, actual);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

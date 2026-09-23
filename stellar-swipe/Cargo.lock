@@ -210,6 +210,7 @@ dependencies = [
 name = "bridge"
 version = "0.1.0"
 dependencies = [
+ "shared",
  "soroban-sdk",
  "stellar_swipe_common",
 ]
@@ -806,6 +807,7 @@ version = "0.0.0"
 dependencies = [
  "fee_collector",
  "proptest",
+ "shared",
  "signal_registry",
  "soroban-sdk",
  "stake_vault",
@@ -1329,6 +1331,7 @@ dependencies = [
 name = "shared"
 version = "0.0.0"
 dependencies = [
+ "proptest",
  "soroban-sdk",
 ]
 
@@ -1343,6 +1346,7 @@ name = "signal_registry"
 version = "0.0.0"
 dependencies = [
  "dlmalloc",
+ "proptest",
  "shared",
  "soroban-sdk",
  "stellar_swipe_common",
@@ -1715,6 +1719,7 @@ dependencies = [
 name = "trade_executor"
 version = "0.0.0"
 dependencies = [
+ "arbitrary",
  "proptest",
  "shared",
  "soroban-sdk",

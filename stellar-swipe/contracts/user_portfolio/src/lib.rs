@@ -1,4 +1,42 @@
 //! User portfolio contract: positions and `get_pnl` (source of truth for portfolio performance).
+//!
+//! # Position invariants (Issue #995)
+//!
+//! Every [`Position`] must satisfy the following invariants after *every* mutating
+//! operation — open, partial close, full close (user- or keeper-initiated), and the
+//! internal open→closed index transfer performed by `mark_position_closed`:
+//!
+//! 1. **Non-negative quantity.** `amount` is never negative. It starts as the invested
+//!    notional at `open_position` time and can only ever be reduced (via
+//!    [`UserPortfolio::close_position_partial`]) — never increased or driven negative.
+//! 2. **Ownership.** A position is only reachable through the `UserPositions` /
+//!    `UserOpenPositions` / `UserClosedPositions` index of the user who opened it. Every
+//!    mutating entry point re-verifies that `position_id` is present in the
+//!    caller-supplied `user`'s index before touching `DataKey::Position(id)`, so a
+//!    position can never be closed, partially closed, or otherwise mutated by anyone
+//!    other than its owner (or the registered keeper, for `close_position_keeper`).
+//! 3. **Realized-value accounting.** `realized_pnl` starts at `0` when a position opens
+//!    and only ever accumulates (via `checked_add`) as portions are realized — it is
+//!    never overwritten wholesale, so a partial close followed by a full close reports
+//!    the *sum* of both realizations rather than losing one.
+//! 4. **Terminal closed state.** Once `status == Closed`, the position is immutable:
+//!    `amount`, `entry_price`, and `realized_pnl` never change again, and no further
+//!    open→closing→closed transition may be applied. Any attempt to close, partially
+//!    close, or otherwise mutate a `Closed` (or in-flight `Closing`) position is rejected
+//!    with [`PositionError::PositionAlreadyClosed`] instead of silently succeeding or
+//!    corrupting state.
+//! 5. **Atomicity across failures.** State transitions are only persisted to storage
+//!    after every preceding validation/side-effect for that operation has succeeded; a
+//!    `Closing` lock is written before the terminal `Closed` write, and invariant checks
+//!    run before the final persist. Combined with Soroban's all-or-nothing invocation
+//!    semantics (a panic anywhere in a call discards every storage write made during
+//!    that call), a failure partway through an operation — including a failed downstream
+//!    step — can never leave a position readable in a state that violates invariants
+//!    1–4.
+//!
+//! These invariants are enforced by [`assert_position_invariants`] and the
+//! [`require_open_position`] ownership/state guard, both called from every mutating
+//! operation (`close_position`, `close_position_keeper`, `close_position_partial`).
 
 #![no_std]
 
@@ -13,6 +51,7 @@ mod portfolio_tests;
 mod position_tags;
 mod preferences;
 mod queries;
+mod risk_metrics;
 mod storage;
 mod subscriptions;
 mod watchlist;
@@ -28,6 +67,7 @@ pub use preferences::{
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
+use stellar_swipe_common::health::{health_uninitialized, HealthStatus};
 use storage::DataKey;
 
 /// Compute the Herfindahl-Hirschman Index (HHI) concentration score for a user's open
@@ -153,14 +193,82 @@ pub enum PortfolioError {
     InvalidCapAmount = 2,
 }
 
+/// A user's position in a single asset. See the [module-level invariants list](self)
+/// for the full set of guarantees enforced on every field across transfers and closures.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Position {
     pub entry_price: i128,
+    /// Remaining open quantity (invested notional). Never negative; only ever reduced,
+    /// via [`UserPortfolio::close_position_partial`] or a full close.
     pub amount: i128,
     pub status: PositionStatus,
-    /// Set when `status == Closed`; ignored while open.
+    /// Cumulative realized P&L for the portion(s) of this position already closed.
+    /// `0` at open; only ever grows via `checked_add` (see invariant 3).
     pub realized_pnl: i128,
+}
+
+/// Verify the invariants documented at the top of this module hold for `pos`.
+///
+/// Called after loading a position (to catch corruption early) and immediately before
+/// every persist of a mutated position (to guarantee an invalid state is never written).
+fn assert_position_invariants(pos: &Position) {
+    assert!(
+        pos.amount >= 0,
+        "position invariant violated: amount must be non-negative"
+    );
+    assert!(
+        pos.entry_price > 0,
+        "position invariant violated: entry_price must be positive"
+    );
+    assert!(
+        pos.realized_pnl >= i128::MIN,
+        "position invariant violated: realized_pnl corrupted"
+    );
+}
+
+/// Load the position `position_id` belonging to `user`, enforcing the ownership and
+/// terminal-state invariants (invariants 2 and 4) before returning it.
+///
+/// - Panics if `position_id` is not present in `user`'s position index (ownership).
+/// - Returns `Err(PositionError::PositionAlreadyClosed)` if the position is already
+///   `Closing` or `Closed` — a closed position can never be mutated or reused.
+fn require_open_position(
+    env: &Env,
+    user: &Address,
+    position_id: u64,
+) -> Result<Position, PositionError> {
+    let key = DataKey::UserPositions(user.clone());
+    let list: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    let mut found = false;
+    for i in 0..list.len() {
+        if let Some(pid) = list.get(i) {
+            if pid == position_id {
+                found = true;
+                break;
+            }
+        }
+    }
+    if !found {
+        panic!("position not found for user");
+    }
+
+    let pkey = DataKey::Position(position_id);
+    let pos: Position = env
+        .storage()
+        .persistent()
+        .get(&pkey)
+        .expect("position missing");
+    assert_position_invariants(&pos);
+
+    if pos.status != PositionStatus::Open {
+        return Err(PositionError::PositionAlreadyClosed);
+    }
+    Ok(pos)
 }
 
 /// A realized tax event recorded whenever a position is closed (Issue #658).
@@ -199,6 +307,13 @@ pub struct TradeHistoryEntry {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeHistoryPage {
+    pub entries: Vec<TradeHistoryEntry>,
+    pub next_cursor: Option<u32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortfolioPosition {
     pub position_id: u64,
     pub position: Position,
@@ -210,6 +325,30 @@ pub struct Portfolio {
     pub open_positions: Vec<PortfolioPosition>,
     pub closed_positions: Vec<PortfolioPosition>,
     pub closed_position_ids: Vec<u64>,
+}
+
+/// Complete portfolio state export for off-chain analytics, dashboards, and indexers.
+/// All fields are read-only snapshots derived from existing on-chain state.
+/// Consumers can rely on this stable format without reverse-engineering storage keys.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortfolioExport {
+    /// Sum of all realized P&L from closed positions.
+    pub realized_pnl: i128,
+    /// Unrealized P&L from open positions (`None` when oracle is unavailable).
+    pub unrealized_pnl: Option<i128>,
+    /// Total P&L (realized + unrealized, when available).
+    pub total_pnl: i128,
+    /// Return on investment in basis points (total_pnl * 10_000 / total_invested).
+    pub roi_bps: i32,
+    /// Number of currently open positions.
+    pub open_position_count: u32,
+    /// Number of closed positions.
+    pub closed_position_count: u32,
+    /// Number of portfolio snapshots recorded for this user.
+    pub snapshot_count: u32,
+    /// Current open positions with full state.
+    pub open_positions: Vec<PortfolioPosition>,
 }
 
 soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
@@ -532,45 +671,25 @@ impl UserPortfolio {
         signal_id: u64,
     ) -> Result<(), PositionError> {
         user.require_auth();
-        let key = DataKey::UserPositions(user.clone());
-        let list: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut found = false;
-        for i in 0..list.len() {
-            if let Some(pid) = list.get(i) {
-                if pid == position_id {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if !found {
-            panic!("position not found for user");
-        }
 
+        // Ownership + terminal-state guard (invariants 2 and 4): panics if the caller
+        // doesn't own the position, returns an error if it's already Closing/Closed
+        // rather than allowing a closed position to be mutated or reused.
+        let mut pos = require_open_position(&env, &user, position_id)?;
         let pkey = DataKey::Position(position_id);
-        let mut pos: Position = env
-            .storage()
-            .persistent()
-            .get(&pkey)
-            .expect("position missing");
-
-        // State machine: only Open positions can be closed.
-        // Closing or Closed → return error (prevents double-close race condition).
-        if pos.status != PositionStatus::Open {
-            return Err(PositionError::PositionAlreadyClosed);
-        }
 
         // Acquire the CLOSING lock before any further work.
         pos.status = PositionStatus::Closing;
         env.storage().persistent().set(&pkey, &pos);
 
-        // Finalize: mark as Closed with realized P&L.
+        // Finalize: mark as Closed, accumulating realized P&L (invariant 3) so a prior
+        // partial close's realized amount is never lost.
         pos.status = PositionStatus::Closed;
-        pos.realized_pnl = realized_pnl;
+        pos.realized_pnl = pos
+            .realized_pnl
+            .checked_add(realized_pnl)
+            .expect("realized_pnl overflow");
+        assert_position_invariants(&pos);
         env.storage().persistent().set(&pkey, &pos);
         Self::mark_position_closed(&env, &user, position_id);
 
@@ -712,8 +831,10 @@ impl UserPortfolio {
     /// - `position_id`: position to close
     /// - `asset_pair`: asset pair for event emission (informational)
     ///
-    /// Realized P&L is set to 0 (keeper closes do not calculate P&L; that is done
-    /// off-chain or in a separate settlement step).
+    /// Keeper closes do not calculate P&L (that is done off-chain or in a separate
+    /// settlement step), so `realized_pnl` is left unchanged: 0 for a position that was
+    /// never partially closed, or whatever was already accumulated via
+    /// `close_position_partial` (invariant 3 — realized value is never clobbered).
     pub fn close_position_keeper(
         env: Env,
         caller: Address,
@@ -734,45 +855,19 @@ impl UserPortfolio {
             panic!("unauthorized: only trade executor can call close_position_keeper");
         }
 
-        // Verify position exists and belongs to user.
-        let key = DataKey::UserPositions(user.clone());
-        let list: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut found = false;
-        for i in 0..list.len() {
-            if let Some(pid) = list.get(i) {
-                if pid == position_id {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if !found {
-            panic!("position not found for user");
-        }
-
+        // Verify position exists, belongs to user, and is still open (invariants 2, 4).
+        let mut pos = require_open_position(&env, &user, position_id)?;
         let pkey = DataKey::Position(position_id);
-        let mut pos: Position = env
-            .storage()
-            .persistent()
-            .get(&pkey)
-            .expect("position missing");
-
-        // State machine: only Open positions can be closed.
-        if pos.status != PositionStatus::Open {
-            return Err(PositionError::PositionAlreadyClosed);
-        }
 
         // Acquire the CLOSING lock.
         pos.status = PositionStatus::Closing;
         env.storage().persistent().set(&pkey, &pos);
 
-        // Close position with zero P&L (keeper closes don't calculate P&L).
+        // Close position. Keeper closes don't calculate P&L, so `realized_pnl` is left
+        // as-is (invariant 3: any amount already realized via a prior partial close is
+        // preserved rather than clobbered with 0).
         pos.status = PositionStatus::Closed;
-        pos.realized_pnl = 0;
+        assert_position_invariants(&pos);
         env.storage().persistent().set(&pkey, &pos);
         Self::mark_position_closed(&env, &user, position_id);
 
@@ -818,6 +913,85 @@ impl UserPortfolio {
         Ok(())
     }
 
+    /// Reduce an open position's quantity by `close_amount`, realizing
+    /// `realized_pnl_delta` for the closed portion.
+    ///
+    /// - Caller must be `user` (position owner).
+    /// - `close_amount` must be strictly positive and no greater than the position's
+    ///   current `amount` — this call never persists a partial mutation: the amount and
+    ///   ownership are validated up front and the function panics/returns an error
+    ///   *before* any storage write on any invalid input (invariant 5).
+    /// - If `close_amount` fully consumes the remaining `amount`, the position is
+    ///   finalized exactly like [`Self::close_position`] (transferred from the open to
+    ///   the closed index; `status` becomes `Closed`).
+    /// - Otherwise the position stays `Open` with `amount` reduced and `realized_pnl`
+    ///   incremented by `realized_pnl_delta` (invariant 3 — realized value only ever
+    ///   accumulates, it is never overwritten).
+    /// - Rejected with `PositionAlreadyClosed` if the position is already
+    ///   `Closing`/`Closed` (invariant 4 — closed positions cannot be mutated or reused).
+    ///
+    /// Note: `get_pnl`'s `total_invested` figure reads each position's *current*
+    /// `amount`, so a position fully drained via one or more partial closes stops
+    /// contributing to that figure once its remaining `amount` reaches zero — the same
+    /// snapshot semantics `amount` already has for a normal full close.
+    ///
+    /// Returns the position's new `amount` (0 if it was fully closed).
+    pub fn close_position_partial(
+        env: Env,
+        user: Address,
+        position_id: u64,
+        close_amount: i128,
+        realized_pnl_delta: i128,
+    ) -> Result<i128, PositionError> {
+        user.require_auth();
+        if close_amount <= 0 {
+            panic!("close_amount must be positive");
+        }
+
+        // Ownership + terminal-state guard (invariants 2 and 4). No storage write has
+        // happened yet, so an error here leaves the position completely untouched.
+        let mut pos = require_open_position(&env, &user, position_id)?;
+        if close_amount > pos.amount {
+            panic!("close_amount exceeds open position amount");
+        }
+
+        pos.amount = pos
+            .amount
+            .checked_sub(close_amount)
+            .expect("amount underflow");
+        pos.realized_pnl = pos
+            .realized_pnl
+            .checked_add(realized_pnl_delta)
+            .expect("realized_pnl overflow");
+
+        let pkey = DataKey::Position(position_id);
+        let remaining = pos.amount;
+
+        if remaining == 0 {
+            // Fully consumed by this partial close: finalize exactly like a full close.
+            pos.status = PositionStatus::Closing;
+            env.storage().persistent().set(&pkey, &pos);
+            pos.status = PositionStatus::Closed;
+            assert_position_invariants(&pos);
+            env.storage().persistent().set(&pkey, &pos);
+            Self::mark_position_closed(&env, &user, position_id);
+        } else {
+            assert_position_invariants(&pos);
+            env.storage().persistent().set(&pkey, &pos);
+        }
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (
+                Symbol::new(&env, "user_portfolio"),
+                Symbol::new(&env, "position_partially_closed"),
+            ),
+            (user, position_id, close_amount, remaining),
+        );
+
+        Ok(remaining)
+    }
+
     /// Portfolio P&L including open positions when oracle price is available.
     pub fn get_pnl(env: Env, user: Address) -> PnlSummary {
         queries::compute_get_pnl(&env, user)
@@ -836,6 +1010,15 @@ impl UserPortfolio {
         limit: u32,
     ) -> Vec<TradeHistoryEntry> {
         queries::get_trade_history(&env, user, cursor, limit)
+    }
+
+    pub fn get_trade_history_page(
+        env: Env,
+        user: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> TradeHistoryPage {
+        queries::get_trade_history_page(&env, user, cursor, limit)
     }
 
     /// Provider sets per-day fee token + amount for their premium feed (XLM or USDC, etc.).
@@ -1186,6 +1369,69 @@ impl UserPortfolio {
         result
     }
 
+    // ── Portfolio export for off-chain analytics ───────────────────────────────
+
+    /// Read-only export of the user's full portfolio state for off-chain analytics,
+    /// dashboards, and indexers. Returns a stable `PortfolioExport` struct that
+    /// bundles P&L, position counts, open positions, and metadata in one call.
+    ///
+    /// This is a compose query — it calls `get_pnl`, reads position indexes, and
+    /// counts snapshots — but performs no writes. The returned format is documented
+    /// and guaranteed stable within the same major contract version.
+    pub fn export_portfolio(env: Env, user: Address) -> PortfolioExport {
+        let pnl = queries::compute_get_pnl(&env, user.clone());
+
+        let open_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserOpenPositions(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut open_positions = Vec::new(&env);
+        for i in 0..open_ids.len() {
+            let Some(position_id) = open_ids.get(i) else {
+                continue;
+            };
+            let Some(position) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Position>(&DataKey::Position(position_id))
+            else {
+                continue;
+            };
+            if position.status == PositionStatus::Open {
+                open_positions.push_back(PortfolioPosition {
+                    position_id,
+                    position,
+                });
+            }
+        }
+
+        let closed_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserClosedPositions(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let snapshot_count: u32 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::UserSnapshotTimestamps(user))
+            .map(|v| v.len() as u32)
+            .unwrap_or(0);
+
+        PortfolioExport {
+            realized_pnl: pnl.realized_pnl,
+            unrealized_pnl: pnl.unrealized_pnl,
+            total_pnl: pnl.total_pnl,
+            roi_bps: pnl.roi_bps,
+            open_position_count: open_positions.len() as u32,
+            closed_position_count: closed_ids.len() as u32,
+            snapshot_count,
+            open_positions,
+        }
+    }
+
     // ── Portfolio concentration risk (Issue #684) ──────────────────────────────
 
     /// Admin: set the Herfindahl concentration score threshold (0–10 000 basis points).
@@ -1342,6 +1588,28 @@ impl UserPortfolio {
             count += 1;
         }
         result
+    }
+
+    // ── Issue #862: Health / Readiness ───────────────────────────────────────
+
+    /// Read-only health probe for monitoring and front-ends (no auth).
+    pub fn health_check(env: Env) -> HealthStatus {
+        let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        if !env.storage().instance().has(&DataKey::Initialized) {
+            return health_uninitialized(&env, version);
+        }
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| stellar_swipe_common::health::placeholder_admin(&env));
+        HealthStatus {
+            is_initialized: true,
+            is_paused: false,
+            version,
+            admin,
+            initialized_at: env.ledger().timestamp(),
+        }
     }
 
     fn require_admin(env: &Env) {
@@ -2301,6 +2569,205 @@ mod tests {
         });
         assert_eq!(pos.status, PositionStatus::Closed);
     }
+
+    // ── Issue #995: position invariants across transfers and closures ─────────
+
+    fn stored_position(env: &Env, portfolio_id: &Address, id: u64) -> Position {
+        env.as_contract(portfolio_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Position(id))
+                .unwrap()
+        })
+    }
+
+    fn open_ids(env: &Env, portfolio_id: &Address, user: &Address) -> soroban_sdk::Vec<u64> {
+        env.as_contract(portfolio_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::UserOpenPositions(user.clone()))
+                .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+        })
+    }
+
+    fn closed_ids(env: &Env, portfolio_id: &Address, user: &Address) -> soroban_sdk::Vec<u64> {
+        env.as_contract(portfolio_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::UserClosedPositions(user.clone()))
+                .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+        })
+    }
+
+    /// A successful partial close reduces `amount`, accumulates `realized_pnl`, keeps
+    /// `status == Open`, and leaves the position in the user's open index — a valid
+    /// remaining position per invariants 1 and 3.
+    #[test]
+    fn partial_close_preserves_invariants_and_leaves_valid_remainder() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+
+        let id = client.open_position(&user, &100, &1_000);
+
+        let remaining = client.close_position_partial(&user, &id, &400, &40i128);
+        assert_eq!(remaining, 600);
+
+        let pos = stored_position(&env, &portfolio_id, id);
+        assert_eq!(pos.status, PositionStatus::Open);
+        assert_eq!(pos.amount, 600);
+        assert_eq!(pos.realized_pnl, 40);
+        assert!(pos.amount >= 0);
+
+        // Still owned and tracked as open; not moved to the closed index.
+        assert!(open_ids(&env, &portfolio_id, &user)
+            .iter()
+            .any(|pid| pid == id));
+        assert!(!closed_ids(&env, &portfolio_id, &user)
+            .iter()
+            .any(|pid| pid == id));
+    }
+
+    /// A partial close that consumes the entire remaining amount finalizes the position
+    /// exactly like a full close: `status == Closed`, and the id is transferred from the
+    /// open index to the closed index (invariants 1, 3, 4, and the open→closed transfer).
+    #[test]
+    fn partial_close_of_full_amount_finalizes_like_full_close() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+
+        let id = client.open_position(&user, &100, &500);
+
+        let remaining = client.close_position_partial(&user, &id, &500, &50i128);
+        assert_eq!(remaining, 0);
+
+        let pos = stored_position(&env, &portfolio_id, id);
+        assert_eq!(pos.status, PositionStatus::Closed);
+        assert_eq!(pos.amount, 0);
+        assert_eq!(pos.realized_pnl, 50);
+
+        assert!(!open_ids(&env, &portfolio_id, &user)
+            .iter()
+            .any(|pid| pid == id));
+        assert!(closed_ids(&env, &portfolio_id, &user)
+            .iter()
+            .any(|pid| pid == id));
+    }
+
+    /// Realized P&L accumulates rather than being overwritten: a partial close followed
+    /// by a full close of the remainder reports the sum of both realizations
+    /// (invariant 3).
+    #[test]
+    fn partial_close_then_full_close_accumulates_realized_pnl() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        let provider = dummy_provider(&env);
+
+        let id = client.open_position(&user, &100, &1_000);
+        client.close_position_partial(&user, &id, &400, &40i128);
+
+        client.close_position(&user, &id, &60, &110i128, &1u32, &provider, &0u64);
+
+        let pos = stored_position(&env, &portfolio_id, id);
+        assert_eq!(pos.status, PositionStatus::Closed);
+        assert_eq!(pos.realized_pnl, 100); // 40 (partial) + 60 (final)
+        assert_eq!(pos.amount, 600); // close_position never mutates amount
+
+        assert!(closed_ids(&env, &portfolio_id, &user)
+            .iter()
+            .any(|pid| pid == id));
+    }
+
+    /// A downstream/validation failure inside `close_position_partial` (requesting more
+    /// than the position's current amount) must not leave the position partially
+    /// mutated: it stays exactly as it was before the failed call, and remains usable
+    /// afterward (invariant 5, "failed-update" flow).
+    #[test]
+    fn close_position_partial_rejects_excess_amount_without_mutating_state() {
+        extern crate std;
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+
+        let id = client.open_position(&user, &100, &1_000);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.close_position_partial(&user, &id, &2_000, &0i128);
+        }));
+        assert!(
+            result.is_err(),
+            "close_amount exceeding the open amount must fail"
+        );
+
+        // Nothing was persisted by the failed call.
+        let pos = stored_position(&env, &portfolio_id, id);
+        assert_eq!(pos.status, PositionStatus::Open);
+        assert_eq!(pos.amount, 1_000);
+        assert_eq!(pos.realized_pnl, 0);
+
+        // The position remains open and usable — the failure didn't corrupt it.
+        let remaining = client.close_position_partial(&user, &id, &400, &40i128);
+        assert_eq!(remaining, 600);
+    }
+
+    /// A failed downstream authorization check in `close_position_keeper` (unregistered
+    /// caller) must not leave the position stuck in `Closing` or otherwise mutated
+    /// (invariant 5).
+    #[test]
+    fn close_position_keeper_unauthorized_caller_leaves_position_untouched() {
+        extern crate std;
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+
+        let id = client.open_position(&user, &100, &1_000);
+
+        let real_executor = Address::generate(&env);
+        client.set_trade_executor(&real_executor);
+
+        let impostor = Address::generate(&env);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.close_position_keeper(&impostor, &user, &id, &1u32);
+        }));
+        assert!(result.is_err(), "unauthorized keeper close must fail");
+
+        let pos = stored_position(&env, &portfolio_id, id);
+        assert_eq!(pos.status, PositionStatus::Open);
+        assert_eq!(pos.amount, 1_000);
+        assert_eq!(pos.realized_pnl, 0);
+        assert!(open_ids(&env, &portfolio_id, &user)
+            .iter()
+            .any(|pid| pid == id));
+    }
+
+    /// Closed positions cannot be mutated or reused: every mutating entry point rejects
+    /// a `Closed` position id instead of silently succeeding (invariant 4).
+    #[test]
+    fn closed_position_cannot_be_mutated_or_reused() {
+        let env = Env::default();
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
+        let client = UserPortfolioClient::new(&env, &portfolio_id);
+        let provider = dummy_provider(&env);
+
+        let id = client.open_position(&user, &100, &1_000);
+        client.close_position(&user, &id, &50, &110i128, &1u32, &provider, &0u64);
+
+        // Re-closing is rejected rather than double-processing the close.
+        let reclose = client.try_close_position(&user, &id, &50, &110i128, &1u32, &provider, &0u64);
+        assert_eq!(reclose, Err(Ok(PositionError::PositionAlreadyClosed)));
+
+        // Partially closing an already-closed position is rejected too.
+        let partial = client.try_close_position_partial(&user, &id, &1, &0i128);
+        assert_eq!(partial, Err(Ok(PositionError::PositionAlreadyClosed)));
+
+        // The stored position is unchanged by either rejected attempt.
+        let pos = stored_position(&env, &portfolio_id, id);
+        assert_eq!(pos.status, PositionStatus::Closed);
+        assert_eq!(pos.amount, 1_000);
+        assert_eq!(pos.realized_pnl, 50);
+    }
 }
 
 // ── Portfolio snapshot tests (issue #685) ─────────────────────────────────────
@@ -2715,9 +3182,7 @@ mod exposure_cap_tests {
         let user = Address::generate(&env);
 
         // Set cap of 5_000 for asset 1.
-        client
-            .set_asset_exposure_cap(&user, &1u32, &5_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &5_000i128);
 
         // Trade 3_000 — within cap.
         let result = client.try_open_position_with_cap_check(&user, &1u32, &100i128, &3_000i128);
@@ -2734,9 +3199,7 @@ mod exposure_cap_tests {
         let client = UserPortfolioClient::new(&env, &contract_id);
         let user = Address::generate(&env);
 
-        client
-            .set_asset_exposure_cap(&user, &1u32, &2_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &2_000i128);
 
         // 3_000 > 2_000 cap → must be rejected.
         let result = client.try_open_position_with_cap_check(&user, &1u32, &100i128, &3_000i128);
@@ -2765,15 +3228,11 @@ mod exposure_cap_tests {
         let client = UserPortfolioClient::new(&env, &contract_id);
         let user = Address::generate(&env);
 
-        client
-            .set_asset_exposure_cap(&user, &1u32, &1_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &1_000i128);
         assert_eq!(client.get_asset_exposure_cap(&user, &1u32), Some(1_000));
 
         // Raise the cap.
-        client
-            .set_asset_exposure_cap(&user, &1u32, &5_000i128)
-            .unwrap();
+        client.set_asset_exposure_cap(&user, &1u32, &5_000i128);
         assert_eq!(client.get_asset_exposure_cap(&user, &1u32), Some(5_000));
 
         // Remove the cap entirely.

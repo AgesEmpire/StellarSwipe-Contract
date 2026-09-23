@@ -9,6 +9,7 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, testutils::Address as _, token::StellarAssetClient,
     Address, Env, Vec,
 };
+use stellar_swipe_common::budget_regression::measure_and_emit;
 use stellar_swipe_common::perf::{
     regression_budget_limit, BASELINE_COPY_TRADE_INSTRUCTIONS, REGRESSION_BUDGET_PCT,
 };
@@ -87,6 +88,7 @@ fn test_single_copy_trade_latency_regression() {
         instructions <= BASELINE_COPY_TRADE_INSTRUCTIONS * 3,
         "copy trade {instructions} exceeds 3x baseline ({BASELINE_COPY_TRADE_INSTRUCTIONS})"
     );
+    measure_and_emit("trade_executor.execute_copy_trade", BASELINE_COPY_TRADE_INSTRUCTIONS, instructions);
 }
 
 #[test]

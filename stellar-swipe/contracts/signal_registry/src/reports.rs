@@ -70,10 +70,10 @@ pub fn get_provider_monthly_report(
         }
     }
 
-    if report.signals_closed > 0 {
-        let successful = best_id.is_some() as u32;
-        report.success_rate = (successful * 10000) / report.signals_closed;
-    }
+    let successful = best_id.is_some() as u32;
+    report.success_rate = (successful * 10000)
+        .checked_div(report.signals_closed)
+        .unwrap_or(0);
 
     report.best_signal_id = best_id;
     report.worst_signal_id = worst_id;

@@ -12,6 +12,21 @@ acknowledgement.
   tell CI that the breaking change is deliberate and paired with a migration or
   major-version bump. The script updates the baseline on the next run.
 
+## How it works in CI
+
+On every PR to `main`, after building optimized WASM, CI runs
+`check_wasm_exports.py --format markdown` and:
+
+1. Compares each contract's exports and spec hash against its committed baseline.
+2. Generates a **WASM ABI Export Diff Report** as a PR comment (the report is
+   also visible in the CI step logs).
+3. Saves updated baselines locally (CI will prompt you to commit them).
+4. Fails the build if a breaking change is detected without an acknowledgement
+   file.
+
+The PR comment is automatically created or updated on each push, so reviewers
+always see the latest diff.
+
 ## Updating baselines (non-breaking additions)
 
 Baselines are updated automatically when new exports are detected (exit code 2).
@@ -30,6 +45,12 @@ Commit the updated JSON files.
 ```bash
 # After building WASM (./scripts/build.sh):
 python3 scripts/check_wasm_exports.py
+
+# Text output (default):
+python3 scripts/check_wasm_exports.py --format text
+
+# Markdown report (same format as CI PR comment):
+python3 scripts/check_wasm_exports.py --format markdown
 
 # Point at a custom WASM directory:
 python3 scripts/check_wasm_exports.py --wasm-dir path/to/wasm/files

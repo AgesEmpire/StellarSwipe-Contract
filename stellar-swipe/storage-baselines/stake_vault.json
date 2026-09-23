@@ -1,0 +1,38 @@
+{
+  "MigrationKey": [
+    "MigrationState",
+    "StakesV1",
+    "StakesV2"
+  ],
+  "StorageKey": [
+    "Admin",
+    "AppealWindowSecs",
+    "EmergencyCooldownSecs",
+    "EmergencyMultiSigConfig",
+    "EmergencyRequest",
+    "GovernanceAddress",
+    "LargeWithdrawalRequestedAt",
+    "LastEmergencyUnstakeAt",
+    "LastStakeLedger",
+    "LockMultiplierTiers",
+    "MaxUnstakeQueueSize",
+    "MinimumStake",
+    "MinimumStakeDuration",
+    "ProviderDelegatedStakes",
+    "ProviderTotalDelegated",
+    "SignalRegistry",
+    "SlashAppeal",
+    "SlashCounter",
+    "SlashRecord",
+    "SlashTierConfig",
+    "SlashedFundsHeld",
+    "StakeBelowMinSince",
+    "StakeDepositTimestamps",
+    "StakeToken",
+    "UnstakeQueueEntry",
+    "UnstakeQueueHead",
+    "UnstakeQueueTail",
+    "UserUnstakeTicket",
+    "WithdrawalCooldownSecs"
+  ]
+}

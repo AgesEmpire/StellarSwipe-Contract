@@ -1209,3 +1209,38 @@ fn migration_v1_to_v2_batches() {
         assert_eq!(s.id, sid);
     }
 }
+
+// ── Instruction-budget regression snapshots (Issue #budget) ───────────────────
+
+use stellar_swipe_common::budget_regression::measure_and_emit;
+
+#[test]
+fn submit_signal_budget_regression() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let provider = Address::generate(&env);
+    let expiry = env.ledger().timestamp() + 60;
+
+    env.budget().reset_tracker();
+    let _ = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Breakout confirmed"),
+        &expiry,
+        &SignalCategory::SWING,
+        &vec![&env, String::from_str(&env, "test")],
+        &RiskLevel::Medium,
+    );
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("signal_registry.submit_signal", 15_000_000, instructions);
+}

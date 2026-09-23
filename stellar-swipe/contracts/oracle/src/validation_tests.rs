@@ -4,9 +4,13 @@
 
 #[cfg(test)]
 mod validation_tests {
-    use soroban_sdk::{testutils::Ledger, Env, String, Address};
+    use soroban_sdk::{testutils::Ledger, Bytes, Env, String, Address, Vec};
     use crate::history::*;
     use crate::errors::OracleError;
+    use crate::external_adapter::process_external_prices;
+    use crate::types::ExternalPrice;
+    use crate::storage::{set_feed_decimals, set_staleness_window};
+    use crate::{OracleContract, OracleContractClient};
     use stellar_swipe_common::{Asset, AssetPair};
 
     fn usdc_xlm_pair(env: &Env) -> AssetPair {
@@ -259,5 +263,170 @@ mod validation_tests {
         // Historical query should complete successfully
         let historical = get_historical_price(&env, &pair, 43200); // 12 hours ago
         assert!(historical.is_some(), "Historical query should complete");
+    }
+
+    // ── Normalization, staleness, and malformed-value tests (Issue #normalization) ──
+
+    #[test]
+    fn normalize_external_prices_mixed_precision() {
+        use crate::external_adapter::process_external_prices;
+        use crate::types::ExternalPrice;
+        use crate::storage::{set_price, set_feed_decimals, set_base_currency};
+        use soroban_sdk::symbol_short;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, crate::OracleContract);
+        let client = crate::OracleContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &Asset {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        });
+
+        let pair = AssetPair {
+            base: Asset { code: String::from_str(&env, "BTC"), issuer: Some(Address::generate(&env)) },
+            quote: Asset { code: String::from_str(&env, "USDC"), issuer: Some(Address::generate(&env)) },
+        };
+
+        // Set feed decimals to 6 for the pair
+        client.set_feed_decimals(&admin, &pair, &6);
+
+        // Oracle A submits 1 BTC = 50_000_000 (6-decimal: $50,000.000000)
+        // Oracle B submits 1 BTC = 500_000_000 (7-decimal: $50,000.0000000)
+        // After normalization to 7 decimals both should be 500_000_000, average = 500_000_000
+        let mut prices = Vec::new(&env);
+        let oracle_a = Address::generate(&env);
+        let oracle_b = Address::generate(&env);
+
+        prices.push_back(ExternalPrice {
+            asset_pair: pair.clone(),
+            price: 50_000_000,
+            timestamp: env.ledger().timestamp(),
+            round_id: 1,
+            signature: Bytes::new(&env),
+            oracle_address: oracle_a,
+            decimals: 6,
+        });
+        prices.push_back(ExternalPrice {
+            asset_pair: pair.clone(),
+            price: 500_000_000,
+            timestamp: env.ledger().timestamp(),
+            round_id: 1,
+            signature: Bytes::new(&env),
+            oracle_address: oracle_b,
+            decimals: 7,
+        });
+
+        let consensus = process_external_prices(&env, prices);
+        assert_eq!(consensus, Ok(500_000_000), "mixed-precision prices should normalize to the same 7-decimal value");
+    }
+
+    #[test]
+    fn stale_external_price_is_dropped() {
+        use crate::external_adapter::process_external_prices;
+        use crate::types::ExternalPrice;
+        use crate::storage::set_staleness_window;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, crate::OracleContract);
+        let client = crate::OracleContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &Asset {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        });
+
+        let pair = AssetPair {
+            base: Asset { code: String::from_str(&env, "BTC"), issuer: Some(Address::generate(&env)) },
+            quote: Asset { code: String::from_str(&env, "USDC"), issuer: Some(Address::generate(&env)) },
+        };
+
+        // Set a 60-second staleness window
+        client.set_staleness_window(&admin, &pair, &60);
+
+        let mut prices = Vec::new(&env);
+        let oracle = Address::generate(&env);
+
+        // Fresh price (now)
+        prices.push_back(ExternalPrice {
+            asset_pair: pair.clone(),
+            price: 50_000_000,
+            timestamp: env.ledger().timestamp(),
+            round_id: 1,
+            signature: Bytes::new(&env),
+            oracle_address: oracle.clone(),
+            decimals: 7,
+        });
+
+        // Stale price (2 minutes ago)
+        prices.push_back(ExternalPrice {
+            asset_pair: pair.clone(),
+            price: 51_000_000,
+            timestamp: env.ledger().timestamp() - 120,
+            round_id: 1,
+            signature: Bytes::new(&env),
+            oracle_address: oracle,
+            decimals: 7,
+        });
+
+        let consensus = process_external_prices(&env, prices);
+        assert_eq!(consensus, Ok(50_000_000), "stale price should be dropped, only fresh price averaged");
+    }
+
+    #[test]
+    fn malformed_external_price_zero_or_negative_is_ignored() {
+        use crate::external_adapter::process_external_prices;
+        use crate::types::ExternalPrice;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, crate::OracleContract);
+        let client = crate::OracleContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &Asset {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        });
+
+        let pair = AssetPair {
+            base: Asset { code: String::from_str(&env, "BTC"), issuer: Some(Address::generate(&env)) },
+            quote: Asset { code: String::from_str(&env, "USDC"), issuer: Some(Address::generate(&env)) },
+        };
+
+        let mut prices = Vec::new(&env);
+        let oracle = Address::generate(&env);
+
+        prices.push_back(ExternalPrice {
+            asset_pair: pair.clone(),
+            price: 0,
+            timestamp: env.ledger().timestamp(),
+            round_id: 1,
+            signature: Bytes::new(&env),
+            oracle_address: oracle.clone(),
+            decimals: 7,
+        });
+        prices.push_back(ExternalPrice {
+            asset_pair: pair.clone(),
+            price: -1,
+            timestamp: env.ledger().timestamp(),
+            round_id: 1,
+            signature: Bytes::new(&env),
+            oracle_address: oracle.clone(),
+            decimals: 7,
+        });
+        prices.push_back(ExternalPrice {
+            asset_pair: pair,
+            price: 50_000_000,
+            timestamp: env.ledger().timestamp(),
+            round_id: 1,
+            signature: Bytes::new(&env),
+            oracle_address: oracle,
+            decimals: 7,
+        });
+
+        let consensus = process_external_prices(&env, prices);
+        assert_eq!(consensus, Ok(50_000_000), "zero and negative prices should be ignored");
     }
 }

@@ -1,6 +1,24 @@
-use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env};
+use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env, String, Vec};
 
 use crate::{require_admin, GovernanceError, StorageKey};
+
+/// Structured event emitted at the end of every shadow-mode simulation
+/// (`simulate_proposal`). Off-chain indexers and dashboards can subscribe to
+/// this event to observe simulation outcomes without an additional contract
+/// call.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ShadowModeResult {
+    /// The proposal being simulated.
+    pub proposal_id: u64,
+    /// `true` when the proposal would execute successfully.
+    pub success: bool,
+    /// Human-readable summaries of the state changes that would occur.
+    pub simulated_state_changes: Vec<String>,
+    /// `None` for successful simulations; `Some(reason)` when the simulation
+    /// detects an execution failure.
+    pub failure_reason: Option<String>,
+}
 
 /// State persisted during a shadow-mode upgrade trial period.
 #[contracttype]

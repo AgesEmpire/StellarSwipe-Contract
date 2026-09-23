@@ -395,6 +395,11 @@ pub struct EvtDCAPlanCancelled {
     pub signal_id: u64,
     pub intervals_completed: u32,
     pub reason: u32, // 0 = signal_expired, 1 = manual
+    /// Unexecuted capital returned to the user. DCA intervals are funded
+    /// per-interval rather than escrowed up front (see `dca::cancel_dca_plan`),
+    /// so this is always 0 today; the field exists so a future pre-funded
+    /// plan type can report a real refund without changing the event shape.
+    pub refunded_amount: i128,
 }
 
 pub fn emit_dca_interval_executed(env: &Env, evt: EvtDCAIntervalExecuted) {
@@ -422,6 +427,37 @@ pub fn emit_dca_plan_cancelled(env: &Env, evt: EvtDCAPlanCancelled) {
         (
             Symbol::new(env, "trade_executor"),
             Symbol::new(env, "dca_plan_cancelled"),
+        ),
+        evt,
+    );
+}
+
+// ── Partial fill event (Issue #959) ──────────────────────────────────────────
+
+/// Emitted when a copy-trade SDEX offer is only partially matched.
+/// Indexers should record the shortfall (`remaining_amount`) and surface it to
+/// the follower so they can decide whether to place a follow-up order.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtPartialFill {
+    pub schema_version: u32,
+    /// Address of the follower whose copy-trade was partially filled.
+    pub user: Address,
+    /// Monotonic receipt / trade ID assigned by the executor.
+    pub trade_id: u64,
+    /// Amount originally requested for the copy-trade.
+    pub requested_amount: i128,
+    /// Amount actually filled by the SDEX (may be 0 for a zero-fill).
+    pub filled_amount: i128,
+    /// Unfilled remainder (`requested_amount - filled_amount`).
+    pub remaining_amount: i128,
+}
+
+pub fn emit_partial_fill(env: &Env, evt: EvtPartialFill) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "partial_fill"),
         ),
         evt,
     );
@@ -1147,6 +1183,8 @@ mod tests {
         });
     }
 
+    // ── Replay-envelope regression test (Issue: replay-compatible envelopes) ────
+
     #[test]
     fn test_retry_scenario_emits_single_event() {
         let (env, contract_id) = setup();
@@ -1161,6 +1199,139 @@ mod tests {
                     .publish((Symbol::new(&env, "signal_adopted"),), 7u64);
             });
             assert_eq!(env.events().all().len(), 1);
+        });
+    }
+}
+
+// ── Replay-compatible event envelope (Issue: replay-compatible envelopes) ───────
+//
+// Stable envelope metadata emitted alongside (or preceding) business events so
+// analytics pipelines can reconstruct causal ordering across ledger replays,
+// node restarts, or cross-ledger archival dumps.
+//
+// # Fields
+//
+#[contracttype]
+pub enum ReplayStorageKey {
+    NextEnvelopeId,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayEnvelope {
+    pub schema_version: u32,
+    pub envelope_id: u64,
+    pub ledger_sequence: u32,
+    pub timestamp: u64,
+}
+
+/// Return the next monotonically-increasing envelope id and bump the counter.
+pub fn next_envelope_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&ReplayStorageKey::NextEnvelopeId)
+        .unwrap_or(0);
+    let next = id + 1;
+    env.storage()
+        .instance()
+        .set(&ReplayStorageKey::NextEnvelopeId, &next);
+    next
+}
+
+pub fn emit_replay_envelope(env: &Env) {
+    let envelope = ReplayEnvelope {
+        schema_version: 1,
+        envelope_id: next_envelope_id(env),
+        ledger_sequence: env.ledger().sequence(),
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(
+        (Symbol::new(env, "replay"), Symbol::new(env, "envelope")),
+        envelope,
+    );
+}
+
+/// Convenience: emit an envelope immediately followed by a business event.
+/// This helps analytics pipelines pair the envelope metadata with the actual
+/// payload while preserving stable ordering.
+pub fn emit_with_replay<E: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    topic: (Symbol, Symbol),
+    event: E,
+) {
+    emit_replay_envelope(env);
+    env.events().publish(topic, event);
+}
+
+// ── Replay envelope tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use soroban_sdk::{contract, testutils::Address as _, Env, FromVal};
+
+    #[contract]
+    struct TestContract;
+
+    fn setup() -> (Env, Address) {
+        let env = Env::default();
+        let id = env.register(TestContract, ());
+        (env, id)
+    }
+
+    #[test]
+    fn envelope_id_is_monotonically_increasing() {
+        let (env, contract_id) = setup();
+
+        env.as_contract(&contract_id, || {
+            let id1 = next_envelope_id(&env);
+            let id2 = next_envelope_id(&env);
+            let id3 = next_envelope_id(&env);
+            assert!(id1 < id2);
+            assert!(id2 < id3);
+        });
+    }
+
+    #[test]
+    fn envelope_survives_replay_of_same_ledger() {
+        use soroban_sdk::testutils::Events;
+        let (env, contract_id) = setup();
+
+        env.as_contract(&contract_id, || {
+            emit_replay_envelope(&env);
+            let first_len = env.events().all().len();
+            emit_replay_envelope(&env);
+            let second_len = env.events().all().len();
+            assert_eq!(first_len, 1);
+            assert_eq!(second_len, 2);
+        });
+    }
+
+    #[test]
+    fn emit_with_replay_publishes_envelope_then_event() {
+        use soroban_sdk::testutils::Events;
+        let (env, contract_id) = setup();
+
+        env.as_contract(&contract_id, || {
+            emit_with_replay(
+                &env,
+                (Symbol::new(&env, "trade"), Symbol::new(&env, "executed")),
+                42u64,
+            );
+
+            let events = env.events().all();
+            assert_eq!(events.len(), 2);
+            // First event must be the replay envelope
+            let envelope_topics = &events.get(0).unwrap().1;
+            assert_eq!(
+                Symbol::from_val(&env, &envelope_topics.get(0).unwrap()),
+                Symbol::new(&env, "replay")
+            );
+            assert_eq!(
+                Symbol::from_val(&env, &envelope_topics.get(1).unwrap()),
+                Symbol::new(&env, "envelope")
+            );
         });
     }
 }

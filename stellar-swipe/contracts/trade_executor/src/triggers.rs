@@ -460,12 +460,9 @@ mod tests {
         exec.set_stop_loss_price(&user, &3u64, &100);
         exec.check_and_trigger_stop_loss(&user, &3u64, &0u32);
         // Just verify the call succeeded and position was closed (event format tested below).
-        assert_eq!(
-            MockPortfolioClient::new(&env, &portfolio_id)
-                .last_closed()
-                .is_none(),
-            false
-        );
+        assert!(MockPortfolioClient::new(&env, &portfolio_id)
+            .last_closed()
+            .is_some());
         let _ = env.events();
     }
 

@@ -105,7 +105,11 @@ fn delegator_cannot_delegate_to_self() {
     stake(&env, &id, &user, 1_000i128);
 
     let result = client.try_delegate_voting_power(&user, &user);
-    assert!(result.is_err(), "self-delegation should be rejected");
+    assert_eq!(
+        result,
+        Err(Ok(GovernanceError::InvalidProposal)),
+        "self-delegation should be rejected"
+    );
 }
 
 #[test]
@@ -124,8 +128,9 @@ fn delegator_cannot_re_delegate_while_active() {
 
     // Attempting to delegate again while active must fail.
     let result = client.try_delegate_voting_power(&delegator, &delegate_b);
-    assert!(
-        result.is_err(),
+    assert_eq!(
+        result,
+        Err(Ok(GovernanceError::InvalidCommitteeAction)),
         "re-delegation while active should be rejected"
     );
 }

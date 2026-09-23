@@ -377,7 +377,16 @@ pub fn refund_bridge_fee(env: &Env, transfer_id: u64, reason: String) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{contract, testutils::Address as _};
+
+    #[contract]
+    struct TestContract;
+
+    fn setup() -> (Env, Address) {
+        let env = Env::default();
+        let contract_id = env.register(TestContract, ());
+        (env, contract_id)
+    }
 
     fn default_config(env: &Env, bridge_id: u64) -> BridgeFeeConfig {
         BridgeFeeConfig {
@@ -400,133 +409,150 @@ mod tests {
 
     #[test]
     fn test_fee_calculations() {
-        let env = Env::default();
-        let bridge_id = 1;
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            let bridge_id = 1;
 
-        let config = BridgeFeeConfig {
-            bridge_id,
-            base_fee_bps: 30, // 0.3%
-            min_fee: 100,
-            max_fee: 10000,
-            validator_reward_pct: 8000, // 80%
-            treasury_pct: 2000,         // 20%
-            dynamic_adjustment_enabled: true,
-        };
-        set_bridge_fee_config(&env, &config);
+            let config = BridgeFeeConfig {
+                bridge_id,
+                base_fee_bps: 30, // 0.3%
+                min_fee: 100,
+                max_fee: 10000,
+                validator_reward_pct: 8000, // 80%
+                treasury_pct: 2000,         // 20%
+                dynamic_adjustment_enabled: true,
+            };
+            set_bridge_fee_config(&env, &config);
 
-        // 0.3% of 1000 is 3, but min_fee is 100
-        let fee1 = calculate_bridge_fee(&env, bridge_id, 1000).unwrap();
-        assert_eq!(fee1, 100);
+            // 0.3% of 1000 is 3, but min_fee is 100
+            let fee1 = calculate_bridge_fee(&env, bridge_id, 1000).unwrap();
+            assert_eq!(fee1, 100);
 
-        // 0.3% of 1,000,000 is 3000
-        let fee2 = calculate_bridge_fee(&env, bridge_id, 1_000_000).unwrap();
-        assert_eq!(fee2, 3000);
+            // 0.3% of 1,000,000 is 3000
+            let fee2 = calculate_bridge_fee(&env, bridge_id, 1_000_000).unwrap();
+            assert_eq!(fee2, 3000);
 
-        // 0.3% of 10,000,000 is 30,000, but max_fee is 10000
-        let fee3 = calculate_bridge_fee(&env, bridge_id, 10_000_000).unwrap();
-        assert_eq!(fee3, 10000);
+            // 0.3% of 10,000,000 is 30,000, but max_fee is 10000
+            let fee3 = calculate_bridge_fee(&env, bridge_id, 10_000_000).unwrap();
+            assert_eq!(fee3, 10000);
+        });
     }
 
     // ── estimate_bridge_fee tests ─────────────────────────────────────────────
 
     #[test]
     fn test_estimate_equals_actual_fee_no_multiplier() {
-        let env = Env::default();
-        let bridge_id = 1u64;
-        set_bridge_fee_config(&env, &default_config(&env, bridge_id));
-        set_destination_bridge_id(&env, ChainId::Ethereum, bridge_id);
-        // No chain multiplier set → defaults to 10_000 (identity).
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            let bridge_id = 1u64;
+            set_bridge_fee_config(&env, &default_config(&env, bridge_id));
+            set_destination_bridge_id(&env, ChainId::Ethereum, bridge_id);
+            // No chain multiplier set → defaults to 10_000 (identity).
 
-        let amount = 1_000_000i128;
-        let estimated =
-            estimate_bridge_fee(&env, ChainId::Ethereum, amount, &xlm_asset(&env)).unwrap();
-        let actual = calculate_bridge_fee(&env, bridge_id, amount).unwrap();
-        assert_eq!(
-            estimated, actual,
-            "estimate must equal actual when multiplier=10_000"
-        );
+            let amount = 1_000_000i128;
+            let estimated =
+                estimate_bridge_fee(&env, ChainId::Ethereum, amount, &xlm_asset(&env)).unwrap();
+            let actual = calculate_bridge_fee(&env, bridge_id, amount).unwrap();
+            assert_eq!(
+                estimated, actual,
+                "estimate must equal actual when multiplier=10_000"
+            );
+        });
     }
 
     #[test]
     fn test_estimate_with_surcharge_multiplier() {
-        let env = Env::default();
-        let bridge_id = 1u64;
-        set_bridge_fee_config(&env, &default_config(&env, bridge_id));
-        set_destination_bridge_id(&env, ChainId::Polygon, bridge_id);
-        // 50 % surcharge: multiplier = 15_000 bps (i.e. × 1.5).
-        set_chain_fee_multiplier(&env, ChainId::Polygon, 15_000);
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            let bridge_id = 1u64;
+            set_bridge_fee_config(&env, &default_config(&env, bridge_id));
+            set_destination_bridge_id(&env, ChainId::Polygon, bridge_id);
+            // 50 % surcharge: multiplier = 15_000 bps (i.e. × 1.5).
+            set_chain_fee_multiplier(&env, ChainId::Polygon, 15_000);
 
-        let amount = 1_000_000i128;
-        let actual_base = calculate_bridge_fee(&env, bridge_id, amount).unwrap(); // 3000
-        let estimated =
-            estimate_bridge_fee(&env, ChainId::Polygon, amount, &xlm_asset(&env)).unwrap();
+            let amount = 1_000_000i128;
+            let actual_base = calculate_bridge_fee(&env, bridge_id, amount).unwrap(); // 3000
+            let estimated =
+                estimate_bridge_fee(&env, ChainId::Polygon, amount, &xlm_asset(&env)).unwrap();
 
-        assert_eq!(estimated, actual_base * 15_000 / 10_000);
-        assert!(estimated > actual_base);
+            assert_eq!(estimated, actual_base * 15_000 / 10_000);
+            assert!(estimated > actual_base);
+        });
     }
 
     #[test]
     fn test_estimate_with_discount_multiplier() {
-        let env = Env::default();
-        let bridge_id = 1u64;
-        set_bridge_fee_config(&env, &default_config(&env, bridge_id));
-        set_destination_bridge_id(&env, ChainId::BNB, bridge_id);
-        // 20 % discount: multiplier = 8_000 bps (× 0.8).
-        set_chain_fee_multiplier(&env, ChainId::BNB, 8_000);
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            let bridge_id = 1u64;
+            set_bridge_fee_config(&env, &default_config(&env, bridge_id));
+            set_destination_bridge_id(&env, ChainId::BNB, bridge_id);
+            // 20 % discount: multiplier = 8_000 bps (× 0.8).
+            set_chain_fee_multiplier(&env, ChainId::BNB, 8_000);
 
-        let amount = 1_000_000i128;
-        let actual_base = calculate_bridge_fee(&env, bridge_id, amount).unwrap();
-        let estimated = estimate_bridge_fee(&env, ChainId::BNB, amount, &xlm_asset(&env)).unwrap();
+            let amount = 1_000_000i128;
+            let actual_base = calculate_bridge_fee(&env, bridge_id, amount).unwrap();
+            let estimated =
+                estimate_bridge_fee(&env, ChainId::BNB, amount, &xlm_asset(&env)).unwrap();
 
-        assert_eq!(estimated, actual_base * 8_000 / 10_000);
-        assert!(estimated < actual_base);
+            assert_eq!(estimated, actual_base * 8_000 / 10_000);
+            assert!(estimated < actual_base);
+        });
     }
 
     #[test]
     fn test_estimate_respects_min_fee() {
-        let env = Env::default();
-        let bridge_id = 1u64;
-        set_bridge_fee_config(&env, &default_config(&env, bridge_id));
-        set_destination_bridge_id(&env, ChainId::Bitcoin, bridge_id);
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            let bridge_id = 1u64;
+            set_bridge_fee_config(&env, &default_config(&env, bridge_id));
+            set_destination_bridge_id(&env, ChainId::Bitcoin, bridge_id);
 
-        // Very small transfer → min_fee kicks in at 100.
-        let amount = 100i128;
-        let actual = calculate_bridge_fee(&env, bridge_id, amount).unwrap(); // min_fee = 100
-        let estimated =
-            estimate_bridge_fee(&env, ChainId::Bitcoin, amount, &xlm_asset(&env)).unwrap();
-        // Identity multiplier: estimated must equal actual.
-        assert_eq!(estimated, actual);
+            // Very small transfer → min_fee kicks in at 100.
+            let amount = 100i128;
+            let actual = calculate_bridge_fee(&env, bridge_id, amount).unwrap(); // min_fee = 100
+            let estimated =
+                estimate_bridge_fee(&env, ChainId::Bitcoin, amount, &xlm_asset(&env)).unwrap();
+            // Identity multiplier: estimated must equal actual.
+            assert_eq!(estimated, actual);
+        });
     }
 
     #[test]
     fn test_estimate_respects_max_fee() {
-        let env = Env::default();
-        let bridge_id = 1u64;
-        set_bridge_fee_config(&env, &default_config(&env, bridge_id));
-        set_destination_bridge_id(&env, ChainId::Ethereum, bridge_id);
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            let bridge_id = 1u64;
+            set_bridge_fee_config(&env, &default_config(&env, bridge_id));
+            set_destination_bridge_id(&env, ChainId::Ethereum, bridge_id);
 
-        // Large transfer → max_fee 10_000 caps the base fee.
-        let amount = 100_000_000i128;
-        let actual = calculate_bridge_fee(&env, bridge_id, amount).unwrap(); // max_fee = 10_000
-        let estimated =
-            estimate_bridge_fee(&env, ChainId::Ethereum, amount, &xlm_asset(&env)).unwrap();
-        assert_eq!(estimated, actual);
+            // Large transfer → max_fee 10_000 caps the base fee.
+            let amount = 100_000_000i128;
+            let actual = calculate_bridge_fee(&env, bridge_id, amount).unwrap(); // max_fee = 10_000
+            let estimated =
+                estimate_bridge_fee(&env, ChainId::Ethereum, amount, &xlm_asset(&env)).unwrap();
+            assert_eq!(estimated, actual);
+        });
     }
 
     #[test]
     fn test_estimate_missing_fee_config_returns_error() {
-        let env = Env::default();
-        // No fee config set for bridge_id 1.
-        let asset = xlm_asset(&env);
-        let result = estimate_bridge_fee(&env, ChainId::Ethereum, 1_000_000, &asset);
-        assert!(result.is_err());
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            // No fee config set for bridge_id 1.
+            let asset = xlm_asset(&env);
+            let result = estimate_bridge_fee(&env, ChainId::Ethereum, 1_000_000, &asset);
+            assert!(result.is_err());
+        });
     }
 
     #[test]
     fn test_chain_multiplier_default_is_identity() {
-        let env = Env::default();
-        // No multiplier set → defaults to 10_000.
-        let m = get_chain_fee_multiplier(&env, ChainId::Stellar);
-        assert_eq!(m, 10_000);
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            // No multiplier set → defaults to 10_000.
+            let m = get_chain_fee_multiplier(&env, ChainId::Stellar);
+            assert_eq!(m, 10_000);
+        });
     }
 }

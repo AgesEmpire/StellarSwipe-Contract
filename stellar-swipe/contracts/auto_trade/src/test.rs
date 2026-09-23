@@ -9,12 +9,27 @@ use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
     Address, Env, IntoVal, Symbol, TryFromVal, Val,
 };
+use stellar_swipe_common::emergency::CAT_TRADING;
 
 fn setup_env() -> Env {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().set_timestamp(1000);
     env
+}
+
+/// `execute_trade` runs `rate_limit::check_rate_limits`; the default bridge
+/// limits reject small test amounts, so trade-execution tests configure
+/// permissive limits (no minimum amount, no cooldown).
+fn set_permissive_rate_limits(env: &Env) {
+    rate_limit::set_limits(
+        env,
+        &rate_limit::BridgeRateLimits {
+            min_transfer_amount: 0,
+            cooldown_between_transfers: 0,
+            ..Default::default()
+        },
+    );
 }
 
 fn setup_signal(_env: &Env, signal_id: u64, expiry: u64) -> storage::Signal {
@@ -232,6 +247,7 @@ fn test_execute_trade_insufficient_balance() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -259,6 +275,7 @@ fn test_execute_trade_market_full_fill() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -292,6 +309,7 @@ fn test_execute_trade_market_partial_fill() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -381,6 +399,7 @@ fn test_execute_trade_limit_filled() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -414,6 +433,7 @@ fn test_execute_trade_limit_not_filled() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -447,6 +467,7 @@ fn test_get_trade_existing() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -541,6 +562,7 @@ fn test_position_limit_allows_first_trade() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -572,6 +594,7 @@ fn test_get_user_positions() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -686,8 +709,8 @@ fn test_trailing_stop_triggers_auto_sell_and_event() {
         risk::update_position(&env, &user, 1, 1_000, 100);
         AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 200);
 
-        let result = AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 180)
-            .unwrap();
+        let result =
+            AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 180).unwrap();
         assert_eq!(result.execution_price, 180);
         assert_eq!(result.trigger_price, 180);
         assert_eq!(result.sold_amount, 1_000);
@@ -734,8 +757,8 @@ fn test_trailing_stop_partial_fill_keeps_remaining_position() {
             .temporary()
             .set(&(symbol_short!("asset_liq"), 1u32), &400i128);
 
-        let result = AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 170)
-            .unwrap();
+        let result =
+            AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 170).unwrap();
         assert_eq!(result.sold_amount, 400);
         assert_eq!(result.remaining_amount, 600);
 
@@ -769,17 +792,13 @@ fn test_fixed_stop_used_when_trailing_disabled() {
         risk::update_position(&env, &user, 1, 1_000, 100);
         AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 200);
 
-        let result = AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 85)
-            .unwrap();
+        let result =
+            AutoTradeContract::process_price_update(env.clone(), user.clone(), 1, 85).unwrap();
         assert_eq!(result.execution_price, 85);
 
         let events = env.events().all();
-        let expected_topics = (
-            Symbol::new(&env, "stop_loss_triggered"),
-            user.clone(),
-            1u32,
-        )
-            .into_val(&env);
+        let expected_topics =
+            (Symbol::new(&env, "stop_loss_triggered"), user.clone(), 1u32).into_val(&env);
         assert!(events.iter().any(|event| event.1 == expected_topics));
     });
 }
@@ -841,6 +860,7 @@ fn test_get_trade_history_paginated() {
 
     // Setup (max_position_pct: 100 so multiple buys in same asset pass risk checks)
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         risk::set_risk_config(
@@ -907,6 +927,7 @@ fn test_get_portfolio() {
     let signal = setup_signal(&env, signal_id, env.ledger().timestamp() + 1000);
 
     env.as_contract(&contract_id, || {
+        set_permissive_rate_limits(&env);
         storage::set_signal(&env, signal_id, &signal);
         auth::grant_authorization(&env, &user, 1000000, 30).unwrap();
         env.storage()
@@ -1375,6 +1396,50 @@ fn test_simulation_failure_emits_simulation_log() {
                     .unwrap_or(false)
         }));
     });
+}
+
+#[test]
+fn error_messages_are_non_empty_and_distinct() {
+    // A representative sample of raw variants plus at least one alias const
+    // (Issue #883). Aliases resolve to their target variant's value, so
+    // `EscrowNotFound` and `StrategyNotFound` intentionally share a message
+    // below — see `AutoTradeError::message()`'s doc comment for why.
+    let samples = [
+        AutoTradeError::InvalidAmount,
+        AutoTradeError::Unauthorized,
+        AutoTradeError::SignalExpired,
+        AutoTradeError::PositionAlreadyExists,
+        AutoTradeError::SystemError,
+        AutoTradeError::AtomicExecutionFailed, // alias const → SystemError
+    ];
+    for err in samples.iter() {
+        assert!(!err.message().is_empty());
+    }
+    assert_eq!(
+        AutoTradeError::SystemError.message(),
+        AutoTradeError::AtomicExecutionFailed.message(),
+        "alias consts share their target variant's runtime value and message"
+    );
+
+    // Distinct underlying variants must have distinct messages.
+    let distinct = [
+        AutoTradeError::InvalidAmount,
+        AutoTradeError::Unauthorized,
+        AutoTradeError::SignalExpired,
+        AutoTradeError::PositionAlreadyExists,
+        AutoTradeError::SystemError,
+    ];
+    for i in 0..distinct.len() {
+        for j in (i + 1)..distinct.len() {
+            assert_ne!(
+                distinct[i].message(),
+                distinct[j].message(),
+                "expected distinct messages for {:?} and {:?}",
+                distinct[i],
+                distinct[j]
+            );
+        }
+    }
 }
 
 // ========================================

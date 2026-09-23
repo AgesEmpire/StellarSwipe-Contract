@@ -137,11 +137,7 @@ pub fn calculate_global_analytics(env: &Env, signals_map: &Map<u64, Signal>) -> 
         }
     }
 
-    let avg_success_rate = if terminal > 0 {
-        (successful * 10000) / terminal
-    } else {
-        0
-    };
+    let avg_success_rate = (successful * 10000).checked_div(terminal).unwrap_or(0);
 
     GlobalAnalytics {
         total_signals_24h,
@@ -364,17 +360,11 @@ pub fn calculate_category_analytics(
         }
     }
 
-    let avg_success_rate = if closed_count > 0 {
-        (total_successful * 10000) / closed_count
-    } else {
-        0
-    };
+    let avg_success_rate = (total_successful * 10000)
+        .checked_div(closed_count)
+        .unwrap_or(0);
 
-    let avg_roi_bps = if closed_count > 0 {
-        total_roi / closed_count as i128
-    } else {
-        0
-    };
+    let avg_roi_bps = total_roi.checked_div(closed_count as i128).unwrap_or(0);
 
     // Find top provider (highest success rate among those with >= 3 closed signals)
     let mut top_provider: Option<Address> = None;
@@ -458,11 +448,9 @@ impl GlobalAnalyticsAccumulator {
 
     /// Average success rate in bps, matching `calculate_global_analytics`'s formula.
     pub fn avg_success_rate(&self) -> u32 {
-        if self.terminal > 0 {
-            (self.successful * 10000) / self.terminal
-        } else {
-            0
-        }
+        (self.successful * 10000)
+            .checked_div(self.terminal)
+            .unwrap_or(0)
     }
 }
 

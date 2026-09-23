@@ -298,10 +298,10 @@ fn test_invalid_price_rejected() {
     client.register_oracle(&admin, &oracle1);
 
     let result = client.try_submit_price(&oracle1, &0);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(OracleError::InvalidPrice)));
 
     let result = client.try_submit_price(&oracle1, &-100);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(OracleError::InvalidPrice)));
 }
 
 #[test]
@@ -314,7 +314,7 @@ fn test_unregistered_oracle_cannot_submit() {
     client.initialize(&admin, &xlm_asset(&env));
 
     let result = client.try_submit_price(&unregistered, &100_000_000);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(OracleError::OracleNotFound)));
 }
 
 // ── Issue #602: minimum independent source count ─────────────────────────────
@@ -546,7 +546,7 @@ fn test_get_normalized_price_differing_native_decimals_to_common_target() {
 }
 
 #[test]
-fn test_get_normalized_price_no_decimals_configured_returns_error() {
+fn test_get_normalized_price_no_decimals_configured_falls_back() {
     let (env, admin, _, _, _) = create_test_env();
     let contract_id = env.register_contract(None, OracleContract);
     let client = OracleContractClient::new(&env, &contract_id);
@@ -554,8 +554,136 @@ fn test_get_normalized_price_no_decimals_configured_returns_error() {
 
     let pair = make_pair(&env, "ETH", "USD");
     client.set_price(&pair, &2_000_000_000i128);
-    // Deliberately omit set_feed_decimals.
+    // Deliberately omit set_feed_decimals — falls back to 7 decimals.
 
-    let result = client.try_get_normalized_price(&pair, &6u32);
-    assert!(result.is_err());
+    // Rescaling a 7-decimal price to 6 decimals divides by 10.
+    let normalized = client.get_normalized_price(&pair, &6u32);
+    assert_eq!(normalized, 200_000_000i128);
+}
+
+#[test]
+fn error_messages_are_non_empty_and_distinct() {
+    let samples = [
+        OracleError::PriceNotFound,
+        OracleError::Unauthorized,
+        OracleError::StalePrice,
+        OracleError::InsufficientSources,
+        OracleError::PriceDeviationBreakerTripped,
+    ];
+    for err in samples.iter() {
+        assert!(!err.message().is_empty());
+    }
+    for i in 0..samples.len() {
+        for j in (i + 1)..samples.len() {
+            assert_ne!(
+                samples[i].message(),
+                samples[j].message(),
+                "expected distinct messages for {:?} and {:?}",
+                samples[i],
+                samples[j]
+            );
+        }
+    }
+}
+
+// ── Instruction-budget regression snapshots (Issue #budget) ───────────────────
+
+use stellar_swipe_common::budget_regression::measure_and_emit;
+
+#[test]
+fn set_price_budget_regression() {
+    let (env, admin, oracle1, _, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &xlm_asset(&env));
+    client.register_oracle(&admin, &oracle1);
+
+    env.budget().reset_tracker();
+    let pair = AssetPair {
+        base: xlm_asset(&env),
+        quote: Asset {
+            code: String::from_str(&env, "USDC"),
+            issuer: Some(Address::generate(&env)),
+        },
+    };
+    client.set_price(&pair, &100_000_000);
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("oracle.set_price", 3_000_000, instructions);
+}
+
+#[test]
+fn get_price_budget_regression() {
+    let (env, admin, oracle1, _, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &xlm_asset(&env));
+    client.register_oracle(&admin, &oracle1);
+
+    let pair = AssetPair {
+        base: xlm_asset(&env),
+        quote: Asset {
+            code: String::from_str(&env, "USDC"),
+            issuer: Some(Address::generate(&env)),
+        },
+    };
+    client.set_price(&pair, &100_000_000);
+    client.submit_price(&oracle1, &100_000_000);
+
+    env.budget().reset_tracker();
+    let _ = client.get_price(&pair);
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("oracle.get_price", 2_000_000, instructions);
+}
+
+// ── Normalization tests (Issue #normalization) ───────────────────────────────
+
+#[test]
+fn get_normalized_price_falls_back_to_7_decimals_when_unconfigured() {
+    let (env, admin, _, _, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &xlm_asset(&env));
+
+    let pair = AssetPair {
+        base: xlm_asset(&env),
+        quote: Asset {
+            code: String::from_str(&env, "USDC"),
+            issuer: Some(Address::generate(&env)),
+        },
+    };
+
+    // Store a 7-decimal price without configuring feed decimals
+    client.set_price(&pair, &100_000_000);
+    let normalized = client.get_normalized_price(&pair, &7);
+    assert_eq!(normalized, 100_000_000);
+}
+
+#[test]
+fn get_normalized_price_rescales_configured_decimals() {
+    let (env, admin, _, _, _) = create_test_env();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &xlm_asset(&env));
+
+    let pair = AssetPair {
+        base: xlm_asset(&env),
+        quote: Asset {
+            code: String::from_str(&env, "USDC"),
+            issuer: Some(Address::generate(&env)),
+        },
+    };
+
+    // Configure 6-decimal feed and store $50,000 as 50_000_000
+    client.set_feed_decimals(&admin, &pair, &6);
+    client.set_price(&pair, &50_000_000);
+
+    // Normalized to 7 decimals: 50_000_000 * 10 = 500_000_000
+    let normalized = client.get_normalized_price(&pair, &7);
+    assert_eq!(normalized, 500_000_000);
+}
+
+#[test]
+fn normalize_price_helper_converts_to_canonical_7_decimals() {
+    let result = crate::conversion::normalize_price(50_000_000, 6);
+    assert_eq!(result, Some(500_000_000));
 }
