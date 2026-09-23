@@ -725,11 +725,11 @@ fn track_sentiment_accuracy(
     }
 
     // Update rolling correlation (simplified)
-    let correlation = if accuracy.total_signals > 0 {
-        ((accuracy.accurate_predictions * SCALE_FACTOR as u32) / accuracy.total_signals) as i32
-    } else {
-        0
-    };
+    let correlation = accuracy
+        .accurate_predictions
+        .checked_mul(SCALE_FACTOR as u32)
+        .and_then(|v| v.checked_div(accuracy.total_signals))
+        .unwrap_or(0) as i32;
     accuracy.avg_sentiment_price_corr = correlation;
 
     store_accuracy(env, strategy_id, &accuracy);
@@ -846,7 +846,7 @@ fn sqrt(n: u32) -> u32 {
     }
 
     let mut x = n;
-    let mut y = (x + 1) / 2;
+    let mut y = (x + 1).div_ceil(2);
 
     while y < x {
         x = y;

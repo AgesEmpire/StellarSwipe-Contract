@@ -324,7 +324,7 @@ mod tests {
             assert!(!a.completed);
 
             // 1 more XLM
-            on_trade_closed(&env, &user, 1 * 10_000_000);
+            on_trade_closed(&env, &user, 10_000_000);
             let list = get_achievements(&env, &user);
             let a = find_achievement(&list, AchievementType::Profit1000Xlm);
             assert!(a.completed);

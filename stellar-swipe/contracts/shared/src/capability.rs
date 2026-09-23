@@ -262,7 +262,8 @@ mod tests {
         env.as_contract(&_id, || {
             delegate_capability(&env, &admin, &operator, CapabilityScope::Upgrade, 0).unwrap();
             assert!(require_capability(&env, &operator, CapabilityScope::Upgrade).is_ok());
-
+        });
+        env.as_contract(&_id, || {
             revoke_capability(&env, &admin, &operator, CapabilityScope::Upgrade).unwrap();
             assert_eq!(
                 require_capability(&env, &operator, CapabilityScope::Upgrade),
@@ -282,8 +283,9 @@ mod tests {
             delegate_capability(&env, &admin, &operator, CapabilityScope::Upgrade, now + 50)
                 .unwrap();
             assert!(require_capability(&env, &operator, CapabilityScope::Upgrade).is_ok());
-
-            env.ledger().with_mut(|l| l.sequence_number += 100);
+        });
+        env.as_contract(&_id, || {
+            env.ledger().with_mut(|l| l.timestamp += 100);
             assert_eq!(
                 require_capability(&env, &operator, CapabilityScope::Upgrade),
                 Err(CapabilityError::InsufficientCapability)
@@ -309,12 +311,14 @@ mod tests {
         let (env, _id) = setup();
         let admin = Address::generate(&env);
 
-        env.as_contract(&_id, || {
-            for _ in 0..MAX_DELEGATIONS_PER_DELEGATOR {
-                let delegate = Address::generate(&env);
+        for _ in 0..MAX_DELEGATIONS_PER_DELEGATOR {
+            let delegate = Address::generate(&env);
+            env.as_contract(&_id, || {
                 delegate_capability(&env, &admin, &delegate, CapabilityScope::Upgrade, 0).unwrap();
-            }
-            let extra = Address::generate(&env);
+            });
+        }
+        let extra = Address::generate(&env);
+        env.as_contract(&_id, || {
             assert_eq!(
                 delegate_capability(&env, &admin, &extra, CapabilityScope::Upgrade, 0),
                 Err(CapabilityError::MaxDelegationsReached)
@@ -333,8 +337,12 @@ mod tests {
             assert_eq!(delegation_count(&env, &admin), 0);
             delegate_capability(&env, &admin, &op1, CapabilityScope::Upgrade, 0).unwrap();
             assert_eq!(delegation_count(&env, &admin), 1);
+        });
+        env.as_contract(&_id, || {
             delegate_capability(&env, &admin, &op2, CapabilityScope::Pause, 0).unwrap();
             assert_eq!(delegation_count(&env, &admin), 2);
+        });
+        env.as_contract(&_id, || {
             revoke_capability(&env, &admin, &op1, CapabilityScope::Upgrade).unwrap();
             assert_eq!(delegation_count(&env, &admin), 1);
         });

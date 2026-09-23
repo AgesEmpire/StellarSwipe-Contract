@@ -385,11 +385,10 @@ pub fn analyze_dca_performance(env: &Env, id: u64) -> Result<DCAPerformance, Aut
 
     let total_purchases = s.purchases.len();
     let expected = calculate_expected_purchases(env, &s);
-    let consistency_pct = if expected > 0 {
-        (total_purchases * 10_000) / expected
-    } else {
-        10_000
-    };
+    let consistency_pct = total_purchases
+        .checked_mul(10_000)
+        .and_then(|v| v.checked_div(expected))
+        .unwrap_or(10_000);
 
     Ok(DCAPerformance {
         total_invested: s.total_invested,

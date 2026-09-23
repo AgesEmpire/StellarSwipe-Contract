@@ -256,4 +256,12 @@ impl GovernanceError {
     pub const PendingAdminNotFound: GovernanceError = GovernanceError::Unauthorized;
     /// Guardian address has not been configured.
     pub const GuardianNotSet: GovernanceError = GovernanceError::Unauthorized;
+    /// A proposal's embedded parameter value (`current` or `proposed` in a
+    /// `ParameterChange`) is outside the allowlisted `±MAX_PARAMETER_VALUE`
+    /// range enforced by `validate_proposal`.
+    pub const ProposalParameterOutOfRange: GovernanceError = GovernanceError::InvalidAmount;
+    /// A direct admin entry point was called while admin-timelock enforcement
+    /// is active (Issue #942). The action must instead be routed through its
+    /// `queue_*` + `*_timelocked` pair so the mandatory delay applies.
+    pub const TimelockBypassBlocked: GovernanceError = GovernanceError::Unauthorized;
 }

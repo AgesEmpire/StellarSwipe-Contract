@@ -2011,6 +2011,7 @@ fn test_insurance_payout_authorized_caller() {
     let env = Env::default();
     env.mock_all_auths();
 
+    // --- setup ---
     let admin = Address::generate(&env);
     let keeper = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -2071,7 +2072,7 @@ fn test_insurance_payout_invalid_amount() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #940: Fee rebate cap tests
+// Issue #940: Fee rebate cap tests (duplicate: also closes #947)
 // ---------------------------------------------------------------------------
 
 /// Helper: sets pending fees for a provider directly in contract storage.

@@ -16,6 +16,7 @@ shared = { path = "../shared" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+shared = { path = "../shared", features = ["testutils"] }
 
 [lints]
 workspace = true

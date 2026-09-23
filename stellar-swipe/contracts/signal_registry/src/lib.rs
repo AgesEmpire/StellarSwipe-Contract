@@ -6,7 +6,10 @@ static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
 
 mod admin;
 mod analytics;
+pub mod param_bounds;
+pub use param_bounds::{ParamBounds, get_param_bounds};
 mod categories;
+pub mod reward_ledger;
 mod churn_risk;
 mod cohort_retention;
 mod collaboration;
@@ -99,7 +102,7 @@ pub use ml_scoring::{MLModel, SignalFeatures, SignalScore};
 use providers::VerificationEligibility;
 use reputation::{
     calculate_trust_score, get_trust_score, update_median_values, update_trust_score,
-    TrustScoreDetails, TrustScoreTier,
+    ReputationSnapshot, TrustScoreDetails, TrustScoreTier,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal, Map, String,
@@ -340,6 +343,37 @@ impl SignalRegistry {
         admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         Ok(storage_monitor::admin_cleanup_storage(&env, batch_size))
+    }
+
+    /// Admin: declare the legal [min, max] range for a named strategy parameter.
+    /// Subsequent calls to `validate_strategy_param` will enforce this range.
+    ///
+    /// # Errors
+    /// - [`AdminError::Unauthorized`] — caller is not the config admin.
+    /// - [`AdminError::InvalidParameter`] — min > max.
+    pub fn set_param_bounds(
+        env: Env,
+        caller: Address,
+        param: Symbol,
+        min: i128,
+        max: i128,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        param_bounds::set_param_bounds(&env, param, param_bounds::ParamBounds { min, max })
+    }
+
+    /// Validate `value` against the declared bounds for `param`.
+    /// Returns `Ok(())` if within range or no bounds declared.
+    ///
+    /// # Errors
+    /// - [`AdminError::InvalidParameter`] — value is outside [min, max].
+    pub fn validate_strategy_param(
+        env: Env,
+        param: Symbol,
+        value: i128,
+    ) -> Result<(), AdminError> {
+        param_bounds::validate_param(&env, param, value)
     }
 
     pub fn set_min_stake(env: Env, caller: Address, new_amount: i128) -> Result<(), AdminError> {
@@ -958,6 +992,20 @@ impl SignalRegistry {
        INTERNAL HELPERS
     ========================== */
 
+    /// Allocates the next signal id from a persistent monotonic counter.
+    ///
+    /// # Invariant (issue #977)
+    /// `StorageKey::SignalCounter` only ever increases, and every id it has
+    /// ever produced is permanently retired — ids are never reused, even if
+    /// the corresponding record is later removed. `migrate_signals_v1_to_v2`
+    /// relies on this: it never calls `next_signal_id`, instead re-writing
+    /// each legacy `SignalV1` row into the v2 map at its *original* id, so a
+    /// migration can only collide with a freshly-created signal if the
+    /// counter were smaller than the highest legacy id — which is why the
+    /// counter itself (not the v1/v2 map lengths) is the bound the migration
+    /// scans against. A restart or replay is safe because the counter is
+    /// read fresh from persistent storage on every call; nothing in this
+    /// path is order- or session-dependent.
     fn next_signal_id(env: &Env) -> u64 {
         let mut counter: u64 = env
             .storage()
@@ -1308,7 +1356,6 @@ impl SignalRegistry {
             submitted_at: now,
             expiry,
             status: SignalStatus::Active,
-            // Initialize performance tracking fields
             executions: 0,
             successful_executions: 0,
             total_volume: 0,
@@ -1317,7 +1364,6 @@ impl SignalRegistry {
             category: category.clone(),
             tags: unique_tags.clone(),
             risk_level,
-            // Collaboration field
             is_collaborative: false,
             rationale_hash,
             confidence: 50,
@@ -2168,6 +2214,13 @@ impl SignalRegistry {
         Ok(())
     }
 
+    /// Read-only: the total staked amount for `provider`, or `0` when not staked.
+    pub fn get_stake(env: Env, provider: Address) -> i128 {
+        stake::get_stake_info(&env, &provider)
+            .map(|info| info.amount)
+            .unwrap_or(0)
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // Issue #424: Provider Ban Mechanism
     // ═══════════════════════════════════════════════════════════════
@@ -2510,6 +2563,23 @@ impl SignalRegistry {
         } else {
             expiry::get_active_signals(&env, &signals)
         }
+    }
+
+    /// Read-only, cursor-paginated history of all signals a provider has
+    /// ever submitted. Newest-first with deterministic ordering; pages are
+    /// bounded to at most [`query::MAX_HISTORY_PAGE_SIZE`] records so large
+    /// histories do not exceed Soroban resource limits.
+    ///
+    /// See [`query::get_provider_signal_history`] for the full pagination
+    /// semantics (cursor exclusivity, clamping, out-of-range / empty pages).
+    pub fn get_provider_signal_history(
+        env: Env,
+        provider: Address,
+        cursor: Option<u64>,
+        limit: u32,
+    ) -> query::ProviderSignalHistoryPage {
+        let signals_map = Self::get_signals_map(&env);
+        query::get_provider_signal_history(&env, &signals_map, &provider, cursor, limit)
     }
 
     /* =========================
@@ -3429,6 +3499,30 @@ impl SignalRegistry {
         ))
     }
 
+    /// Cross-contract read-only reputation snapshot (issue #1027).
+    ///
+    /// Returns a stable, self-describing [`ReputationSnapshot`] for `provider`,
+    /// derived entirely from canonical contract state (provider stats, stake and
+    /// rolling reputation score) as of the current ledger timestamp. It performs
+    /// no authentication and no storage writes, so other contracts can call it
+    /// during risk assessment or incentive determination without mutating this
+    /// contract. An unknown provider yields a well-formed, zeroed snapshot with
+    /// `has_sufficient_history == false`.
+    pub fn reputation_snapshot(env: Env, provider: Address) -> ReputationSnapshot {
+        let performance =
+            Self::get_provider_stats(env.clone(), provider.clone()).unwrap_or_default();
+        let stake_info = stake::get_stake_info(&env, &provider);
+        let reputation_score = Self::get_provider_reputation_score(env.clone(), provider.clone());
+
+        reputation::build_reputation_snapshot(
+            &env,
+            &provider,
+            &performance,
+            &stake_info,
+            reputation_score,
+        )
+    }
+
     /// Update trust score for a provider (called after performance changes)
     ///
     /// This should be called when:
@@ -3620,6 +3714,51 @@ impl SignalRegistry {
             estimated_rent_xlm,
         }
     }
+
+    // ── Issue #1038: Claimable rewards emission ledger tie-in ─────────────────────
+
+    /// Admin: open a new reward window anchored to the current ledger sequence.
+    ///
+    /// All claims within this epoch use `anchor_ledger` as their snapshot
+    /// reference, ensuring stable, reproducible eligibility calculations.
+    pub fn open_reward_window(
+        env: Env,
+        caller: Address,
+        window_duration_ledgers: u32,
+        total_pool: i128,
+    ) -> Result<reward_ledger::RewardWindow, AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        Ok(reward_ledger::open_reward_window(&env, window_duration_ledgers, total_pool))
+    }
+
+    /// Returns the currently active reward window, if any.
+    pub fn get_reward_window(env: Env) -> Option<reward_ledger::RewardWindow> {
+        reward_ledger::get_active_window(&env)
+    }
+
+    /// Provider: claim rewards for the active window.
+    ///
+    /// Eligibility is validated against the window's `anchor_ledger` snapshot.
+    /// Emits `reward_claimed` with the anchor ledger for auditability.
+    pub fn claim_ledger_rewards(
+        env: Env,
+        provider: Address,
+        amount: i128,
+    ) -> Result<reward_ledger::ClaimRecord, AdminError> {
+        provider.require_auth();
+        reward_ledger::record_claim(&env, &provider, amount)
+            .map_err(|_| AdminError::InvalidParameter)
+    }
+
+    /// Returns the claim record for `provider` in `epoch_id`, if any.
+    pub fn get_reward_claim_record(
+        env: Env,
+        provider: Address,
+        epoch_id: u64,
+    ) -> Option<reward_ledger::ClaimRecord> {
+        reward_ledger::get_claim_record(&env, &provider, epoch_id)
+    }
 }
 
 #[contracttype]
@@ -3636,6 +3775,8 @@ pub struct StorageStats {
 mod test;
 #[cfg(test)]
 mod test_admin_roles;
+#[cfg(test)]
+mod test_param_bounds;
 #[cfg(test)]
 mod test_admin_transfer;
 #[cfg(test)]

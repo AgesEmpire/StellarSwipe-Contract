@@ -70,7 +70,7 @@ impl BenchPortfolio {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn setup_contract(env: &Env) -> (TradeExecutorContractClient, Address, Address, Address) {
+fn setup_contract(env: &Env) -> (TradeExecutorContractClient<'_>, Address, Address, Address) {
     let admin = Address::generate(env);
     let user = Address::generate(env);
 
@@ -171,11 +171,11 @@ fn dca_interval_storage_rent_baseline_smoke() {
 #[test]
 fn storage_rent_delta_within_threshold() {
     // Sanity: threshold must be > 0.
-    assert!(RENT_DELTA_THRESHOLD_PCT > 0);
+    const _: () = assert!(RENT_DELTA_THRESHOLD_PCT > 0);
     // Baselines must be positive — a value of 0 would mean the entrypoint
     // performs no storage writes, which is always wrong.
-    assert!(BASELINE_COPY_TRADE_STORAGE_WRITES > 0);
-    assert!(BASELINE_DCA_INTERVAL_STORAGE_WRITES > 0);
+    const _: () = assert!(BASELINE_COPY_TRADE_STORAGE_WRITES > 0);
+    const _: () = assert!(BASELINE_DCA_INTERVAL_STORAGE_WRITES > 0);
 
     // If a future SDK bump changes storage mechanics, update the constants
     // above and explain the delta in the PR description.  The threshold check

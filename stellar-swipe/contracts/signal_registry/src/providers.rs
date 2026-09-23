@@ -664,6 +664,19 @@ mod tests {
         env.as_contract(&cid, || f(&env))
     }
 
+    fn mocked_contract() -> (Env, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        (env, cid)
+    }
+
+    fn with_contract_mocked<R>(f: impl FnOnce(&Env) -> R) -> R {
+        let (env, cid) = mocked_contract();
+        env.as_contract(&cid, || f(&env))
+    }
+
     #[test]
     fn profile_created_on_first_stake() {
         with_contract(|env| {
@@ -894,126 +907,147 @@ mod tests {
 
     #[test]
     fn add_and_list_specialization_tags() {
-        with_contract(|env| {
-            let admin = Address::generate(env);
-            let provider1 = Address::generate(env);
-            let provider2 = Address::generate(env);
+        let (env, cid) = mocked_contract();
+        let admin = Address::generate(&env);
+        let provider1 = Address::generate(&env);
+        let provider2 = Address::generate(&env);
 
-            // Add admin-defined tags
-            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
-            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
-
-            let tags = get_specialization_tags(env);
-            assert_eq!(tags.len(), 2);
-
-            // Set provider specializations
-            let mut p1_tags = soroban_sdk::Vec::new(env);
-            p1_tags.push_back(String::from_str(env, "DeFi"));
-            set_provider_specializations(env, &provider1, p1_tags);
-
-            let mut p2_tags = soroban_sdk::Vec::new(env);
-            p2_tags.push_back(String::from_str(env, "Forex"));
-            set_provider_specializations(env, &provider2, p2_tags);
-
-            // List by tag
-            let defi_providers =
-                list_providers_by_specialization(env, String::from_str(env, "DeFi"));
-            assert_eq!(defi_providers.len(), 1);
-            assert_eq!(defi_providers.get(0).unwrap(), provider1);
+        // Add admin-defined tags
+        env.as_contract(&cid, || {
+            add_specialization_tag(&env, &admin, String::from_str(&env, "DeFi")).unwrap();
         });
+        env.as_contract(&cid, || {
+            add_specialization_tag(&env, &admin, String::from_str(&env, "Forex")).unwrap();
+        });
+
+        let tags = env.as_contract(&cid, || get_specialization_tags(&env));
+        assert_eq!(tags.len(), 2);
+
+        // Set provider specializations
+        let mut p1_tags = soroban_sdk::Vec::new(&env);
+        p1_tags.push_back(String::from_str(&env, "DeFi"));
+        env.as_contract(&cid, || {
+            set_provider_specializations(&env, &provider1, p1_tags.clone());
+        });
+
+        let mut p2_tags = soroban_sdk::Vec::new(&env);
+        p2_tags.push_back(String::from_str(&env, "Forex"));
+        env.as_contract(&cid, || {
+            set_provider_specializations(&env, &provider2, p2_tags.clone());
+        });
+
+        // List by tag
+        let defi_providers =
+            env.as_contract(&cid, || list_providers_by_specialization(&env, String::from_str(&env, "DeFi")));
+        assert_eq!(defi_providers.len(), 1);
+        assert_eq!(defi_providers.get(0).unwrap(), provider1);
     }
 
     #[test]
     fn tag_count_limit_enforced() {
-        with_contract(|env| {
-            let admin = Address::generate(env);
-            let provider = Address::generate(env);
+        let (env, cid) = mocked_contract();
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
 
-            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
-            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
-            add_specialization_tag(env, &admin, String::from_str(env, "Large-cap")).unwrap();
-            add_specialization_tag(env, &admin, String::from_str(env, "Crypto")).unwrap();
+        for tag in ["DeFi", "Forex", "Large-cap", "Crypto"] {
+            env.as_contract(&cid, || {
+                add_specialization_tag(&env, &admin, String::from_str(&env, tag)).unwrap();
+            });
+        }
 
-            // Try to set 4 tags (limit is 3)
-            let mut tags = soroban_sdk::Vec::new(env);
-            tags.push_back(String::from_str(env, "DeFi"));
-            tags.push_back(String::from_str(env, "Forex"));
-            tags.push_back(String::from_str(env, "Large-cap"));
-            tags.push_back(String::from_str(env, "Crypto"));
+        // Try to set 4 tags (limit is 3)
+        let mut tags = soroban_sdk::Vec::new(&env);
+        tags.push_back(String::from_str(&env, "DeFi"));
+        tags.push_back(String::from_str(&env, "Forex"));
+        tags.push_back(String::from_str(&env, "Large-cap"));
+        tags.push_back(String::from_str(&env, "Crypto"));
 
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                set_provider_specializations(env, &provider, tags);
-            }));
-            assert!(result.is_err());
-        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.as_contract(&cid, || set_provider_specializations(&env, &provider, tags));
+        }));
+        assert!(result.is_err());
     }
 
     #[test]
     fn unknown_tag_rejected() {
-        with_contract(|env| {
-            let admin = Address::generate(env);
-            let provider = Address::generate(env);
+        let (env, cid) = mocked_contract();
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
 
-            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
-
-            let mut tags = soroban_sdk::Vec::new(env);
-            tags.push_back(String::from_str(env, "UnknownTag"));
-
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                set_provider_specializations(env, &provider, tags);
-            }));
-            assert!(result.is_err());
+        env.as_contract(&cid, || {
+            add_specialization_tag(&env, &admin, String::from_str(&env, "DeFi")).unwrap();
         });
+
+        let mut tags = soroban_sdk::Vec::new(&env);
+        tags.push_back(String::from_str(&env, "UnknownTag"));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.as_contract(&cid, || set_provider_specializations(&env, &provider, tags));
+        }));
+        assert!(result.is_err());
     }
 
     #[test]
     fn provider_can_retag() {
-        with_contract(|env| {
-            let admin = Address::generate(env);
-            let provider = Address::generate(env);
+        let (env, cid) = mocked_contract();
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
 
-            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
-            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
-
-            let mut tags1 = soroban_sdk::Vec::new(env);
-            tags1.push_back(String::from_str(env, "DeFi"));
-            set_provider_specializations(env, &provider, tags1);
-
-            let stored1 = get_provider_specializations(env, &provider);
-            assert_eq!(stored1.len(), 1);
-            assert_eq!(stored1.get(0).unwrap(), String::from_str(env, "DeFi"));
-
-            // Retag
-            let mut tags2 = soroban_sdk::Vec::new(env);
-            tags2.push_back(String::from_str(env, "Forex"));
-            set_provider_specializations(env, &provider, tags2);
-
-            let stored2 = get_provider_specializations(env, &provider);
-            assert_eq!(stored2.len(), 1);
-            assert_eq!(stored2.get(0).unwrap(), String::from_str(env, "Forex"));
-
-            // Old tag should no longer list the provider
-            let defi_providers =
-                list_providers_by_specialization(env, String::from_str(env, "DeFi"));
-            assert_eq!(defi_providers.len(), 0);
+        env.as_contract(&cid, || {
+            add_specialization_tag(&env, &admin, String::from_str(&env, "DeFi")).unwrap();
         });
+        env.as_contract(&cid, || {
+            add_specialization_tag(&env, &admin, String::from_str(&env, "Forex")).unwrap();
+        });
+
+        let mut tags1 = soroban_sdk::Vec::new(&env);
+        tags1.push_back(String::from_str(&env, "DeFi"));
+        env.as_contract(&cid, || {
+            set_provider_specializations(&env, &provider, tags1.clone());
+        });
+
+        let stored1 = env.as_contract(&cid, || get_provider_specializations(&env, &provider));
+        assert_eq!(stored1.len(), 1);
+        assert_eq!(stored1.get(0).unwrap(), String::from_str(&env, "DeFi"));
+
+        // Retag
+        let mut tags2 = soroban_sdk::Vec::new(&env);
+        tags2.push_back(String::from_str(&env, "Forex"));
+        env.as_contract(&cid, || {
+            set_provider_specializations(&env, &provider, tags2.clone());
+        });
+
+        let stored2 = env.as_contract(&cid, || get_provider_specializations(&env, &provider));
+        assert_eq!(stored2.len(), 1);
+        assert_eq!(stored2.get(0).unwrap(), String::from_str(&env, "Forex"));
+
+        // Old tag should no longer list the provider
+        let defi_providers = env
+            .as_contract(&cid, || list_providers_by_specialization(&env, String::from_str(&env, "DeFi")));
+        assert_eq!(defi_providers.len(), 0);
     }
 
     #[test]
     fn remove_specialization_tag_works() {
-        with_contract(|env| {
-            let admin = Address::generate(env);
+        let (env, cid) = mocked_contract();
+        let admin = Address::generate(&env);
 
-            add_specialization_tag(env, &admin, String::from_str(env, "DeFi")).unwrap();
-            add_specialization_tag(env, &admin, String::from_str(env, "Forex")).unwrap();
-
-            assert_eq!(get_specialization_tags(env).len(), 2);
-
-            remove_specialization_tag(env, &admin, String::from_str(env, "DeFi"));
-
-            let remaining = get_specialization_tags(env);
-            assert_eq!(remaining.len(), 1);
-            assert_eq!(remaining.get(0).unwrap(), String::from_str(env, "Forex"));
+        env.as_contract(&cid, || {
+            add_specialization_tag(&env, &admin, String::from_str(&env, "DeFi")).unwrap();
         });
+        env.as_contract(&cid, || {
+            add_specialization_tag(&env, &admin, String::from_str(&env, "Forex")).unwrap();
+        });
+
+        let count = env.as_contract(&cid, || get_specialization_tags(&env).len());
+        assert_eq!(count, 2);
+
+        env.as_contract(&cid, || {
+            remove_specialization_tag(&env, &admin, String::from_str(&env, "DeFi"));
+        });
+
+        let remaining = env.as_contract(&cid, || get_specialization_tags(&env));
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get(0).unwrap(), String::from_str(&env, "Forex"));
     }
 }

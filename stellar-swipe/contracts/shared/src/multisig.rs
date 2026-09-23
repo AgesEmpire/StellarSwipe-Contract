@@ -420,7 +420,9 @@ mod tests {
 
         let proposal = env.as_contract(&cid, || get_proposal(&env, id).unwrap());
         assert_eq!(proposal.approvals.len(), 2);
-        assert!(require_can_execute(&env, &proposal).is_ok());
+        env.as_contract(&cid, || {
+            assert!(require_can_execute(&env, &proposal).is_ok());
+        });
     }
 
     #[test]

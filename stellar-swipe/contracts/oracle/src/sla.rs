@@ -104,11 +104,10 @@ pub fn record_update(env: &Env, pair: &AssetPair) {
 /// Read-only summary of recent update cadence for an asset pair.
 pub fn get_feed_health(env: &Env, pair: &AssetPair) -> FeedHealth {
     let record = load(env, pair);
-    let avg = if record.interval_count > 0 {
-        record.interval_sum / record.interval_count
-    } else {
-        0
-    };
+    let avg = record
+        .interval_sum
+        .checked_div(record.interval_count)
+        .unwrap_or(0);
     let sla_breached =
         record.expected_interval_secs > 0 && avg > 0 && avg > record.expected_interval_secs;
     FeedHealth {

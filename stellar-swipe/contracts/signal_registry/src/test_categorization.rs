@@ -5,7 +5,7 @@ use crate::types::SignalAction;
 use crate::{SignalRegistry, SignalRegistryClient};
 use soroban_sdk::{testutils::Address as _, vec, Address, Env, String};
 
-fn setup(env: &Env) -> (Address, SignalRegistryClient) {
+fn setup(env: &Env) -> (Address, SignalRegistryClient<'_>) {
     env.mock_all_auths();
     #[allow(deprecated)]
     let contract_id = env.register_contract(None, SignalRegistry);

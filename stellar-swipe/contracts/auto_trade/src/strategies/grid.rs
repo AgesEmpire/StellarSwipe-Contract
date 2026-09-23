@@ -426,11 +426,10 @@ pub fn calculate_grid_performance(
     };
 
     let expected_fills = strategy.grid_config.num_grids * 2;
-    let fill_rate = if expected_fills > 0 {
-        ((total_fills * 10_000) / expected_fills) as u32
-    } else {
-        0
-    };
+    let fill_rate = total_fills
+        .checked_mul(10_000)
+        .and_then(|v| v.checked_div(expected_fills))
+        .unwrap_or(0) as u32;
 
     let avg_profit_per_fill = if total_fills > 0 {
         strategy.total_profit / total_fills as i128

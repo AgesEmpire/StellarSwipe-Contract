@@ -14,6 +14,8 @@ mod shadow_mode;
 mod timelock;
 mod token;
 mod treasury;
+/// Stash-account isolation for treasury funds (Issue #1044).
+mod treasury_stash;
 mod voting;
 
 #[cfg(test)]
@@ -180,6 +182,13 @@ pub enum StorageKey {
     PausePropagationTargets,
     /// Pending admin timelock action entries.
     AdminPendingActions,
+    StorageVersion,
+    MigrationInProgress,
+    /// Issue #942: when set to `true`, every category (b) admin entry point
+    /// (see `docs/governance-timelock-audit.md`) rejects direct calls and the
+    /// action must be routed through its `queue_*` + `*_timelocked` pair. This
+    /// is a one-way latch — see `enforce_admin_timelock`.
+    EnforceAdminTimelock,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -311,6 +320,9 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .set(&StorageKey::Initialized, &true);
+        env.storage()
+            .instance()
+            .set(&StorageKey::StorageVersion, &1u32);
         // Initialize pause state via shared::pausable (no event on init).
         env.storage()
             .instance()
@@ -440,6 +452,7 @@ impl GovernanceContract {
         guardian: Address,
     ) -> Result<(), GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         env.storage()
             .instance()
             .set(&StorageKey::Guardian, &guardian);
@@ -552,6 +565,8 @@ impl GovernanceContract {
         require_initialized(&env)?;
         // Issue #860: Capability-based authorization.
         require_capability(&env, &admin, Capability::ParameterChange)?;
+        // Issue #942: direct call is blocked once timelock enforcement is on.
+        require_no_timelock_bypass(&env)?;
         proposals::configure_governance(&env, &admin, config)
     }
 
@@ -570,6 +585,8 @@ impl GovernanceContract {
         require_initialized(&env)?;
         // Issue #860: Capability-based authorization.
         require_capability(&env, &admin, Capability::ParameterChange)?;
+        // Issue #942: direct call is blocked once timelock enforcement is on.
+        require_no_timelock_bypass(&env)?;
         set_category_thresholds(&env, &admin, category, threshold)
     }
 
@@ -745,6 +762,47 @@ impl GovernanceContract {
         require_initialized(&env)?;
         require_not_paused(&env)?;
         proposals::execute_proposal(&env, proposal_id, executor)
+    }
+
+    pub fn migrate_storage(env: Env, admin: Address, from: u32) -> Result<u32, GovernanceError> {
+        require_admin(&env, &admin)?;
+        let current: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StorageVersion)
+            .unwrap_or(0);
+        if current == 1 {
+            return Ok(1);
+        }
+        if from != 0 || current != from {
+            return Err(GovernanceError::InvalidGovernanceConfig);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::MigrationInProgress, &true);
+        let state = proposals::get_proposals_state(&env);
+        if state.next_proposal_id == 0 {
+            return Err(GovernanceError::InvalidProposal);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::StorageVersion, &1u32);
+        env.storage()
+            .instance()
+            .remove(&StorageKey::MigrationInProgress);
+        Ok(1)
+    }
+
+    pub fn storage_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::StorageVersion)
+            .unwrap_or(0)
+    }
+
+    pub fn cleanup_proposals(env: Env, cursor: u32, limit: u32) -> Result<u32, GovernanceError> {
+        require_initialized(&env)?;
+        proposals::cleanup_terminal_proposals(&env, cursor, limit)
     }
 
     /// # Summary
@@ -992,6 +1050,7 @@ impl GovernanceContract {
         new_delay: u64,
     ) -> Result<(), GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         timelock::update_timelock_delay(&env, action_type, new_delay)
     }
 
@@ -1287,6 +1346,7 @@ impl GovernanceContract {
         duration_seconds: u64,
     ) -> Result<(), GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         create_schedule(
             &env,
             beneficiary.clone(),
@@ -1344,6 +1404,7 @@ impl GovernanceContract {
         trial_duration_seconds: u64,
     ) -> Result<ShadowModeState, GovernanceError> {
         require_initialized(&env)?;
+        require_no_timelock_bypass(&env)?;
         shadow_mode::enter_shadow_mode(&env, &admin, new_wasm_hash, trial_duration_seconds)
     }
 
@@ -1367,6 +1428,7 @@ impl GovernanceContract {
     /// Admin-only: promote the new logic and end the shadow trial.
     pub fn promote_from_shadow_mode(env: Env, admin: Address) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
+        require_no_timelock_bypass(&env)?;
         shadow_mode::promote_from_shadow_mode(&env, &admin)
     }
 
@@ -1467,6 +1529,7 @@ impl GovernanceContract {
         amount: i128,
     ) -> Result<Treasury, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut treasury = get_treasury(&env);
         treasury::set_asset_balance(&env, &mut treasury, asset, amount)?;
         put_treasury(&env, &treasury);
@@ -1486,6 +1549,7 @@ impl GovernanceContract {
         auto_renew: bool,
     ) -> Result<Budget, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut treasury = get_treasury(&env);
         let budget = treasury::upsert_budget(
             &env,
@@ -1530,6 +1594,7 @@ impl GovernanceContract {
         approved_cap: i128,
     ) -> Result<BudgetApproval, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut treasury = get_treasury(&env);
         let approval = treasury::approve_budget(
             &env,
@@ -1556,6 +1621,7 @@ impl GovernanceContract {
         approved_by_proposal: Option<u64>,
     ) -> Result<TreasurySpend, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut treasury = get_treasury(&env);
         let spend = treasury::execute_spend(
             &env,
@@ -1587,6 +1653,7 @@ impl GovernanceContract {
         end_date: Option<u64>,
     ) -> Result<RecurringPayment, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut treasury = get_treasury(&env);
         let payment = treasury::schedule_recurring_payment(
             &env,
@@ -1659,6 +1726,7 @@ impl GovernanceContract {
         term_duration_days: Option<u32>,
     ) -> Result<Committee, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut committees_state = get_committees_state(&env);
         let committee = committees::create_committee(
             &env,
@@ -1874,6 +1942,7 @@ impl GovernanceContract {
         decision_id: u64,
     ) -> Result<CommitteeDecision, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut committees_state = get_committees_state(&env);
         let decision =
             committees::override_decision(&mut committees_state, committee_id, decision_id)?;
@@ -1888,6 +1957,7 @@ impl GovernanceContract {
         committee_id: u64,
     ) -> Result<Committee, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut committees_state = get_committees_state(&env);
         let committee = committees::dissolve_committee(&env, &mut committees_state, committee_id)?;
         put_committees_state(&env, &committees_state);
@@ -1953,6 +2023,7 @@ impl GovernanceContract {
         target_bps: i128,
     ) -> Result<Treasury, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut treasury = get_treasury(&env);
         treasury::set_rebalance_target(&env, &mut treasury, asset, target_bps)?;
         put_treasury(&env, &treasury);
@@ -1989,6 +2060,7 @@ impl GovernanceContract {
     ) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
         require_capability(&env, &caller, Capability::SuperAdmin)?;
+        require_no_timelock_bypass(&env)?;
         capabilities::grant_capability(&env, &caller, &target, capability);
         Ok(())
     }
@@ -2002,6 +2074,7 @@ impl GovernanceContract {
     ) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
         require_capability(&env, &caller, Capability::SuperAdmin)?;
+        require_no_timelock_bypass(&env)?;
         capabilities::revoke_capability(&env, &caller, &target, capability);
         Ok(())
     }
@@ -2553,6 +2626,35 @@ impl GovernanceContract {
         Ok(treasury)
     }
 
+    /// Issue #942: irreversibly enable admin-timelock enforcement.
+    ///
+    /// Once enabled, every category (b) admin entry point (the ones with a
+    /// `queue_*` / `*_timelocked` counterpart — see
+    /// `docs/governance-timelock-audit.md`) rejects direct calls with
+    /// [`GovernanceError::TimelockBypassBlocked`]; the action must be routed
+    /// through its queue + timelocked-execute pair so the mandatory delay
+    /// applies. Category (c) functions (emergency pause, key rotation, and the
+    /// low-risk operational setters documented in `SECURITY.md`) are
+    /// unaffected.
+    ///
+    /// Intended to be switched on before a DAO token launch. This latch is
+    /// **one-way** — there is deliberately no disable function, so a
+    /// compromised admin cannot re-open the bypass.
+    pub fn enforce_admin_timelock(env: Env, admin: Address) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::EnforceAdminTimelock, &true);
+        emit_admin_action(&env, symbol_short!("tlenforce"), &admin, 1);
+        Ok(())
+    }
+
+    /// Issue #942: whether admin-timelock enforcement has been latched on via
+    /// [`Self::enforce_admin_timelock`].
+    pub fn is_admin_timelock_enforced(env: Env) -> bool {
+        admin_timelock_enforced(&env)
+    }
+
     pub fn admin_pending_actions(env: Env) -> Result<Vec<AdminTimelockEntry>, GovernanceError> {
         require_initialized(&env)?;
         Ok(get_admin_pending_actions(&env))
@@ -2625,6 +2727,27 @@ fn require_admin_identity(env: &Env, caller: &Address) -> Result<(), GovernanceE
         .ok_or(GovernanceError::NotInitialized)?;
     if admin != *caller {
         return Err(GovernanceError::Unauthorized);
+    }
+    Ok(())
+}
+
+/// Issue #942: `true` once `enforce_admin_timelock` has latched
+/// admin-timelock enforcement on. Defaults to `false` for backward
+/// compatibility (pre-DAO-launch deployments and the existing test suite).
+pub(crate) fn admin_timelock_enforced(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&StorageKey::EnforceAdminTimelock)
+        .unwrap_or(false)
+}
+
+/// Issue #942: reject a direct call to a category (b) admin entry point while
+/// admin-timelock enforcement is active. Such actions must instead be routed
+/// through their `queue_*` + `*_timelocked` pair so the mandatory delay
+/// applies. A no-op (returns `Ok`) while enforcement is disabled.
+fn require_no_timelock_bypass(env: &Env) -> Result<(), GovernanceError> {
+    if admin_timelock_enforced(env) {
+        return Err(GovernanceError::TimelockBypassBlocked);
     }
     Ok(())
 }

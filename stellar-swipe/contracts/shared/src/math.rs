@@ -142,7 +142,14 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 10_000, ..ProptestConfig::default() })]
+        // The `prop_assume!` filters below reject roughly half of all draws, so
+        // the reject budget must comfortably exceed the case count.
+        #![proptest_config(ProptestConfig {
+            cases: 10_000,
+            max_local_rejects: 100_000,
+            max_global_rejects: 100_000,
+            ..ProptestConfig::default()
+        })]
 
         #[test]
         fn same_precision_is_identity(

@@ -283,11 +283,7 @@ pub fn execute_twap_segments(env: &Env) -> Vec<u64> {
             continue;
         }
 
-        let elapsed = if current > twap.start_time {
-            current - twap.start_time
-        } else {
-            0
-        };
+        let elapsed = current.saturating_sub(twap.start_time);
         let expected_segments = (elapsed / twap.interval_seconds.max(1)) as u32;
 
         while twap.segments_executed < expected_segments

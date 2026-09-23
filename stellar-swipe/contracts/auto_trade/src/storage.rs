@@ -28,6 +28,9 @@ pub enum DataKey {
     Trades(Address, u64),
     Signal(u64),
     RateLimitInfo(Address),
+    /// Last ledger timestamp at which `(user, signal_id)` executed a trade
+    /// (per-signal execution rate limit).
+    LastExecution(Address, u64),
 }
 
 /// Get a signal by ID
@@ -113,19 +116,10 @@ pub fn is_rate_limited(env: &Env, user: &Address) -> bool {
 // ── Loss-streak pause (Issue #698) ────────────────────────────────────────────
 
 #[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct LossStreakCounter {
     pub consecutive_losses: u32,
     pub updated_at: u64,
-}
-
-impl Default for LossStreakCounter {
-    fn default() -> Self {
-        Self {
-            consecutive_losses: 0,
-            updated_at: 0,
-        }
-    }
 }
 
 #[contracttype]
@@ -144,7 +138,9 @@ impl Default for LossStreakConfig {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LossStreakKey {
-    Counter(Address),
+    /// Per-user consecutive-loss counter. Deliberately NOT named `Counter` to
+    /// avoid a storage-key collision with `DailyExecutionCapKey::Counter`.
+    StreakCounter(Address),
     ConfigState,
     /// Whether auto-trading is paused due to loss-streak for a user.
     Paused(Address),
@@ -155,7 +151,7 @@ pub fn get_loss_streak_counter(env: &Env, user: &Address) -> LossStreakCounter {
     crud_get_or(
         env,
         StorageTier::Persistent,
-        &LossStreakKey::Counter(user.clone()),
+        &LossStreakKey::StreakCounter(user.clone()),
         LossStreakCounter::default(),
     )
 }
@@ -165,7 +161,7 @@ pub fn set_loss_streak_counter(env: &Env, user: &Address, counter: &LossStreakCo
     crud_set(
         env,
         StorageTier::Persistent,
-        &LossStreakKey::Counter(user.clone()),
+        &LossStreakKey::StreakCounter(user.clone()),
         counter,
     );
 }
@@ -221,19 +217,10 @@ pub fn clear_loss_streak_paused(env: &Env, user: &Address) {
 // ── Daily Execution Cap ───────────────────────────────────────────────────────
 
 #[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct DailyExecutionCounter {
     pub count: u32,
     pub window_start: u64,
-}
-
-impl Default for DailyExecutionCounter {
-    fn default() -> Self {
-        Self {
-            count: 0,
-            window_start: 0,
-        }
-    }
 }
 
 #[contracttype]

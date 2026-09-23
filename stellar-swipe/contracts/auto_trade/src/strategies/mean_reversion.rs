@@ -405,7 +405,7 @@ pub fn adjust_strategy_parameters(env: &Env, strategy_id: u64) -> Result<(), Aut
     let closed: Vec<ReversionPosition> = {
         let mut v: Vec<ReversionPosition> = Vec::new(env);
         let len = strategy.active_positions.len();
-        let start = if len > 20 { len - 20 } else { 0 };
+        let start = len.saturating_sub(20);
         for i in start..len {
             let p = strategy.active_positions.get(i).unwrap();
             if p.status == PositionStatus::Closed {

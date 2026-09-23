@@ -101,6 +101,15 @@ pub enum ContractError {
     TradeExpired = 33,
     /// The contract is paused (governance-driven emergency pause). See Issue #865.
     ContractPaused = 34,
+    /// One or both assets in the pair are not registered in the asset registry
+    /// (Issue #992).
+    AssetNotRegistered = 35,
+    /// Both assets of the pair are identical; distinct assets are required (Issue #992).
+    IdenticalAssets = 36,
+    /// The selected route does not support the requested asset pair (Issue #992).
+    UnsupportedPair = 37,
+    /// No asset registry is configured, so the pair cannot be validated (Issue #992).
+    AssetRegistryNotConfigured = 38,
 }
 
 impl ContractError {
@@ -192,6 +201,18 @@ impl ContractError {
             }
             ContractError::ContractPaused => {
                 "contract is paused (governance-driven emergency pause)"
+            }
+            ContractError::AssetNotRegistered => {
+                "one or both assets in the pair are not registered in the asset registry"
+            }
+            ContractError::IdenticalAssets => {
+                "both assets of the pair are identical; distinct assets are required"
+            }
+            ContractError::UnsupportedPair => {
+                "the selected route does not support the requested asset pair"
+            }
+            ContractError::AssetRegistryNotConfigured => {
+                "no asset registry is configured; cannot validate the asset pair"
             }
         }
     }

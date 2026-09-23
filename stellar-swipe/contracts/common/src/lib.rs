@@ -5,17 +5,25 @@ pub mod emit;
 /// Shared input-sanitization helper for string-based metadata fields (issue #676).
 pub mod sanitize;
 pub use sanitize::{sanitize_string, SanitizeError};
+/// Centralized asset-pair validation for trading contracts (Issue #992).
+pub mod pair_validation;
 
 #[allow(deprecated)]
 pub mod amm_bridge;
+/// Safe arithmetic guardrails for APY / reward-rate calculations (issue #1024).
+pub mod apy_math;
 pub mod assets;
 pub mod budget_regression;
 /// Checked-arithmetic wrapper for financial amounts (issue #599).
 pub mod checked_amount;
+/// Oracle price-freshness gating for collateral / health checks (Issue #1031).
+pub mod collateral_oracle;
 pub mod commit_reveal;
 pub mod constants;
 pub mod emergency;
 pub mod health;
+/// Contract-level (aggregate, per-asset) rate limiting for join operations (Issue #1030).
+pub mod join_rate_limit;
 #[allow(deprecated)]
 pub mod multisig;
 pub mod oracle;
@@ -26,6 +34,10 @@ pub mod perf;
 pub mod rate_limit;
 #[allow(deprecated)]
 pub mod replay_protection;
+/// Reserve health monitoring event stream (issue #1034).
+pub mod reserve_health;
+/// Soroban resource-budget regression suite for core flows (issue #985).
+pub mod resource_budget;
 pub mod retry_backoff;
 /// Generic CRUD helpers to replace per-contract storage boilerplate (Issue #579).
 pub mod storage_crud;
@@ -40,6 +52,10 @@ pub use amm_bridge::{
     AmmRouteSegment, AmmSourceConfig, AmmSourceKind, BPS_DENOMINATOR, FN_GET_BEST_ASK, FN_SWAP,
 };
 pub use assets::{validate_asset_pair, Asset, AssetPair, AssetPairError};
+pub use collateral_oracle::{
+    evaluate_collateral_health, get_freshness_config, require_fresh_price, set_freshness_config,
+    CollateralError, CollateralHealth, CollateralOracleConfig, DEFAULT_MIN_COLLATERAL_RATIO_BPS,
+};
 pub use commit_reveal::{
     constant_time_eq, forfeit_expired, hash_trade_intent, reveal_and_clear, store_commitment,
     verify_commitment, CommitKey, CommitRecord, CommitRevealError,
@@ -52,6 +68,11 @@ pub use constants::{
 };
 pub use emergency::PauseState;
 pub use health::{emit_health_event, health_uninitialized, placeholder_admin, HealthStatus};
+pub use join_rate_limit::{
+    check as check_join_rate_limit, record as record_join, try_consume as try_join, JoinBucket,
+    JoinRateLimitConfig, JoinRateLimitError, DEFAULT_JOIN_WINDOW_SECS,
+    DEFAULT_MAX_JOINS_PER_WINDOW,
+};
 pub use multisig::{
     approve, cancel, emit_approval_recorded, emit_proposal_approved, emit_proposal_cancelled,
     emit_proposal_created, emit_proposal_executed, emit_timelock_config_updated,
@@ -66,6 +87,10 @@ pub use oracle::{
     oracle_price_to_i128, validate_freshness, validate_oracle_price, validate_price_bounds,
     IOracleClient, MockOracleClient, OnChainOracleClient, OracleError, OraclePrice,
     MAX_ORACLE_PRICE, MIN_ORACLE_PRICE,
+};
+pub use pair_validation::{
+    asset_is_registered, route_supports_pair, validate_distinct, validate_pair_for_route,
+    validate_registered_distinct_pair, PairValidationError,
 };
 pub use perf::{
     mark_operation, op_batch_execute, op_collect_fee, op_create_signal, op_execute_trade,

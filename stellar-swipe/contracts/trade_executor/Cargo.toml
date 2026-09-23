@@ -15,6 +15,9 @@ shared = { path = "../shared" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+# Required so the `#[cfg_attr(test, derive(soroban_sdk::testutils::arbitrary::Arbitrary))]`
+# on ContractError can resolve the `::arbitrary` paths emitted by the derive macro.
+arbitrary = { version = "1", features = ["derive"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 
 [lints]

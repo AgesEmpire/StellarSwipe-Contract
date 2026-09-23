@@ -130,6 +130,31 @@ pub enum AutoTradeError {
     LastOracleForPair = 49,
     /// Action requires the contract to be paused, but it is not.
     NotPaused = 50,
+    // ── Issue #1001: standardized token/cross-contract error mapping ─────────
+    /// A router-required allowance was insufficient or expired.
+    InsufficientAllowance = 51,
+}
+
+/// Maps the shared token/cross-contract invocation failure classification
+/// (Issue #1001) onto this contract's stable error codes. Every non-success
+/// outcome from an AMM-router invocation must flow through here rather than
+/// being treated as `Ok`.
+impl From<shared::TokenFailure> for AutoTradeError {
+    fn from(failure: shared::TokenFailure) -> Self {
+        match failure {
+            shared::TokenFailure::Unauthorized => AutoTradeError::Unauthorized,
+            shared::TokenFailure::InsufficientBalance => AutoTradeError::InsufficientBalance,
+            shared::TokenFailure::InsufficientAllowance => AutoTradeError::InsufficientAllowance,
+            // Invalid input, overflow, an unrecognized custom-token error
+            // code, and host-level aborts are all execution failures the
+            // router/token layer surfaced — `SystemError` (aliased here as
+            // `AtomicExecutionFailed`) already documents that category.
+            shared::TokenFailure::InvalidRequest
+            | shared::TokenFailure::Overflow
+            | shared::TokenFailure::OtherContractError(_)
+            | shared::TokenFailure::HostError => AutoTradeError::SystemError,
+        }
+    }
 }
 
 impl AutoTradeError {
@@ -278,6 +303,9 @@ impl AutoTradeError {
                 "cannot remove the last remaining whitelisted oracle for a pair"
             }
             AutoTradeError::NotPaused => "action requires the contract to be paused, but it is not",
+            AutoTradeError::InsufficientAllowance => {
+                "router token operation failed: insufficient or expired allowance"
+            }
         }
     }
 }
@@ -360,4 +388,24 @@ impl AutoTradeError {
     /// `upgrade()` was called with a version that is not strictly greater
     /// than the currently stored contract version.
     pub const IncompatibleContractVersion: AutoTradeError = AutoTradeError::SystemError;
+
+    // ── Issue #992: asset-pair validation ────────────────────────────────────
+    // Same 50-variant cap constraint as above: these reuse existing
+    // discriminants under clearer names. See `message()` on the underlying
+    // variants for the human-readable description.
+    /// One or both assets of the pair are not registered in the asset registry.
+    pub const AssetNotRegistered: AutoTradeError = AutoTradeError::SystemError;
+    /// Both assets of the pair are identical (distinct assets are required).
+    pub const IdenticalAssetPair: AutoTradeError = AutoTradeError::SystemError;
+    /// No asset registry is configured, so the pair cannot be validated.
+    pub const AssetRegistryNotConfigured: AutoTradeError = AutoTradeError::SystemError;
+    /// No AMM route is configured for the requested asset pair.
+    pub const RouteNotConfigured: AutoTradeError = AutoTradeError::RoutingPlanNotFound;
+    /// No enabled AMM route supports the requested asset pair.
+    pub const UnsupportedAssetPair: AutoTradeError = AutoTradeError::RoutingPlanNotFound;
+
+    // ── Per-signal execution rate limit ──────────────────────────────────────
+    /// A trade for this (user, signal) was executed too recently; retry after
+    /// the per-signal rate-limit window has elapsed.
+    pub const ExecutionRateLimited: AutoTradeError = AutoTradeError::RateLimited;
 }

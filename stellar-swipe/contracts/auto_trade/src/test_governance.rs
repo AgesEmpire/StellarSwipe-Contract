@@ -62,15 +62,22 @@ fn test_execute_after_timelock_succeeds() {
 #[test]
 fn test_repeated_execution_within_cooldown_is_rejected() {
     let (env, caller) = setup();
-    env.as_contract(&env.register(crate::AutoTradeContract, ()), || {
-        let id = create_proposal(&env, caller.clone());
-        env.ledger()
-            .set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
+    let contract_id = env.register(crate::AutoTradeContract, ());
 
-        // First execution — ok
+    // `execute_proposal` requires caller auth, and two `require_auth` calls on
+    // the same address inside one frame raise "frame is already authorized",
+    // so each execution runs in its own frame.
+    let id = env.as_contract(&contract_id, || create_proposal(&env, caller.clone()));
+    env.ledger()
+        .set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
+
+    // First execution — ok
+    env.as_contract(&contract_id, || {
         assert!(execute_proposal(&env, id, &caller).is_ok());
+    });
 
-        // Immediate second attempt — rate limited
+    // Immediate second attempt — rate limited
+    env.as_contract(&contract_id, || {
         let err = execute_proposal(&env, id, &caller).unwrap_err();
         assert_eq!(err, GovernanceError::ExecutionRateLimited);
     });
@@ -79,15 +86,19 @@ fn test_repeated_execution_within_cooldown_is_rejected() {
 #[test]
 fn test_execution_after_cooldown_succeeds() {
     let (env, caller) = setup();
-    env.as_contract(&env.register(crate::AutoTradeContract, ()), || {
-        let id = create_proposal(&env, caller.clone());
-        env.ledger()
-            .set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
-        assert!(execute_proposal(&env, id, &caller).is_ok());
+    let contract_id = env.register(crate::AutoTradeContract, ());
 
-        // Advance past cooldown
-        env.ledger()
-            .set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS + PROPOSAL_COOLDOWN_SECONDS);
+    let id = env.as_contract(&contract_id, || create_proposal(&env, caller.clone()));
+    env.ledger()
+        .set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS);
+    env.as_contract(&contract_id, || {
+        assert!(execute_proposal(&env, id, &caller).is_ok());
+    });
+
+    // Advance past cooldown
+    env.ledger()
+        .set_timestamp(1_000 + PROPOSAL_TIMELOCK_SECONDS + PROPOSAL_COOLDOWN_SECONDS);
+    env.as_contract(&contract_id, || {
         assert!(execute_proposal(&env, id, &caller).is_ok());
     });
 }
@@ -97,18 +108,22 @@ fn test_execution_after_cooldown_succeeds() {
 #[test]
 fn test_execution_cap_is_enforced() {
     let (env, caller) = setup();
-    env.as_contract(&env.register(crate::AutoTradeContract, ()), || {
-        let id = create_proposal(&env, caller.clone());
-        let mut t = 1_000 + PROPOSAL_TIMELOCK_SECONDS;
+    let contract_id = env.register(crate::AutoTradeContract, ());
 
-        for _ in 0..MAX_EXECUTIONS_PER_PROPOSAL {
-            env.ledger().set_timestamp(t);
-            assert!(execute_proposal(&env, id, &caller).is_ok());
-            t += PROPOSAL_COOLDOWN_SECONDS;
-        }
+    let id = env.as_contract(&contract_id, || create_proposal(&env, caller.clone()));
+    let mut t = 1_000 + PROPOSAL_TIMELOCK_SECONDS;
 
-        // One more — should be blocked
+    for _ in 0..MAX_EXECUTIONS_PER_PROPOSAL {
         env.ledger().set_timestamp(t);
+        env.as_contract(&contract_id, || {
+            assert!(execute_proposal(&env, id, &caller).is_ok());
+        });
+        t += PROPOSAL_COOLDOWN_SECONDS;
+    }
+
+    // One more — should be blocked
+    env.ledger().set_timestamp(t);
+    env.as_contract(&contract_id, || {
         let err = execute_proposal(&env, id, &caller).unwrap_err();
         assert!(
             err == GovernanceError::ExecutionLimitReached
@@ -122,18 +137,22 @@ fn test_execution_cap_is_enforced() {
 #[test]
 fn test_already_executed_proposal_is_rejected() {
     let (env, caller) = setup();
-    env.as_contract(&env.register(crate::AutoTradeContract, ()), || {
-        let id = create_proposal(&env, caller.clone());
-        let mut t = 1_000 + PROPOSAL_TIMELOCK_SECONDS;
+    let contract_id = env.register(crate::AutoTradeContract, ());
 
-        // Exhaust all executions to reach Executed status
-        for _ in 0..MAX_EXECUTIONS_PER_PROPOSAL {
-            env.ledger().set_timestamp(t);
-            let _ = execute_proposal(&env, id, &caller);
-            t += PROPOSAL_COOLDOWN_SECONDS;
-        }
+    let id = env.as_contract(&contract_id, || create_proposal(&env, caller.clone()));
+    let mut t = 1_000 + PROPOSAL_TIMELOCK_SECONDS;
 
+    // Exhaust all executions to reach Executed status
+    for _ in 0..MAX_EXECUTIONS_PER_PROPOSAL {
         env.ledger().set_timestamp(t);
+        env.as_contract(&contract_id, || {
+            let _ = execute_proposal(&env, id, &caller);
+        });
+        t += PROPOSAL_COOLDOWN_SECONDS;
+    }
+
+    env.ledger().set_timestamp(t);
+    env.as_contract(&contract_id, || {
         let err = execute_proposal(&env, id, &caller).unwrap_err();
         assert_eq!(err, GovernanceError::ProposalAlreadyExecuted);
     });
@@ -176,15 +195,19 @@ fn test_proposal_status_transitions_correctly() {
 #[test]
 fn test_execution_count_increments() {
     let (env, caller) = setup();
-    env.as_contract(&env.register(crate::AutoTradeContract, ()), || {
-        let id = create_proposal(&env, caller.clone());
-        let mut t = 1_000 + PROPOSAL_TIMELOCK_SECONDS;
+    let contract_id = env.register(crate::AutoTradeContract, ());
 
-        for expected in 1..MAX_EXECUTIONS_PER_PROPOSAL {
-            env.ledger().set_timestamp(t);
+    let id = env.as_contract(&contract_id, || create_proposal(&env, caller.clone()));
+    let mut t = 1_000 + PROPOSAL_TIMELOCK_SECONDS;
+
+    for expected in 1..MAX_EXECUTIONS_PER_PROPOSAL {
+        env.ledger().set_timestamp(t);
+        env.as_contract(&contract_id, || {
             execute_proposal(&env, id, &caller).unwrap();
+        });
+        env.as_contract(&contract_id, || {
             assert_eq!(get_proposal(&env, id).unwrap().execution_count, expected);
-            t += PROPOSAL_COOLDOWN_SECONDS;
-        }
-    });
+        });
+        t += PROPOSAL_COOLDOWN_SECONDS;
+    }
 }

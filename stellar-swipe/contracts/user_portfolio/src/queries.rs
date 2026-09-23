@@ -3,6 +3,7 @@
 use crate::storage::DataKey;
 use crate::{
     PnlSummary, Portfolio, PortfolioPosition, Position, PositionStatus, TradeHistoryEntry,
+    TradeHistoryPage,
 };
 use soroban_sdk::{Address, Env, Vec};
 use stellar_swipe_common::checked_amount::Amount;
@@ -12,6 +13,44 @@ use stellar_swipe_common::{
 
 const MAX_INLINE_CLOSED_POSITIONS: u32 = 20;
 const MAX_TRADE_HISTORY_LIMIT: u32 = 50;
+
+pub fn get_trade_history_page(
+    env: &Env,
+    user: Address,
+    cursor: Option<u32>,
+    limit: u32,
+) -> TradeHistoryPage {
+    assert!(
+        limit > 0 && limit <= MAX_TRADE_HISTORY_LIMIT,
+        "invalid page size"
+    );
+    let ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UserClosedPositions(user.clone()))
+        .unwrap_or_else(|| rebuild_closed_position_index(env, user));
+    let mut index = cursor.unwrap_or(ids.len());
+    assert!(index <= ids.len(), "invalid cursor");
+    let mut entries = Vec::new(env);
+    while index > 0 && entries.len() < limit {
+        index -= 1;
+        let id = ids.get_unchecked(index);
+        if let Some(position) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Position>(&DataKey::Position(id))
+        {
+            entries.push_back(TradeHistoryEntry {
+                trade_id: id,
+                position,
+            });
+        }
+    }
+    TradeHistoryPage {
+        entries,
+        next_cursor: if index > 0 { Some(index) } else { None },
+    }
+}
 
 // --- Portfolio budget notes (Issue #303) ---
 // Active-trader snapshots use per-user open/closed indexes. `include_closed=false`

@@ -331,11 +331,11 @@ mod tests {
         };
         client.set_notification_preferences(&user, &prefs);
         let stored = client.get_notification_preferences(&user);
-        assert_eq!(stored.stop_loss_alerts, true);
-        assert_eq!(stored.take_profit_alerts, false);
-        assert_eq!(stored.signal_expiry_alerts, true);
-        assert_eq!(stored.new_signal_alert, false);
-        assert_eq!(stored.leaderboard_rank_change, true);
+        assert!(stored.stop_loss_alerts);
+        assert!(!stored.take_profit_alerts);
+        assert!(stored.signal_expiry_alerts);
+        assert!(!stored.new_signal_alert);
+        assert!(stored.leaderboard_rank_change);
     }
 
     #[test]
@@ -361,11 +361,11 @@ mod tests {
         };
         client.set_notification_preferences(&user, &prefs2);
         let stored = client.get_notification_preferences(&user);
-        assert_eq!(stored.stop_loss_alerts, true);
-        assert_eq!(stored.take_profit_alerts, true);
-        assert_eq!(stored.signal_expiry_alerts, false);
-        assert_eq!(stored.new_signal_alert, true);
-        assert_eq!(stored.leaderboard_rank_change, false);
+        assert!(stored.stop_loss_alerts);
+        assert!(stored.take_profit_alerts);
+        assert!(!stored.signal_expiry_alerts);
+        assert!(stored.new_signal_alert);
+        assert!(!stored.leaderboard_rank_change);
     }
 
     #[test]
