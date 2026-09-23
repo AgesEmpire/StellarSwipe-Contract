@@ -2,6 +2,12 @@ use crate::storage::WaterfallTierResult;
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use soroban_sdk::{contractevent, Address, Env, String, Symbol, Vec};
 
+/// Current event schema version for fee_collector events.
+/// Indexers MUST check this field before deserialising event bodies.
+/// Bump on breaking changes (field removal, type change, rename).
+/// Backward-compatible additions (new optional fields, new events) keep the same version.
+pub const SCHEMA_VERSION: u32 = 1;
+
 #[contractevent]
 pub struct SnapshotRecorded {
     pub ledger: u64,

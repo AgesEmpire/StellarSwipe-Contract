@@ -7,7 +7,7 @@
 //! per-transaction idempotency marker so a partially failed or retried write
 //! cannot duplicate balances or rewards, and always leaves a consistent state.
 
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, Env};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[contracttype]
@@ -103,6 +103,47 @@ impl DepositGuard {
     }
 }
 
+/// Configuration state holding the hard cap on total provider stake allocation.
+#[derive(Clone)]
+#[contracttype]
+pub struct ProviderCapConfig {
+    pub provider_cap: i128,
+}
+
+impl ProviderCapConfig {
+    /// Validate and store the provider cap. The cap must be strictly positive so
+    /// that a misconfigured zero/negative value cannot silently block all stake.
+    pub fn new(provider_cap: i128) -> Self {
+        if provider_cap <= 0 {
+            panic!("provider cap must be positive");
+        }
+        Self { provider_cap }
+    }
+
+    /// Enforce the cap before any state mutation. Returns the accepted allocation
+    /// on success, or rejects with an explanatory event when the cap is exceeded.
+    pub fn enforce_allocation(&self, env: &Env, provider: &Address, current_stake: i128, attempted: i128) -> i128 {
+        if attempted <= 0 {
+            panic!("allocation must be positive");
+        }
+        let new_total = current_stake.saturating_add(attempted);
+        if new_total > self.provider_cap {
+            env.events().publish(
+                (soroban_sdk::symbol_short!("cap_exceeded"), provider.clone()),
+                (attempted, self.provider_cap, current_stake),
+            );
+            panic!("allocation exceeds provider cap");
+        }
+        env.events().publish(
+            (soroban_sdk::symbol_short!("alloc_ok"), provider.clone()),
+            (attempted, new_total),
+        );
+        new_total
+    }
+}
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -158,5 +199,28 @@ mod test {
         guard.rollback();
         assert!(!guard.is_retry(7));
         assert_eq!(guard.apply(7), DepositOutcome::Applied);
+    }
+
+    #[test]
+    fn accepts_allocation_within_cap() {
+        let env = Env::default();
+        let cfg = ProviderCapConfig::new(1000);
+        let total = cfg.enforce_allocation(&env, &owner(&env), 400, 500);
+        assert_eq!(total, 900);
+    }
+
+    #[test]
+    #[should_panic]
+    fn rejects_allocation_over_cap() {
+        let env = Env::default();
+        let cfg = ProviderCapConfig::new(1000);
+        cfg.enforce_allocation(&env, &owner(&env), 800, 500);
+    }
+
+    #[test]
+    #[should_panic]
+    fn rejects_non_positive_cap() {
+        ProviderCapConfig::new(0);
+    }
     }
 }
