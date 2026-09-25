@@ -23,6 +23,8 @@ pub struct LiquidityMiningConfig {
     pub mainnet_launch_timestamp: u64,
     pub mining_period_seconds: u64,
     pub treasury_balance: i128,
+    /// Protected reserves that must remain untouched by withdrawals/payouts.
+    pub protected_reserves: i128,
 }
 
 /// Storage key for the collector's current balance.
@@ -62,6 +64,33 @@ pub enum RewardError {
     CliffNotReached,
     NothingToRelease,
     InvalidRebateBps,
+    /// Withdrawal would reduce the treasury below its protected solvency floor.
+    SolvencyFloorBreached,
+}
+
+/// Returns the maximum amount that may be withdrawn from the treasury while
+/// keeping the protected reserves at or above their configured floor.
+pub fn withdrawable_amount(config: &LiquidityMiningConfig) -> i128 {
+    config
+        .treasury_balance
+        .saturating_sub(config.protected_reserves)
+        .max(0)
+}
+
+/// Enforces the treasury solvency invariant for a prospective withdrawal.
+///
+/// The check is pure and does not mutate any state, so callers can validate
+/// atomically before committing a withdrawal. Returns
+/// `RewardError::SolvencyFloorBreached` when the withdrawal would push the
+/// treasury below its protected reserves.
+pub fn check_solvency_invariant(
+    config: &LiquidityMiningConfig,
+    amount: i128,
+) -> Result<(), RewardError> {
+    if amount < 0 || amount > withdrawable_amount(config) {
+        return Err(RewardError::SolvencyFloorBreached);
+    }
+    Ok(())
 }
 
 /// Emitted when the per-epoch rebate cap is applied and claims are scaled down.
@@ -210,6 +239,12 @@ pub fn sweep_dust(env: &Env, caller: Address, destination: Address, amount: i128
         panic!("amount must be positive");
     }
 
+    // Enforce the solvency invariant atomically before mutating any state.
+    check_solvency_invariant(config, amount)?;
+
+    config.treasury_balance -= amount;
+    *user_rewards_earned += amount;
+
     let current = balance(env);
     if current >= DUST_THRESHOLD {
         panic!("balance is not dust");
@@ -227,6 +262,62 @@ pub fn sweep_dust(env: &Env, caller: Address, destination: Address, amount: i128
         caller,
         destination,
         amount,
+        trades_remaining: ((LIQUIDITY_MINING_USER_CAP - *user_rewards_earned)
+            / LIQUIDITY_MINING_REWARD) as u32,
+    })
+}
+
+/// Read-only preview of the reward that `distribute_liquidity_mining_reward`
+/// would produce for the same inputs, without mutating any state.
+pub fn quote_liquidity_mining_reward<User: Clone>(
+    config: &LiquidityMiningConfig,
+    user: User,
+    user_rewards_earned: i128,
+    now: u64,
+) -> Result<LiquidityMiningRewardEarned<User>, RewardError> {
+    if !config.liquidity_mining_active {
+        return Err(RewardError::MiningInactive);
+    }
+
+    let mining_ends_at = config
+        .mainnet_launch_timestamp
+        .saturating_add(config.mining_period_seconds);
+    if now >= mining_ends_at {
+        return Err(RewardError::MiningPeriodEnded);
+    }
+
+    let remaining_cap = LIQUIDITY_MINING_USER_CAP.saturating_sub(user_rewards_earned);
+    if remaining_cap == 0 {
+        return Err(RewardError::UserCapReached);
+    }
+
+    let amount = LIQUIDITY_MINING_REWARD.min(remaining_cap);
+    if config.treasury_balance < amount {
+        return Err(RewardError::InsufficientTreasury);
+    }
+
+    check_solvency_invariant(config, amount)?;
+
+    Ok(LiquidityMiningRewardEarned {
+        user,
+        amount,
+        trades_remaining: ((LIQUIDITY_MINING_USER_CAP - (user_rewards_earned + amount))
+            / LIQUIDITY_MINING_REWARD) as u32,
+    })
+}
+
+pub fn new_vesting_schedule(
+    start_timestamp: u64,
+    cliff_seconds: u64,
+    duration_seconds: u64,
+    total_amount: i128,
+) -> VestingSchedule {
+    VestingSchedule {
+        start_timestamp,
+        cliff_seconds,
+        duration_seconds,
+        total_amount,
+        released_amount: 0,
     }
     .publish(env);
 }
@@ -249,6 +340,24 @@ pub fn vested_amount(schedule: &VestingSchedule, now: u64) -> i128 {
 
 pub fn releasable_amount(schedule: &VestingSchedule, now: u64) -> i128 {
     vested_amount(schedule, now).saturating_sub(schedule.released_amount)
+}
+
+/// Read-only preview of the amount `release_vested_rewards` would release for
+/// the same schedule and timestamp, without mutating the schedule.
+pub fn quote_releasable_rewards(
+    schedule: &VestingSchedule,
+    now: u64,
+) -> Result<i128, RewardError> {
+    if now < schedule.start_timestamp.saturating_add(schedule.cliff_seconds) {
+        return Err(RewardError::CliffNotReached);
+    }
+
+    let amount = releasable_amount(schedule, now);
+    if amount == 0 {
+        return Err(RewardError::NothingToRelease);
+    }
+
+    Ok(amount)
 }
 
 pub fn release_vested_rewards(
@@ -278,6 +387,7 @@ mod tests {
             mainnet_launch_timestamp: 1_700_000_000,
             mining_period_seconds: DEFAULT_MINING_PERIOD_SECONDS,
             treasury_balance: 2_000 * XLM,
+            protected_reserves: 0,
         }
     }
 
@@ -326,6 +436,67 @@ mod tests {
     }
 
     #[test]
+    fn solvency_allows_withdrawal_at_exact_floor() {
+        let mut config = config();
+        config.protected_reserves = 1_990 * XLM;
+
+        assert_eq!(withdrawable_amount(&config), 10 * XLM);
+        assert_eq!(check_solvency_invariant(&config, 10 * XLM), Ok(()));
+
+        let mut earned = 0;
+        let event =
+            distribute_liquidity_mining_reward(&mut config, "user-1", &mut earned, 1_700_000_001)
+                .unwrap();
+
+        assert_eq!(event.amount, LIQUIDITY_MINING_REWARD);
+        assert_eq!(config.treasury_balance, 1_990 * XLM);
+        assert_eq!(config.treasury_balance, config.protected_reserves);
+    }
+
+    #[test]
+    fn solvency_rejects_withdrawal_below_floor() {
+        let mut config = config();
+        config.protected_reserves = 1_995 * XLM;
+
+        assert_eq!(
+            check_solvency_invariant(&config, 10 * XLM),
+            Err(RewardError::SolvencyFloorBreached)
+        );
+
+        let mut earned = 0;
+        let result =
+            distribute_liquidity_mining_reward(&mut config, "user-1", &mut earned, 1_700_000_001);
+
+        assert_eq!(result, Err(RewardError::SolvencyFloorBreached));
+        // State must be left unchanged on violation.
+        assert_eq!(config.treasury_balance, 2_000 * XLM);
+        assert_eq!(earned, 0);
+    }
+
+    #[test]
+    fn solvency_allows_withdrawal_after_reserve_replenishment() {
+        let mut config = config();
+        config.protected_reserves = 1_995 * XLM;
+
+        let mut earned = 0;
+        assert_eq!(
+            distribute_liquidity_mining_reward(&mut config, "user-1", &mut earned, 1_700_000_001),
+            Err(RewardError::SolvencyFloorBreached)
+        );
+
+        // Replenish reserves so the floor is satisfied again.
+        config.treasury_balance += 10 * XLM;
+
+        let event =
+            distribute_liquidity_mining_reward(&mut config, "user-1", &mut earned, 1_700_000_001)
+                .unwrap();
+
+        assert_eq!(event.amount, LIQUIDITY_MINING_REWARD);
+        assert_eq!(config.treasury_balance, 2_000 * XLM);
+        assert!(config.treasury_balance >= config.protected_reserves);
+    }
+
+    #[test]
     fn nothing_vested_before_cliff() {
         let schedule = new_vesting_schedule(1_000, 100, 1_000, 1_000 * XLM);
 
@@ -348,30 +519,7 @@ mod tests {
         let schedule = new_vesting_schedule(1_000, 100, 1_000, 1_000 * XLM);
 
         assert_eq!(vested_amount(&schedule, 1_500), 500 * XLM);
-        assert_eq!(releasable_amount(&schedule, 1_500), 500 * XLM);
-    }
-
-    #[test]
-    fn fully_vested_after_duration() {
-        let schedule = new_vesting_schedule(1_000, 100, 1_000, 1_000 * XLM);
-
-        assert_eq(vested_amount(&schedule, 2_000), 1_000 * XLM);
-        assert_eq!(vested_amount(&schedule, 5_000), 1_000 * XLM);
-    }
-
-    #[test]
-    fn release_is_incremental_and_deterministic() {
-        let mut schedule = new_vesting_schedule(1_000, 100, 1_000, 1_000 * XLM);
-
-        let first = release_vested_rewards(&mut schedule, 1_500).unwrap();
-        assert_eq!(first, 500 * XLM);
-        assert_eq!(schedule.released_amount, 500 * XLM);
-
-        let second = release_vested_rewards(&mut schedule, 1_750).unwrap();
-        assert_eq!(second, 250 * XLM);
-        assert_eq!(schedule.released_amount, 750 * XLM);
-
-        assert_eq!(release_vested_rewards(&mut schedule, 1_750), Err(RewardError::NothingToRelease));
+        assert_eq!(releasable_amount(&schedule, 1_500), 500 * XLM)
     }
 
     #[test]

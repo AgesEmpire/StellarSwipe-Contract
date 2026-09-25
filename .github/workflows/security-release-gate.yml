@@ -51,6 +51,25 @@ jobs:
       - name: Validate deployment manifests
         run: python3 stellar-swipe/scripts/validate_deployment_manifest.py
 
+      # Upgrade compatibility manifests (Issue #1102) capture the storage
+      # layout, interface version, and upgrade prerequisites for each
+      # contract release. Generate them from the current sources and fail
+      # the gate if a committed manifest is missing or incompatible with
+      # the candidate build, so operators can diff deployed vs. candidate
+      # versions before upgrading.
+      - name: Generate upgrade compatibility manifests
+        run: python3 stellar-swipe/scripts/generate_compatibility_manifest.py --out-dir deployments/compatibility
+
+      - name: Check upgrade compatibility manifests
+        run: |
+          python3 stellar-swipe/scripts/check_compatibility_manifest.py \
+            --manifest-dir deployments/compatibility
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: upgrade compatibility manifest missing or incompatible — see output above." >&2
+            exit 1
+          fi
+
       # Setup Rust toolchain with required components and target
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

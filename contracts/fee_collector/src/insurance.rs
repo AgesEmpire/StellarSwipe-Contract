@@ -63,6 +63,11 @@ pub struct DustSwept<Actor, Destination> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct InsurancePool {
     pub balance: i128,
+    /// Protected treasury reserves that must never be withdrawn below the
+    /// configured solvency floor.
+    pub protected_reserves: i128,
+    /// Minimum protected reserves that must remain after any withdrawal.
+    pub solvency_floor: i128,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -84,6 +89,10 @@ pub enum ContractError {
     InvalidClaim,
     LossWithinStopLoss,
     Unauthorized,
+    /// Stable error returned when a withdrawal or payout would reduce the
+    /// protected treasury reserves below their configured solvency floor.
+    /// State is left unchanged when this is returned.
+    SolvencyFloorBreached,
     InvalidSweep,
 }
 
@@ -169,6 +178,18 @@ pub fn set_authorization<Actor: Clone>(
     emit_config_changed(ConfigField::Authorization, None, None, actor)
 }
 
+/// Returns `true` when withdrawing `amount` from the pool would keep the
+/// protected treasury reserves at or above the configured solvency floor.
+///
+/// This is a pure check so callers can validate the invariant before any
+/// state mutation, guaranteeing atomicity.
+pub fn solvency_invariant_holds(pool: &InsurancePool, amount: i128) -> bool {
+    if amount < 0 {
+        return false;
+    }
+    pool.protected_reserves.saturating_sub(amount) >= pool.solvency_floor
+}
+
 /// Sweeps a negligible fee_collector dust balance to an explicit destination.
 ///
 /// Only balances strictly below [`DUST_SWEEP_THRESHOLD`] are sweepable, so
@@ -211,6 +232,23 @@ pub fn allocate_insurance_fee(pool: &mut InsurancePool, collected_fee: i128) -> 
     insurance_share
 }
 
+/// Withdraws `amount` from the protected treasury reserves.
+///
+/// The solvency invariant is enforced atomically: the check runs before any
+/// mutation, so a violation returns [`ContractError::SolvencyFloorBreached`]
+/// and leaves the pool completely unchanged.
+pub fn withdraw_protected_reserves(
+    pool: &mut InsurancePool,
+    amount: i128,
+) -> Result<i128, ContractError> {
+    if !solvency_invariant_holds(pool, amount) {
+        return Err(ContractError::SolvencyFloorBreached);
+    }
+
+    pool.protected_reserves -= amount;
+    Ok(pool.protected_reserves)
+}
+
 pub fn claim_insurance<User: Clone>(
     pool: &mut InsurancePool,
     user: User,
@@ -226,7 +264,15 @@ pub fn claim_insurance<User: Clone>(
 
     let max_loss_payout = loss_amount / 2;
     let amount_claimed = max_loss_payout.min(pool.balance);
+
+    // Enforce the treasury solvency invariant atomically before mutating any
+    // state. A breach returns a stable error and leaves the pool untouched.
+    if !solvency_invariant_holds(pool, amount_claimed) {
+        return Err(ContractError::SolvencyFloorBreached);
+    }
+
     pool.balance -= amount_claimed;
+    pool.protected_reserves -= amount_claimed;
 
     Ok(InsuranceClaimed {
         user,
@@ -239,9 +285,17 @@ pub fn claim_insurance<User: Clone>(
 mod tests {
     use super::*;
 
+    fn pool(balance: i128, protected_reserves: i128, solvency_floor: i128) -> InsurancePool {
+        InsurancePool {
+            balance,
+            protected_reserves,
+            solvency_floor,
+        }
+    }
+
     #[test]
     fn valid_claim_pays_half_loss() {
-        let mut pool = InsurancePool { balance: 1_000 };
+        let mut pool = pool(1_000, 1_000, 0);
         let trade = TradeLoss {
             trade_id: 42,
             slashed_signal: true,
@@ -257,7 +311,7 @@ mod tests {
 
     #[test]
     fn invalid_claim_without_slashed_signal_is_rejected() {
-        let mut pool = InsurancePool { balance: 1_000 };
+        let mut pool = pool(1_000, 1_000, 0);
         let trade = TradeLoss {
             trade_id: 43,
             slashed_signal: false,
@@ -272,7 +326,7 @@ mod tests {
 
     #[test]
     fn pool_insufficient_caps_payout_at_balance() {
-        let mut pool = InsurancePool { balance: 75 };
+        let mut pool = pool(75, 75, 0);
         let trade = TradeLoss {
             trade_id: 44,
             slashed_signal: true,
@@ -287,7 +341,7 @@ mod tests {
 
     #[test]
     fn collected_fees_fund_pool_at_five_percent() {
-        let mut pool = InsurancePool { balance: 0 };
+        let mut pool = pool(0, 0, 0);
 
         let allocated = allocate_insurance_fee(&mut pool, 10_000);
 
@@ -322,7 +376,7 @@ mod tests {
 
     #[test]
     fn cap_change_emits_one_versioned_event() {
-        let mut pool = InsurancePool { balance: 100 };
+        let mut pool = pool(100, 100, 0);
 
         let event = set_insurance_cap(&mut pool, 5_000, "admin").unwrap();
 
@@ -341,6 +395,65 @@ mod tests {
 
         assert_eq!(result, Err(ContractError::Unauthorized));
         assert_eq!(pool.balance, 5_000);
+    }
+
+    #[test]
+    fn withdrawal_at_exact_floor_is_allowed() {
+        let mut pool = pool(1_000, 1_000, 400);
+
+        let remaining = withdraw_protected_reserves(&mut pool, 600).unwrap();
+
+        assert_eq!(remaining, 400);
+        assert_eq!(pool.protected_reserves, 400);
+        assert_eq!(pool.solvency_floor, 400);
+    }
+
+    #[test]
+    fn withdrawal_below_floor_is_rejected_and_state_unchanged() {
+        let mut pool = pool(1_000, 1_000, 400);
+
+        let result = withdraw_protected_reserves(&mut pool, 601);
+
+        assert_eq!(result, Err(ContractError::SolvencyFloorBreached));
+        assert_eq!(pool.protected_reserves, 1_000);
+        assert_eq!(pool.balance, 1_000);
+    }
+
+    #[test]
+    fn withdrawal_allowed_after_reserves_replenished() {
+        let mut pool = pool(1_000, 1_000, 400);
+
+        // First withdrawal drains reserves down to the floor.
+        assert_eq!(withdraw_protected_reserves(&mut pool, 600), Ok(400));
+        // Further withdrawal is rejected at the floor.
+        assert_eq!(
+            withdraw_protected_reserves(&mut pool, 1),
+            Err(ContractError::SolvencyFloorBreached)
+        );
+
+        // Replenish reserves above the floor.
+        pool.protected_reserves += 500;
+
+        // Withdrawal is allowed again.
+        assert_eq!(withdraw_protected_reserves(&mut pool, 500), Ok(400));
+        assert_eq!(pool.protected_reserves, 400);
+    }
+
+    #[test]
+    fn claim_below_floor_is_rejected_and_state_unchanged() {
+        let mut pool = pool(1_000, 500, 400);
+        let trade = TradeLoss {
+            trade_id: 45,
+            slashed_signal: true,
+            stop_loss_amount: 100,
+        };
+
+        // Half of 600 is 300, which would drop protected reserves to 200 < 400.
+        let result = claim_insurance(&mut pool, "user-1", &trade, 600);
+
+        assert_eq!(result, Err(ContractError::SolvencyFloorBreached));
+        assert_eq!(pool.balance, 1_000);
+        assert_eq!(pool.protected_reserves, 500);
     }
 
     #[test]
@@ -390,5 +503,6 @@ mod tests {
             Err(ContractError::InvalidSweep)
         );
         assert_eq!(balance, 400);
+    }
     }
 }

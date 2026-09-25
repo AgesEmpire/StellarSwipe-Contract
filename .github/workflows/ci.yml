@@ -36,6 +36,26 @@ jobs:
       - name: Validate deployment manifests
         run: python3 stellar-swipe/scripts/validate_deployment_manifest.py
 
+      # Upgrade compatibility manifests (compatibility/*.compat.json) capture
+      # each contract release's storage layout, interface version, and upgrade
+      # prerequisites.  CI rejects missing or incompatible manifest changes so
+      # operators can always compare a deployed version against a candidate.
+      - name: Validate upgrade compatibility manifests
+        run: |
+          python3 stellar-swipe/scripts/validate_compatibility_manifest.py \
+            --manifest-dir stellar-swipe/compatibility
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: Missing or incompatible upgrade compatibility manifest — see output above." >&2
+            echo "  Regenerate locally with:" >&2
+            echo "    python3 stellar-swipe/scripts/generate_compatibility_manifest.py" >&2
+            echo "  then commit the updated stellar-swipe/compatibility/*.compat.json files." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: New compatibility manifest entries detected; commit the updated files."
+          fi
+
       - name: Validate event schema
         run: python3 scripts/validate_event_schema.py
 
@@ -307,6 +327,20 @@ jobs:
             exit 1
           fi
 
+      # Generate the upgrade compatibility manifest for each contract release.
+      # The manifest records storage layout, interface version, and upgrade
+      # prerequisites so operators can compare a deployed version against a
+      # candidate before upgrading.  Runs after the optimized WASM build so the
+      # interface version is derived from the actual release artifacts.
+      - name: Generate upgrade compatibility manifests
+        run: |
+          python3 stellar-swipe/scripts/generate_compatibility_manifest.py \
+            --wasm-dir stellar-swipe/target/wasm-optimized \
+            --storage-baseline-dir stellar-swipe/storage-baselines \
+            --output-dir stellar-swipe/compatibility
+          echo "Generated compatibility manifests:"
+          ls -1 stellar-swipe/compatibility/*.compat.json
+
       # Diff each contract's exported function names and contract-spec hash
       # against the committed baselines in abi-baselines/.
       # Exit 0 = clean; exit 2 = new exports added (baseline updated, commit
@@ -323,6 +357,19 @@ jobs:
             > /tmp/abi-diff-report.md
           rc=$?
           cat /tmp/abi-diff-report.md
+          echo ""
+          echo "---"
+          echo "Exit code: $rc"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: Breaking ABI change detected — see report above." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: New ABI exports detected; baseline files updated."
+            echo "Please commit the updated stellar-swipe/abi-baselines/*.json files."
+          fi
+     cat /tmp/abi-diff-report.md
           echo ""
           echo "---"
           echo "Exit code: $rc"
