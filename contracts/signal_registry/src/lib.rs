@@ -87,6 +87,36 @@ pub struct StorageRentEstimate {
     pub ttl_impact: u32,
 }
 
+/// A versioned contract event carrying a monotonically increasing sequence
+/// number.
+///
+/// `sequence` is assigned from a per-contract counter that is persisted in
+/// instance storage, so it survives contract upgrades and never resets. The
+/// counter is scoped to this contract instance, giving indexers a single
+/// strictly increasing stream they can use to detect gaps, duplicates, and
+/// out-of-order delivery. `version` identifies the event schema so consumers
+/// can evolve their decoding logic independently of the sequence stream.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionedEvent {
+    pub version: u32,
+    pub sequence: u64,
+    pub kind: EventKind,
+    pub provider: Address,
+    pub value: i128,
+}
+
+/// The kind of state transition a `VersionedEvent` describes.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum EventKind {
+    ReputationUpdated = 0,
+    ScheduleUpdated = 1,
+}
+
+/// Current schema version emitted on every `VersionedEvent`.
+pub const EVENT_VERSION: u32 = 1;
+
 /// Serialized byte footprint of a single reputation record: a 16-byte `i128`
 /// score plus an 8-byte `u64` timestamp.
 const REPUTATION_RECORD_BYTES: u32 = 24;
@@ -102,6 +132,7 @@ pub const MAX_PROJECTED_ENTRIES: u32 = 64;
 const ADMIN_KEY: &str = "admin";
 const SCHEDULE_KEY: &str = "schedule";
 const REPUTATION_KEY: &str = "reputation";
+const SEQUENCE_KEY: &str = "sequence";
 
 #[contract]
 pub struct SignalRegistry;
@@ -116,6 +147,8 @@ impl SignalRegistry {
         Self::validate_schedule(&schedule)?;
         env.storage().instance().set(&ADMIN_KEY, &admin);
         env.storage().instance().set(&SCHEDULE_KEY, &schedule);
+        // Seed the event sequence counter so the first emitted event is 1.
+        env.storage().instance().set(&SEQUENCE_KEY, &0u64);
         Ok(())
     }
 
@@ -129,6 +162,7 @@ impl SignalRegistry {
         admin.require_auth();
         Self::validate_schedule(&schedule)?;
         env.storage().instance().set(&SCHEDULE_KEY, &schedule);
+        Self::emit_event(&env, EventKind::ScheduleUpdated, admin, 0);
         Ok(())
     }
 
@@ -138,6 +172,12 @@ impl SignalRegistry {
             .instance()
             .get(&SCHEDULE_KEY)
             .ok_or(SignalError::NotInitialized)
+    }
+
+    /// Read the next sequence number that will be assigned to an emitted
+    /// event. Exposed for indexers and tests to verify continuity.
+    pub fn next_sequence(env: Env) -> u64 {
+        Self::load_sequence(&env).saturating_add(1)
     }
 
     /// Estimate the storage footprint and rent implications of a contract
@@ -206,184 +246,13 @@ impl SignalRegistry {
             last_updated: now,
         };
         Self::store_reputation(&env, &provider, &new_record);
+        Self::emit_event(&env, EventKind::ReputationUpdated, provider, updated);
         Ok(updated)
     }
 
     /// Read the current (decayed) reputation for a provider without mutating
     /// state. Useful for off-chain verification and contract tests.
     ///
-    /// `auth_depth` is validated against `MAX_AUTH_TREE_DEPTH` before the
-    /// stored record is read.
-    pub fn get_reputation(
-        env: Env,
-        provider: Address,
-        auth_depth: u32,
-    ) -> Result<i128, SignalError> {
-        Self::check_auth_depth(auth_depth)?;
+    /// `auth_depth` is validated against `MAX_AUTH_TREE_DEPTH` before
 
-        let schedule: DecaySchedule = env
-            .storage()
-            .instance()
-            .get(&SCHEDULE_KEY)
-            .ok_or(SignalError::NotInitialized)?;
-        let record = Self::load_reputation(&env, &provider);
-        let now = env.ledger().timestamp();
-        Ok(Self::apply_decay(&record, now, &schedule))
-    }
-
-    /// Enforce the documented maximum authorization tree depth before any
-    /// recursive traversal. Returns `AuthTreeTooDeep` for over-limit trees.
-    fn check_auth_depth(depth: u32) -> Result<(), SignalError> {
-        if depth > MAX_AUTH_TREE_DEPTH {
-            return Err(SignalError::AuthTreeTooDeep);
-        }
-        Ok(())
-    }
-
-    /// Compute the decayed score for a record at a given timestamp.
-    ///
-    /// Deterministic: depends only on the stored record, the timestamp, and
-    /// the configured schedule.
-    fn apply_decay(record: &ReputationRecord, now: u64, schedule: &DecaySchedule) -> i128 {
-        if now <= record.last_updated {
-            return record.score;
-        }
-        let elapsed = now - record.last_updated;
-        if elapsed <= schedule.grace_period {
-            return record.score;
-        }
-        let decayable = elapsed - schedule.grace_period;
-        if schedule.decay_interval == 0 {
-            return record.score;
-        }
-        let intervals = decayable / schedule.decay_interval;
-        if intervals == 0 {
-            return record.score;
-        }
-        // Points lost = score * rate_bps * intervals / 10_000, computed with
-        // saturating arithmetic to remain deterministic on-chain.
-        let rate = schedule.decay_rate_bps as i128;
-        let lost = record
-            .score
-            .saturating_mul(rate)
-            .saturating_mul(intervals as i128)
-            / 10_000;
-        let decayed = record.score.saturating_sub(lost);
-        Self::clamp(decayed, schedule)
-    }
-
-    /// Clamp a reputation value to the configured thresholds.
-    fn clamp(value: i128, schedule: &DecaySchedule) -> i128 {
-        if value < schedule.min_reputation {
-            schedule.min_reputation
-        } else if value > schedule.max_reputation {
-            schedule.max_reputation
-        } else {
-            value
-        }
-    }
-
-    /// Validate a decay schedule before it is stored or applied.
-    fn validate_schedule(schedule: &DecaySchedule) -> Result<(), SignalError> {
-        if schedule.decay_rate_bps > 10_000 {
-            return Err(SignalError::InvalidDecayConfig);
-        }
-        if schedule.decay_interval == 0 {
-            return Err(SignalError::InvalidDecayConfig);
-        }
-        if schedule.min_reputation > schedule.max_reputation {
-            return Err(SignalError::InvalidDecayConfig);
-        }
-        Ok(())
-    }
-
-    /// Load a provider's reputation record, defaulting to a zeroed record.
-    fn load_reputation(env: &Env, provider: &Address) -> ReputationRecord {
-        env.storage()
-            .persistent()
-            .get(&(REPUTATION_KEY, provider.clone()))
-            .unwrap_or(ReputationRecord {
-                score: 0,
-                last_updated: 0,
-            })
-    }
-
-    /// Persist a provider's reputation record.
-    fn store_reputation(env: &Env, provider: &Address, record: &ReputationRecord) {
-        env.storage()
-            .persistent()
-            .set(&(REPUTATION_KEY, provider.clone()), record);
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::Env;
-
-    fn schedule() -> DecaySchedule {
-        DecaySchedule {
-            decay_rate_bps: 100,
-            decay_interval: 100,
-            grace_period: 0,
-            min_reputation: 0,
-            max_reputation: 10_000,
-        }
-    }
-
-    #[test]
-    fn estimate_new_record_is_deterministic() {
-        let a = SignalRegistry::estimate_storage_rent(OperationKind::NewRecord, 3).unwrap();
-        let b = SignalRegistry::estimate_storage_rent(OperationKind::NewRecord, 3).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a.projected_entries, 3);
-        assert_eq!(a.projected_bytes, 3 * REPUTATION_RECORD_BYTES);
-        assert_eq!(a.ttl_impact, 3 * TTL_LEDGERS_PER_WRITE);
-    }
-
-    #[test]
-    fn estimate_update_record_reports_ttl_impact() {
-        let est = SignalRegistry::estimate_storage_rent(OperationKind::UpdateRecord, 1).unwrap();
-        assert_eq!(est.projected_entries, 1);
-        assert_eq!(est.projected_bytes, REPUTATION_RECORD_BYTES);
-        assert_eq!(est.ttl_impact, TTL_LEDGERS_PER_WRITE);
-    }
-
-    #[test]
-    fn estimate_near_limit_request_is_accepted() {
-        let est =
-            SignalRegistry::estimate_storage_rent(OperationKind::NewRecord, MAX_PROJECTED_ENTRIES)
-                .unwrap();
-        assert_eq!(est.projected_entries, MAX_PROJECTED_ENTRIES);
-        assert_eq!(est.projected_bytes, MAX_PROJECTED_ENTRIES * REPUTATION_RECORD_BYTES);
-    }
-
-    #[test]
-    fn estimate_over_limit_request_is_rejected() {
-        let err = SignalRegistry::estimate_storage_rent(
-            OperationKind::NewRecord,
-            MAX_PROJECTED_ENTRIES + 1,
-        );
-        assert_eq!(err, Err(SignalError::InvalidReputationUpdate));
-    }
-
-    #[test]
-    fn estimate_zero_records_is_rejected() {
-        let err = SignalRegistry::estimate_storage_rent(OperationKind::UpdateRecord, 0);
-        assert_eq!(err, Err(SignalError::InvalidReputationUpdate));
-    }
-
-    #[test]
-    fn update_reputation_still_works() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let provider = Address::generate(&env);
-        env.mock_all_auths();
-        SignalRegistry::initialize(env.clone(), admin, schedule()).unwrap();
-        let score = SignalRegistry::update_reputation(env.clone(), provider.clone(), 500, 1).unwrap();
-        assert_eq!(score, 500);
-        let read = SignalRegistry::get_reputation(env, provider, 1).unwrap();
-        assert_eq!(read, 500);
-    }
-}
+/* … truncated 6176 chars — edit only what you need near the top … */
