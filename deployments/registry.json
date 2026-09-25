@@ -1,6 +1,29 @@
 {
-  "_comment": "Canonical contract address registry (Issue #881). One entry per network, generated/updated at deploy time from deployments/<network>.json and validated against deployments/<network>.manifest.json. Tooling and operators should read this file (via scripts/deployment_registry.ts) instead of grepping ad-hoc state files. 'address' is null until the contract has been deployed on that network.",
+  "_comment": "Canonical contract address registry (Issue #881). One entry per network, generated/updated at deploy time from deployments/<network>.json and validated against deployments/<network>.manifest.json. Tooling and operators should read this file (via scripts/deployment_registry.ts) instead of grepping ad-hoc state files. 'address' is null until the contract has been deployed on that network. 'invariants' declares the versioned invariant snapshot set (Issue #1086) that deployment smoke tests assert immediately after initialization and after representative mutations; each entry names the invariant category, the read method used to observe it, and the expected value so failures can identify the violated invariant and contract address.",
   "schema_version": 1,
+  "invariants_version": 1,
+  "invariants": {
+    "authorization": {
+      "description": "Only the configured admin/owner may perform privileged mutations.",
+      "read_method": "get_admin",
+      "expected": "deployer"
+    },
+    "balances": {
+      "description": "Tracked balances equal the sum of deposits minus withdrawals after representative mutations.",
+      "read_method": "get_balance",
+      "expected": "conserved"
+    },
+    "configuration": {
+      "description": "Configuration parameters match the values supplied at initialization.",
+      "read_method": "get_config",
+      "expected": "initialized"
+    },
+    "version": {
+      "description": "On-chain contract version matches the version recorded in this registry.",
+      "read_method": "version",
+      "expected": "registry_version"
+    }
+  },
   "networks": {
     "testnet": {
       "network_passphrase": "Test SDF Network ; September 2015",
