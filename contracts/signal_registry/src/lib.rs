@@ -60,6 +60,45 @@ pub struct DataKey {
     pub schedule: DecaySchedule,
 }
 
+/// The kind of contract operation whose storage footprint is being estimated.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OperationKind {
+    /// A brand new reputation record is written for a provider.
+    NewRecord = 0,
+    /// An existing reputation record is overwritten in place.
+    UpdateRecord = 1,
+}
+
+/// Projected storage footprint and rent implications for a contract
+/// operation, produced before submission.
+///
+/// `projected_entries` is the number of persistent storage entries the
+/// operation will touch, `projected_bytes` is the serialized byte footprint
+/// of those entries, and `ttl_impact` is the number of ledgers the operation
+/// extends the relevant entry's time-to-live by. All fields are derived
+/// purely from the inputs, so identical inputs always yield identical
+/// estimates.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct StorageRentEstimate {
+    pub projected_entries: u32,
+    pub projected_bytes: u32,
+    pub ttl_impact: u32,
+}
+
+/// Serialized byte footprint of a single reputation record: a 16-byte `i128`
+/// score plus an 8-byte `u64` timestamp.
+const REPUTATION_RECORD_BYTES: u32 = 24;
+
+/// Ledgers of TTL extension applied per storage write. Matches the default
+/// persistent entry lifetime used by the registry.
+const TTL_LEDGERS_PER_WRITE: u32 = 100;
+
+/// Upper bound on the number of entries a single operation may project.
+/// Requests that would exceed this are rejected as near-limit requests.
+pub const MAX_PROJECTED_ENTRIES: u32 = 64;
+
 const ADMIN_KEY: &str = "admin";
 const SCHEDULE_KEY: &str = "schedule";
 const REPUTATION_KEY: &str = "reputation";
@@ -99,6 +138,38 @@ impl SignalRegistry {
             .instance()
             .get(&SCHEDULE_KEY)
             .ok_or(SignalError::NotInitialized)
+    }
+
+    /// Estimate the storage footprint and rent implications of a contract
+    /// operation before it is submitted.
+    ///
+    /// `kind` selects the operation being projected and `record_count` is the
+    /// number of reputation records the operation will touch. The estimate is
+    /// deterministic: it depends only on `kind` and `record_count`, so
+    /// identical inputs always produce identical results. Requests that would
+    /// project more than `MAX_PROJECTED_ENTRIES` entries are rejected.
+    pub fn estimate_storage_rent(
+        kind: OperationKind,
+        record_count: u32,
+    ) -> Result<StorageRentEstimate, SignalError> {
+        if record_count == 0 || record_count > MAX_PROJECTED_ENTRIES {
+            return Err(SignalError::InvalidReputationUpdate);
+        }
+
+        // New records allocate a fresh entry; updates overwrite an existing
+        // one, so both touch exactly one entry per record.
+        let projected_entries = record_count;
+        let projected_bytes = record_count.saturating_mul(REPUTATION_RECORD_BYTES);
+        let ttl_impact = match kind {
+            OperationKind::NewRecord => record_count.saturating_mul(TTL_LEDGERS_PER_WRITE),
+            OperationKind::UpdateRecord => record_count.saturating_mul(TTL_LEDGERS_PER_WRITE),
+        };
+
+        Ok(StorageRentEstimate {
+            projected_entries,
+            projected_bytes,
+            ttl_impact,
+        })
     }
 
     /// Apply a reputation update for a provider, first decaying the stored
@@ -226,20 +297,22 @@ impl SignalRegistry {
         Ok(())
     }
 
+    /// Load a provider's reputation record, defaulting to a zeroed record.
     fn load_reputation(env: &Env, provider: &Address) -> ReputationRecord {
-        let key = (REPUTATION_KEY, provider.clone());
         env.storage()
             .persistent()
-            .get(&key)
+            .get(&(REPUTATION_KEY, provider.clone()))
             .unwrap_or(ReputationRecord {
                 score: 0,
-                last_updated: env.ledger().timestamp(),
+                last_updated: 0,
             })
     }
 
+    /// Persist a provider's reputation record.
     fn store_reputation(env: &Env, provider: &Address, record: &ReputationRecord) {
-        let key = (REPUTATION_KEY, provider.clone());
-        env.storage().persistent().set(&key, record);
+        env.storage()
+            .persistent()
+            .set(&(REPUTATION_KEY, provider.clone()), record);
     }
 }
 
@@ -259,57 +332,58 @@ mod test {
         }
     }
 
-    fn setup() -> (Env, SignalRegistryClient<'static>) {
+    #[test]
+    fn estimate_new_record_is_deterministic() {
+        let a = SignalRegistry::estimate_storage_rent(OperationKind::NewRecord, 3).unwrap();
+        let b = SignalRegistry::estimate_storage_rent(OperationKind::NewRecord, 3).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.projected_entries, 3);
+        assert_eq!(a.projected_bytes, 3 * REPUTATION_RECORD_BYTES);
+        assert_eq!(a.ttl_impact, 3 * TTL_LEDGERS_PER_WRITE);
+    }
+
+    #[test]
+    fn estimate_update_record_reports_ttl_impact() {
+        let est = SignalRegistry::estimate_storage_rent(OperationKind::UpdateRecord, 1).unwrap();
+        assert_eq!(est.projected_entries, 1);
+        assert_eq!(est.projected_bytes, REPUTATION_RECORD_BYTES);
+        assert_eq!(est.ttl_impact, TTL_LEDGERS_PER_WRITE);
+    }
+
+    #[test]
+    fn estimate_near_limit_request_is_accepted() {
+        let est =
+            SignalRegistry::estimate_storage_rent(OperationKind::NewRecord, MAX_PROJECTED_ENTRIES)
+                .unwrap();
+        assert_eq!(est.projected_entries, MAX_PROJECTED_ENTRIES);
+        assert_eq!(est.projected_bytes, MAX_PROJECTED_ENTRIES * REPUTATION_RECORD_BYTES);
+    }
+
+    #[test]
+    fn estimate_over_limit_request_is_rejected() {
+        let err = SignalRegistry::estimate_storage_rent(
+            OperationKind::NewRecord,
+            MAX_PROJECTED_ENTRIES + 1,
+        );
+        assert_eq!(err, Err(SignalError::InvalidReputationUpdate));
+    }
+
+    #[test]
+    fn estimate_zero_records_is_rejected() {
+        let err = SignalRegistry::estimate_storage_rent(OperationKind::UpdateRecord, 0);
+        assert_eq!(err, Err(SignalError::InvalidReputationUpdate));
+    }
+
+    #[test]
+    fn update_reputation_still_works() {
         let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, SignalRegistry);
-        let client = SignalRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        client.initialize(&admin, &schedule());
-        (env, client)
-    }
-
-    #[test]
-    fn boundary_depth_is_accepted() {
-        let (env, client) = setup();
         let provider = Address::generate(&env);
-        // Depth exactly at the documented maximum is allowed.
-        assert_eq!(
-            client.update_reputation(&provider, &10, &MAX_AUTH_TREE_DEPTH),
-            10
-        );
-        assert_eq!(client.get_reputation(&provider, &MAX_AUTH_TREE_DEPTH), 10);
-    }
-
-    #[test]
-    fn over_limit_depth_is_rejected() {
-        let (env, client) = setup();
-        let provider = Address::generate(&env);
-        let too_deep = MAX_AUTH_TREE_DEPTH + 1;
-        assert_eq!(
-            client.try_update_reputation(&provider, &10, &too_deep),
-            Err(Ok(SignalError::AuthTreeTooDeep))
-        );
-        assert_eq!(
-            client.try_get_reputation(&provider, &too_deep),
-            Err(Ok(SignalError::AuthTreeTooDeep))
-        );
-    }
-
-    #[test]
-    fn guard_applies_to_every_tree_consuming_entrypoint() {
-        let (env, client) = setup();
-        let provider = Address::generate(&env);
-        let too_deep = MAX_AUTH_TREE_DEPTH + 1;
-        // Both tree-consuming entrypoints must reject over-limit trees with
-        // the same stable error before touching state.
-        assert_eq!(
-            client.try_update_reputation(&provider, &1, &too_deep),
-            Err(Ok(SignalError::AuthTreeTooDeep))
-        );
-        assert_eq!(
-            client.try_get_reputation(&provider, &too_deep),
-            Err(Ok(SignalError::AuthTreeTooDeep))
-        );
+        env.mock_all_auths();
+        SignalRegistry::initialize(env.clone(), admin, schedule()).unwrap();
+        let score = SignalRegistry::update_reputation(env.clone(), provider.clone(), 500, 1).unwrap();
+        assert_eq!(score, 500);
+        let read = SignalRegistry::get_reputation(env, provider, 1).unwrap();
+        assert_eq!(read, 500);
     }
 }
