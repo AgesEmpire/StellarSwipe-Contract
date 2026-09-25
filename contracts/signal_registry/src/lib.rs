@@ -18,7 +18,17 @@ pub enum SignalError {
     Unauthorized = 3,
     InvalidDecayConfig = 4,
     InvalidReputationUpdate = 5,
+    AuthTreeTooDeep = 6,
 }
+
+/// Maximum depth of an authorization tree accepted by tree-consuming
+/// entrypoints. Trees deeper than this are rejected before any recursive
+/// traversal begins, bounding execution resources and keeping validation
+/// behavior consistent across entrypoints.
+///
+/// The limit is inclusive: a tree whose depth equals `MAX_AUTH_TREE_DEPTH` is
+/// accepted, while a tree one level deeper returns `AuthTreeTooDeep`.
+pub const MAX_AUTH_TREE_DEPTH: u32 = 8;
 
 /// Configuration-driven reputation decay schedule.
 ///
@@ -93,11 +103,18 @@ impl SignalRegistry {
 
     /// Apply a reputation update for a provider, first decaying the stored
     /// score according to the configured schedule.
+    ///
+    /// `auth_depth` is the depth of the caller's authorization tree. It is
+    /// validated against `MAX_AUTH_TREE_DEPTH` before any state is read or
+    /// mutated, so over-limit trees fail fast with a stable error.
     pub fn update_reputation(
         env: Env,
         provider: Address,
         delta: i128,
+        auth_depth: u32,
     ) -> Result<i128, SignalError> {
+        Self::check_auth_depth(auth_depth)?;
+
         let schedule: DecaySchedule = env
             .storage()
             .instance()
@@ -123,7 +140,16 @@ impl SignalRegistry {
 
     /// Read the current (decayed) reputation for a provider without mutating
     /// state. Useful for off-chain verification and contract tests.
-    pub fn get_reputation(env: Env, provider: Address) -> Result<i128, SignalError> {
+    ///
+    /// `auth_depth` is validated against `MAX_AUTH_TREE_DEPTH` before the
+    /// stored record is read.
+    pub fn get_reputation(
+        env: Env,
+        provider: Address,
+        auth_depth: u32,
+    ) -> Result<i128, SignalError> {
+        Self::check_auth_depth(auth_depth)?;
+
         let schedule: DecaySchedule = env
             .storage()
             .instance()
@@ -132,6 +158,15 @@ impl SignalRegistry {
         let record = Self::load_reputation(&env, &provider);
         let now = env.ledger().timestamp();
         Ok(Self::apply_decay(&record, now, &schedule))
+    }
+
+    /// Enforce the documented maximum authorization tree depth before any
+    /// recursive traversal. Returns `AuthTreeTooDeep` for over-limit trees.
+    fn check_auth_depth(depth: u32) -> Result<(), SignalError> {
+        if depth > MAX_AUTH_TREE_DEPTH {
+            return Err(SignalError::AuthTreeTooDeep);
+        }
+        Ok(())
     }
 
     /// Compute the decayed score for a record at a given timestamp.
@@ -205,5 +240,76 @@ impl SignalRegistry {
     fn store_reputation(env: &Env, provider: &Address, record: &ReputationRecord) {
         let key = (REPUTATION_KEY, provider.clone());
         env.storage().persistent().set(&key, record);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::Env;
+
+    fn schedule() -> DecaySchedule {
+        DecaySchedule {
+            decay_rate_bps: 100,
+            decay_interval: 100,
+            grace_period: 0,
+            min_reputation: 0,
+            max_reputation: 10_000,
+        }
+    }
+
+    fn setup() -> (Env, SignalRegistryClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SignalRegistry);
+        let client = SignalRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &schedule());
+        (env, client)
+    }
+
+    #[test]
+    fn boundary_depth_is_accepted() {
+        let (env, client) = setup();
+        let provider = Address::generate(&env);
+        // Depth exactly at the documented maximum is allowed.
+        assert_eq!(
+            client.update_reputation(&provider, &10, &MAX_AUTH_TREE_DEPTH),
+            10
+        );
+        assert_eq!(client.get_reputation(&provider, &MAX_AUTH_TREE_DEPTH), 10);
+    }
+
+    #[test]
+    fn over_limit_depth_is_rejected() {
+        let (env, client) = setup();
+        let provider = Address::generate(&env);
+        let too_deep = MAX_AUTH_TREE_DEPTH + 1;
+        assert_eq!(
+            client.try_update_reputation(&provider, &10, &too_deep),
+            Err(Ok(SignalError::AuthTreeTooDeep))
+        );
+        assert_eq!(
+            client.try_get_reputation(&provider, &too_deep),
+            Err(Ok(SignalError::AuthTreeTooDeep))
+        );
+    }
+
+    #[test]
+    fn guard_applies_to_every_tree_consuming_entrypoint() {
+        let (env, client) = setup();
+        let provider = Address::generate(&env);
+        let too_deep = MAX_AUTH_TREE_DEPTH + 1;
+        // Both tree-consuming entrypoints must reject over-limit trees with
+        // the same stable error before touching state.
+        assert_eq!(
+            client.try_update_reputation(&provider, &1, &too_deep),
+            Err(Ok(SignalError::AuthTreeTooDeep))
+        );
+        assert_eq!(
+            client.try_get_reputation(&provider, &too_deep),
+            Err(Ok(SignalError::AuthTreeTooDeep))
+        );
     }
 }
