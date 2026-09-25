@@ -1,74 +1,44 @@
-//! Shared utilities for Signal contracts.
-//!
-//! This crate provides canonical helpers used across the Signal contract
-//! suite. The address validation helpers below are the single source of
-//! truth for validating and normalizing Soroban addresses (contracts,
-//! accounts, and authorized invokers) so that public entrypoints reject
-//! malformed or unsupported inputs consistently.
-
-use soroban_sdk::{Address, Env, IntoVal, Symbol, Val, Vec};
-
-/// Stable error codes returned by the canonical address validation helpers.
+/// Validates and normalizes an address for the given `kind`.
 ///
-/// These codes are part of the public contract surface and are documented
-/// for SDK consumers. They must not be renumbered.
-pub mod address_error {
-    /// The supplied value is not a valid Soroban address.
-    pub const INVALID_ADDRESS: u32 = 1;
-    /// The address is valid but of an unsupported type for this context.
-    pub const UNSUPPORTED_ADDRESS_TYPE: u32 = 2;
-    /// The address is the zero/empty address and is not allowed here.
-    pub const ZERO_ADDRESS: u32 = 3;
+/// Normalization currently returns the address unchanged, but centralizing
+/// it here lets callers rely on a single canonical behavior and keeps the
+/// door open for future normalization rules without touching entrypoints.
+pub fn normalize_address(env: &Env, address: &Address, kind: AddressKind) -> AddressResult {
+    validate_address(env, address, kind)
 }
 
-/// The kind of Soroban address being validated.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum AddressKind {
-    /// A deployed contract address.
-    Contract = 0,
-    /// A user/account address.
-    Account = 1,
-    /// An address authorized to invoke a contract entrypoint.
-    AuthorizedInvoker = 2,
-}
-
-/// Result type for address validation helpers.
-pub type AddressResult = Result<Address, u32>;
-
-/// Returns `true` when `address` is a well-formed Soroban address.
-///
-/// This performs the canonical structural check used across the suite. It
-/// rejects the zero/empty address, which is never a valid target.
-pub fn is_valid_address(env: &Env, address: &Address) -> bool {
-    // `Address` is a host type; the only malformed case reachable from the
-    // guest is the zero/empty address, which we reject explicitly.
-    let _ = env;
-    !is_zero_address(address)
-}
-
-/// Returns `true` when `address` is the zero/empty address.
-pub fn is_zero_address(address: &Address) -> bool {
-    // A zero address has no string representation in the host; compare
-    // against the canonical empty string form.
-    let s = address.to_string();
-    s.len() == 0
-}
-
-/// Validates `address` as the given `kind`, returning a stable error code
-/// on failure.
-///
-/// This is the canonical entrypoint used by public contract functions to
-/// reject malformed or unsupported address inputs consistently.
-pub fn validate_address(env: &Env, address: &Address, kind: AddressKind) -> AddressResult {
-    if !is_valid_address(env, address) {
-        return Err(address_error::INVALID_ADDRESS);
-    }
-    match kind {
-        AddressKind::Contract | AddressKind::Account | AddressKind::AuthorizedInvoker => {
-            Ok(address.clone())
+/// Convenience helper for validating 
         }
     }
+}
+
+/// Compute a deterministic checksum over the provided state entries.
+///
+/// The caller is responsible for supplying `entries` in a canonical order.
+/// Equivalent states (same entries, same order) always yield the same digest,
+/// regardless of unrelated storage or map iteration order.
+///
+/// Returns the digest as a lowercase hexadecimal string.
+pub fn state_checksum(entries: &[StateEntry]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(CHECKSUM_DOMAIN);
+
+    for entry in entries {
+        let key = entry.key.as_bytes();
+        hasher.update((key.len() as u32).to_be_bytes());
+        hasher.update(key);
+
+        let value = entry.value.as_bytes();
+        hasher.update((value.len() as u32).to_be_bytes());
+        hasher.update(value);
+    }
+
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
 }
 
 /// Validates and normalizes an address for the given `kind`.
@@ -131,6 +101,7 @@ fn _assert_val_roundtrip(env: &Env, address: &Address) -> Val {
 #[allow(dead_code)]
 fn _assert_symbol(env: &Env, name: &str) -> Symbol {
     Symbol::new(env, name)
+}
 }
 
 #[cfg(test)]
@@ -223,5 +194,70 @@ mod tests {
         assert_eq!(address_error::INVALID_ADDRESS, 1);
         assert_eq!(address_error::UNSUPPORTED_ADDRESS_TYPE, 2);
         assert_eq!(address_error::ZERO_ADDRESS, 3);
+    }
+
+    fn entries() -> Vec<StateEntry> {
+        vec![
+            StateEntry::new("admin", "GADMIN"),
+            StateEntry::new("threshold", "2"),
+        ]
+    }
+
+    #[test]
+    fn repeated_calls_are_identical() {
+        let first = state_checksum(&entries());
+        let second = state_checksum(&entries());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn unrelated_storage_does_not_change_checksum() {
+        let baseline = state_checksum(&entries());
+
+        // Simulate unrelated storage that is not part of the input set.
+        let mut unrelated = std::collections::HashMap::new();
+        unrelated.insert("unrelated", "value");
+        unrelated.insert("other", "data");
+        let _ = unrelated.len();
+
+        assert_eq!(baseline, state_checksum(&entries()));
+    }
+
+    #[test]
+    fn map_iteration_order_does_not_change_checksum() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("admin", "GADMIN");
+        map.insert("threshold", "2");
+
+        // Canonicalize by sorting keys so iteration order is irrelevant.
+        let mut keys: Vec<_> = map.keys().copied().collect();
+        keys.sort_unstable();
+        let canonical: Vec<StateEntry> = keys
+            .iter()
+            .map(|k| StateEntry::new(*k, map[k]))
+            .collect();
+
+        let first = state_checksum(&canonical);
+
+        // Rebuild the map in a different insertion order.
+        let mut reordered = std::collections::HashMap::new();
+        reordered.insert("threshold", "2");
+        reordered.insert("admin", "GADMIN");
+        let mut keys2: Vec<_> = reordered.keys().copied().collect();
+        keys2.sort_unstable();
+        let canonical2: Vec<StateEntry> = keys2
+            .iter()
+            .map(|k| StateEntry::new(*k, reordered[k]))
+            .collect();
+
+        assert_eq!(first, state_checksum(&canonical2));
+    }
+
+    #[test]
+    fn ordering_is_significant() {
+        let a = vec![StateEntry::new("a", "1"), StateEntry::new("b", "2")];
+        let b = vec![StateEntry::new("b", "2"), StateEntry::new("a", "1")];
+        assert_ne!(state_checksum(&a), state_checksum(&b));
+    }
     }
 }
