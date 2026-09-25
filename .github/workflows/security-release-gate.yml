@@ -111,3 +111,65 @@ jobs:
             echo "INFO: new error codes added; baseline updated locally."
             echo "This is not a gate failure — commit the updated stellar-swipe/error-baselines/*.json files."
           fi
+
+      # WASM reproducibility check (Issue #1083). Build the contract WASM
+      # twice from the same source under the pinned toolchain and locked
+      # dependencies, then compare the resulting hashes. Any difference means
+      # the release artifact is not reproducible and the gate fails with
+      # actionable diagnostics (hashes, artifact paths, toolchain, lock state).
+      - name: WASM reproducibility check
+        run: |
+          set -euo pipefail
+          cd stellar-swipe
+
+          # Capture the toolchain, target, and dependency lock state used for
+          # the build so a hash mismatch can be investigated later.
+          echo "=== Build environment ==="
+          rustc --version | tee /tmp/repro-env.txt
+          cargo --version | tee -a /tmp/repro-env.txt
+          echo "target: wasm32-unknown-unknown" | tee -a /tmp/repro-env.txt
+          echo "lockfile: Cargo.lock" | tee -a /tmp/repro-env.txt
+          if [ -f Cargo.lock ]; then
+            sha256sum Cargo.lock | tee -a /tmp/repro-env.txt
+          else
+            echo "ERROR: Cargo.lock is missing — locked dependencies are required for reproducible builds." >&2
+            exit 1
+          fi
+
+          # Build the contract WASM twice from the same source. The second
+          # build reuses the same toolchain, target, and lockfile; identical
+          # hashes prove the output is reproducible.
+          build_wasm() {
+            local out_dir="$1"
+            rm -rf "$out_dir"
+            mkdir -p "$out_dir"
+            cargo build --release --locked --target wasm32-unknown-unknown \
+              -p signal_registry
+            cp target/wasm32-unknown-unknown/release/signal_registry.wasm "$out_dir/"
+          }
+
+          build_wasm /tmp/repro-build-1
+          build_wasm /tmp/repro-build-2
+
+          hash1=$(sha256sum /tmp/repro-build-1/signal_registry.wasm | awk '{print $1}')
+          hash2=$(sha256sum /tmp/repro-build-2/signal_registry.wasm | awk '{print $1}')
+
+          echo "=== Reproducibility result ==="
+          echo "build 1: $hash1  (/tmp/repro-build-1/signal_registry.wasm)"
+          echo "build 2: $hash2  (/tmp/repro-build-2/signal_registry.wasm)"
+
+          if [ "$hash1" != "$hash2" ]; then
+            echo "" >&2
+            echo "ERROR: contract WASM is not reproducible — hashes differ." >&2
+            echo "  build 1: $hash1" >&2
+            echo "  build 2: $hash2" >&2
+            echo "" >&2
+            echo "Build environment (toolchain, target, lock state):" >&2
+            cat /tmp/repro-env.txt >&2
+            echo "" >&2
+            echo "See docs/security/release_security_checklist.md for how to" >&2
+            echo "investigate hash differences." >&2
+            exit 1
+          fi
+
+          echo "OK: contract WASM hashes match ($hash1)."

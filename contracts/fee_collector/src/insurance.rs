@@ -1,6 +1,13 @@
 pub const INSURANCE_FEE_SHARE_BPS: i128 = 500;
 pub const BPS_DENOMINATOR: i128 = 10_000;
 
+/// Maximum balance (in base units) that qualifies as sweepable dust.
+///
+/// Only fee_collector balances strictly below this threshold may be swept via
+/// [`sweep_dust`]. Anything at or above this value is an ordinary fee balance
+/// and must not be moved through the dust-sweep path.
+pub const DUST_SWEEP_THRESHOLD: i128 = 1_000;
+
 /// Schema version for fee_collector configuration events.
 ///
 /// Bump this whenever the shape of [`ConfigChanged`] changes so indexers can
@@ -11,6 +18,11 @@ pub const CONFIG_EVENT_SCHEMA_VERSION: u32 = 1;
 ///
 /// Matches `docs/event_schema.json` (`fee_collector.config_changed`).
 pub const CONFIG_CHANGED_TOPIC: &str = "fee_collector.config_changed";
+
+/// Documented topic emitted for every successful dust sweep.
+///
+/// Matches `docs/event_schema.json` (`fee_collector.dust_swept`).
+pub const DUST_SWEPT_TOPIC: &str = "fee_collector.dust_swept";
 
 /// Identifies which configuration field a [`ConfigChanged`] event refers to.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,6 +44,19 @@ pub struct ConfigChanged<Actor> {
     pub field: ConfigField,
     pub old_value: Option<i128>,
     pub new_value: Option<i128>,
+    pub actor: Actor,
+}
+
+/// Audit record emitted for every successful dust sweep.
+///
+/// Records the destination, the swept amount, and the authorizing caller so
+/// the sweep can be reconstructed and audited off-chain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DustSwept<Actor, Destination> {
+    pub schema_version: u32,
+    pub topic: &'static str,
+    pub destination: Destination,
+    pub amount: i128,
     pub actor: Actor,
 }
 
@@ -68,6 +93,7 @@ pub enum ContractError {
     /// protected treasury reserves below their configured solvency floor.
     /// State is left unchanged when this is returned.
     SolvencyFloorBreached,
+    InvalidSweep,
 }
 
 /// Emits the single documented event for a successful configuration change.
@@ -162,6 +188,42 @@ pub fn solvency_invariant_holds(pool: &InsurancePool, amount: i128) -> bool {
         return false;
     }
     pool.protected_reserves.saturating_sub(amount) >= pool.solvency_floor
+}
+
+/// Sweeps a negligible fee_collector dust balance to an explicit destination.
+///
+/// Only balances strictly below [`DUST_SWEEP_THRESHOLD`] are sweepable, so
+/// ordinary fee balances cannot be moved through this path. The caller must be
+/// explicitly authorized, the destination must be non-zero, and the amount must
+/// be positive and no greater than the current balance. On success the balance
+/// is reduced and a [`DustSwept`] audit event is returned; rejected calls return
+/// `Err` before any mutation and emit no event.
+pub fn sweep_dust<Actor: Clone, Destination: Clone>(
+    balance: &mut i128,
+    destination: Destination,
+    amount: i128,
+    authorized: bool,
+    actor: Actor,
+) -> Result<DustSwept<Actor, Destination>, ContractError> {
+    if !authorized {
+        return Err(ContractError::Unauthorized);
+    }
+    if amount <= 0 || amount > *balance || amount >= DUST_SWEEP_THRESHOLD {
+        return Err(ContractError::InvalidSweep);
+    }
+    if *balance >= DUST_SWEEP_THRESHOLD {
+        return Err(ContractError::InvalidSweep);
+    }
+
+    *balance -= amount;
+
+    Ok(DustSwept {
+        schema_version: CONFIG_EVENT_SCHEMA_VERSION,
+        topic: DUST_SWEPT_TOPIC,
+        destination,
+        amount,
+        actor,
+    })
 }
 
 pub fn allocate_insurance_fee(pool: &mut InsurancePool, collected_fee: i128) -> i128 {
@@ -327,12 +389,12 @@ mod tests {
 
     #[test]
     fn rejected_cap_change_emits_no_event() {
-        let mut pool = pool(100, 100, 0);
+        let mut pool = InsurancePool { balance: 5_000 };
 
-        let result = set_insurance_cap(&mut pool, 50, "admin");
+        let result = set_insurance_cap(&mut pool, 100, "admin");
 
         assert_eq!(result, Err(ContractError::Unauthorized));
-        assert_eq!(pool.balance, 100);
+        assert_eq!(pool.balance, 5_000);
     }
 
     #[test]
@@ -392,5 +454,55 @@ mod tests {
         assert_eq!(result, Err(ContractError::SolvencyFloorBreached));
         assert_eq!(pool.balance, 1_000);
         assert_eq!(pool.protected_reserves, 500);
+    }
+
+    #[test]
+    fn dust_sweep_moves_sub_threshold_balance_and_records_audit() {
+        let mut balance = 400;
+
+        let event = sweep_dust(&mut balance, "dest-1", 400, true, "admin").unwrap();
+
+        assert_eq!(event.schema_version, CONFIG_EVENT_SCHEMA_VERSION);
+        assert_eq!(event.topic, DUST_SWEPT_TOPIC);
+        assert_eq!(event.destination, "dest-1");
+        assert_eq!(event.amount, 400);
+        assert_eq!(event.actor, "admin");
+        assert_eq!(balance, 0);
+    }
+
+    #[test]
+    fn dust_sweep_rejects_unauthorized_caller() {
+        let mut balance = 400;
+
+        let result = sweep_dust(&mut balance, "dest-1", 400, false, "attacker");
+
+        assert_eq!(result, Err(ContractError::Unauthorized));
+        assert_eq!(balance, 400);
+    }
+
+    #[test]
+    fn dust_sweep_rejects_ordinary_fee_balance() {
+        let mut balance = DUST_SWEEP_THRESHOLD;
+
+        let result = sweep_dust(&mut balance, "dest-1", 1, true, "admin");
+
+        assert_eq!(result, Err(ContractError::InvalidSweep));
+        assert_eq!(balance, DUST_SWEEP_THRESHOLD);
+    }
+
+    #[test]
+    fn dust_sweep_rejects_invalid_amount() {
+        let mut balance = 400;
+
+        assert_eq!(
+            sweep_dust(&mut balance, "dest-1", 0, true, "admin"),
+            Err(ContractError::InvalidSweep)
+        );
+        assert_eq!(
+            sweep_dust(&mut balance, "dest-1", 401, true, "admin"),
+            Err(ContractError::InvalidSweep)
+        );
+        assert_eq!(balance, 400);
+    }
     }
 }

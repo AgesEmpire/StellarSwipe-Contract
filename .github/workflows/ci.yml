@@ -91,6 +91,19 @@ jobs:
       - name: Tests
         run: cd stellar-swipe && cargo test --workspace --all-targets
 
+      # WASM memory allocation regression tests (issue #1116).
+      # Measures heap allocation for representative high-volume entrypoints in
+      # the core contracts and compares against the documented budget in
+      # stellar-swipe/allocation-baselines/budget.json.  Runs deterministically
+      # on the supported Soroban toolchain (wasm32-unknown-unknown).
+      - name: WASM memory allocation regression tests
+        run: |
+          cd stellar-swipe
+          cargo test -p batch_processor -p liquidity_pool -p rewards -p withdrawal_queue \
+            --features allocation-tests -- --nocapture
+          python3 scripts/check_allocation_budget.py \
+            --baseline-dir allocation-baselines
+
       - name: Reward conservation regression tests
         run: cd scripts && npx tsx --test reward_conservation.test.ts
 
@@ -138,6 +151,27 @@ jobs:
       - name: Validate error baseline integrity
         run: python3 stellar-swipe/scripts/test_error_baselines.py
 
+      # Export the machine-readable contract error ABI (issue #1075): public
+      # error variants, numeric values, and associated entrypoints, generated
+      # from the Rust source of truth.  Validation fails on duplicate numeric
+      # values and on undocumented public errors.  The committed artifact is
+      # regenerated and diffed so CI fails when it is stale.
+      - name: Check contract error ABI export is current
+        run: |
+          python3 stellar-swipe/scripts/export_error_abi.py \
+            --output stellar-swipe/error-abi/contract-error-abi.json
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: contract error ABI validation failed — see output above." >&2
+            exit 1
+          fi
+          if ! git diff --exit-code -- stellar-swipe/error-abi/contract-error-abi.json; then
+            echo "ERROR: committed contract error ABI artifact is stale." >&2
+            echo "  Regenerate locally and commit the result:" >&2
+            echo "    python3 stellar-swipe/scripts/export_error_abi.py --output stellar-swipe/error-abi/contract-error-abi.json" >&2
+            exit 1
+          fi
+
       # Diff each contract's storage layout against committed baselines.
       # Exit 0 = clean; exit 2 = new keys added (baseline updated, commit the
       # JSON files); exit 1 = breaking change (removed/renamed key) → fail build.
@@ -156,6 +190,60 @@ jobs:
           if [ $rc -eq 2 ]; then
             echo "INFO: New storage keys detected; baseline files updated."
             echo "Please commit the updated stellar-swipe/storage-baselines/*.json files."
+          fi
+
+      # Panic-path and forbidden-API lint (issue #1084).
+      # Scans every contract crate under contracts/ for panic paths
+      # (unwrap/expect/panic!/unreachable!/todo!/unimplemented!/indexing) and
+      # forbidden non-deterministic or unsupported APIs (std::time, std::env,
+      # std::fs, std::net, rand, SystemTime, Instant, thread, process, etc.).
+      # Covers all release profiles (debug + release).  Intentional exceptions
+      # must be listed with justification + reviewer in
+      # stellar-swipe/contract-lint-allowlist.toml.  On failure the check prints
+      # the offending file:line:col and remediation guidance.
+      - name: Contract panic / forbidden API lint
+        run: |
+          python3 stellar-swipe/scripts/check_contract_panics.py \
+            --contracts-dir stellar-swipe/contracts \
+            --allowlist stellar-swipe/contract-lint-allowlist.toml \
+            --profiles debug,release
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "ERROR: contract panic/forbidden-API lint failed — see locations above." >&2
+            echo "  Remediation: replace panic paths with typed Result errors and" >&2
+            echo "  remove non-deterministic APIs.  For a reviewed exception, add an" >&2
+            echo "  entry to stellar-swipe/contract-lint-allowlist.toml with a" >&2
+            echo "  justification and reviewer.  See docs/CONTRACT_DEVELOPMENT_GUIDE.md." >&2
+            exit 1
+          fi
+
+      # Prove the lint actually catches a forbidden pattern using a fixture
+      # that intentionally contains one.  The fixture must be flagged; if the
+      # check passes on it, the lint is broken and CI fails.
+      - name: Contract lint self-test (fixture must be caught)
+        run: python3 stellar-swipe/scripts/test_contract_panics.py
+
+      # Enforce the contract interface semver compatibility policy (issue #1094).
+      # Classifies public entrypoints, argument/return types, events, errors,
+      # and storage schemas as breaking vs non-breaking against the prior
+      # release baseline.  Exit 0 = compatible; exit 1 = unsupported breaking
+      # change (requires a major version bump + compatibility review);
+      # exit 2 = new interface surface added (baseline updated, commit the
+      # JSON files).
+      - name: Check contract interface semver compatibility
+        run: |
+          python3 stellar-swipe/scripts/check_interface_semver.py \
+            --baseline-dir stellar-swipe/interface-baselines
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: Unsupported breaking interface change detected — see output above." >&2
+            echo "  Breaking changes require a major version bump and the" >&2
+            echo "  compatibility review checklist in docs/INTERFACE_SEMVER.md." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: New interface surface detected; baseline files updated."
+            echo "Please commit the updated stellar-swipe/interface-baselines/*.json files."
           fi
 
       # Release WASM (workspace [profile.release]) + stellar contract optimize
@@ -183,10 +271,61 @@ jobs:
           source scripts/embed_source_hash.sh
           ./scripts/build.sh
           if [[ -z "${STELLAR_SOURCE_HASH:-}" ]]; then
-            echo "error: STELLAR_SOURCE_HASH was not set — release aborted." >&2
+            echo "error: STELLAR_SOURCE_HASH is empty" >&2
             exit 1
           fi
           echo "Embedded SourceHash: $STELLAR_SOURCE_HASH"
+
+      # Reproducibility check (issue #1083): rebuild the same source a second
+      # time under the identical toolchain/target/lock state and assert the
+      # optimized WASM hashes match.  Non-reproducible output fails CI with
+      # actionable diagnostics (differing hashes, artifact paths, toolchain
+      # and lock info).  See docs/RELEASE_REPRODUCIBILITY.md for investigation.
+      - name: WASM reproducibility check
+        run: |
+          set -euo pipefail
+          cd stellar-swipe
+
+          # Capture the toolchain, target, and dependency lock state used for
+          # the build so a hash mismatch can be diagnosed from CI logs alone.
+          echo "=== Build environment ==="
+          rustc --version | tee /tmp/repro-env.txt
+          cargo --version | tee -a /tmp/repro-env.txt
+          stellar --version | tee -a /tmp/repro-env.txt
+          echo "target: wasm32-unknown-unknown" | tee -a /tmp/repro-env.txt
+          echo "lock: Cargo.lock sha256=$(sha256sum Cargo.lock | awk '{print $1}')" | tee -a /tmp/repro-env.txt
+
+          # Snapshot the first build's optimized artifacts, then rebuild and
+          # compare.  Any differing hash fails the job with the artifact paths
+          # and environment captured above.
+          snapshot_dir="$(mktemp -d)"
+          find target/wasm32-unknown-unknown/release -name '*.optimized.wasm' \
+            -exec cp {} "$snapshot_dir" \;
+          ./scripts/build.sh
+          status=0
+          for f in "$snapshot_dir"/*.optimized.wasm; do
+            name="$(basename "$f")"
+            new="target/wasm32-unknown-unknown/release/$name"
+            if [ ! -f "$new" ]; then
+              echo "ERROR: rebuild did not produce $name" >&2
+              status=1
+              continue
+            fi
+            old_hash="$(sha256sum "$f" | awk '{print $1}')"
+            new_hash="$(sha256sum "$new" | awk '{print $1}')"
+            if [ "$old_hash" != "$new_hash" ]; then
+              echo "ERROR: non-reproducible WASM: $name" >&2
+              echo "  first:  $old_hash" >&2
+              echo "  second: $new_hash" >&2
+              status=1
+            else
+              echo "OK: $name reproducible ($new_hash)"
+            fi
+          done
+          if [ $status -ne 0 ]; then
+            echo "See docs/RELEASE_REPRODUCIBILITY.md for investigation steps." >&2
+            exit 1
+          fi
 
       # Generate the upgrade compatibility manifest for each contract release.
       # The manifest records storage layout, interface version, and upgrade
@@ -230,3 +369,17 @@ jobs:
             echo "INFO: New ABI exports detected; baseline files updated."
             echo "Please commit the updated stellar-swipe/abi-baselines/*.json files."
           fi
+     cat /tmp/abi-diff-report.md
+          echo ""
+          echo "---"
+          echo "Exit code: $rc"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: Breaking ABI change detected — see report above." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: New ABI exports detected; baseline files updated."
+            echo "Please commit the updated stellar-swipe/abi-baselines/*.json files."
+          fi
+
