@@ -22,6 +22,9 @@ pub enum SpendError {
     ExceedsPerTxLimit,
     ExceedsPeriodLimit,
     InsufficientApprovals,
+    /// The withdrawal would reduce protected treasury reserves below the
+    /// configured solvency floor. State is left unchanged.
+    BelowSolvencyFloor,
 }
 
 /// Pure guardrail check: given the policy, the amount being spent, approvals
@@ -43,6 +46,40 @@ pub fn check_spend(
         return Err(SpendError::InsufficientApprovals);
     }
     Ok(())
+}
+
+/// Enforces the treasury solvency invariant: a withdrawal of `amount` from
+/// `treasury_balance` must not reduce protected reserves below `solvency_floor`.
+///
+/// This is a pure precondition check so it can be evaluated atomically with the
+/// withdrawal: callers must run it *before* mutating any balance, and only apply
+/// the debit when it returns `Ok(())`. On violation it returns the stable
+/// [`SpendError::BelowSolvencyFloor`] error and no state is touched.
+pub fn check_solvency(
+    treasury_balance: i128,
+    amount: i128,
+    solvency_floor: i128,
+) -> Result<(), SpendError> {
+    if treasury_balance - amount < solvency_floor {
+        return Err(SpendError::BelowSolvencyFloor);
+    }
+    Ok(())
+}
+
+/// Combined precondition for a withdrawal: validates the spend policy bounds and
+/// the treasury solvency invariant together. Returns `Ok(())` only when both
+/// checks pass, so the caller can apply the debit atomically without partial
+/// state mutation.
+pub fn check_withdrawal(
+    policy: &SpendPolicy,
+    treasury_balance: i128,
+    amount: i128,
+    approvals_collected: u32,
+    period_spent_so_far: i128,
+    solvency_floor: i128,
+) -> Result<(), SpendError> {
+    check_spend(policy, amount, approvals_collected, period_spent_so_far)?;
+    check_solvency(treasury_balance, amount, solvency_floor)
 }
 
 #[cfg(test)]
@@ -82,5 +119,36 @@ mod test {
     #[test]
     fn allows_large_spend_with_enough_approvals() {
         assert_eq!(check_spend(&policy(), 600, 2, 0), Ok(()));
+    }
+
+    #[test]
+    fn allows_withdrawal_landing_exactly_on_floor() {
+        // balance 1_000, withdraw 400, floor 600 -> exactly at floor, allowed.
+        assert_eq!(check_solvency(1_000, 400, 600), Ok(()));
+    }
+
+    #[test]
+    fn rejects_withdrawal_below_floor() {
+        // balance 1_000, withdraw 401, floor 600 -> 599 < 600, rejected.
+        assert_eq!(check_solvency(1_000, 401, 600), Err(SpendError::BelowSolvencyFloor));
+    }
+
+    #[test]
+    fn allows_withdrawal_after_reserve_replenishment() {
+        // Initially below floor, then reserves are topped up and the same
+        // withdrawal becomes valid.
+        assert_eq!(check_solvency(500, 400, 600), Err(SpendError::BelowSolvencyFloor));
+        assert_eq!(check_solvency(1_500, 400, 600), Ok(()));
+    }
+
+    #[test]
+    fn combined_withdrawal_enforces_both_policy_and_solvency() {
+        // Policy-valid but solvency-violating withdrawal is rejected.
+        assert_eq!(
+            check_withdrawal(&policy(), 1_000, 400, 2, 0, 600),
+            Err(SpendError::BelowSolvencyFloor)
+        );
+        // Policy-valid and solvency-valid withdrawal is allowed.
+        assert_eq!(check_withdrawal(&policy(), 1_000, 400, 2, 0, 500), Ok(()));
     }
 }
