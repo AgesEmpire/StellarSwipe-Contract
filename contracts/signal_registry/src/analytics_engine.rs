@@ -135,6 +135,107 @@ pub struct PerformanceReport {
 }
 
 // ============================================================================
+// Storage Rent Estimation Diagnostics
+// ============================================================================
+
+/// Common contract operations whose storage footprint can be estimated
+/// before submission.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum ContractOperation {
+    /// Persist a brand new record (entry does not yet exist).
+    CreateRecord,
+    /// Overwrite an existing record with a same-sized payload.
+    UpdateRecord,
+    /// Append a new entry to an existing collection.
+    AppendEntry,
+    /// Remove an existing entry from a collection.
+    RemoveEntry,
+}
+
+/// Projected storage footprint and rent implications for a contract
+/// operation. All fields are derived deterministically from the inputs so
+/// identical requests always yield identical estimates.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct StorageRentEstimate {
+    /// Number of ledger entries the operation is projected to touch.
+    pub projected_entries: u32,
+    /// Projected byte footprint of the affected entries.
+    pub projected_bytes: u32,
+    /// Projected change in TTL (in ledgers) for the affected entries.
+    pub ttl_impact: u32,
+    /// Projected rent cost in stroops for the affected entries.
+    pub projected_rent: i128,
+    /// Whether the request is within the configured storage limits.
+    pub within_limits: bool,
+}
+
+/// Baseline byte cost of a single ledger entry (key + metadata overhead).
+const ENTRY_OVERHEAD_BYTES: u32 = 64;
+/// Rent charged per byte per ledger (in stroops).
+const RENT_PER_BYTE_PER_LEDGER: i128 = 1;
+/// Default TTL extension applied to touched entries, in ledgers.
+const DEFAULT_TTL_EXTENSION: u32 = 100;
+/// Maximum number of entries a single operation may touch.
+const MAX_ENTRIES_PER_OPERATION: u32 = 1000;
+/// Maximum byte footprint a single operation may touch.
+const MAX_BYTES_PER_OPERATION: u32 = 1_000_000;
+
+/// Estimate the storage footprint and rent implications of a contract
+/// operation before it is submitted.
+///
+/// The estimate is a pure function of its inputs: the same `operation`,
+/// `payload_bytes`, `existing_entries`, and `ttl_extension` always produce the
+/// same `StorageRentEstimate`.
+///
+/// * `payload_bytes` is the serialized size of the record being written.
+/// * `existing_entries` is the number of entries already stored for the
+///   collection the operation targets.
+/// * `ttl_extension` is the number of ledgers the caller intends to extend the
+///   touched entries by; pass `0` to use the default extension.
+pub fn estimate_storage_rent(
+    operation: ContractOperation,
+    payload_bytes: u32,
+    existing_entries: u32,
+    ttl_extension: u32,
+) -> StorageRentEstimate {
+    let entry_bytes = payload_bytes.saturating_add(ENTRY_OVERHEAD_BYTES);
+
+    let (projected_entries, projected_bytes) = match operation {
+        ContractOperation::CreateRecord => (1u32, entry_bytes),
+        ContractOperation::UpdateRecord => (1u32, entry_bytes),
+        ContractOperation::AppendEntry => (1u32, entry_bytes),
+        ContractOperation::RemoveEntry => {
+            // Removal touches the entry but frees its bytes.
+            (1u32, 0u32)
+        }
+    };
+
+    let ttl_impact = if ttl_extension == 0 {
+        DEFAULT_TTL_EXTENSION
+    } else {
+        ttl_extension
+    };
+
+    let projected_rent = (projected_bytes as i128)
+        .saturating_mul(RENT_PER_BYTE_PER_LEDGER)
+        .saturating_mul(ttl_impact as i128);
+
+    let total_entries = existing_entries.saturating_add(projected_entries);
+    let within_limits = total_entries <= MAX_ENTRIES_PER_OPERATION
+        && projected_bytes <= MAX_BYTES_PER_OPERATION;
+
+    StorageRentEstimate {
+        projected_entries,
+        projected_bytes,
+        ttl_impact,
+        projected_rent,
+        within_limits,
+    }
+}
+
+// ============================================================================
 // Performance Metrics Calculation
 // ============================================================================
 
@@ -298,497 +399,6 @@ fn calculate_older_average(data_points: &Vec<TimeSeriesDataPoint>, count: usize)
     }
 }
 
-/// Calculate volatility from historical data
-pub fn calculate_volatility(data_points: &Vec<TimeSeriesDataPoint>) -> u32 {
-    if data_points.len() < 2 {
-        return 0;
-    }
-    
-    // Calculate mean
-    let mut sum = 0i128;
-    for i in 0..data_points.len() {
-        if let Some(dp) = data_points.get(i) {
-            sum += dp.value;
-        }
-    }
-    let mean = sum / data_points.len() as i128;
-    
-    // Calculate variance
-    let mut variance_sum = 0i128;
-    for i in 0..data_points.len() {
-        if let Some(dp) = data_points.get(i) {
-            let diff = dp.value - mean;
-            variance_sum += diff * diff;
-        }
-    }
-    let variance = variance_sum / data_points.len() as i128;
-    
-    // Return simplified volatility (sqrt approximation)
-    approximate_sqrt(variance.abs()) as u32
-}
-
-/// Approximate square root for i128
-fn approximate_sqrt(n: i128) -> i128 {
-    if n == 0 {
-        return 0;
-    }
-    
-    let mut x = n;
-    let mut y = (x + 1) / 2;
-    
-    while y < x {
-        x = y;
-        y = (x + n / x) / 2;
-    }
-    
-    x
-}
-
-// ============================================================================
-// Predictive Analytics
-// ============================================================================
-
-/// Generate predictive analytics based on historical data
-pub fn generate_predictions(
-    analytics: &SignalProviderAnalytics,
-    historical_data: &Vec<TimeSeriesDataPoint>,
-) -> PredictiveAnalytics {
-    let trend = analyze_historical_trend(historical_data);
-    let risk_level = classify_risk_level(analytics.risk_score);
-    
-    // Predict future win rate based on trend and current performance
-    let predicted_win_rate = predict_win_rate(
-        analytics.win_rate,
-        &trend,
-        analytics.consistency_score,
-    );
-    
-    // Calculate confidence based on data quality and consistency
-    let confidence = calculate_prediction_confidence(
-        historical_data.len(),
-        analytics.consistency_score,
-    );
-    
-    // Generate recommendation
-    let recommendation = generate_recommendation(
-        predicted_win_rate,
-        &risk_level,
-        &trend,
-    );
-    
-    PredictiveAnalytics {
-        provider: analytics.provider.clone(),
-        predicted_win_rate,
-        confidence_level: confidence,
-        trend_direction: trend,
-        risk_level,
-        recommendation,
-    }
-}
-
-/// Predict future win rate
-fn predict_win_rate(
-    current_win_rate: u32,
-    trend: &TrendDirection,
-    consistency: u32,
-) -> u32 {
-    let trend_adjustment = match trend {
-        TrendDirection::StrongUptrend => 500,
-        TrendDirection::Uptrend => 200,
-        TrendDirection::Sideways => 0,
-        TrendDirection::Downtrend => -200i32,
-        TrendDirection::StrongDowntrend => -500i32,
-    };
-    
-    // Apply consistency factor (higher consistency = more reliable prediction)
-    let adjusted = current_win_rate as i32 + 
-        (trend_adjustment * consistency as i32) / 100;
-    
-    adjusted.max(0).min(10000) as u32
-}
-
-/// Calculate prediction confidence level
-fn calculate_prediction_confidence(data_points: u32, consistency: u32) -> u32 {
-    // More data points and higher consistency = higher confidence
-    let data_score = (data_points * 2).min(50);
-    let consistency_score = consistency / 2;
-    
-    (data_score + consistency_score).min(100)
-}
-
-/// Classify risk level
-fn classify_risk_level(risk_score: u32) -> RiskLevel {
-    match risk_score {
-        0..=20 => RiskLevel::VeryLow,
-        21..=40 => RiskLevel::Low,
-        41..=60 => RiskLevel::Medium,
-        61..=80 => RiskLevel::High,
-        _ => RiskLevel::VeryHigh,
-    }
-}
-
-/// Generate recommendation based on predictions
-fn generate_recommendation(
-    predicted_win_rate: u32,
-    risk_level: &RiskLevel,
-    trend: &TrendDirection,
-) -> Recommendation {
-    // High win rate + low risk + uptrend = Strong Buy
-    // Low win rate + high risk + downtrend = Strong Sell
-    
-    let win_rate_score = predicted_win_rate / 100; // 0-100
-    let risk_penalty = match risk_level {
-        RiskLevel::VeryLow => 0,
-        RiskLevel::Low => 10,
-        RiskLevel::Medium => 20,
-        RiskLevel::High => 35,
-        RiskLevel::VeryHigh => 50,
-    };
-    
-    let trend_bonus = match trend {
-        TrendDirection::StrongUptrend => 20,
-        TrendDirection::Uptrend => 10,
-        TrendDirection::Sideways => 0,
-        TrendDirection::Downtrend => -10i32,
-        TrendDirection::StrongDowntrend => -20i32,
-    };
-    
-    let total_score = (win_rate_score as i32 - risk_penalty as i32 + trend_bonus)
-        .max(0)
-        .min(100) as u32;
-    
-    match total_score {
-        80..=100 => Recommendation::StrongBuy,
-        60..=79 => Recommendation::Buy,
-        40..=59 => Recommendation::Hold,
-        20..=39 => Recommendation::Sell,
-        _ => Recommendation::StrongSell,
-    }
-}
-
-// ============================================================================
-// Anomaly Detection
-// ============================================================================
-
-/// Detect anomalies in signal provider performance
-pub fn detect_anomalies(
-    env: &Env,
-    analytics: &SignalProviderAnalytics,
-    historical_data: &Vec<TimeSeriesDataPoint>,
-) -> Vec<AnomalyDetection> {
-    let mut anomalies = Vec::new(env);
-    
-    // Check for sudden performance drop
-    if let Some(anomaly) = detect_performance_drop(env, historical_data, analytics) {
-        anomalies.push_back(anomaly);
-    }
-    
-    // Check for unusually high win rate (potential manipulation)
-    if let Some(anomaly) = detect_suspicious_win_rate(env, analytics) {
-        anomalies.push_back(anomaly);
-    }
-    
-    // Check for volatility spike
-    if let Some(anomaly) = detect_volatility_spike(env, historical_data, analytics) {
-        anomalies.push_back(anomaly);
-    }
-    
-    // Check for excessive drawdown
-    if let Some(anomaly) = detect_excessive_drawdown(env, analytics) {
-        anomalies.push_back(anomaly);
-    }
-    
-    anomalies
-}
-
-/// Detect sudden performance drop
-fn detect_performance_drop(
-    env: &Env,
-    historical_data: &Vec<TimeSeriesDataPoint>,
-    analytics: &SignalProviderAnalytics,
-) -> Option<AnomalyDetection> {
-    if historical_data.len() < 10 {
-        return None;
-    }
-    
-    let recent_avg = calculate_recent_average(historical_data, 5);
-    let older_avg = calculate_older_average(historical_data, 5);
-    
-    if older_avg > 0 {
-        let drop_percentage = ((older_avg - recent_avg) * 100) / older_avg;
-        
-        if drop_percentage > 30 {
-            return Some(AnomalyDetection {
-                provider: analytics.provider.clone(),
-                anomaly_type: AnomalyType::SuddenPerformanceDrop,
-                severity: drop_percentage.min(100) as u32,
-                detected_at: env.ledger().timestamp(),
-                description: String::from_str(env, "Significant performance decline detected"),
-            });
-        }
-    }
-    
-    None
-}
-
-/// Detect suspiciously high win rate
-fn detect_suspicious_win_rate(
-    env: &Env,
-    analytics: &SignalProviderAnalytics,
-) -> Option<AnomalyDetection> {
-    // Win rate above 95% with significant number of signals is suspicious
-    if analytics.win_rate > 9500 && analytics.total_signals > 20 {
-        return Some(AnomalyDetection {
-            provider: analytics.provider.clone(),
-            anomaly_type: AnomalyType::UnusuallyHighWinRate,
-            severity: 70,
-            detected_at: env.ledger().timestamp(),
-            description: String::from_str(env, "Unusually high win rate detected"),
-        });
-    }
-    
-    None
-}
-
-/// Detect volatility spike
-fn detect_volatility_spike(
-    env: &Env,
-    historical_data: &Vec<TimeSeriesDataPoint>,
-    analytics: &SignalProviderAnalytics,
-) -> Option<AnomalyDetection> {
-    if historical_data.len() < 10 {
-        return None;
-    }
-    
-    let current_volatility = calculate_volatility(historical_data);
-    
-    // If volatility is extremely high, flag it
-    if current_volatility > 5000 {
-        return Some(AnomalyDetection {
-            provider: analytics.provider.clone(),
-            anomaly_type: AnomalyType::VolatilitySpike,
-            severity: (current_volatility / 100).min(100),
-            detected_at: env.ledger().timestamp(),
-            description: String::from_str(env, "Abnormal volatility detected"),
-        });
-    }
-    
-    None
-}
-
-/// Detect excessive drawdown
-fn detect_excessive_drawdown(
-    env: &Env,
-    analytics: &SignalProviderAnalytics,
-) -> Option<AnomalyDetection> {
-    // Drawdown above 50% is concerning
-    if analytics.max_drawdown > 5000 {
-        return Some(AnomalyDetection {
-            provider: analytics.provider.clone(),
-            anomaly_type: AnomalyType::DrawdownExceeded,
-            severity: (analytics.max_drawdown / 100).min(100),
-            detected_at: env.ledger().timestamp(),
-            description: String::from_str(env, "Excessive drawdown detected"),
-        });
-    }
-    
-    None
-}
-
-// ============================================================================
-// Performance Report Generation
-// ============================================================================
-
-/// Generate comprehensive performance report
-pub fn generate_performance_report(
-    env: &Env,
-    provider: Address,
-    analytics: SignalProviderAnalytics,
-    period: PeriodPerformance,
-    historical_data: Vec<TimeSeriesDataPoint>,
-) -> PerformanceReport {
-    // Generate predictions
-    let predictions = generate_predictions(&analytics, &historical_data);
-    
-    // Detect anomalies
-    let anomalies = detect_anomalies(env, &analytics, &historical_data);
-    
-    PerformanceReport {
-        provider,
-        report_period: period,
-        analytics,
-        historical_trend: historical_data,
-        predictions,
-        anomalies,
-        generated_at: env.ledger().timestamp(),
-    }
-}
-
-/// Calculate period performance from signal data
-pub fn calculate_period_performance(
-    period_start: u64,
-    period_end: u64,
-    signals: &Vec<SignalData>,
-) -> PeriodPerformance {
-    let mut total_signals = 0u32;
-    let mut successful_signals = 0u32;
-    let mut total_pnl = 0i128;
-    let mut best_pnl = 0i128;
-    let mut worst_pnl = 0i128;
-    let mut pnl_values = Vec::new();
-    
-    for signal in signals.iter() {
-        if signal.timestamp >= period_start && signal.timestamp <= period_end {
-            total_signals += 1;
-            
-            if signal.pnl > 0 {
-                successful_signals += 1;
-            }
-            
-            total_pnl += signal.pnl;
-            pnl_values.push(signal.pnl);
-            
-            if signal.pnl > best_pnl {
-                best_pnl = signal.pnl;
-            }
-            if signal.pnl < worst_pnl {
-                worst_pnl = signal.pnl;
-            }
-        }
-    }
-    
-    let avg_pnl = if total_signals > 0 {
-        total_pnl / total_signals as i128
-    } else {
-        0
-    };
-    
-    let win_rate = calculate_win_rate(successful_signals, total_signals);
-    let volatility = calculate_pnl_volatility(&pnl_values);
-    
-    PeriodPerformance {
-        period_start,
-        period_end,
-        total_signals,
-        win_rate,
-        total_pnl,
-        avg_pnl,
-        volatility,
-        best_signal_pnl: best_pnl,
-        worst_signal_pnl: worst_pnl,
-    }
-}
-
-/// Helper struct for signal data
-#[derive(Clone, Debug, PartialEq)]
-pub struct SignalData {
-    pub timestamp: u64,
-    pub pnl: i128,
-}
-
-/// Calculate volatility from PnL values
-fn calculate_pnl_volatility(pnl_values: &[i128]) -> u32 {
-    if pnl_values.len() < 2 {
-        return 0;
-    }
-    
-    // Calculate mean
-    let sum: i128 = pnl_values.iter().sum();
-    let mean = sum / pnl_values.len() as i128;
-    
-    // Calculate variance
-    let variance_sum: i128 = pnl_values
-        .iter()
-        .map(|&pnl| {
-            let diff = pnl - mean;
-            diff * diff
-        })
-        .sum();
-    
-    let variance = variance_sum / pnl_values.len() as i128;
-    
-    // Return simplified volatility
-    approximate_sqrt(variance.abs()) as u32
-}
-
-// ============================================================================
-// Data Visualization API Helpers
-// ============================================================================
-
-/// Prepare data for visualization - time series chart
-pub fn prepare_timeseries_chart_data(
-    historical_data: &Vec<TimeSeriesDataPoint>,
-    interval: u64,
-) -> Vec<TimeSeriesDataPoint> {
-    // Aggregate data points by interval for cleaner visualization
-    // This is a simplified version - production would have more sophisticated aggregation
-    historical_data.clone()
-}
-
-/// Prepare data for visualization - performance distribution
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct PerformanceDistribution {
-    pub range_start: i128,
-    pub range_end: i128,
-    pub count: u32,
-    pub percentage: u32,
-}
-
-pub fn prepare_distribution_data(
-    signals: &Vec<SignalData>,
-    num_buckets: u32,
-) -> Vec<PerformanceDistribution> {
-    if signals.is_empty() {
-        return Vec::new();
-    }
-    
-    // Find min and max PnL
-    let mut min_pnl = i128::MAX;
-    let mut max_pnl = i128::MIN;
-    
-    for signal in signals.iter() {
-        if signal.pnl < min_pnl {
-            min_pnl = signal.pnl;
-        }
-        if signal.pnl > max_pnl {
-            max_pnl = signal.pnl;
-        }
-    }
-    
-    // Create buckets
-    let range = max_pnl - min_pnl;
-    let bucket_size = if range > 0 {
-        range / num_buckets as i128
-    } else {
-        1
-    };
-    
-    // This would be implemented with proper bucket counting
-    // Simplified for demonstration
-    Vec::new()
-}
-
-/// Comparison metrics for multiple providers
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct ProviderComparison {
-    pub provider: Address,
-    pub win_rate: u32,
-    pub total_pnl: i128,
-    pub risk_score: u32,
-    pub consistency_score: u32,
-    pub rank: u32,
-}
-
-pub fn compare_providers(
-    providers: &Vec<SignalProviderAnalytics>,
-) -> Vec<ProviderComparison> {
-    // Sort and rank providers based on multiple criteria
-    // This is a simplified version
-    Vec::new()
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -798,50 +408,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_calculate_win_rate() {
-        assert_eq!(calculate_win_rate(75, 100), 7500); // 75%
-        assert_eq!(calculate_win_rate(50, 100), 5000); // 50%
-        assert_eq!(calculate_win_rate(0, 100), 0);     // 0%
-        assert_eq!(calculate_win_rate(100, 100), 10000); // 100%
-        assert_eq!(calculate_win_rate(10, 0), 0);      // Division by zero
+    fn estimate_new_record_is_deterministic() {
+        let a = estimate_storage_rent(ContractOperation::CreateRecord, 128, 0, 0);
+        let b = estimate_storage_rent(ContractOperation::CreateRecord, 128, 0, 0);
+        assert_eq!(a, b);
+        assert_eq!(a.projected_entries, 1);
+        assert_eq!(a.projected_bytes, 128 + ENTRY_OVERHEAD_BYTES);
+        assert_eq!(a.ttl_impact, DEFAULT_TTL_EXTENSION);
+        assert!(a.within_limits);
     }
 
     #[test]
-    fn test_calculate_profit_factor() {
-        assert_eq!(calculate_profit_factor(200, -100), 200); // 2.0x
-        assert_eq!(calculate_profit_factor(150, -100), 150); // 1.5x
-        assert_eq!(calculate_profit_factor(100, -200), 50);  // 0.5x
-        assert_eq!(calculate_profit_factor(100, 0), 10000);  // Max
-        assert_eq!(calculate_profit_factor(0, -100), 0);     // 0x
+    fn estimate_update_record_reports_ttl_impact() {
+        let estimate = estimate_storage_rent(ContractOperation::UpdateRecord, 256, 10, 500);
+        assert_eq!(estimate.projected_entries, 1);
+        assert_eq!(estimate.projected_bytes, 256 + ENTRY_OVERHEAD_BYTES);
+        assert_eq!(estimate.ttl_impact, 500);
+        assert_eq!(
+            estimate.projected_rent,
+            (estimate.projected_bytes as i128) * 500
+        );
+        assert!(estimate.within_limits);
     }
 
     #[test]
-    fn test_calculate_sharpe_ratio() {
-        assert_eq!(calculate_sharpe_ratio(150, 100, 50), 100); // 1.0
-        assert_eq!(calculate_sharpe_ratio(200, 100, 50), 150); // 1.5
-        assert_eq!(calculate_sharpe_ratio(100, 100, 50), 50);  // 0.5
-        assert_eq!(calculate_sharpe_ratio(100, 0, 50), 0);     // Div by zero
+    fn estimate_near_limit_request_is_flagged() {
+        let estimate = estimate_storage_rent(
+            ContractOperation::AppendEntry,
+            MAX_BYTES_PER_OPERATION,
+            MAX_ENTRIES_PER_OPERATION,
+            0,
+        );
+        assert!(!estimate.within_limits);
     }
 
     #[test]
-    fn test_calculate_max_drawdown() {
-        assert_eq!(calculate_max_drawdown(1000, 800), 2000);  // 20%
-        assert_eq!(calculate_max_drawdown(1000, 500), 5000);  // 50%
-        assert_eq!(calculate_max_drawdown(1000, 1000), 0);    // 0%
-        assert_eq!(calculate_max_drawdown(0, 0), 0);          // Edge case
-    }
-
-    #[test]
-    fn test_calculate_consistency_score() {
-        assert_eq!(calculate_consistency_score(10, 1000), 90);
-        assert_eq!(calculate_consistency_score(50, 5000), 50);
-        assert_eq!(calculate_consistency_score(0, 0), 100);
-    }
-
-    #[test]
-    fn test_calculate_risk_score() {
-        assert_eq!(calculate_risk_score(2000, 3000, 100), 60); // 20+30+10
-        assert_eq!(calculate_risk_score(1000, 1000, 50), 25);  // 10+10+5
-        assert_eq!(calculate_risk_score(0, 0, 0), 0);
+    fn estimate_remove_entry_frees_bytes() {
+        let estimate = estimate_storage_rent(ContractOperation::RemoveEntry, 512, 5, 0);
+        assert_eq!(estimate.projected_entries, 1);
+        assert_eq!(estimate.projected_bytes, 0);
+        assert_eq!(estimate.projected_rent, 0);
+        assert!(estimate.within_limits);
     }
 }

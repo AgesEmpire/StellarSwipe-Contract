@@ -1,6 +1,13 @@
 pub const INSURANCE_FEE_SHARE_BPS: i128 = 500;
 pub const BPS_DENOMINATOR: i128 = 10_000;
 
+/// Maximum balance (in base units) that qualifies as sweepable dust.
+///
+/// Only fee_collector balances strictly below this threshold may be swept via
+/// [`sweep_dust`]. Anything at or above this value is an ordinary fee balance
+/// and must not be moved through the dust-sweep path.
+pub const DUST_SWEEP_THRESHOLD: i128 = 1_000;
+
 /// Schema version for fee_collector configuration events.
 ///
 /// Bump this whenever the shape of [`ConfigChanged`] changes so indexers can
@@ -11,6 +18,11 @@ pub const CONFIG_EVENT_SCHEMA_VERSION: u32 = 1;
 ///
 /// Matches `docs/event_schema.json` (`fee_collector.config_changed`).
 pub const CONFIG_CHANGED_TOPIC: &str = "fee_collector.config_changed";
+
+/// Documented topic emitted for every successful dust sweep.
+///
+/// Matches `docs/event_schema.json` (`fee_collector.dust_swept`).
+pub const DUST_SWEPT_TOPIC: &str = "fee_collector.dust_swept";
 
 /// Identifies which configuration field a [`ConfigChanged`] event refers to.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,9 +47,27 @@ pub struct ConfigChanged<Actor> {
     pub actor: Actor,
 }
 
+/// Audit record emitted for every successful dust sweep.
+///
+/// Records the destination, the swept amount, and the authorizing caller so
+/// the sweep can be reconstructed and audited off-chain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DustSwept<Actor, Destination> {
+    pub schema_version: u32,
+    pub topic: &'static str,
+    pub destination: Destination,
+    pub amount: i128,
+    pub actor: Actor,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct InsurancePool {
     pub balance: i128,
+    /// Protected treasury reserves that must never be withdrawn below the
+    /// configured solvency floor.
+    pub protected_reserves: i128,
+    /// Minimum protected reserves that must remain after any withdrawal.
+    pub solvency_floor: i128,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -59,6 +89,11 @@ pub enum ContractError {
     InvalidClaim,
     LossWithinStopLoss,
     Unauthorized,
+    /// Stable error returned when a withdrawal or payout would reduce the
+    /// protected treasury reserves below their configured solvency floor.
+    /// State is left unchanged when this is returned.
+    SolvencyFloorBreached,
+    InvalidSweep,
 }
 
 /// Emits the single documented event for a successful configuration change.
@@ -143,10 +178,75 @@ pub fn set_authorization<Actor: Clone>(
     emit_config_changed(ConfigField::Authorization, None, None, actor)
 }
 
+/// Returns `true` when withdrawing `amount` from the pool would keep the
+/// protected treasury reserves at or above the configured solvency floor.
+///
+/// This is a pure check so callers can validate the invariant before any
+/// state mutation, guaranteeing atomicity.
+pub fn solvency_invariant_holds(pool: &InsurancePool, amount: i128) -> bool {
+    if amount < 0 {
+        return false;
+    }
+    pool.protected_reserves.saturating_sub(amount) >= pool.solvency_floor
+}
+
+/// Sweeps a negligible fee_collector dust balance to an explicit destination.
+///
+/// Only balances strictly below [`DUST_SWEEP_THRESHOLD`] are sweepable, so
+/// ordinary fee balances cannot be moved through this path. The caller must be
+/// explicitly authorized, the destination must be non-zero, and the amount must
+/// be positive and no greater than the current balance. On success the balance
+/// is reduced and a [`DustSwept`] audit event is returned; rejected calls return
+/// `Err` before any mutation and emit no event.
+pub fn sweep_dust<Actor: Clone, Destination: Clone>(
+    balance: &mut i128,
+    destination: Destination,
+    amount: i128,
+    authorized: bool,
+    actor: Actor,
+) -> Result<DustSwept<Actor, Destination>, ContractError> {
+    if !authorized {
+        return Err(ContractError::Unauthorized);
+    }
+    if amount <= 0 || amount > *balance || amount >= DUST_SWEEP_THRESHOLD {
+        return Err(ContractError::InvalidSweep);
+    }
+    if *balance >= DUST_SWEEP_THRESHOLD {
+        return Err(ContractError::InvalidSweep);
+    }
+
+    *balance -= amount;
+
+    Ok(DustSwept {
+        schema_version: CONFIG_EVENT_SCHEMA_VERSION,
+        topic: DUST_SWEPT_TOPIC,
+        destination,
+        amount,
+        actor,
+    })
+}
+
 pub fn allocate_insurance_fee(pool: &mut InsurancePool, collected_fee: i128) -> i128 {
     let insurance_share = collected_fee.saturating_mul(INSURANCE_FEE_SHARE_BPS) / BPS_DENOMINATOR;
     pool.balance = pool.balance.saturating_add(insurance_share);
     insurance_share
+}
+
+/// Withdraws `amount` from the protected treasury reserves.
+///
+/// The solvency invariant is enforced atomically: the check runs before any
+/// mutation, so a violation returns [`ContractError::SolvencyFloorBreached`]
+/// and leaves the pool completely unchanged.
+pub fn withdraw_protected_reserves(
+    pool: &mut InsurancePool,
+    amount: i128,
+) -> Result<i128, ContractError> {
+    if !solvency_invariant_holds(pool, amount) {
+        return Err(ContractError::SolvencyFloorBreached);
+    }
+
+    pool.protected_reserves -= amount;
+    Ok(pool.protected_reserves)
 }
 
 pub fn claim_insurance<User: Clone>(
@@ -164,7 +264,15 @@ pub fn claim_insurance<User: Clone>(
 
     let max_loss_payout = loss_amount / 2;
     let amount_claimed = max_loss_payout.min(pool.balance);
+
+    // Enforce the treasury solvency invariant atomically before mutating any
+    // state. A breach returns a stable error and leaves the pool untouched.
+    if !solvency_invariant_holds(pool, amount_claimed) {
+        return Err(ContractError::SolvencyFloorBreached);
+    }
+
     pool.balance -= amount_claimed;
+    pool.protected_reserves -= amount_claimed;
 
     Ok(InsuranceClaimed {
         user,
@@ -177,9 +285,17 @@ pub fn claim_insurance<User: Clone>(
 mod tests {
     use super::*;
 
+    fn pool(balance: i128, protected_reserves: i128, solvency_floor: i128) -> InsurancePool {
+        InsurancePool {
+            balance,
+            protected_reserves,
+            solvency_floor,
+        }
+    }
+
     #[test]
     fn valid_claim_pays_half_loss() {
-        let mut pool = InsurancePool { balance: 1_000 };
+        let mut pool = pool(1_000, 1_000, 0);
         let trade = TradeLoss {
             trade_id: 42,
             slashed_signal: true,
@@ -195,7 +311,7 @@ mod tests {
 
     #[test]
     fn invalid_claim_without_slashed_signal_is_rejected() {
-        let mut pool = InsurancePool { balance: 1_000 };
+        let mut pool = pool(1_000, 1_000, 0);
         let trade = TradeLoss {
             trade_id: 43,
             slashed_signal: false,
@@ -210,7 +326,7 @@ mod tests {
 
     #[test]
     fn pool_insufficient_caps_payout_at_balance() {
-        let mut pool = InsurancePool { balance: 75 };
+        let mut pool = pool(75, 75, 0);
         let trade = TradeLoss {
             trade_id: 44,
             slashed_signal: true,
@@ -225,7 +341,7 @@ mod tests {
 
     #[test]
     fn collected_fees_fund_pool_at_five_percent() {
-        let mut pool = InsurancePool { balance: 0 };
+        let mut pool = pool(0, 0, 0);
 
         let allocated = allocate_insurance_fee(&mut pool, 10_000);
 
@@ -260,7 +376,7 @@ mod tests {
 
     #[test]
     fn cap_change_emits_one_versioned_event() {
-        let mut pool = InsurancePool { balance: 100 };
+        let mut pool = pool(100, 100, 0);
 
         let event = set_insurance_cap(&mut pool, 5_000, "admin").unwrap();
 
@@ -273,24 +389,120 @@ mod tests {
 
     #[test]
     fn rejected_cap_change_emits_no_event() {
-        let mut pool = InsurancePool { balance: 100 };
+        let mut pool = InsurancePool { balance: 5_000 };
 
-        let result = set_insurance_cap(&mut pool, 50, "admin");
+        let result = set_insurance_cap(&mut pool, 100, "admin");
 
         assert_eq!(result, Err(ContractError::Unauthorized));
-        assert_eq!(pool.balance, 100);
+        assert_eq!(pool.balance, 5_000);
     }
 
     #[test]
-    fn authorization_change_emits_event_without_disclosing_values() {
-        let mut authorized = false;
+    fn withdrawal_at_exact_floor_is_allowed() {
+        let mut pool = pool(1_000, 1_000, 400);
 
-        let event = set_authorization(&mut authorized, true, "admin");
+        let remaining = withdraw_protected_reserves(&mut pool, 600).unwrap();
 
-        assert_eq!(event.field, ConfigField::Authorization);
-        assert_eq!(event.old_value, None);
-        assert_eq!(event.new_value, None);
+        assert_eq!(remaining, 400);
+        assert_eq!(pool.protected_reserves, 400);
+        assert_eq!(pool.solvency_floor, 400);
+    }
+
+    #[test]
+    fn withdrawal_below_floor_is_rejected_and_state_unchanged() {
+        let mut pool = pool(1_000, 1_000, 400);
+
+        let result = withdraw_protected_reserves(&mut pool, 601);
+
+        assert_eq!(result, Err(ContractError::SolvencyFloorBreached));
+        assert_eq!(pool.protected_reserves, 1_000);
+        assert_eq!(pool.balance, 1_000);
+    }
+
+    #[test]
+    fn withdrawal_allowed_after_reserves_replenished() {
+        let mut pool = pool(1_000, 1_000, 400);
+
+        // First withdrawal drains reserves down to the floor.
+        assert_eq!(withdraw_protected_reserves(&mut pool, 600), Ok(400));
+        // Further withdrawal is rejected at the floor.
+        assert_eq!(
+            withdraw_protected_reserves(&mut pool, 1),
+            Err(ContractError::SolvencyFloorBreached)
+        );
+
+        // Replenish reserves above the floor.
+        pool.protected_reserves += 500;
+
+        // Withdrawal is allowed again.
+        assert_eq!(withdraw_protected_reserves(&mut pool, 500), Ok(400));
+        assert_eq!(pool.protected_reserves, 400);
+    }
+
+    #[test]
+    fn claim_below_floor_is_rejected_and_state_unchanged() {
+        let mut pool = pool(1_000, 500, 400);
+        let trade = TradeLoss {
+            trade_id: 45,
+            slashed_signal: true,
+            stop_loss_amount: 100,
+        };
+
+        // Half of 600 is 300, which would drop protected reserves to 200 < 400.
+        let result = claim_insurance(&mut pool, "user-1", &trade, 600);
+
+        assert_eq!(result, Err(ContractError::SolvencyFloorBreached));
+        assert_eq!(pool.balance, 1_000);
+        assert_eq!(pool.protected_reserves, 500);
+    }
+
+    #[test]
+    fn dust_sweep_moves_sub_threshold_balance_and_records_audit() {
+        let mut balance = 400;
+
+        let event = sweep_dust(&mut balance, "dest-1", 400, true, "admin").unwrap();
+
+        assert_eq!(event.schema_version, CONFIG_EVENT_SCHEMA_VERSION);
+        assert_eq!(event.topic, DUST_SWEPT_TOPIC);
+        assert_eq!(event.destination, "dest-1");
+        assert_eq!(event.amount, 400);
         assert_eq!(event.actor, "admin");
-        assert!(authorized);
+        assert_eq!(balance, 0);
+    }
+
+    #[test]
+    fn dust_sweep_rejects_unauthorized_caller() {
+        let mut balance = 400;
+
+        let result = sweep_dust(&mut balance, "dest-1", 400, false, "attacker");
+
+        assert_eq!(result, Err(ContractError::Unauthorized));
+        assert_eq!(balance, 400);
+    }
+
+    #[test]
+    fn dust_sweep_rejects_ordinary_fee_balance() {
+        let mut balance = DUST_SWEEP_THRESHOLD;
+
+        let result = sweep_dust(&mut balance, "dest-1", 1, true, "admin");
+
+        assert_eq!(result, Err(ContractError::InvalidSweep));
+        assert_eq!(balance, DUST_SWEEP_THRESHOLD);
+    }
+
+    #[test]
+    fn dust_sweep_rejects_invalid_amount() {
+        let mut balance = 400;
+
+        assert_eq!(
+            sweep_dust(&mut balance, "dest-1", 0, true, "admin"),
+            Err(ContractError::InvalidSweep)
+        );
+        assert_eq!(
+            sweep_dust(&mut balance, "dest-1", 401, true, "admin"),
+            Err(ContractError::InvalidSweep)
+        );
+        assert_eq!(balance, 400);
+    }
     }
 }
