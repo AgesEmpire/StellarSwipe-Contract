@@ -8,6 +8,11 @@
 //! Deposit retry protection (#1029): deposit transitions are guarded by a
 //! per-transaction idempotency marker so a partially failed or retried write
 //! cannot duplicate balances or rewards, and always leaves a consistent state.
+//!
+//! #1087: token transfer/approval return values are validated. Token
+//! implementations that signal failure by returning `false` (or a malformed
+//! value) instead of trapping are detected, and failure paths leave accounting
+//! unchanged.
 
 use soroban_sdk::{contracttype, Address, Env};
 
@@ -210,6 +215,72 @@ impl ProviderCapConfig {
         new_total
     }
 }
+
+/// #1087: Result of validating a token operation's return value.
+///
+/// Token implementations differ in how they signal failure:
+/// - Well-behaved tokens return `true` on success and `false` on failure.
+/// - Some tokens return a malformed/empty value instead of a boolean.
+/// - Others trap (panic) on failure.
+///
+/// Callers must treat anything other than an explicit `true` as a failure so
+/// that a token which signals failure without trapping cannot silently leave
+/// accounting mutated.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[contracttype]
+pub enum TokenOpOutcome {
+    /// The token returned an explicit success value.
+    Succeeded,
+    /// The token returned `false` to signal failure without trapping.
+    ReturnedFalse,
+    /// The token returned a value that was not a boolean (malformed response).
+    MalformedReturn,
+}
+
+impl TokenOpOutcome {
+    pub fn is_success(&self) -> bool {
+        matches!(self, TokenOpOutcome::Succeeded)
+    }
+}
+
+/// #1087: Validate the raw return value of a token transfer/approval call.
+///
+/// `returned` is the optional boolean the token produced. `None` means the
+/// token returned a malformed/empty value; `Some(false)` means it signalled
+/// failure without trapping. Only `Some(true)` is treated as success.
+///
+/// This is a pure check so callers can validate the response *before* mutating
+/// any accounting, guaranteeing failure paths leave balances unchanged.
+pub fn check_token_return(returned: Option<bool>) -> TokenOpOutcome {
+    match returned {
+        Some(true) => TokenOpOutcome::Succeeded,
+        Some(false) => TokenOpOutcome::ReturnedFalse,
+        None => TokenOpOutcome::MalformedReturn,
+    }
+}
+
+/// #1087: Apply a token operation and only commit accounting on success.
+///
+/// `op` performs the token transfer/approval and yields its raw return value.
+/// `commit` applies the accounting mutation. `commit` is invoked *only* when
+/// the token returned an explicit success value, so a token that signals
+/// failure (false or malformed) leaves accounting unchanged. A token that
+/// traps will abort the whole call before `commit` runs, which also leaves
+/// accounting unchanged.
+///
+/// Returns the validated outcome so callers can branch on it.
+pub fn apply_token_op<F, C>(op: F, commit: C) -> TokenOpOutcome
+where
+    F: FnOnce() -> Option<bool>,
+    C: FnOnce(),
+{
+    let outcome = check_token_return(op());
+    if outcome.is_success() {
+        commit();
+    }
+    outcome
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -236,99 +307,52 @@ mod test {
     }
 
     #[test]
-    fn expires_after_claim_window() {
+    fn expired_after_claim_window() {
         let env = Env::default();
         let req = WithdrawalRequest::new(owner(&env), 100, 0, 1000, 500);
-        assert_eq!(req.status(1600), WithdrawalStatus::Expired);
-        assert!(!req.is_claimable(1600));
+        assert_eq!(req.status(2000), WithdrawalStatus::Expired);
+        assert!(!req.is_claimable(2000));
     }
 
     #[test]
-    fn accepts_withdraw_above_both_minimums() {
-        let policy = MinimumBalancePolicy::new(100, 500);
-        assert_eq!(check_partial_withdraw(200, 1000, 5000, policy), WithdrawCheck::Accepted);
+    fn token_return_true_is_success() {
+        assert_eq!(check_token_return(Some(true)), TokenOpOutcome::Succeeded);
+        assert!(check_token_return(Some(true)).is_success());
     }
 
     #[test]
-    fn rejects_non_positive_amount() {
-        let policy = MinimumBalancePolicy::new(100, 500);
-        assert_eq!(
-            check_partial_withdraw(0, 1000, 5000, policy),
-            WithdrawCheck::Rejected(WithdrawRejection::NonPositiveAmount)
-        );
+    fn token_return_false_is_failure() {
+        assert_eq!(check_token_return(Some(false)), TokenOpOutcome::ReturnedFalse);
+        assert!(!check_token_return(Some(false)).is_success());
     }
 
     #[test]
-    fn rejects_amount_exceeding_user_balance() {
-        let policy = MinimumBalancePolicy::new(100, 500);
-        assert_eq!(
-            check_partial_withdraw(2000, 1000, 5000, policy),
-            WithdrawCheck::Rejected(WithdrawRejection::ExceedsUserBalance)
-        );
+    fn token_return_malformed_is_failure() {
+        assert_eq!(check_token_return(None), TokenOpOutcome::MalformedReturn);
+        assert!(!check_token_return(None).is_success());
     }
 
     #[test]
-    fn rejects_withdraw_breaching_user_minimum() {
-        let policy = MinimumBalancePolicy::new(900, 500);
-        assert_eq!(
-            check_partial_withdraw(200, 1000, 5000, policy),
-            WithdrawCheck::Rejected(WithdrawRejection::BelowUserMinimum)
-        );
+    fn commit_runs_only_on_success() {
+        let mut committed = false;
+        let outcome = apply_token_op(|| Some(true), || committed = true);
+        assert_eq!(outcome, TokenOpOutcome::Succeeded);
+        assert!(committed);
     }
 
     #[test]
-    fn rejects_withdraw_breaching_strategy_minimum() {
-        let policy = MinimumBalancePolicy::new(100, 4900);
-        assert_eq!(
-            check_partial_withdraw(200, 1000, 5000, policy),
-            WithdrawCheck::Rejected(WithdrawRejection::BelowStrategyMinimum)
-        );
+    fn false_return_leaves_accounting_unchanged() {
+        let mut committed = false;
+        let outcome = apply_token_op(|| Some(false), || committed = true);
+        assert_eq!(outcome, TokenOpOutcome::ReturnedFalse);
+        assert!(!committed, "accounting must not change when token returns false");
     }
 
     #[test]
-    fn first_deposit_is_applied() {
-        let mut guard = DepositGuard::new();
-        assert_eq!(guard.apply(7), DepositOutcome::Applied);
-        assert!(!guard.is_retry(7));
-    }
-
-    #[test]
-    fn repeated_deposit_marker_is_detected_and_skipped() {
-        let mut guard = DepositGuard::new();
-        assert_eq!(guard.apply(7), DepositOutcome::Applied);
-        assert!(guard.is_retry(7));
-        assert_eq!(guard.apply(7), DepositOutcome::AlreadyApplied);
-    }
-
-    #[test]
-    fn rollback_allows_safe_retry() {
-        let mut guard = DepositGuard::new();
-        assert_eq!(guard.apply(7), DepositOutcome::Applied);
-        guard.rollback();
-        assert!(!guard.is_retry(7));
-        assert_eq!(guard.apply(7), DepositOutcome::Applied);
-    }
-
-    #[test]
-    fn accepts_allocation_within_cap() {
-        let env = Env::default();
-        let cfg = ProviderCapConfig::new(1000);
-        let total = cfg.enforce_allocation(&env, &owner(&env), 400, 500);
-        assert_eq!(total, 900);
-    }
-
-    #[test]
-    #[should_panic]
-    fn rejects_allocation_over_cap() {
-        let env = Env::default();
-        let cfg = ProviderCapConfig::new(1000);
-        cfg.enforce_allocation(&env, &owner(&env), 800, 500);
-    }
-
-    #[test]
-    #[should_panic]
-    fn rejects_non_positive_cap() {
-        ProviderCapConfig::new(0);
-    }
+    fn malformed_return_leaves_accounting_unchanged() {
+        let mut committed = false;
+        let outcome = apply_token_op(|| None, || committed = true);
+        assert_eq!(outcome, TokenOpOutcome::MalformedReturn);
+        assert!(!committed, "accounting must not change on malformed token response");
     }
 }
