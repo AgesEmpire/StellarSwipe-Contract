@@ -79,6 +79,39 @@ pub enum StepStatus {
     Skipped,
 }
 
+/// Maximum number of records a single paginated query may return.
+pub const MAX_PAGE_SIZE: u32 = 50;
+
+/// A provider relationship record (e.g. a provider linked to another provider).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ProviderRelationship {
+    pub provider: Address,
+    pub counterparty: Address,
+    pub relationship_id: u64,
+    pub created_at: u64,
+}
+
+/// A provider membership record (e.g. a provider belonging to a group).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ProviderMembership {
+    pub provider: Address,
+    pub group_id: u64,
+    pub membership_id: u64,
+    pub joined_at: u64,
+}
+
+/// A single page of results plus the cursor to fetch the next page.
+///
+/// `next_cursor` is `0` when the returned page is the final page.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: u64,
+}
+
 /// Verification workflow manager
 pub struct VerificationWorkflowManager;
 
@@ -174,6 +207,124 @@ impl VerificationWorkflowManager {
         env.storage()
             .instance()
             .get(&DataKey::Workflow(workflow_id))
+    }
+}
+
+// ============================================================================
+// Paginated Provider Relationship Queries
+// ============================================================================
+
+/// Read-only paginated queries over provider relationships and memberships.
+///
+/// Cursors are stable: a cursor is the id of the last record returned by the
+/// previous page, and `0` denotes the first page. Records are always returned
+/// in ascending id order, so repeated calls with the same cursor and limit
+/// yield identical results.
+pub struct ProviderQueryManager;
+
+impl ProviderQueryManager {
+    /// Validate a requested page size against the documented bound.
+    fn validate_limit(limit: u32) -> Result<(), OnboardingError> {
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+            return Err(OnboardingError::InvalidPageSize);
+        }
+        Ok(())
+    }
+
+    /// Fetch a bounded page of relationships for `provider`.
+    ///
+    /// `cursor` is the id of the last relationship seen; pass `0` for the
+    /// first page. Returns `OnboardingError::InvalidCursor` when the cursor
+    /// does not correspond to a stored relationship for this provider, and
+    /// `OnboardingError::InvalidPageSize` when `limit` is `0` or exceeds
+    /// `MAX_PAGE_SIZE`.
+    pub fn get_relationships(
+        env: &Env,
+        provider: Address,
+        cursor: u64,
+        limit: u32,
+    ) -> Result<Page<ProviderRelationship>, OnboardingError> {
+        Self::validate_limit(limit)?;
+
+        let ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RelationshipIds(provider.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        if cursor != 0 && !ids.iter().any(|id| id == cursor) {
+            return Err(OnboardingError::InvalidCursor);
+        }
+
+        let mut items = Vec::new(env);
+        let mut next_cursor: u64 = 0;
+        let mut collected: u32 = 0;
+
+        for id in ids.iter() {
+            if id <= cursor {
+                continue;
+            }
+            if collected == limit {
+                next_cursor = id;
+                break;
+            }
+            if let Some(record) = env
+                .storage()
+                .instance()
+                .get::<DataKey, ProviderRelationship>(&DataKey::Relationship(id))
+            {
+                items.push_back(record);
+                collected += 1;
+            }
+        }
+
+        Ok(Page { items, next_cursor })
+    }
+
+    /// Fetch a bounded page of memberships for `provider`.
+    ///
+    /// Cursor and limit semantics match `get_relationships`.
+    pub fn get_memberships(
+        env: &Env,
+        provider: Address,
+        cursor: u64,
+        limit: u32,
+    ) -> Result<Page<ProviderMembership>, OnboardingError> {
+        Self::validate_limit(limit)?;
+
+        let ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MembershipIds(provider.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        if cursor != 0 && !ids.iter().any(|id| id == cursor) {
+            return Err(OnboardingError::InvalidCursor);
+        }
+
+        let mut items = Vec::new(env);
+        let mut next_cursor: u64 = 0;
+        let mut collected: u32 = 0;
+
+        for id in ids.iter() {
+            if id <= cursor {
+                continue;
+            }
+            if collected == limit {
+                next_cursor = id;
+                break;
+            }
+            if let Some(record) = env
+                .storage()
+                .instance()
+                .get::<DataKey, ProviderMembership>(&DataKey::Membership(id))
+            {
+                items.push_back(record);
+                collected += 1;
+            }
+        }
+
+        Ok(Page { items, next_cursor })
     }
 }
 
@@ -289,10 +440,10 @@ impl KYCIntegrationManager {
         if success {
             // Update KYC data
             kyc_data.verified_at = env.ledger().timestamp();
-            kyc_data.expires_at = env.ledger().timestamp() + (365 * 24 * 60 * 60); // 1 year
+            kyc_data.expires_at = env.ledger().timestamp() + (365 * 24 * 60 * 60);
             
             env.storage().instance().set(
-                &DataKey::KYCData(provider),
+                &DataKey::KYCData(provider.clone()),
                 &kyc_data
             );
         }
@@ -307,864 +458,257 @@ impl KYCIntegrationManager {
             checks_failed,
         })
     }
+    
+    /// Verify document
+    fn verify_document(_env: &Env, document_hash: &String) -> bool {
+        // In production, this would call external verification service
+        document_hash.len() > 0
+    }
+    
+    /// Verify identity
+    fn verify_identity(_env: &Env, _provider: &Address) -> bool {
+        // In production, this would call external identity verification
+        true
+    }
+}
 
-    /// Check if KYC is valid
-    pub fn is_kyc_valid(env: &Env, provider: &Address) -> bool {
+// ============================================================================
+// Risk Assessment
+// ============================================================================
+
+/// Risk level
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Risk assessment result
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct RiskAssessment {
+    pub provider: Address,
+    pub risk_level: RiskLevel,
+    pub risk_score: u32,
+    pub assessed_at: u64,
+    pub factors: Vec<String>,
+}
+
+/// Risk assessment manager
+pub struct RiskAssessmentManager;
+
+impl RiskAssessmentManager {
+    /// Assess provider risk
+    pub fn assess_risk(
+        env: &Env,
+        provider: Address,
+    ) -> Result<RiskAssessment, OnboardingError> {
+        let mut factors = Vec::new(env);
+        let mut risk_score: u32 = 0;
+        
+        // Factor 1: KYC level
         if let Some(kyc_data) = env
             .storage()
             .instance()
             .get::<DataKey, KYCData>(&DataKey::KYCData(provider.clone()))
         {
-            let current_time = env.ledger().timestamp();
-            kyc_data.verified_at > 0 && kyc_data.expires_at > current_time
+            match kyc_data.verification_level {
+                KYCLevel::None => {
+                    risk_score += 40;
+                    factors.push_back(String::from_str(env, "No KYC"));
+                }
+                KYCLevel::Basic => {
+                    risk_score += 20;
+                    factors.push_back(String::from_str(env, "Basic KYC only"));
+                }
+                KYCLevel::Enhanced => {
+                    risk_score += 10;
+                }
+                KYCLevel::Full => {
+                    // No risk added
+                }
+            }
         } else {
-            false
-        }
-    }
-    
-    /// Verify document (placeholder)
-    fn verify_document(env: &Env, document_hash: &String) -> bool {
-        // In production, integrate with document verification service
-        true
-    }
-    
-    /// Verify identity (placeholder)
-    fn verify_identity(env: &Env, provider: &Address) -> bool {
-        // In production, integrate with identity verification service
-        true
-    }
-    
-    /// Get KYC data
-    pub fn get_kyc_data(env: &Env, provider: &Address) -> Option<KYCData> {
-        env.storage()
-            .instance()
-            .get(&DataKey::KYCData(provider.clone()))
-    }
-}
-
-// ============================================================================
-// Background Check Interface
-// ============================================================================
-
-/// Background check result
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct BackgroundCheckResult {
-    pub provider: Address,
-    pub check_id: String,
-    pub passed: bool,
-    pub risk_score: u32,
-    pub checks_performed: Vec<BackgroundCheckType>,
-    pub flags: Vec<String>,
-    pub completed_at: u64,
-}
-
-/// Background check type
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub enum BackgroundCheckType {
-    CriminalRecord,
-    CreditHistory,
-    EmploymentHistory,
-    EducationVerification,
-    RegulatoryCheck,
-    SanctionsList,
-}
-
-/// Background check manager
-pub struct BackgroundCheckManager;
-
-impl BackgroundCheckManager {
-    /// Initiate background check
-    pub fn initiate_check(
-        env: &Env,
-        provider: Address,
-        check_types: Vec<BackgroundCheckType>,
-    ) -> Result<String, OnboardingError> {
-        // Generate check ID
-        let check_id = generate_check_id(env, &provider);
-        
-        // Store check request
-        env.storage().instance().set(
-            &DataKey::BackgroundCheck(provider.clone()),
-            &check_id
-        );
-        
-        Ok(check_id)
-    }
-    
-    /// Complete background check
-    pub fn complete_check(
-        env: &Env,
-        provider: Address,
-        check_id: String,
-    ) -> Result<BackgroundCheckResult, OnboardingError> {
-        // Perform checks
-        let mut checks_performed = Vec::new(env);
-        let mut flags = Vec::new(env);
-        
-        // Check 1: Criminal record
-        checks_performed.push_back(BackgroundCheckType::CriminalRecord);
-        if !Self::check_criminal_record(env, &provider) {
-            flags.push_back(String::from_str(env, "Criminal record found"));
+            risk_score += 50;
+            factors.push_back(String::from_str(env, "No KYC data"));
         }
         
-        // Check 2: Sanctions list
-        checks_performed.push_back(BackgroundCheckType::SanctionsList);
-        if !Self::check_sanctions_list(env, &provider) {
-            flags.push_back(String::from_str(env, "On sanctions list"));
-        }
+        // Factor 2: Verification status
+        // In production, would check verification history
         
-        // Check 3: Regulatory check
-        checks_performed.push_back(BackgroundCheckType::RegulatoryCheck);
-        if !Self::check_regulatory(env, &provider) {
-            flags.push_back(String::from_str(env, "Regulatory issues"));
-        }
-        
-        // Calculate risk score (0-100, lower is better)
-        let risk_score = Self::calculate_risk_score(&flags);
-        let passed = risk_score < 50;
-        
-        let result = BackgroundCheckResult {
-            provider: provider.clone(),
-            check_id,
-            passed,
-            risk_score,
-            checks_performed,
-            flags,
-            completed_at: env.ledger().timestamp(),
+        let risk_level = if risk_score >= 70 {
+            RiskLevel::Critical
+        } else if risk_score >= 50 {
+            RiskLevel::High
+        } else if risk_score >= 30 {
+            RiskLevel::Medium
+        } else {
+            RiskLevel::Low
         };
         
-        // Store result
+        let assessment = RiskAssessment {
+            provider: provider.clone(),
+            risk_level,
+            risk_score,
+            assessed_at: env.ledger().timestamp(),
+            factors,
+        };
+        
+        // Store assessment
         env.storage().instance().set(
-            &DataKey::BackgroundCheckResult(provider),
-            &result
+            &DataKey::RiskAssessment(provider.clone()),
+            &assessment
         );
         
-        Ok(result)
+        Ok(assessment)
     }
     
-    /// Check criminal record (placeholder)
-    fn check_criminal_record(env: &Env, provider: &Address) -> bool {
-        // In production, integrate with background check service
-        true
-    }
-    
-    /// Check sanctions list (placeholder)
-    fn check_sanctions_list(env: &Env, provider: &Address) -> bool {
-        // In production, integrate with sanctions screening service
-        true
-    }
-    
-    /// Check regulatory status (placeholder)
-    fn check_regulatory(env: &Env, provider: &Address) -> bool {
-        // In production, integrate with regulatory database
-        true
-    }
-    
-    /// Calculate risk score
-    fn calculate_risk_score(flags: &Vec<String>) -> u32 {
-        // Each flag adds 20 points to risk score
-        (flags.len() * 20).min(100) as u32
-    }
-    
-    /// Get background check result
-    pub fn get_check_result(
+    /// Get risk assessment
+    pub fn get_assessment(
         env: &Env,
-        provider: &Address,
-    ) -> Option<BackgroundCheckResult> {
+        provider: Address,
+    ) -> Option<RiskAssessment> {
         env.storage()
             .instance()
-            .get(&DataKey::BackgroundCheckResult(provider.clone()))
+            .get(&DataKey::RiskAssessment(provider))
     }
 }
 
 // ============================================================================
-// Provider Tier Assignment
+// Provider Onboarding Manager
 // ============================================================================
 
-/// Tier assignment criteria
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct TierCriteria {
-    pub min_kyc_level: KYCLevel,
-    pub max_risk_score: u32,
-    pub min_track_record_days: u32,
-    pub min_success_rate: u32,
-    pub requires_institutional_backing: bool,
-}
+/// Onboarding manager
+pub struct ProviderOnboardingManager;
 
-/// Tier assignment result
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct TierAssignmentResult {
-    pub provider: Address,
-    pub assigned_tier: ProviderTier,
-    pub previous_tier: ProviderTier,
-    pub criteria_met: Vec<String>,
-    pub criteria_not_met: Vec<String>,
-    pub assigned_at: u64,
-}
-
-/// Provider tier manager
-pub struct ProviderTierManager;
-
-impl ProviderTierManager {
-    /// Assign tier to provider
+impl ProviderOnboardingManager {
+    /// Start onboarding process
+    pub fn start_onboarding(
+        env: &Env,
+        provider: Address,
+    ) -> Result<VerificationWorkflow, OnboardingError> {
+        provider.require_auth();
+        
+        // Check if already onboarded
+        if env.storage().instance().has(&DataKey::OnboardingStatus(provider.clone())) {
+            return Err(OnboardingError::AlreadyOnboarded);
+        }
+        
+        // Create workflow
+        let workflow = VerificationWorkflowManager::create_workflow(env, provider.clone());
+        
+        // Set onboarding status
+        env.storage().instance().set(
+            &DataKey::OnboardingStatus(provider.clone()),
+            &VerificationStatus::Pending
+        );
+        
+        Ok(workflow)
+    }
+    
+    /// Get onboarding status
+    pub fn get_onboarding_status(
+        env: &Env,
+        provider: Address,
+    ) -> Option<VerificationStatus> {
+        env.storage()
+            .instance()
+            .get(&DataKey::OnboardingStatus(provider))
+    }
+    
+    /// Assign provider tier
     pub fn assign_tier(
         env: &Env,
         provider: Address,
-    ) -> Result<TierAssignmentResult, OnboardingError> {
-        // Get KYC data
-        let kyc_data = KYCIntegrationManager::get_kyc_data(env, &provider)
-            .ok_or(OnboardingError::KYCNotFound)?;
+        tier: ProviderTier,
+    ) -> Result<(), OnboardingError> {
+        // Verify provider is approved
+        let status: VerificationStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::OnboardingStatus(provider.clone()))
+            .ok_or(OnboardingError::NotOnboarded)?;
         
-        // Get background check result
-        let bg_check = BackgroundCheckManager::get_check_result(env, &provider)
-            .ok_or(OnboardingError::BackgroundCheckNotFound)?;
+        if status != VerificationStatus::Approved {
+            return Err(OnboardingError::NotApproved);
+        }
         
-        // Get current tier
-        let previous_tier = Self::get_provider_tier(env, &provider);
-        
-        // Determine tier based on criteria
-        let mut criteria_met = Vec::new(env);
-        let mut criteria_not_met = Vec::new(env);
-        
-        let assigned_tier = Self::determine_tier(
-            env,
-            &kyc_data,
-            &bg_check,
-            &mut criteria_met,
-            &mut criteria_not_met,
-        );
-        
-        // Store tier assignment
         env.storage().instance().set(
-            &DataKey::ProviderTier(provider.clone()),
-            &assigned_tier
+            &DataKey::ProviderTier(provider),
+            &tier
         );
         
-        Ok(TierAssignmentResult {
-            provider,
-            assigned_tier,
-            previous_tier,
-            criteria_met,
-            criteria_not_met,
-            assigned_at: env.ledger().timestamp(),
-        })
-    }
-
-    /// Determine appropriate tier
-    fn determine_tier(
-        env: &Env,
-        kyc_data: &KYCData,
-        bg_check: &BackgroundCheckResult,
-        criteria_met: &mut Vec<String>,
-        criteria_not_met: &mut Vec<String>,
-    ) -> ProviderTier {
-        // Platinum tier criteria
-        if Self::meets_platinum_criteria(env, kyc_data, bg_check, criteria_met, criteria_not_met) {
-            return ProviderTier::Platinum;
-        }
-        
-        // Gold tier criteria
-        if Self::meets_gold_criteria(env, kyc_data, bg_check, criteria_met, criteria_not_met) {
-            return ProviderTier::Gold;
-        }
-        
-        // Silver tier criteria
-        if Self::meets_silver_criteria(env, kyc_data, bg_check, criteria_met, criteria_not_met) {
-            return ProviderTier::Silver;
-        }
-        
-        // Bronze tier criteria
-        if Self::meets_bronze_criteria(env, kyc_data, bg_check, criteria_met, criteria_not_met) {
-            return ProviderTier::Bronze;
-        }
-        
-        ProviderTier::Unverified
-    }
-    
-    /// Check Platinum tier criteria
-    fn meets_platinum_criteria(
-        env: &Env,
-        kyc_data: &KYCData,
-        bg_check: &BackgroundCheckResult,
-        criteria_met: &mut Vec<String>,
-        criteria_not_met: &mut Vec<String>,
-    ) -> bool {
-        let mut all_met = true;
-        
-        // Full KYC required
-        if kyc_data.verification_level == KYCLevel::Full {
-            criteria_met.push_back(String::from_str(env, "Full KYC verified"));
-        } else {
-            criteria_not_met.push_back(String::from_str(env, "Full KYC required"));
-            all_met = false;
-        }
-        
-        // Perfect background check
-        if bg_check.risk_score == 0 {
-            criteria_met.push_back(String::from_str(env, "Perfect background check"));
-        } else {
-            criteria_not_met.push_back(String::from_str(env, "Perfect background required"));
-            all_met = false;
-        }
-        
-        all_met
-    }
-    
-    /// Check Gold tier criteria
-    fn meets_gold_criteria(
-        env: &Env,
-        kyc_data: &KYCData,
-        bg_check: &BackgroundCheckResult,
-        criteria_met: &mut Vec<String>,
-        criteria_not_met: &mut Vec<String>,
-    ) -> bool {
-        let mut all_met = true;
-        
-        // Enhanced or Full KYC
-        if kyc_data.verification_level == KYCLevel::Enhanced 
-            || kyc_data.verification_level == KYCLevel::Full {
-            criteria_met.push_back(String::from_str(env, "Enhanced KYC verified"));
-        } else {
-            criteria_not_met.push_back(String::from_str(env, "Enhanced KYC required"));
-            all_met = false;
-        }
-        
-        // Low risk score
-        if bg_check.risk_score < 20 {
-            criteria_met.push_back(String::from_str(env, "Low risk score"));
-        } else {
-            criteria_not_met.push_back(String::from_str(env, "Lower risk score required"));
-            all_met = false;
-        }
-        
-        all_met
-    }
-    
-    /// Check Silver tier criteria
-    fn meets_silver_criteria(
-        env: &Env,
-        kyc_data: &KYCData,
-        bg_check: &BackgroundCheckResult,
-        criteria_met: &mut Vec<String>,
-        criteria_not_met: &mut Vec<String>,
-    ) -> bool {
-        let mut all_met = true;
-        
-        // Basic or higher KYC
-        if kyc_data.verification_level != KYCLevel::None {
-            criteria_met.push_back(String::from_str(env, "KYC verified"));
-        } else {
-            criteria_not_met.push_back(String::from_str(env, "KYC required"));
-            all_met = false;
-        }
-        
-        // Moderate risk score
-        if bg_check.risk_score < 50 {
-            criteria_met.push_back(String::from_str(env, "Acceptable risk score"));
-        } else {
-            criteria_not_met.push_back(String::from_str(env, "Risk score too high"));
-            all_met = false;
-        }
-        
-        all_met
-    }
-    
-    /// Check Bronze tier criteria
-    fn meets_bronze_criteria(
-        env: &Env,
-        kyc_data: &KYCData,
-        bg_check: &BackgroundCheckResult,
-        criteria_met: &mut Vec<String>,
-        criteria_not_met: &mut Vec<String>,
-    ) -> bool {
-        // Basic KYC and passed background check
-        if kyc_data.verification_level != KYCLevel::None && bg_check.passed {
-            criteria_met.push_back(String::from_str(env, "Basic requirements met"));
-            true
-        } else {
-            criteria_not_met.push_back(String::from_str(env, "Basic requirements not met"));
-            false
-        }
+        Ok(())
     }
     
     /// Get provider tier
-    pub fn get_provider_tier(env: &Env, provider: &Address) -> ProviderTier {
+    pub fn get_tier(
+        env: &Env,
+        provider: Address,
+    ) -> Option<ProviderTier> {
         env.storage()
             .instance()
-            .get(&DataKey::ProviderTier(provider.clone()))
-            .unwrap_or(ProviderTier::Unverified)
-    }
-    
-    /// Get tier benefits
-    pub fn get_tier_benefits(tier: &ProviderTier) -> TierBenefits {
-        match tier {
-            ProviderTier::Platinum => TierBenefits {
-                max_signals: 100,
-                reduced_fees: 50,
-                priority_support: true,
-                featured_listing: true,
-            },
-            ProviderTier::Gold => TierBenefits {
-                max_signals: 50,
-                reduced_fees: 30,
-                priority_support: true,
-                featured_listing: false,
-            },
-            ProviderTier::Silver => TierBenefits {
-                max_signals: 20,
-                reduced_fees: 15,
-                priority_support: false,
-                featured_listing: false,
-            },
-            ProviderTier::Bronze => TierBenefits {
-                max_signals: 10,
-                reduced_fees: 5,
-                priority_support: false,
-                featured_listing: false,
-            },
-            ProviderTier::Unverified => TierBenefits {
-                max_signals: 3,
-                reduced_fees: 0,
-                priority_support: false,
-                featured_listing: false,
-            },
-        }
-    }
-}
-
-/// Tier benefits
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct TierBenefits {
-    pub max_signals: u32,
-    pub reduced_fees: u32,        // Percentage
-    pub priority_support: bool,
-    pub featured_listing: bool,
-}
-
-// ============================================================================
-// Verification Tracking
-// ============================================================================
-
-/// Verification tracking record
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct VerificationTracking {
-    pub provider: Address,
-    pub events: Vec<VerificationEvent>,
-    pub current_status: VerificationStatus,
-    pub last_updated: u64,
-}
-
-/// Verification event
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct VerificationEvent {
-    pub event_id: u64,
-    pub event_type: EventType,
-    pub timestamp: u64,
-    pub details: String,
-    pub actor: Address,
-}
-
-/// Event type
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub enum EventType {
-    WorkflowStarted,
-    StepCompleted,
-    KYCSubmitted,
-    KYCVerified,
-    BackgroundCheckInitiated,
-    BackgroundCheckCompleted,
-    TierAssigned,
-    StatusChanged,
-    DocumentUploaded,
-    ReviewCompleted,
-}
-
-/// Verification tracking manager
-pub struct VerificationTrackingManager;
-
-impl VerificationTrackingManager {
-    /// Initialize tracking for provider
-    pub fn initialize_tracking(
-        env: &Env,
-        provider: Address,
-    ) -> VerificationTracking {
-        let tracking = VerificationTracking {
-            provider: provider.clone(),
-            events: Vec::new(env),
-            current_status: VerificationStatus::NotStarted,
-            last_updated: env.ledger().timestamp(),
-        };
-        
-        // Store tracking
-        env.storage().instance().set(
-            &DataKey::Tracking(provider),
-            &tracking
-        );
-        
-        tracking
-    }
-    
-    /// Add verification event
-    pub fn add_event(
-        env: &Env,
-        provider: Address,
-        event_type: EventType,
-        details: String,
-        actor: Address,
-    ) -> Result<(), OnboardingError> {
-        let mut tracking: VerificationTracking = env
-            .storage()
-            .instance()
-            .get(&DataKey::Tracking(provider.clone()))
-            .ok_or(OnboardingError::TrackingNotFound)?;
-        
-        let event = VerificationEvent {
-            event_id: tracking.events.len() as u64,
-            event_type,
-            timestamp: env.ledger().timestamp(),
-            details,
-            actor,
-        };
-        
-        tracking.events.push_back(event);
-        tracking.last_updated = env.ledger().timestamp();
-        
-        // Update storage
-        env.storage().instance().set(
-            &DataKey::Tracking(provider),
-            &tracking
-        );
-        
-        Ok(())
-    }
-
-    /// Update verification status
-    pub fn update_status(
-        env: &Env,
-        provider: Address,
-        new_status: VerificationStatus,
-        actor: Address,
-    ) -> Result<(), OnboardingError> {
-        let mut tracking: VerificationTracking = env
-            .storage()
-            .instance()
-            .get(&DataKey::Tracking(provider.clone()))
-            .ok_or(OnboardingError::TrackingNotFound)?;
-        
-        tracking.current_status = new_status.clone();
-        tracking.last_updated = env.ledger().timestamp();
-        
-        // Add status change event
-        let event = VerificationEvent {
-            event_id: tracking.events.len() as u64,
-            event_type: EventType::StatusChanged,
-            timestamp: env.ledger().timestamp(),
-            details: String::from_str(env, "Status updated"),
-            actor,
-        };
-        
-        tracking.events.push_back(event);
-        
-        // Update storage
-        env.storage().instance().set(
-            &DataKey::Tracking(provider),
-            &tracking
-        );
-        
-        Ok(())
-    }
-    
-    /// Get verification tracking
-    pub fn get_tracking(
-        env: &Env,
-        provider: &Address,
-    ) -> Option<VerificationTracking> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Tracking(provider.clone()))
-    }
-    
-    /// Get event history
-    pub fn get_event_history(
-        env: &Env,
-        provider: &Address,
-    ) -> Vec<VerificationEvent> {
-        if let Some(tracking) = Self::get_tracking(env, provider) {
-            tracking.events
-        } else {
-            Vec::new(env)
-        }
+            .get(&DataKey::ProviderTier(provider))
     }
 }
 
 // ============================================================================
-// Provider Dashboard
+// Storage Keys
 // ============================================================================
 
-/// Provider dashboard data
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 #[contracttype]
-pub struct ProviderDashboard {
-    pub provider: Address,
-    pub tier: ProviderTier,
-    pub verification_status: VerificationStatus,
-    pub kyc_status: KYCStatus,
-    pub background_check_status: BackgroundCheckStatus,
-    pub active_signals: u32,
-    pub total_followers: u32,
-    pub success_rate: u32,
-    pub tier_benefits: TierBenefits,
-    pub next_tier: Option<ProviderTier>,
-    pub requirements_for_next_tier: Vec<String>,
+pub enum DataKey {
+    Workflow(u64),
+    WorkflowCounter,
+    KYCData(Address),
+    RiskAssessment(Address),
+    OnboardingStatus(Address),
+    ProviderTier(Address),
+    Relationship(u64),
+    RelationshipIds(Address),
+    Membership(u64),
+    MembershipIds(Address),
 }
 
-/// KYC status summary
+// ============================================================================
+// Errors
+// ============================================================================
+
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
-pub struct KYCStatus {
-    pub verified: bool,
-    pub level: KYCLevel,
-    pub expires_at: u64,
-}
-
-/// Background check status summary
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct BackgroundCheckStatus {
-    pub completed: bool,
-    pub passed: bool,
-    pub risk_score: u32,
-}
-
-/// Provider dashboard manager
-pub struct ProviderDashboardManager;
-
-impl ProviderDashboardManager {
-    /// Get provider dashboard
-    pub fn get_dashboard(
-        env: &Env,
-        provider: Address,
-    ) -> Result<ProviderDashboard, OnboardingError> {
-        // Get tier
-        let tier = ProviderTierManager::get_provider_tier(env, &provider);
-        
-        // Get verification status
-        let tracking = VerificationTrackingManager::get_tracking(env, &provider)
-            .ok_or(OnboardingError::TrackingNotFound)?;
-        
-        // Get KYC status
-        let kyc_status = Self::get_kyc_status(env, &provider);
-        
-        // Get background check status
-        let bg_check_status = Self::get_background_check_status(env, &provider);
-        
-        // Get tier benefits
-        let tier_benefits = ProviderTierManager::get_tier_benefits(&tier);
-        
-        // Determine next tier and requirements
-        let (next_tier, requirements) = Self::get_next_tier_info(env, &tier, &kyc_status, &bg_check_status);
-        
-        Ok(ProviderDashboard {
-            provider: provider.clone(),
-            tier,
-            verification_status: tracking.current_status,
-            kyc_status,
-            background_check_status: bg_check_status,
-            active_signals: Self::get_active_signals(env, &provider),
-            total_followers: Self::get_total_followers(env, &provider),
-            success_rate: Self::get_success_rate(env, &provider),
-            tier_benefits,
-            next_tier,
-            requirements_for_next_tier: requirements,
-        })
-    }
-    
-    /// Get KYC status summary
-    fn get_kyc_status(env: &Env, provider: &Address) -> KYCStatus {
-        if let Some(kyc_data) = KYCIntegrationManager::get_kyc_data(env, provider) {
-            KYCStatus {
-                verified: kyc_data.verified_at > 0,
-                level: kyc_data.verification_level,
-                expires_at: kyc_data.expires_at,
-            }
-        } else {
-            KYCStatus {
-                verified: false,
-                level: KYCLevel::None,
-                expires_at: 0,
-            }
-        }
-    }
-    
-    /// Get background check status summary
-    fn get_background_check_status(env: &Env, provider: &Address) -> BackgroundCheckStatus {
-        if let Some(bg_check) = BackgroundCheckManager::get_check_result(env, provider) {
-            BackgroundCheckStatus {
-                completed: true,
-                passed: bg_check.passed,
-                risk_score: bg_check.risk_score,
-            }
-        } else {
-            BackgroundCheckStatus {
-                completed: false,
-                passed: false,
-                risk_score: 100,
-            }
-        }
-    }
-    
-    /// Get next tier information
-    fn get_next_tier_info(
-        env: &Env,
-        current_tier: &ProviderTier,
-        kyc_status: &KYCStatus,
-        bg_check_status: &BackgroundCheckStatus,
-    ) -> (Option<ProviderTier>, Vec<String>) {
-        let mut requirements = Vec::new(env);
-        
-        let next_tier = match current_tier {
-            ProviderTier::Unverified => {
-                requirements.push_back(String::from_str(env, "Complete KYC verification"));
-                requirements.push_back(String::from_str(env, "Pass background check"));
-                Some(ProviderTier::Bronze)
-            },
-            ProviderTier::Bronze => {
-                requirements.push_back(String::from_str(env, "Upgrade to Enhanced KYC"));
-                requirements.push_back(String::from_str(env, "Achieve risk score < 50"));
-                Some(ProviderTier::Silver)
-            },
-            ProviderTier::Silver => {
-                requirements.push_back(String::from_str(env, "Upgrade to Full KYC"));
-                requirements.push_back(String::from_str(env, "Achieve risk score < 20"));
-                Some(ProviderTier::Gold)
-            },
-            ProviderTier::Gold => {
-                requirements.push_back(String::from_str(env, "Achieve perfect risk score"));
-                requirements.push_back(String::from_str(env, "Obtain institutional backing"));
-                Some(ProviderTier::Platinum)
-            },
-            ProviderTier::Platinum => None,
-        };
-        
-        (next_tier, requirements)
-    }
-    
-    /// Get active signals count (placeholder)
-    fn get_active_signals(env: &Env, provider: &Address) -> u32 {
-        // In production, query actual signal count
-        0
-    }
-    
-    /// Get total followers count (placeholder)
-    fn get_total_followers(env: &Env, provider: &Address) -> u32 {
-        // In production, query actual follower count
-        0
-    }
-    
-    /// Get success rate (placeholder)
-    fn get_success_rate(env: &Env, provider: &Address) -> u32 {
-        // In production, calculate actual success rate
-        0
-    }
+pub enum OnboardingError {
+    WorkflowNotFound,
+    KYCNotFound,
+    AlreadyOnboarded,
+    NotOnboarded,
+    NotApproved,
+    InvalidPageSize,
+    InvalidCursor,
 }
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
 
-/// Get next workflow ID
 fn get_next_workflow_id(env: &Env) -> u64 {
-    let current: u64 = env
+    let counter: u64 = env
         .storage()
         .instance()
         .get(&DataKey::WorkflowCounter)
         .unwrap_or(0);
     
-    let next = current + 1;
-    env.storage()
-        .instance()
-        .set(&DataKey::WorkflowCounter, &next);
-    
+    let next = counter + 1;
+    env.storage().instance().set(&DataKey::WorkflowCounter, &next);
     next
 }
 
-/// Generate KYC ID
 fn generate_kyc_id(env: &Env, provider: &Address) -> String {
-    let timestamp = env.ledger().timestamp();
-    String::from_str(env, &format!("KYC-{}-{}", provider, timestamp))
-}
-
-/// Generate check ID
-fn generate_check_id(env: &Env, provider: &Address) -> String {
-    let timestamp = env.ledger().timestamp();
-    String::from_str(env, &format!("BGC-{}-{}", provider, timestamp))
-}
-
-// ============================================================================
-// Error Types
-// ============================================================================
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(u32)]
-pub enum OnboardingError {
-    WorkflowNotFound = 1,
-    KYCNotFound = 2,
-    BackgroundCheckNotFound = 3,
-    TrackingNotFound = 4,
-    InvalidStatus = 5,
-    VerificationFailed = 6,
-    InsufficientTier = 7,
-}
-
-/// Storage keys
-#[derive(Clone)]
-#[contracttype]
-pub enum DataKey {
-    WorkflowCounter,
-    Workflow(u64),
-    KYCData(Address),
-    BackgroundCheck(Address),
-    BackgroundCheckResult(Address),
-    ProviderTier(Address),
-    Tracking(Address),
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_workflow_creation() {
-        let env = Env::default();
-        let provider = Address::generate(&env);
-        
-        let workflow = VerificationWorkflowManager::create_workflow(&env, provider);
-        
-        assert_eq!(workflow.status, VerificationStatus::Pending);
-        assert_eq!(workflow.current_step, 0);
-        assert_eq!(workflow.total_steps, 6);
-    }
-
-    #[test]
-    fn test_tier_benefits() {
-        let platinum_benefits = ProviderTierManager::get_tier_benefits(&ProviderTier::Platinum);
-        assert_eq!(platinum_benefits.max_signals, 100);
-        assert_eq!(platinum_benefits.reduced_fees, 50);
-        
-        let bronze_benefits = ProviderTierManager::get_tier_benefits(&ProviderTier::Bronze);
-        assert_eq!(bronze_benefits.max_signals, 10);
-        assert_eq!(bronze_benefits.reduced_fees, 5);
-    }
+    // In production, this would generate a unique ID
+    // For now, use a simple hash-based approach
+    let _ = (env, provider);
+    String::from_str(env, "KYC_ID")
 }
