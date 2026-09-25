@@ -5,8 +5,11 @@
 //! stale activity loses impact over time. Decay points are computed directly
 //! from stored timestamps and configuration values, keeping the behavior
 //! verifiable on-chain.
+//!
+//! Provider metadata is validated before any persistent write. Metadata must
+//! be non-empty, valid UTF-8, and at most [`MAX_METADATA_LEN`] bytes long.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
 
 /// Errors returned by the signal registry contract.
 #[contracterror]
@@ -18,7 +21,17 @@ pub enum SignalError {
     Unauthorized = 3,
     InvalidDecayConfig = 4,
     InvalidReputationUpdate = 5,
+    EmptyMetadata = 6,
+    MetadataTooLong = 7,
+    InvalidMetadataEncoding = 8,
 }
+
+/// Maximum accepted length, in bytes, of provider metadata.
+///
+/// Metadata is stored and indexed on-chain, so an explicit upper bound keeps
+/// storage and indexing costs predictable. Values longer than this are
+/// rejected before any persistent write occurs.
+pub const MAX_METADATA_LEN: u32 = 256;
 
 /// Configuration-driven reputation decay schedule.
 ///
@@ -53,6 +66,7 @@ pub struct DataKey {
 const ADMIN_KEY: &str = "admin";
 const SCHEDULE_KEY: &str = "schedule";
 const REPUTATION_KEY: &str = "reputation";
+const METADATA_KEY: &str = "metadata";
 
 #[contract]
 pub struct SignalRegistry;
@@ -89,6 +103,28 @@ impl SignalRegistry {
             .instance()
             .get(&SCHEDULE_KEY)
             .ok_or(SignalError::NotInitialized)
+    }
+
+    /// Store provider metadata after validating its length and encoding.
+    ///
+    /// Validation runs before any persistent write, so empty, over-limit, or
+    /// malformed values never reach storage.
+    pub fn set_provider_metadata(
+        env: Env,
+        provider: Address,
+        metadata: String,
+    ) -> Result<(), SignalError> {
+        provider.require_auth();
+        Self::validate_metadata(&metadata)?;
+        let key = (METADATA_KEY, provider);
+        env.storage().persistent().set(&key, &metadata);
+        Ok(())
+    }
+
+    /// Read the stored metadata for a provider, if any.
+    pub fn get_provider_metadata(env: Env, provider: Address) -> Option<String> {
+        let key = (METADATA_KEY, provider);
+        env.storage().persistent().get(&key)
     }
 
     /// Apply a reputation update for a provider, first decaying the stored
@@ -187,6 +223,29 @@ impl SignalRegistry {
         }
         if schedule.min_reputation > schedule.max_reputation {
             return Err(SignalError::InvalidDecayConfig);
+        }
+        Ok(())
+    }
+
+    /// Validate provider metadata before it is persisted.
+    ///
+    /// Rules:
+    /// - Must not be empty.
+    /// - Must be at most [`MAX_METADATA_LEN`] bytes long.
+    /// - Must be valid UTF-8 (Soroban `String` guarantees this, but we verify
+    ///   the byte length explicitly so the constraint is enforced on-chain).
+    fn validate_metadata(metadata: &String) -> Result<(), SignalError> {
+        let len = metadata.len();
+        if len == 0 {
+            return Err(SignalError::EmptyMetadata);
+        }
+        if len > MAX_METADATA_LEN {
+            return Err(SignalError::MetadataTooLong);
+        }
+        // Soroban `String` is always valid UTF-8; reject any value that fails
+        // to round-trip through the UTF-8 decoder as a defensive check.
+        if core::str::from_utf8(metadata.as_slice()).is_err() {
+            return Err(SignalError::InvalidMetadataEncoding);
         }
         Ok(())
     }
