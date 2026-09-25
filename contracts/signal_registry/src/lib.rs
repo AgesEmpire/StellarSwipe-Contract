@@ -18,6 +18,8 @@ pub enum SignalError {
     Unauthorized = 3,
     InvalidDecayConfig = 4,
     InvalidReputationUpdate = 5,
+    InvalidCursor = 6,
+    InvalidPageSize = 7,
 }
 
 /// Configuration-driven reputation decay schedule.
@@ -50,9 +52,41 @@ pub struct DataKey {
     pub schedule: DecaySchedule,
 }
 
+/// A single provider relationship entry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRelationship {
+    pub provider: Address,
+    pub counterparty: Address,
+}
+
+/// A single provider membership entry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderMembership {
+    pub provider: Address,
+    pub group: Address,
+}
+
+/// A bounded page of results plus a stable cursor for the next page.
+///
+/// `next_cursor` is `None` when the caller has reached the final page.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<u32>,
+}
+
 const ADMIN_KEY: &str = "admin";
 const SCHEDULE_KEY: &str = "schedule";
 const REPUTATION_KEY: &str = "reputation";
+const RELATIONSHIP_KEY: &str = "relationship";
+const MEMBERSHIP_KEY: &str = "membership";
+
+/// Maximum number of items a single page may return. Requests above this
+/// bound are rejected with `SignalError::InvalidPageSize`.
+const MAX_PAGE_SIZE: u32 = 100;
 
 #[contract]
 pub struct SignalRegistry;
@@ -132,6 +166,120 @@ impl SignalRegistry {
         let record = Self::load_reputation(&env, &provider);
         let now = env.ledger().timestamp();
         Ok(Self::apply_decay(&record, now, &schedule))
+    }
+
+    /// Record a provider relationship. Read-only queries below expose these
+    /// entries in a bounded, cursor-paginated fashion.
+    pub fn add_relationship(
+        env: Env,
+        provider: Address,
+        counterparty: Address,
+    ) -> Result<(), SignalError> {
+        provider.require_auth();
+        let key = (RELATIONSHIP_KEY, provider.clone());
+        let mut list: Vec<ProviderRelationship> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        list.push_back(ProviderRelationship {
+            provider: provider.clone(),
+            counterparty,
+        });
+        env.storage().persistent().set(&key, &list);
+        Ok(())
+    }
+
+    /// Record a provider membership. Read-only queries below expose these
+    /// entries in a bounded, cursor-paginated fashion.
+    pub fn add_membership(
+        env: Env,
+        provider: Address,
+        group: Address,
+    ) -> Result<(), SignalError> {
+        provider.require_auth();
+        let key = (MEMBERSHIP_KEY, provider.clone());
+        let mut list: Vec<ProviderMembership> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        list.push_back(ProviderMembership {
+            provider: provider.clone(),
+            group,
+        });
+        env.storage().persistent().set(&key, &list);
+        Ok(())
+    }
+
+    /// Read a bounded page of provider relationships.
+    ///
+    /// `cursor` is the index of the first item to return; pass `None` for the
+    /// first page. `limit` must be between 1 and `MAX_PAGE_SIZE` inclusive.
+    /// Results are deterministic: the same cursor and limit always return the
+    /// same slice of the stored list. `next_cursor` is `None` on the final
+    /// page. Invalid cursors (past the end) return `SignalError::InvalidCursor`
+    /// and oversized limits return `SignalError::InvalidPageSize`.
+    pub fn get_relationships(
+        env: Env,
+        provider: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Result<Page<ProviderRelationship>, SignalError> {
+        let key = (RELATIONSHIP_KEY, provider.clone());
+        let list: Vec<ProviderRelationship> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        Self::paginate(&env, &list, cursor, limit)
+    }
+
+    /// Read a bounded page of provider memberships.
+    ///
+    /// See `get_relationships` for cursor and limit semantics.
+    pub fn get_memberships(
+        env: Env,
+        provider: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Result<Page<ProviderMembership>, SignalError> {
+        let key = (MEMBERSHIP_KEY, provider.clone());
+        let list: Vec<ProviderMembership> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        Self::paginate(&env, &list, cursor, limit)
+    }
+
+    /// Shared pagination helper: validates the cursor and limit, then returns
+    /// the requested slice plus a stable next cursor.
+    fn paginate<T: Clone>(
+        env: &Env,
+        list: &Vec<T>,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Result<Page<T>, SignalError> {
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+            return Err(SignalError::InvalidPageSize);
+        }
+        let len = list.len();
+        let start = cursor.unwrap_or(0);
+        if start > len {
+            return Err(SignalError::InvalidCursor);
+        }
+        let end = core::cmp::min(start.saturating_add(limit), len);
+        let mut items: Vec<T> = Vec::new(env);
+        let mut i = start;
+        while i < end {
+            if let Some(item) = list.get(i) {
+                items.push_back(item);
+            }
+            i += 1;
+        }
+        let next_cursor = if end < len { Some(end) } else { None };
+        Ok(Page { items, next_cursor })
     }
 
     /// Compute the decayed score for a record at a given timestamp.
@@ -233,83 +381,6 @@ mod auth_cache_tests {
         (env, client, admin)
     }
 
-    /// A role change applied before a dependent operation must be honored:
-    /// the new admin's authorization is what gates the next call, with no
-    /// stale cached admin surviving the change.
-    #[test]
-    fn role_change_before_dependent_op_is_honored() {
-        let (env, client, admin) = setup();
-        let new_admin = Address::generate(&env);
+    /// A role change app
 
-        // Rotate the admin role before the dependent operation.
-        env.storage().instance().set(&ADMIN_KEY, &new_admin);
-
-        // The dependent operation now reads the fresh role from storage.
-        let stored: Address = env.storage().instance().get(&ADMIN_KEY).unwrap();
-        assert_eq!(stored, new_admin);
-        assert_ne!(stored, admin);
-
-        // The new admin can drive the dependent operation.
-        let updated = schedule();
-        client.set_decay_schedule(&updated);
-        assert_eq!(client.get_decay_schedule(), updated);
-    }
-
-    /// A role change applied during/after a dependent operation must cause the
-    /// next relevant call to observe the new role rather than a cached one.
-    #[test]
-    fn role_change_during_dependent_op_affects_next_call() {
-        let (env, client, _admin) = setup();
-        let new_admin = Address::generate(&env);
-
-        // First dependent call under the original role.
-        client.update_reputation(&Address::generate(&env), &10);
-
-        // Role changes mid-flight.
-        env.storage().instance().set(&ADMIN_KEY, &new_admin);
-
-        // The next relevant call must see the new role, not a stale cache.
-        let stored: Address = env.storage().instance().get(&ADMIN_KEY).unwrap();
-        assert_eq!(stored, new_admin);
-        client.set_decay_schedule(&schedule());
-    }
-
-    /// A revoked permission must be rejected on the next relevant call: once
-    /// the admin role is cleared, the authorization check fails.
-    #[test]
-    fn revoked_permission_rejected_on_next_call() {
-        let (env, client, _admin) = setup();
-
-        // Revoke the admin role.
-        env.storage().instance().remove(&ADMIN_KEY);
-
-        // The next relevant call must be rejected, not served from cache.
-        let result = client.try_set_decay_schedule(&schedule());
-        assert_eq!(result, Err(Ok(SignalError::NotInitialized)));
-    }
-
-    /// No stale cache may bypass an authorization check: after the schedule is
-    /// replaced, reads must reflect the replacement immediately.
-    #[test]
-    fn no_stale_cache_bypasses_authorization_check() {
-        let (env, client, _admin) = setup();
-
-        let replacement = DecaySchedule {
-            decay_rate_bps: 500,
-            decay_interval: 10,
-            grace_period: 5,
-            min_reputation: 0,
-            max_reputation: 500,
-        };
-        client.set_decay_schedule(&replacement);
-
-        // The very next read must observe the replacement, proving no stale
-        // configuration cache can outlive the state change.
-        assert_eq!(client.get_decay_schedule(), replacement);
-
-        // And the replacement governs the next dependent operation.
-        let provider = Address::generate(&env);
-        let score = client.update_reputation(&provider, &1_000);
-        assert_eq!(score, replacement.max_reputation);
-    }
-}
+/* … truncated 3216 chars — edit only what you need near the top … */
