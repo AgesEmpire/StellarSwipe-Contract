@@ -131,6 +131,27 @@ jobs:
       - name: Validate error baseline integrity
         run: python3 stellar-swipe/scripts/test_error_baselines.py
 
+      # Export the machine-readable contract error ABI (issue #1075): public
+      # error variants, numeric values, and associated entrypoints, generated
+      # from the Rust source of truth.  Validation fails on duplicate numeric
+      # values and on undocumented public errors.  The committed artifact is
+      # regenerated and diffed so CI fails when it is stale.
+      - name: Check contract error ABI export is current
+        run: |
+          python3 stellar-swipe/scripts/export_error_abi.py \
+            --output stellar-swipe/error-abi/contract-error-abi.json
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: contract error ABI validation failed — see output above." >&2
+            exit 1
+          fi
+          if ! git diff --exit-code -- stellar-swipe/error-abi/contract-error-abi.json; then
+            echo "ERROR: committed contract error ABI artifact is stale." >&2
+            echo "  Regenerate locally and commit the result:" >&2
+            echo "    python3 stellar-swipe/scripts/export_error_abi.py --output stellar-swipe/error-abi/contract-error-abi.json" >&2
+            exit 1
+          fi
+
       # Diff each contract's storage layout against committed baselines.
       # Exit 0 = clean; exit 2 = new keys added (baseline updated, commit the
       # JSON files); exit 1 = breaking change (removed/renamed key) → fail build.
@@ -201,4 +222,34 @@ jobs:
           if [[ -z "${STELLAR_SOURCE_HASH:-}" ]]; then
             echo "error: STELLAR_SOURCE_HASH is empty" >&2
             exit 1
+          fi
+          echo "Embedded SourceHash: $STELLAR_SOURCE_HASH"
+
+      # Diff each contract's exported function names and contract-spec hash
+      # against the committed baselines in abi-baselines/.
+      # Exit 0 = clean; exit 2 = new exports added (baseline updated, commit
+      # the JSON files); exit 1 = breaking change (removed export or changed
+      # parameter signature) → fail the build unless
+      # abi-baselines/<contract>.breaking.txt is present.
+      # Generates a markdown report that is also posted as a PR comment.
+      - name: Check WASM ABI exports for breaking changes
+        id: wasm-abi
+        run: |
+          python3 stellar-swipe/scripts/check_wasm_exports.py \
+            --wasm-dir stellar-swipe/target/wasm-optimized \
+            --format markdown \
+            > /tmp/abi-diff-report.md
+          rc=$?
+          cat /tmp/abi-diff-report.md
+          echo ""
+          echo "---"
+          echo "Exit code: $rc"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: Breaking ABI change detected — see report above." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: New ABI exports detected; baseline files updated."
+            echo "Please commit the updated stellar-swipe/abi-baselines/*.json files."
           fi
