@@ -18,3 +18,7 @@ soroban-sdk = { version = "23", features = [] }
 
 [dev-dependencies]
 soroban-sdk = { version = "23", features = ["testutils"] }
+
+[[bench]]
+name = "batch_authorization"
+harness = false
