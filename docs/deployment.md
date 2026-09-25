@@ -1,141 +1,83 @@
-# Deployment Guide
+# Deployment
 
-This guide covers deploying StellarSwipe contracts to testnet and mainnet.
+This document describes how contracts are deployed and how the deployment
+smoke tests verify that a freshly deployed contract is in a healthy state.
 
-## Prerequisites
+## Deployment process
 
-Install required tools:
+1. Build the WASM artifacts locally (`cargo build --release --target wasm32-unknown-unknown`).
+2. Deploy the artifacts to the target network.
+3. Run the deployment smoke tests against the locally deployed WASM artifacts.
 
-```bash
-rustup target add wasm32-unknown-unknown
-cargo --version
-stellar --version
-jq --version
+## Contract invariant snapshots
+
+Deployment smoke tests read a set of **critical invariants** immediately after
+initialization and again after representative mutations. Each invariant is
+identified by a stable name and is versioned together with the deployment
+process, so a snapshot taken by one deployment can be compared against the
+snapshot taken by the next.
+
+### Invariant set
+
+The invariant set is versioned with the deployment process. The current
+snapshot version is recorded alongside the deployment so that a mismatch
+between the expected and observed invariant set is itself a failure.
+
+| Invariant | Category | Checked after init | Checked after mutation |
+| --- | --- | --- | --- |
+| `authorization.admin` | authorization | yes | yes |
+| `authorization.roles` | authorization | yes | yes |
+| `balances.total_supply` | balances | yes | yes |
+| `balances.holder` | balances | yes | yes |
+| `configuration.params` | configuration | yes | yes |
+| `version.contract` | version | yes | yes |
+
+### Snapshot format
+
+A snapshot is a map from invariant name to the observed value, plus the
+contract address and the snapshot version:
+
+```json
+{
+  "snapshot_version": 1,
+  "contract_address": "C...",
+  "invariants": {
+    "authorization.admin": "G...",
+    "balances.total_supply": "1000000",
+    "configuration.params": { "fee_bps": 30 },
+    "version.contract": "1.0.0"
+  }
+}
 ```
 
-Prepare funded keypairs:
+### Failure reporting
 
-- **Testnet:** funded account for `STELLAR_SOURCE_ACCOUNT` and matching `STELLAR_ADMIN_ADDRESS`
-- **Mainnet:** production signer(s), funded account, and approved admin address
+When an invariant does not match its expected value, the smoke test fails with
+a message that identifies **both the violated invariant and the contract
+address**, for example:
 
-From repository root, build contracts:
-
-```bash
-cd stellar-swipe
-cargo build --workspace --target wasm32-unknown-unknown --release
+```
+invariant `balances.total_supply` violated for contract C...:
+  expected 1000000, observed 999999
 ```
 
-## Testnet Deployment (Step-by-Step)
+This makes it possible to tell, from CI output alone, which contract is
+unhealthy and which invariant it broke.
 
-1) Set deployment environment variables:
+### Running the smoke tests
 
-```bash
-export STELLAR_NETWORK=testnet
-export STELLAR_RPC_URL="https://soroban-testnet.stellar.org"
-export STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
-export STELLAR_SOURCE_ACCOUNT="YOUR_TESTNET_SECRET_OR_IDENTITY"
-export STELLAR_ADMIN_ADDRESS="YOUR_TESTNET_G_ADDRESS"
+The smoke tests run against locally deployed WASM artifacts, so they exercise
+the exact bytecode that will be deployed:
+
+```
+# deploy locally, then run the invariant smoke tests
+cargo test --test deployment_smoke
 ```
 
-2) Run deployment script and capture logs:
+## Versioning the invariant set
 
-```bash
-./scripts/deploy_testnet.sh 2>&1 | tee ../deployments/testnet-deploy.log
-```
-
-3) Confirm state file exists and includes contract IDs:
-
-```bash
-cat ../deployments/testnet.json
-```
-
-4) Verify deployment health and cross-contract wiring:
-
-```bash
-./scripts/verify_deployment.sh
-```
-
-Expected result:
-
-- Script prints pass/fail summary
-- Final exit code is `0`
-
-## Mainnet Deployment
-
-Mainnet follows the same deployment flow, with additional controls.
-
-### Security Warnings (Required)
-
-- Use a hardware wallet or offline signer for the primary admin key.
-- Require multisig authorization for production admin actions.
-- Never deploy from a personal developer machine with long-lived plaintext secrets.
-- Require a second reviewer to validate contract IDs, addresses, and logs before activation.
-
-### Mainnet Steps
-
-1) Set mainnet environment variables:
-
-```bash
-export STELLAR_NETWORK=mainnet
-export STELLAR_RPC_URL="https://mainnet.sorobanrpc.com"
-export STELLAR_NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
-export STELLAR_SOURCE_ACCOUNT="YOUR_MAINNET_SIGNER_OR_IDENTITY"
-export STELLAR_ADMIN_ADDRESS="YOUR_MAINNET_G_ADDRESS"
-```
-
-2) Deploy using the same script (writes state + contract IDs):
-
-```bash
-./scripts/deploy_testnet.sh 2>&1 | tee ../deployments/mainnet-deploy.log
-```
-
-3) Verify mainnet deployment using the verification script:
-
-```bash
-DEPLOY_STATE="../deployments/mainnet.json" \
-STELLAR_NETWORK="mainnet" \
-STELLAR_RPC_URL="https://mainnet.sorobanrpc.com" \
-STELLAR_NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015" \
-./scripts/verify_deployment.sh
-```
-
-## Verification
-
-Use `verify_deployment.sh` after every deployment:
-
-- Default behavior verifies `deployments/testnet.json`
-- Override with `DEPLOY_STATE` for other environments
-- Exit code `0` = all checks passed; exit code `1` = at least one check failed
-
-Example:
-
-```bash
-STELLAR_SOURCE_ACCOUNT="YOUR_SIGNER" ./scripts/verify_deployment.sh
-```
-
-## Rollback Procedure
-
-If deployment fails:
-
-1) Stop further deploy or initialize steps immediately.
-2) Preserve all logs:
-   - `deployments/testnet-deploy.log` or `deployments/mainnet-deploy.log`
-3) Run verification script to identify exact failing contract/check.
-4) If only a subset deployed, redeploy idempotently using the same state file after fixing the issue.
-5) If a bad mainnet deployment is active:
-   - Pause affected contracts (if pause controls are available).
-   - Rotate compromised keys.
-   - Prepare and execute a multisig-approved redeploy/migration plan.
-
-## Additional Resources
-
-- [Testnet Deployment Checklist](./testnet_checklist.md) — step-by-step checklist for testnet deployments
-- [Mainnet Deployment Checklist](./mainnet_checklist.md) — enhanced checklist with security sign-offs for mainnet
-
-## Release Checklist (Done Criteria)
-
-Before merge/release, confirm:
-
-- [ ] A new contributor successfully deployed to testnet using only this guide.
-- [ ] Mainnet section security warnings were reviewed and acknowledged.
-- [ ] Test deployment feedback is included in the PR description/comments.
+Because the invariant set is versioned with the deployment process, adding,
+removing, or changing an invariant requires bumping `snapshot_version` and
+updating this document in the same change. Deployments that observe a
+`snapshot_version` different from the one they expect must fail rather than
+silently accept a drifted invariant set.

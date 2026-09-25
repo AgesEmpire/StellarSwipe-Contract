@@ -89,3 +89,44 @@ const stakeVault = getContractId(loadRegistry(), "testnet", "stake_vault");
 `recordDeployment(network, contract, address)` writes a freshly deployed address
 back into the registry and stamps `deployed_at`, so deploy scripts keep the file
 current instead of leaving addresses scattered across per-run state files.
+
+## Contract invariant snapshots (Issue #1086)
+
+`deployments/invariants.json` is the **versioned** set of critical invariants
+that deployment smoke tests assert against. It is checked in alongside the
+manifests and registry so the invariant set evolves with the deployment
+process rather than living only inside test code.
+
+Each entry names the contract, the invariant `kind`, and the expected value:
+
+```json
+{
+  "version": 1,
+  "invariants": [
+    { "contract": "governance", "kind": "authorization", "name": "admin", "expected": "G..." },
+    { "contract": "fee_collector", "kind": "balance", "name": "fee_token", "expected": "0" },
+    { "contract": "oracle", "kind": "configuration", "name": "max_staleness", "expected": "300" },
+    { "contract": "stake_vault", "kind": "version", "name": "version", "expected": "1" }
+  ]
+}
+```
+
+Supported `kind` values are `authorization`, `balance`, `configuration`, and
+`version`. Bump `version` whenever the invariant set changes so a smoke-test
+run can be tied back to the deployment it validated.
+
+The smoke tests under `tests/smoke/` deploy the locally built WASM artifacts,
+read each invariant immediately after initialization and again after a
+representative mutation, and fail with a message that names both the violated
+invariant and the contract address, e.g.:
+
+```
+invariant violated: governance.authorization.admin (expected G..., got G...)
+  contract: C...
+```
+
+Run them against a local deployment with:
+
+```sh
+cargo test --test smoke -- --nocapture
+```
