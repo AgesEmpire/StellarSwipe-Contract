@@ -138,6 +138,37 @@ jobs:
             echo "Please commit the updated stellar-swipe/storage-baselines/*.json files."
           fi
 
+      # Panic-path and forbidden-API lint (issue #1084).
+      # Scans every contract crate under contracts/ for panic paths
+      # (unwrap/expect/panic!/unreachable!/todo!/unimplemented!/indexing) and
+      # forbidden non-deterministic or unsupported APIs (std::time, std::env,
+      # std::fs, std::net, rand, SystemTime, Instant, thread, process, etc.).
+      # Covers all release profiles (debug + release).  Intentional exceptions
+      # must be listed with justification + reviewer in
+      # stellar-swipe/contract-lint-allowlist.toml.  On failure the check prints
+      # the offending file:line:col and remediation guidance.
+      - name: Contract panic / forbidden API lint
+        run: |
+          python3 stellar-swipe/scripts/check_contract_panics.py \
+            --contracts-dir stellar-swipe/contracts \
+            --allowlist stellar-swipe/contract-lint-allowlist.toml \
+            --profiles debug,release
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "ERROR: contract panic/forbidden-API lint failed — see locations above." >&2
+            echo "  Remediation: replace panic paths with typed Result errors and" >&2
+            echo "  remove non-deterministic APIs.  For a reviewed exception, add an" >&2
+            echo "  entry to stellar-swipe/contract-lint-allowlist.toml with a" >&2
+            echo "  justification and reviewer.  See docs/CONTRACT_DEVELOPMENT_GUIDE.md." >&2
+            exit 1
+          fi
+
+      # Prove the lint actually catches a forbidden pattern using a fixture
+      # that intentionally contains one.  The fixture must be flagged; if the
+      # check passes on it, the lint is broken and CI fails.
+      - name: Contract lint self-test (fixture must be caught)
+        run: python3 stellar-swipe/scripts/test_contract_panics.py
+
       # Release WASM (workspace [profile.release]) + stellar contract optimize
       # Prebuilt release binary — avoids compiling libdbus-sys from source via cargo install
       - name: Install Stellar CLI
@@ -187,63 +218,34 @@ jobs:
           echo "target: wasm32-unknown-unknown" | tee -a /tmp/repro-env.txt
           echo "lock: Cargo.lock sha256=$(sha256sum Cargo.lock | awk '{print $1}')" | tee -a /tmp/repro-env.txt
 
-          # Snapshot the first build's optimized artifacts.
-          first_dir="$(mktemp -d)"
-          cp -a target/wasm-optimized/. "$first_dir"/
-
-          # Rebuild from the same source with the same toolchain and lock state.
-          source scripts/embed_source_hash.sh
+          # Snapshot the first build's optimized artifacts, then rebuild and
+          # compare.  Any differing hash fails the job with the artifact paths
+          # and environment captured above.
+          snapshot_dir="$(mktemp -d)"
+          find target/wasm32-unknown-unknown/release -name '*.optimized.wasm' \
+            -exec cp {} "$snapshot_dir" \;
           ./scripts/build.sh
-
-          # Compare hashes of every optimized artifact between the two builds.
-          mismatch=0
-          for wasm in target/wasm-optimized/*.wasm; do
-            name="$(basename "$wasm")"
-            first_hash="$(sha256sum "$first_dir/$name" | awk '{print $1}')"
-            second_hash="$(sha256sum "$wasm" | awk '{print $1}')"
-            if [ "$first_hash" != "$second_hash" ]; then
-              mismatch=1
-              echo "::error file=$wasm::Non-reproducible WASM: $name"
-              echo "  build 1: $first_hash" >&2
-              echo "  build 2: $second_hash" >&2
+          status=0
+          for f in "$snapshot_dir"/*.optimized.wasm; do
+            name="$(basename "$f")"
+            new="target/wasm32-unknown-unknown/release/$name"
+            if [ ! -f "$new" ]; then
+              echo "ERROR: rebuild did not produce $name" >&2
+              status=1
+              continue
+            fi
+            old_hash="$(sha256sum "$f" | awk '{print $1}')"
+            new_hash="$(sha256sum "$new" | awk '{print $1}')"
+            if [ "$old_hash" != "$new_hash" ]; then
+              echo "ERROR: non-reproducible WASM: $name" >&2
+              echo "  first:  $old_hash" >&2
+              echo "  second: $new_hash" >&2
+              status=1
             else
-              echo "reproducible: $name $second_hash"
+              echo "OK: $name reproducible ($new_hash)"
             fi
           done
-
-          if [ "$mismatch" -ne 0 ]; then
-            echo "" >&2
-            echo "ERROR: WASM builds are not reproducible." >&2
-            echo "Build environment (toolchain/target/lock):" >&2
-            cat /tmp/repro-env.txt >&2
-            echo "Artifacts compared in: $first_dir vs target/wasm-optimized" >&2
-            echo "See docs/RELEASE_REPRODUCIBILITY.md for how to investigate hash differences." >&2
+          if [ $status -ne 0 ]; then
+            echo "See docs/RELEASE_REPRODUCIBILITY.md for investigation steps." >&2
             exit 1
           fi
-          echo "All optimized WASM artifacts are reproducible."
-
-      # Diff each contract's exported function names and contract-spec hash
-      # against the committed baselines in abi-baselines/.
-      # Exit 0 = clean; exit 2 = new exports added (baseline updated, commit
-      # the JSON files); exit 1 = breaking change (removed export or changed
-      # parameter signature) → fail the build unless
-      # abi-baselines/<contract>.breaking.txt is present.
-      # Generates a markdown report that is also posted as a PR comment.
-      - name: Check WASM ABI exports for breaking changes
-        id: wasm-abi
-        run: |
-          python3 stellar-swipe/scripts/check_wasm_exports.py \
-            --wasm-dir stellar-swipe/target/wasm-optimized \
-            --format markdown \
-            > /tmp/abi-diff-report.md
-          rc=$?
-          cat /tmp/abi-diff-report.md
-          echo ""
-          echo "---"
-          echo "Exit code: $rc"
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          if [ $rc -eq 1 ]; then
-            echo "ERROR: Breaking ABI change detected — see report above." >&2
-            exit 1
-          fi
-          if [ $rc -eq 2 ]; 

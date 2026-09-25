@@ -2,7 +2,8 @@
 
 This guide covers building, testing, and releasing the Soroban smart contracts in
 this repository. It focuses on the release process and, in particular, on the
-WASM reproducibility check that gates every contract release.
+WASM reproducibility check that gates every contract release, and on the panic
+detection and forbidden API lint that gate every contract build.
 
 ## Toolchain
 
@@ -35,6 +36,73 @@ cargo build \
 
 The resulting artifact is written to
 `target/wasm32-unknown-unknown/release/<contract>.wasm`.
+
+## Panic detection and forbidden API lint
+
+Before a contract can be deployed, CI runs a static check that rejects panic
+paths and forbidden non-deterministic or unsupported APIs. The check covers
+**all contract crates** under `contracts/` and runs for **both the debug and
+release profiles**, so a forbidden pattern cannot slip through by only building
+one profile.
+
+### Forbidden patterns
+
+The check fails the build when a contract crate contains any of the following:
+
+- **Panic paths:** `panic!`, `unreachable!`, `todo!`, `unimplemented!`,
+  `assert!`, `assert_eq!`, `assert_ne!`, and `unwrap()` / `expect()` calls.
+  These abort the contract and are not recoverable on-chain.
+- **Non-deterministic APIs:** `std::time`, `SystemTime`, `Instant`,
+  `std::env::var`, `std::env::args`, `rand::`, and `getrandom::`. Contract
+  execution must be deterministic across validators.
+- **Unsupported APIs:** `std::fs`, `std::net`, `std::process`, `std::thread`,
+  and `std::io`. These are unavailable in the Soroban host environment.
+
+### Running the check locally
+
+Run the same check CI runs, for every contract crate and both profiles:
+
+```sh
+./scripts/check-contract-panics.sh
+```
+
+The script scans each crate under `contracts/` and reports every offending
+source location as `path:line: <pattern>`. It exits non-zero when any forbidden
+pattern is found.
+
+### Allowlist for intentional exceptions
+
+Intentional exceptions must be explicit and reviewed. Add an entry to
+`contracts/panic-allowlist.toml` with the source location, the pattern, and a
+justification plus the reviewer who approved it:
+
+```toml
+[[allow]]
+path = "contracts/signal_registry/src/lib.rs"
+pattern = "unwrap"
+justification = "Infallible: value is set immediately above."
+reviewer = "@maintainer"
+```
+
+Allowlist entries are reviewed like any other code change. An entry without a
+justification and reviewer is rejected by the check.
+
+### Test fixture
+
+The check is itself tested by a fixture that intentionally contains a forbidden
+pattern (`contracts/test-fixtures/panic-fixture/src/lib.rs`). The fixture test
+asserts that the check **fails** on the fixture, proving the check catches a
+forbidden pattern rather than silently passing.
+
+### CI behavior
+
+When the check fails, CI reports, for each violation:
+
+- the offending **source location** (`path:line`),
+- the **pattern** that matched,
+- **remediation guidance** pointing back to this section.
+
+A panic path or forbidden API is treated as a release blocker.
 
 ## Reproducibility check
 
