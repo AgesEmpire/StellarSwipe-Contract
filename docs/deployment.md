@@ -25,6 +25,64 @@ cd stellar-swipe
 cargo build --workspace --target wasm32-unknown-unknown --release
 ```
 
+## WASM Reproducibility Check
+
+Contract releases must be reproducible: building the same source with the same
+toolchain and locked dependencies must produce byte-identical WASM hashes. The
+release check builds each contract WASM twice and fails if the hashes differ.
+
+Run the check locally before tagging a release:
+
+```bash
+./scripts/check_wasm_reproducibility.sh
+```
+
+The script captures the build context so a failing run is actionable:
+
+- **Toolchain:** `rustc --version` and the active `rust-toolchain.toml` channel
+- **Target:** `wasm32-unknown-unknown`
+- **Lock state:** `Cargo.lock` hash (dependencies must be committed and locked)
+
+On success it prints the matching hash for each contract. On failure it exits
+non-zero and prints the two differing hashes, the artifact paths, and the
+toolchain/lock info above so CI fails with a clear diagnostic.
+
+### Investigating Hash Differences
+
+If the reproducibility check reports differing hashes:
+
+1) Confirm the toolchain matches the release toolchain:
+
+```bash
+rustc --version
+cat rust-toolchain.toml
+```
+
+2) Confirm dependencies are locked and unchanged:
+
+```bash
+git status --porcelain Cargo.lock
+sha256sum Cargo.lock
+```
+
+3) Rebuild cleanly and compare hashes manually:
+
+```bash
+cargo clean
+cargo build --workspace --target wasm32-unknown-unknown --release
+sha256sum target/wasm32-unknown-unknown/release/*.wasm
+```
+
+4) Common causes of non-reproducible output:
+
+- A different `rustc`/toolchain version than the release toolchain.
+- An unlocked or locally modified `Cargo.lock`.
+- Absolute paths or timestamps embedded by a build script.
+- Non-deterministic codegen from an unpinned dependency.
+
+Fix the cause, re-run `./scripts/check_wasm_reproducibility.sh`, and only then
+proceed with deployment.
+
 ## Testnet Deployment (Step-by-Step)
 
 1) Set deployment environment variables:
@@ -139,3 +197,4 @@ Before merge/release, confirm:
 - [ ] A new contributor successfully deployed to testnet using only this guide.
 - [ ] Mainnet section security warnings were reviewed and acknowledged.
 - [ ] Test deployment feedback is included in the PR description/comments.
+- [ ] `./scripts/check_wasm_reproducibility.sh` passes with identical hashes.
