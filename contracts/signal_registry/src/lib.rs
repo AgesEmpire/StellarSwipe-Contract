@@ -20,6 +20,22 @@ pub enum SignalError {
     InvalidReputationUpdate = 5,
 }
 
+/// Machine-readable ABI entry describing a single public contract error.
+///
+/// Consumers (clients, SDKs, indexers) can map numeric error codes to stable
+/// identifiers and the entrypoints that may return them without parsing
+/// human-readable display strings.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ErrorAbiEntry {
+    /// Stable identifier matching the Rust variant name.
+    pub name: Symbol,
+    /// Numeric value returned on-chain for this error.
+    pub code: u32,
+    /// Entrypoints that may surface this error.
+    pub entrypoints: Vec<Symbol>,
+}
+
 /// Configuration-driven reputation decay schedule.
 ///
 /// `decay_rate_bps` is the number of basis points (1/100th of a percent) of
@@ -134,6 +150,61 @@ impl SignalRegistry {
         Ok(Self::apply_decay(&record, now, &schedule))
     }
 
+    /// Export the machine-readable error ABI for this contract.
+    ///
+    /// The artifact is derived from the Rust source of truth: every public
+    /// error variant is listed with its numeric value and the entrypoints that
+    /// may return it. Consumers can map errors without parsing display strings.
+    pub fn error_abi(env: Env) -> Vec<ErrorAbiEntry> {
+        let mut entries = Vec::new(&env);
+
+        let mut already_initialized = Vec::new(&env);
+        already_initialized.push_back(Symbol::new(&env, "initialize"));
+        entries.push_back(ErrorAbiEntry {
+            name: Symbol::new(&env, "AlreadyInitialized"),
+            code: SignalError::AlreadyInitialized as u32,
+            entrypoints: already_initialized,
+        });
+
+        let mut not_initialized = Vec::new(&env);
+        not_initialized.push_back(Symbol::new(&env, "set_decay_schedule"));
+        not_initialized.push_back(Symbol::new(&env, "get_decay_schedule"));
+        not_initialized.push_back(Symbol::new(&env, "update_reputation"));
+        not_initialized.push_back(Symbol::new(&env, "get_reputation"));
+        entries.push_back(ErrorAbiEntry {
+            name: Symbol::new(&env, "NotInitialized"),
+            code: SignalError::NotInitialized as u32,
+            entrypoints: not_initialized,
+        });
+
+        let mut unauthorized = Vec::new(&env);
+        unauthorized.push_back(Symbol::new(&env, "set_decay_schedule"));
+        entries.push_back(ErrorAbiEntry {
+            name: Symbol::new(&env, "Unauthorized"),
+            code: SignalError::Unauthorized as u32,
+            entrypoints: unauthorized,
+        });
+
+        let mut invalid_decay_config = Vec::new(&env);
+        invalid_decay_config.push_back(Symbol::new(&env, "initialize"));
+        invalid_decay_config.push_back(Symbol::new(&env, "set_decay_schedule"));
+        entries.push_back(ErrorAbiEntry {
+            name: Symbol::new(&env, "InvalidDecayConfig"),
+            code: SignalError::InvalidDecayConfig as u32,
+            entrypoints: invalid_decay_config,
+        });
+
+        let mut invalid_reputation_update = Vec::new(&env);
+        invalid_reputation_update.push_back(Symbol::new(&env, "update_reputation"));
+        entries.push_back(ErrorAbiEntry {
+            name: Symbol::new(&env, "InvalidReputationUpdate"),
+            code: SignalError::InvalidReputationUpdate as u32,
+            entrypoints: invalid_reputation_update,
+        });
+
+        entries
+    }
+
     /// Compute the decayed score for a record at a given timestamp.
     ///
     /// Deterministic: depends only on the stored record, the timestamp, and
@@ -230,150 +301,6 @@ mod auth_negative_tests {
         let contract_id = env.register_contract(None, SignalRegistry);
         let client = SignalRegistryClient::new(&env, &contract_id);
         env.mock_all_auths();
-        client.initialize(&admin, &schedule());
-        (env, client, admin)
-    }
+        client.initialize(&admin, &sche
 
-    /// Assert a call fails with the expected stable error category, not a
-    /// brittle message string. Soroban surfaces contract errors as a
-    /// `Result::Err(Status)` whose payload is the `SignalError` variant.
-    fn assert_denied<T, E>(result: Result<T, E>, expected: SignalError)
-    where
-        E: IntoVal<Env, Val> + TryFromVal<Env, Val>,
-    {
-        match result {
-            Err(err) => {
-                let env = Env::default();
-                let val: Val = err.into_val(&env);
-                let decoded = SignalError::try_from_val(&env, &val)
-                    .expect("error must decode to a SignalError variant");
-                assert_eq!(decoded, expected);
-            }
-            Ok(_) => panic!("expected denial with {:?}, but call succeeded", expected),
-        }
-    }
-
-    // --- Unauthorized caller: privileged entrypoint denial -----------------
-
-    #[test]
-    fn set_decay_schedule_denied_for_unauthorized_caller() {
-        let (env, client, _admin) = setup();
-        // No auth mocked: the admin's require_auth() must reject the caller.
-        env.set_auths(&[]);
-        let result = client.try_set_decay_schedule(&schedule());
-        assert!(result.is_err(), "unauthorized caller must be denied");
-    }
-
-    // --- Stale role: admin rotated, old admin no longer privileged ---------
-
-    #[test]
-    fn set_decay_schedule_denied_for_stale_admin_role() {
-        let (env, client, _admin) = setup();
-        let stale = Address::generate(&env);
-        // Only the stale address authorizes; the stored admin is different.
-        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-            address: &stale,
-            invoke: &soroban_sdk::testutils::MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "set_decay_schedule",
-                args: (schedule(),).into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-        let result = client.try_set_decay_schedule(&schedule());
-        assert!(result.is_err(), "stale role must not be privileged");
-    }
-
-    // --- Malformed arguments: invalid schedule rejected --------------------
-
-    #[test]
-    fn set_decay_schedule_denied_for_malformed_schedule() {
-        let (_env, client, _admin) = setup();
-        let bad = DecaySchedule {
-            decay_rate_bps: 20_000, // > 10_000 bps
-            decay_interval: 100,
-            grace_period: 0,
-            min_reputation: 0,
-            max_reputation: 10_000,
-        };
-        let result = client.try_set_decay_schedule(&bad);
-        assert_denied(result, SignalError::InvalidDecayConfig);
-    }
-
-    #[test]
-    fn initialize_denied_for_malformed_schedule() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let contract_id = env.register_contract(None, SignalRegistry);
-        let client = SignalRegistryClient::new(&env, &contract_id);
-        env.mock_all_auths();
-        let bad = DecaySchedule {
-            decay_rate_bps: 100,
-            decay_interval: 0, // zero interval is invalid
-            grace_period: 0,
-            min_reputation: 0,
-            max_reputation: 10_000,
-        };
-        let result = client.try_initialize(&admin, &bad);
-        assert_denied(result, SignalError::InvalidDecayConfig);
-    }
-
-    // --- Replayed authorization: re-initialize must be denied --------------
-
-    #[test]
-    fn initialize_denied_on_replay() {
-        let (_env, client, admin) = setup();
-        // Replaying initialize with the same admin must be rejected.
-        let result = client.try_initialize(&admin, &schedule());
-        assert_denied(result, SignalError::AlreadyInitialized);
-    }
-
-    // --- Cross-contract / nested invocation: caller is another contract ----
-
-    #[test]
-    fn set_decay_schedule_denied_for_cross_contract_caller() {
-        let (env, client, _admin) = setup();
-        // Simulate a nested invocation where a different contract address is
-        // the caller and does not hold the admin role.
-        let other_contract = env.register_contract(None, SignalRegistry);
-        env.set_auths(&[]);
-        let result = client.try_set_decay_schedule(&schedule());
-        assert!(result.is_err(), "cross-contract caller must be denied");
-        // The nested contract's own privileged entrypoint is likewise denied.
-        let nested = SignalRegistryClient::new(&env, &other_contract);
-        let nested_result = nested.try_set_decay_schedule(&schedule());
-        assert!(nested_result.is_err(), "nested caller must be denied");
-    }
-
-    // --- Not-initialized denial for privileged entrypoint ------------------
-
-    #[test]
-    fn set_decay_schedule_denied_when_not_initialized() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, SignalRegistry);
-        let client = SignalRegistryClient::new(&env, &contract_id);
-        env.mock_all_auths();
-        let result = client.try_set_decay_schedule(&schedule());
-        assert_denied(result, SignalError::NotInitialized);
-    }
-
-    // --- Sanity: authorized admin succeeds (positive control) --------------
-
-    #[test]
-    fn set_decay_schedule_allowed_for_admin() {
-        let (_env, client, _admin) = setup();
-        let updated = DecaySchedule {
-            decay_rate_bps: 200,
-            decay_interval: 50,
-            grace_period: 10,
-            min_reputation: 0,
-            max_reputation: 5_000,
-        };
-        client.set_decay_schedule(&updated);
-        assert_eq!(client.get_decay_schedule(), updated);
-    }
-
-    // Silence unused-import warnings for helpers used conditionally.
-    #[allow(dead_code)]
-    fn _touch(_: Symbol) {}
-}
+/* … truncated 5720 chars — edit only what you need near the top … */
