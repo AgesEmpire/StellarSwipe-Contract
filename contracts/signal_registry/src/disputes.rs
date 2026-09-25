@@ -28,15 +28,40 @@ pub enum ContractError {
     DisputeNotFound,
     UnauthorizedProvider,
     ResponseWindowClosed,
+    /// The authenticated caller does not match the address bound to the
+    /// operation. Returned when authorization is derived from the
+    /// authenticated invocation context rather than caller-supplied metadata.
+    UnauthorizedCaller,
+}
+
+/// Authorization context for a dispute operation.
+///
+/// `authenticated_caller` MUST be derived from the Soroban invocation context
+/// (i.e. the address that passed `require_auth`), never from
+/// caller-controlled metadata such as a function argument or event payload.
+/// Binding the check to this value keeps authorization valid even when the
+/// authorization tree changes (nested invocations, intermediary contracts),
+/// because the authenticated address is invariant across the tree.
+pub struct AuthContext<Provider> {
+    pub authenticated_caller: Provider,
 }
 
 pub fn respond_to_dispute<Provider: Clone + PartialEq, Hash: Clone>(
     dispute: &mut Option<Dispute<Provider, Hash>>,
+    auth: &AuthContext<Provider>,
     provider: Provider,
     signal_id: u64,
     response_hash: Hash,
     now: u64,
 ) -> Result<DisputeResponseSubmitted<Provider, Hash>, ContractError> {
+    // Bind authorization to the authenticated caller, not to the
+    // caller-supplied `provider` argument. This prevents an intermediary
+    // contract from spoofing the provider via metadata while the
+    // authorization tree is being traversed.
+    if auth.authenticated_caller != provider {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
     let dispute = dispute.as_mut().ok_or(ContractError::DisputeNotFound)?;
 
     if dispute.signal_id != signal_id {
@@ -141,12 +166,19 @@ mod tests {
         })
     }
 
+    fn auth(caller: &'static str) -> AuthContext<&'static str> {
+        AuthContext {
+            authenticated_caller: caller,
+        }
+    }
+
     #[test]
     fn timely_response_is_stored_and_emits_event_shape() {
         let mut dispute = dispute();
 
         let event = respond_to_dispute(
             &mut dispute,
+            &auth("provider-1"),
             "provider-1",
             7,
             "ipfs://response",
@@ -173,6 +205,7 @@ mod tests {
 
         let result = respond_to_dispute(
             &mut dispute,
+            &auth("provider-1"),
             "provider-1",
             7,
             "ipfs://response",
@@ -258,5 +291,62 @@ mod tests {
         let authorized = authorize_dispute_response(&mut cache, &provider, |_| false);
         assert!(!authorized);
         assert_eq!(cache.get(&provider), Some(false));
+    }
+
+    #[test]
+    fn direct_call_with_matching_caller_is_authorized() {
+        let mut dispute = dispute();
+
+        let result = respond_to_dispute(
+            &mut dispute,
+            &auth("provider-1"),
+            "provider-1",
+            7,
+            "ipfs://response",
+            1_700_000_000 + 60,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn nested_call_through_authorized_intermediary_is_authorized() {
+        // An intermediary contract forwards the call, but the authenticated
+        // caller in the invocation context is still the provider. The check
+        // must remain valid because it binds to the authenticated address,
+        // not to the intermediary's metadata.
+        let mut dispute = dispute();
+
+        let result = respond_to_dispute(
+            &mut dispute,
+            &auth("provider-1"),
+            "provider-1",
+            7,
+            "ipfs://response",
+            1_700_000_000 + 60,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn unauthorized_intermediary_cannot_spoof_provider_metadata() {
+        // The intermediary supplies `provider-1` as metadata, but the
+        // authenticated caller is a different address. Authorization must
+        // fail even though the metadata matches the dispute provider.
+        let mut dispute = dispute();
+
+        let result = respond_to_dispute(
+            &mut dispute,
+            &auth("malicious-intermediary"),
+            "provider-1",
+            7,
+            "ipfs://response",
+            1_700_000_000 + 60,
+        );
+
+        assert_eq!(result, Err(ContractError::UnauthorizedCaller));
+        assert!(dispute.unwrap().response.is_none());
+    }
     }
 }

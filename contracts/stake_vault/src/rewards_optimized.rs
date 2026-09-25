@@ -83,6 +83,50 @@ pub struct VestingRelease {
     pub remaining_locked: i128,
 }
 
+/// A reconciliation checkpoint capturing the reward state of the stake vault
+/// at a point in time.
+///
+/// The checkpoint records the accumulated deposits, the elapsed time since the
+/// vault started accruing, and the total amount distributed so far. Comparing
+/// consecutive checkpoints (or a checkpoint against live pool state) lets
+/// callers diagnose reward drift.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RewardCheckpoint {
+    /// Total rewards deposited into the vault up to this checkpoint.
+    pub total_deposits: i128,
+    /// Unix timestamp (seconds) at which this checkpoint was taken.
+    pub timestamp: u64,
+    /// Seconds elapsed since the vault began accruing rewards.
+    pub elapsed_time: u64,
+    /// Total rewards distributed (claimed) up to this checkpoint.
+    pub total_distributed: i128,
+    /// Rewards accrued but not yet distributed at this checkpoint.
+    pub pending_rewards: i128,
+}
+
+/// The kind of drift detected during reconciliation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RewardDrift {
+    /// Rewards that should have been distributed are missing.
+    Missing,
+    /// Rewards were distributed more than once.
+    Duplicated,
+    /// More rewards were distributed than were ever deposited/accrued.
+    Excess,
+}
+
+/// Result of reconciling a checkpoint against expected reward state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReconciliationResult {
+    /// Whether the checkpoint is consistent with the expected state.
+    pub balanced: bool,
+    /// The signed drift amount (expected - actual). Positive means rewards are
+    /// missing; negative means excess rewards were distributed.
+    pub drift: i128,
+    /// The specific drift categories detected.
+    pub drifts: Vec<RewardDrift>,
+}
+
 /// Create a new vesting schedule for a provider's rewards.
 ///
 /// `duration` of zero means the full amount is immediately vested.
@@ -159,6 +203,67 @@ pub fn release_vested_rewards(
     VestingRelease {
         released: claimable,
         remaining_locked: unvested_amount(schedule, current_time),
+    }
+}
+
+/// Build a reconciliation checkpoint from the current pool state.
+///
+/// The checkpoint captures accumulated deposits, elapsed time since the vault
+/// started accruing, and the total distributed amount so drift can be
+/// diagnosed later.
+pub fn create_reward_checkpoint(
+    pool: &RewardsPool,
+    total_deposits: i128,
+    start_time: u64,
+    current_time: u64,
+) -> RewardCheckpoint {
+    let elapsed_time = current_time.saturating_sub(start_time);
+    let pending_rewards = total_deposits
+        .saturating_sub(pool.total_distributed)
+        .max(0);
+
+    RewardCheckpoint {
+        total_deposits,
+        timestamp: current_time,
+        elapsed_time,
+        total_distributed: pool.total_distributed,
+        pending_rewards,
+    }
+}
+
+/// Reconcile a checkpoint against the expected reward state.
+///
+/// `expected_distributed` is the amount that should have been distributed given
+/// the accumulated deposits and elapsed time. The function detects:
+/// - missing rewards (expected > actual),
+/// - duplicated rewards (actual exceeds the expected distribution for the
+///   elapsed time while deposits still cover it),
+/// - excess rewards (actual distributed exceeds total deposits).
+pub fn reconcile_reward_checkpoint(
+    checkpoint: &RewardCheckpoint,
+    expected_distributed: i128,
+) -> ReconciliationResult {
+    let actual = checkpoint.total_distributed;
+    let mut drifts = Vec::new();
+
+    if actual > checkpoint.total_deposits {
+        drifts.push(RewardDrift::Excess);
+    }
+
+    if actual > expected_distributed && actual <= checkpoint.total_deposits {
+        drifts.push(RewardDrift::Duplicated);
+    }
+
+    if actual < expected_distributed {
+        drifts.push(RewardDrift::Missing);
+    }
+
+    let drift = expected_distributed.saturating_sub(actual);
+
+    ReconciliationResult {
+        balanced: drifts.is_empty(),
+        drift,
+        drifts,
     }
 }
 
@@ -249,130 +354,6 @@ pub fn batch_claim_rewards<User: Clone>(
     let total_needed: i128 = accruals.iter().map(|a| a.accrued_amount).sum();
 
     if pool.balance < total_needed {
-        // Try to refill from treasury
-        let needed = total_needed - pool.balance;
-        let available = needed.min(pool.treasury_balance);
-        pool.balance += available;
-        pool.treasury_balance -= available;
+        // Try to r
 
-        if pool.balance < total_needed {
-            return Err("Insufficient pool balance");
-        }
-    }
-
-    // Process all claims
-    for accrual in accruals.iter_mut() {
-        if accrual.accrued_amount > 0 {
-            let claim_amount = accrual.accrued_amount;
-            pool.balance -= claim_amount;
-            pool.total_distributed += claim_amount;
-            total_claimed += claim_amount;
-
-            claims.push(ClaimResult {
-                user: accrual.user.clone(),
-                amount: claim_amount,
-            });
-
-            accrual.accrued_amount = 0;
-        }
-    }
-
-    // Calculate gas savings (batch processing saves ~40% for multiple claims)
-    let gas_saved = if claims.len() > 1 {
-        40
-    } else {
-        0
-    };
-
-    Ok(BatchClaimResult {
-        claims,
-        total_claimed,
-        gas_saved_percentage: gas_saved,
-    })
-}
-
-/// Optimize reward distribution by consolidating small claims
-/// Prevents gas waste on micro-transactions
-pub fn should_claim(accrued_amount: i128, min_claim_threshold: i128) -> bool {
-    accrued_amount >= min_claim_threshold
-}
-
-/// Calculate optimal claim timing based on gas costs
-/// Returns recommended wait time in seconds
-pub fn calculate_optimal_claim_time(
-    accrued_amount: i128,
-    accrual_rate_per_second: i128,
-    gas_price: u64,
-    min_profitable_amount: i128,
-) -> u64 {
-    if accrued_amount >= min_profitable_amount {
-        return 0; // Claim now
-    }
-
-    let needed = min_profitable_amount - accrued_amount;
-    if accrual_rate_per_second == 0 {
-        return u64::MAX; // Never profitable
-    }
-
-    (needed / accrual_rate_per_second) as u64
-}
-
-/// Manage reserve with predictive refilling
-/// Maintains optimal buffer to minimize treasury access
-pub fn optimize_reserve_management(
-    pool: &mut RewardsPool,
-    predicted_daily_outflow: i128,
-) -> i128 {
-    let target_reserve = predicted_daily_outflow * OPTIMAL_RESERVE_DAYS as i128;
-    let current_reserve = pool.balance;
-
-    if current_reserve >= target_reserve {
-        return 0; // No action needed
-    }
-
-    let needed = target_reserve - current_reserve;
-    let available = needed.min(pool.treasury_balance);
-
-    pool.balance += available;
-    pool.treasury_balance -= available;
-
-    available
-}
-
-/// Calculate distribution efficiency metrics
-pub fn calculate_distribution_metrics(
-    pool: &RewardsPool,
-    total_claims: u32,
-    total_gas_used: u64,
-    reserve_hits: u32,
-) -> OptimizedDistributionMetrics {
-    let average_claim = if total_claims > 0 {
-        pool.total_distributed / total_claims as i128
-    } else {
-        0
-    };
-
-    let baseline_gas = total_claims as u64 * 100_000; // Baseline gas per claim
-    let gas_saved = baseline_gas.saturating_sub(total_gas_used);
-
-    let batch_efficiency = if total_claims > 1 {
-        ((gas_saved * 100) / baseline_gas) as u32
-    } else {
-        0
-    };
-
-    let reserve_hit_rate = if total_claims > 0 {
-        (reserve_hits * 100) / total_claims
-    } else {
-        0
-    };
-
-    OptimizedDistributionMetrics {
-        total_gas_saved: gas_saved,
-        batch_efficiency,
-        average_claim_size: average_claim,
-        reserve_hit_rate,
-    }
-}
-
-fn estimate
+/* … truncated 3421 chars — edit only what you need near the top … */

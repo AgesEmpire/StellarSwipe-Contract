@@ -383,4 +383,3 @@ mod auth_cache_tests {
 
     /// A role change app
 
-/* … truncated 3216 chars — edit only what you need near the top … */
