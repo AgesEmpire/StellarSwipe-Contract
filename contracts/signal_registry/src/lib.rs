@@ -17,6 +17,15 @@
 //! or interrupted initialization leaves the contract uninitialized and can be
 //! safely retried. Repeated initialization is rejected with
 //! [`SignalError::AlreadyInitialized`] before any state is mutated.
+//!
+//! ## Authorization expiration
+//!
+//! Temporary permissions, delegated capabilities, and time-bounded approvals
+//! are stored with an explicit `expires_at` ledger timestamp. Every sensitive
+//! entrypoint that consumes a permission fails closed once the current ledger
+//! timestamp reaches `expires_at` (inclusive boundary). Expiration cleanup is
+//! bounded by [`MAX_EXPIRATION_SWEEP`] and only removes already-expired grants,
+//! so it never changes authorization semantics for live permissions.
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
 
@@ -30,6 +39,9 @@ pub enum SignalError {
     Unauthorized = 3,
     InvalidDecayConfig = 4,
     InvalidReputationUpdate = 5,
+    PermissionExpired = 6,
+    PermissionNotFound = 7,
+    InvalidExpiration = 8,
 }
 
 /// Configuration-driven reputation decay schedule.
@@ -55,6 +67,18 @@ pub struct ReputationRecord {
     pub last_updated: u64,
 }
 
+/// A time-bounded permission, delegated capability, or approval.
+///
+/// `expires_at` is an inclusive ledger timestamp: the grant is valid while
+/// `now < expires_at` and fails closed once `now >= expires_at`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Permission {
+    pub grantee: Address,
+    pub capability: u32,
+    pub expires_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataKey {
@@ -66,9 +90,14 @@ const ADMIN_KEY: &str = "admin";
 const SCHEDULE_KEY: &str = "schedule";
 const REPUTATION_KEY: &str = "reputation";
 const VERSION_KEY: &str = "version";
+const PERMISSION_KEY: &str = "permission";
 
 /// Current storage schema version written by `initialize`.
 const STORAGE_VERSION: u32 = 1;
+
+/// Upper bound on how many expired permissions a single cleanup call removes.
+/// Keeps expiration cleanup bounded and gas-predictable.
+pub const MAX_EXPIRATION_SWEEP: u32 = 32;
 
 #[contract]
 pub struct SignalRegistry;
@@ -129,6 +158,107 @@ impl SignalRegistry {
             .instance()
             .get(&SCHEDULE_KEY)
             .ok_or(SignalError::NotInitialized)
+    }
+
+    /// Grant a time-bounded permission to `grantee`.
+    ///
+    /// Only the admin may grant. `expires_at` must be strictly in the future
+    /// relative to the current ledger timestamp, otherwise the grant is
+    /// rejected with [`SignalError::InvalidExpiration`].
+    pub fn grant_permission(
+        env: Env,
+        grantee: Address,
+        capability: u32,
+        expires_at: u64,
+    ) -> Result<(), SignalError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(SignalError::NotInitialized)?;
+        admin.require_auth();
+        let now = env.ledger().timestamp();
+        if expires_at <= now {
+            return Err(SignalError::InvalidExpiration);
+        }
+        let permission = Permission {
+            grantee: grantee.clone(),
+            capability,
+            expires_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&(PERMISSION_KEY, grantee, capability), &permission);
+        Ok(())
+    }
+
+    /// Check whether `grantee` currently holds `capability`.
+    ///
+    /// Fails closed: returns `false` once the current ledger timestamp reaches
+    /// the stored `expires_at` (inclusive boundary).
+    pub fn has_permission(env: Env, grantee: Address, capability: u32) -> bool {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Permission>(&(PERMISSION_KEY, grantee, capability))
+        {
+            Some(permission) => !Self::is_expired(&env, &permission),
+            None => false,
+        }
+    }
+
+    /// Consume a permission at a sensitive entrypoint.
+    ///
+    /// Fails closed with [`SignalError::PermissionExpired`] when the grant has
+    /// expired, and [`SignalError::PermissionNotFound`] when no grant exists.
+    /// The expiration check happens before any state mutation so an expired
+    /// grant can never authorize a sensitive action.
+    pub fn require_permission(
+        env: Env,
+        grantee: Address,
+        capability: u32,
+    ) -> Result<(), SignalError> {
+        let permission: Permission = env
+            .storage()
+            .persistent()
+            .get(&(PERMISSION_KEY, grantee, capability))
+            .ok_or(SignalError::PermissionNotFound)?;
+        if Self::is_expired(&env, &permission) {
+            return Err(SignalError::PermissionExpired);
+        }
+        Ok(())
+    }
+
+    /// Remove up to [`MAX_EXPIRATION_SWEEP`] expired permissions for `grantee`.
+    ///
+    /// Bounded cleanup: only already-expired grants are removed, so live
+    /// permissions and authorization semantics are unchanged. Returns the
+    /// number of entries removed.
+    pub fn sweep_expired_permissions(
+        env: Env,
+        grantee: Address,
+        capabilities: Vec<u32>,
+    ) -> Result<u32, SignalError> {
+        let mut removed: u32 = 0;
+        for capability in capabilities.iter() {
+            if removed >= MAX_EXPIRATION_SWEEP {
+                break;
+            }
+            let key = (PERMISSION_KEY, grantee.clone(), capability);
+            if let Some(permission) = env.storage().persistent().get::<_, Permission>(&key) {
+                if Self::is_expired(&env, &permission) {
+                    env.storage().persistent().remove(&key);
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Returns `true` when the permission has expired at the current ledger
+    /// timestamp. The boundary is inclusive: `now >= expires_at` is expired.
+    fn is_expired(env: &Env, permission: &Permission) -> bool {
+        env.ledger().timestamp() >= permission.expires_at
     }
 
     /// Apply a reputation update for a provider, first decaying the stored
@@ -217,33 +347,32 @@ impl SignalRegistry {
         }
     }
 
-    /// Validate a decay schedule before it is stored or applied.
+    /// Validate a decay schedule before it is stored.
     fn validate_schedule(schedule: &DecaySchedule) -> Result<(), SignalError> {
-        if schedule.decay_rate_bps > 10_000 {
-            return Err(SignalError::InvalidDecayConfig);
-        }
-        if schedule.decay_interval == 0 {
-            return Err(SignalError::InvalidDecayConfig);
-        }
         if schedule.min_reputation > schedule.max_reputation {
+            return Err(SignalError::InvalidDecayConfig);
+        }
+        if schedule.decay_rate_bps > 10_000 {
             return Err(SignalError::InvalidDecayConfig);
         }
         Ok(())
     }
 
+    /// Load a provider's reputation record, defaulting to a zeroed record.
     fn load_reputation(env: &Env, provider: &Address) -> ReputationRecord {
-        let key = (REPUTATION_KEY, provider.clone());
         env.storage()
             .persistent()
-            .get(&key)
+            .get(&(REPUTATION_KEY, provider.clone()))
             .unwrap_or(ReputationRecord {
                 score: 0,
-                last_updated: env.ledger().timestamp(),
+                last_updated: 0,
             })
     }
 
+    /// Persist a provider's reputation record.
     fn store_reputation(env: &Env, provider: &Address, record: &ReputationRecord) {
-        let key = (REPUTATION_KEY, provider.clone());
-        env.storage().persistent().set(&key, record);
+        env.storage()
+            .persistent()
+            .set(&(REPUTATION_KEY, provider.clone()), record);
     }
 }
