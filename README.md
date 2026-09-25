@@ -2,6 +2,8 @@
 
 ## Handsoff notes
 
+<!-- handsoff-issue-1101 -->
+- #1101: Invalidate cached token metadata after asset configuration changes
 <!-- handsoff-issue-1088 -->
 - #1088: Add Soroban contract reentrancy fixture harness
 <!-- handsoff-issue-1074 -->
