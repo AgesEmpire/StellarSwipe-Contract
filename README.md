@@ -10,3 +10,6 @@
 - #1074: Add storage footprint growth regression tests
 <!-- handsoff-issue-949 -->
 - #949: Add provider churn risk score integration test covering all risk factors in analytics
+
+<!-- handsoff-issue-956 -->
+- #956: Add slash cooldown window to prevent repeated slashing of same provider in stake_vault
