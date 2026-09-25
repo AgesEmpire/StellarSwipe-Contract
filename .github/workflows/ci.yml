@@ -71,6 +71,19 @@ jobs:
       - name: Tests
         run: cd stellar-swipe && cargo test --workspace --all-targets
 
+      # WASM memory allocation regression tests (issue #1116).
+      # Measures heap allocation for representative high-volume entrypoints in
+      # the core contracts and compares against the documented budget in
+      # stellar-swipe/allocation-baselines/budget.json.  Runs deterministically
+      # on the supported Soroban toolchain (wasm32-unknown-unknown).
+      - name: WASM memory allocation regression tests
+        run: |
+          cd stellar-swipe
+          cargo test -p batch_processor -p liquidity_pool -p rewards -p withdrawal_queue \
+            --features allocation-tests -- --nocapture
+          python3 scripts/check_allocation_budget.py \
+            --baseline-dir allocation-baselines
+
       - name: Reward conservation regression tests
         run: cd scripts && npx tsx --test reward_conservation.test.ts
 
@@ -159,6 +172,29 @@ jobs:
             echo "Please commit the updated stellar-swipe/storage-baselines/*.json files."
           fi
 
+      # Enforce the contract interface semver compatibility policy (issue #1094).
+      # Classifies public entrypoints, argument/return types, events, errors,
+      # and storage schemas as breaking vs non-breaking against the prior
+      # release baseline.  Exit 0 = compatible; exit 1 = unsupported breaking
+      # change (requires a major version bump + compatibility review);
+      # exit 2 = new interface surface added (baseline updated, commit the
+      # JSON files).
+      - name: Check contract interface semver compatibility
+        run: |
+          python3 stellar-swipe/scripts/check_interface_semver.py \
+            --baseline-dir stellar-swipe/interface-baselines
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: Unsupported breaking interface change detected — see output above." >&2
+            echo "  Breaking changes require a major version bump and the" >&2
+            echo "  compatibility review checklist in docs/INTERFACE_SEMVER.md." >&2
+            exit 1
+          fi
+          if [ $rc -eq 2 ]; then
+            echo "INFO: New interface surface detected; baseline files updated."
+            echo "Please commit the updated stellar-swipe/interface-baselines/*.json files."
+          fi
+
       # Release WASM (workspace [profile.release]) + stellar contract optimize
       # Prebuilt release binary — avoids compiling libdbus-sys from source via cargo install
       - name: Install Stellar CLI
@@ -184,7 +220,7 @@ jobs:
           source scripts/embed_source_hash.sh
           ./scripts/build.sh
           if [[ -z "${STELLAR_SOURCE_HASH:-}" ]]; then
-            echo "error: STELLAR_SOURCE_HASH was not set — release aborted." >&2
+            echo "error: STELLAR_SOURCE_HASH is empty" >&2
             exit 1
           fi
           echo "Embedded SourceHash: $STELLAR_SOURCE_HASH"
