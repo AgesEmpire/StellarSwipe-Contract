@@ -101,7 +101,7 @@ pub enum SignalError {
     Unauthorized = 3,
     InvalidDecayConfig = 4,
     InvalidReputationUpdate = 5,
-    InvalidTtlConfig = 6,
+    InvalidCleanupLimit = 6,
     /// The supplied address is malformed or of an unsupported type.
     InvalidAddress = 7,
     /// An event payload exceeded the configured size limits. Returned before
@@ -272,6 +272,20 @@ pub struct DataKey {
     pub schedule: DecaySchedule,
 }
 
+/// Summary of a bounded cleanup run.
+///
+/// `removed` counts records that were eligible and deleted during this call.
+/// `skipped` counts records that were inspected but not eligible (still live
+/// or otherwise not orphaned). `scanned` is the total number of records
+/// inspected, bounded by the caller-supplied maximum.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupReport {
+    pub scanned: u32,
+    pub removed: u32,
+    pub skipped: u32,
+}
+
 /// Namespaced storage keys. Each variant maps to a distinct namespace prefix
 /// so keys from different state domains cannot collide.
 const ADMIN_KEY: &str = "cfg:admin";
@@ -282,6 +296,8 @@ const PENDING_HANDOFF_KEY: &str = "cfg:pending_handoff";
 const VERSION_KEY: &str = "cfg:version";
 const PERMISSION_KEY: &str = "perm:permission";
 const NONCE_KEY: &str = "nonce:nonce";
+const OWNER_KEY: &str = "owner";
+const RELATIONSHIP_KEY: &str = "relationship";
 
 /// Legacy (pre-namespace) keys, retained only for the explicit migration path.
 const LEGACY_ADMIN_KEY: &str = "admin";
@@ -628,6 +644,113 @@ impl SignalRegistry {
 
     /// Read the current (decayed) reputation for a provider without mutating
     /// state. Useful for off-chain 
+
+    /// Register an owning account for a provider's state record. Only the
+    /// admin may call this. A record with an owner is considered live and is
+    /// never eligible for cleanup.
+    pub fn set_owner(env: Env, provider: Address, owner: Address) -> Result<(), SignalError> {
+        Self::require_admin(&env)?;
+        let key = (OWNER_KEY, provider);
+        env.storage().persistent().set(&key, &owner);
+        Ok(())
+    }
+
+    /// Mark a provider's state record as having an active relationship. Only
+    /// the admin may call this. A record with an active relationship is
+    /// considered live and is never eligible for cleanup.
+    pub fn set_relationship_active(
+        env: Env,
+        provider: Address,
+        active: bool,
+    ) -> Result<(), SignalError> {
+        Self::require_admin(&env)?;
+        let key = (RELATIONSHIP_KEY, provider);
+        env.storage().persistent().set(&key, &active);
+        Ok(())
+    }
+
+    /// Permissioned, bounded cleanup of orphaned reputation state.
+    ///
+    /// Only the admin may call this. At most `max_records` records are
+    /// inspected in a single invocation, so cleanup work is bounded by the
+    /// caller-supplied maximum and can be paginated across calls. A record is
+    /// eligible for removal only when it has no owning account and no active
+    /// relationship; eligibility is revalidated immediately before deletion
+    /// so concurrent state changes cannot cause a live record to be removed.
+    ///
+    /// Returns a [`CleanupReport`] describing how many records were scanned,
+    /// removed, and skipped.
+    pub fn cleanup_orphaned_state(
+        env: Env,
+        providers: Vec<Address>,
+        max_records: u32,
+    ) -> Result<CleanupReport, SignalError> {
+        Self::require_admin(&env)?;
+        if max_records == 0 {
+            return Err(SignalError::InvalidCleanupLimit);
+        }
+
+        let mut report = CleanupReport {
+            scanned: 0,
+            removed: 0,
+            skipped: 0,
+        };
+
+        for provider in providers.iter() {
+            if report.scanned >= max_records {
+                break;
+            }
+            report.scanned += 1;
+
+            // Revalidate eligibility immediately before deletion. A record is
+            // orphaned only when it has neither an owner nor an active
+            // relationship at this exact point in time.
+            if !Self::is_orphaned(&env, &provider) {
+                report.skipped += 1;
+                continue;
+            }
+
+            let key = (REPUTATION_KEY, provider.clone());
+            env.storage().persistent().remove(&key);
+            report.removed += 1;
+        }
+
+        Ok(report)
+    }
+
+    /// Deterministic eligibility check for orphaned state.
+    ///
+    /// A record is orphaned when it has no owning account and no active
+    /// relationship. The result depends only on stored state, so it is
+    /// reproducible and safe to revalidate before deletion.
+    fn is_orphaned(env: &Env, provider: &Address) -> bool {
+        let owner_key = (OWNER_KEY, provider.clone());
+        if env.storage().persistent().has(&owner_key) {
+            return false;
+        }
+        let relationship_key = (RELATIONSHIP_KEY, provider.clone());
+        if let Some(active) = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&relationship_key)
+        {
+            if active {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Require that the caller is the configured admin.
+    fn require_admin(env: &Env) -> Result<(), SignalError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(SignalError::NotInitialized)?;
+        admin.require_auth();
+        Ok(())
+    }
 
     /// Compute the decayed score for a record at a given timestamp.
     ///

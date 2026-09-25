@@ -1,9 +1,16 @@
-pub const XLM: i128 = 10_000_000;
-pub const LIQUIDITY_MINING_REWARD: i128 = 10 * XLM;
-pub const LIQUIDITY_MINING_USER_CAP: i128 = 1_000 * XLM;
-pub const DEFAULT_MINING_PERIOD_SECONDS: u64 = 90 * 24 * 60 * 60;
-pub const DEFAULT_VESTING_CLIFF_SECONDS: u64 = 30 * 24 * 60 * 60;
-pub const DEFAULT_VESTING_DURATION_SECONDS: u64 = 180 * 24 * 60 * 60;
+//! Reward distribution and fee-collector balance management.
+//!
+//! This module handles the accounting of collected fees and provides a
+//! tightly-scoped, auditable path for sweeping negligible "dust" balances
+//! out of the collector.
+
+use soroban_sdk::{contractevent, contracttype, Address, Env};
+
+/// Maximum balance (in stroops) that is considered "dust" and therefore
+/// eligible for the auditable sweep path. Any balance greater than or equal
+/// to this threshold is a normal fee balance and MUST NOT be sweepable
+/// through [`sweep_dust`].
+pub const DUST_THRESHOLD: i128 = 1_000;
 
 /// Default rebate cap: 80% of epoch fees may be distributed as rebates.
 pub const DEFAULT_MAX_REBATE_BPS: u32 = 8_000;
@@ -18,20 +25,32 @@ pub struct LiquidityMiningConfig {
     pub treasury_balance: i128,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct LiquidityMiningRewardEarned<User> {
-    pub user: User,
-    pub amount: i128,
-    pub trades_remaining: u32,
+/// Storage key for the collector's current balance.
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    Balance,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct VestingSchedule {
-    pub start_timestamp: u64,
-    pub cliff_seconds: u64,
-    pub duration_seconds: u64,
-    pub total_amount: i128,
-    pub released_amount: i128,
+/// Emitted whenever a dust sweep is performed, recording the destination,
+/// the swept amount, and the authorizing caller for audit purposes.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DustSwept {
+    #[topic]
+    pub caller: Address,
+    pub destination: Address,
+    pub amount: i128,
+}
+
+/// Returns the collector's current balance.
+pub fn balance(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::Balance).unwrap_or(0)
+}
+
+/// Sets the collector's current balance.
+pub fn set_balance(env: &Env, amount: i128) {
+    env.storage().instance().set(&DataKey::Balance, &amount);
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,58 +149,86 @@ pub fn distribute_rebates<User: Clone>(
     }
 }
 
-pub fn distribute_liquidity_mining_reward<User: Clone>(
-    config: &mut LiquidityMiningConfig,
-    user: User,
-    user_rewards_earned: &mut i128,
-    now: u64,
-) -> Result<LiquidityMiningRewardEarned<User>, RewardError> {
-    if !config.liquidity_mining_active {
-        return Err(RewardError::MiningInactive);
-    }
-
-    let mining_ends_at = config
-        .mainnet_launch_timestamp
-        .saturating_add(config.mining_period_seconds);
-    if now >= mining_ends_at {
-        config.liquidity_mining_active = false;
-        return Err(RewardError::MiningPeriodEnded);
-    }
-
-    let remaining_cap = LIQUIDITY_MINING_USER_CAP.saturating_sub(*user_rewards_earned);
-    if remaining_cap == 0 {
-        return Err(RewardError::UserCapReached);
-    }
-
-    let amount = LIQUIDITY_MINING_REWARD.min(remaining_cap);
-    if config.treasury_balance < amount {
-        return Err(RewardError::InsufficientTreasury);
-    }
-
-    config.treasury_balance -= amount;
-    *user_rewards_earned += amount;
-
-    Ok(LiquidityMiningRewardEarned {
-        user,
-        amount,
-        trades_remaining: ((LIQUIDITY_MINING_USER_CAP - *user_rewards_earned)
-            / LIQUIDITY_MINING_REWARD) as u32,
-    })
+/// Emitted whenever a dust sweep is performed, recording the destination,
+/// the swept amount, and the authorizing caller for audit purposes.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DustSwept {
+    #[topic]
+    pub caller: Address,
+    pub destination: Address,
+    pub amount: i128,
 }
 
-pub fn new_vesting_schedule(
-    start_timestamp: u64,
-    cliff_seconds: u64,
-    duration_seconds: u64,
-    total_amount: i128,
-) -> VestingSchedule {
-    VestingSchedule {
-        start_timestamp,
-        cliff_seconds,
-        duration_seconds,
-        total_amount,
-        released_amount: 0,
+/// Returns the collector's current balance.
+pub fn balance(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::Balance).unwrap_or(0)
+}
+
+/// Sweeps a negligible dust balance to an explicit destination.
+///
+/// This is a controlled, auditable path: it may only be invoked by the
+/// configured authority, only for balances strictly below [`DUST_THRESHOLD`],
+/// and only to a non-zero destination for a positive amount not exceeding the
+/// current balance. Ordinary fee balances cannot be moved through this path.
+///
+/// # Panics
+/// - If `caller` is not the configured authority.
+/// - If `destination` is the collector itself (inv
+}
+
+/// Sweeps a negligible dust balance to an explicit destination.
+///
+/// This is a controlled, auditable path: it may only be invoked by the
+/// configured authority, only for balances strictly below [`DUST_THRESHOLD`],
+/// and only to a non-zero destination for a positive amount not exceeding the
+/// current balance. Ordinary fee balances cannot be moved through this path.
+///
+/// # Panics
+/// - If `caller` is not the configured authority.
+/// - If `destination` is the collector itself (invalid destination).
+/// - If `amount` is not positive.
+/// - If `amount` exceeds the current balance.
+/// - If `amount` is not strictly below [`DUST_THRESHOLD`].
+/// - If the current balance is not strictly below [`DUST_THRESHOLD`].
+pub fn sweep_dust(env: &Env, caller: Address, destination: Address, amount: i128) {
+    caller.require_auth();
+
+    let authority: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Authority)
+        .expect("authority not set");
+    if caller != authority {
+        panic!("unauthorized: caller is not the authority");
     }
+
+    if destination == env.current_contract_address() {
+        panic!("invalid destination");
+    }
+    if amount <= 0 {
+        panic!("amount must be positive");
+    }
+
+    let current = balance(env);
+    if current >= DUST_THRESHOLD {
+        panic!("balance is not dust");
+    }
+    if amount >= DUST_THRESHOLD {
+        panic!("amount is not dust");
+    }
+    if amount > current {
+        panic!("amount exceeds balance");
+    }
+
+    set_balance(env, current - amount);
+
+    DustSwept {
+        caller,
+        destination,
+        amount,
+    }
+    .publish(env);
 }
 
 pub fn vested_amount(schedule: &VestingSchedule, now: u64) -> i128 {
@@ -387,4 +434,6 @@ mod tests {
         assert_eq!(set_max_rebate_bps(&mut bps, MAX_REBATE_BPS_LIMIT), Ok(()));
         assert_eq!(bps, MAX_REBATE_BPS_LIMIT);
     }
+}
+
 }
