@@ -83,4 +83,73 @@ mod test {
     fn allows_large_spend_with_enough_approvals() {
         assert_eq!(check_spend(&policy(), 600, 2, 0), Ok(()));
     }
+
+    // --- Authorization negative-test matrix (#1073) ---
+    //
+    // The guardrail surface is the privileged spend path for fee_collector
+    // treasury balances. Each denial case below asserts a stable error
+    // *category* (the `SpendError` variant) rather than brittle message text,
+    // so the matrix stays valid across refactors of the error ABI.
+
+    /// Unauthorized caller: no approvals collected at all for a large spend.
+    #[test]
+    fn denies_unauthorized_caller_without_approvals() {
+        assert_eq!(check_spend(&policy(), 600, 0, 0), Err(SpendError::InsufficientApprovals));
+    }
+
+    /// Stale role: approvals were collected but fall short of the current
+    /// `approvals_required` threshold (e.g. role revoked since sign-off).
+    #[test]
+    fn denies_stale_role_below_current_threshold() {
+        let mut p = policy();
+        p.approvals_required = 3;
+        assert_eq!(check_spend(&p, 600, 2, 0), Err(SpendError::InsufficientApprovals));
+    }
+
+    /// Malformed argument: negative spend amount must not slip past the caps.
+    #[test]
+    fn denies_malformed_negative_amount() {
+        assert_eq!(check_spend(&policy(), -1, 5, 0), Err(SpendError::ExceedsPerTxLimit));
+    }
+
+    /// Malformed argument: zero-value spend is still bounded by the period cap
+    /// when the period is already exhausted.
+    #[test]
+    fn denies_malformed_zero_amount_when_period_exhausted() {
+        assert_eq!(check_spend(&policy(), 0, 5, 5_000), Err(SpendError::ExceedsPeriodLimit));
+    }
+
+    /// Cross-contract caller: a spend forwarded from another contract still
+    /// has to satisfy the per-tx cap, independent of approval count.
+    #[test]
+    fn denies_cross_contract_caller_over_per_tx_cap() {
+        assert_eq!(check_spend(&policy(), 2_000, 5, 0), Err(SpendError::ExceedsPerTxLimit));
+    }
+
+    /// Nested invocation: an inner spend that would fit alone is denied once
+    /// the outer call has already consumed the rolling-period budget.
+    #[test]
+    fn denies_nested_invocation_over_period_cap() {
+        let p = policy();
+        // Outer spend commits 4_800 of the 5_000 period budget.
+        assert_eq!(check_spend(&p, 4_800, 2, 0), Ok(()));
+        // Inner spend of 300 would fit per-tx but busts the period cap.
+        assert_eq!(check_spend(&p, 300, 2, 4_800), Err(SpendError::ExceedsPeriodLimit));
+    }
+
+    /// Replayed authorization: the same approvals cannot be reused to push a
+    /// second large spend through once the period budget is spent.
+    #[test]
+    fn denies_replayed_authorization_after_period_spent() {
+        let p = policy();
+        assert_eq!(check_spend(&p, 600, 2, 0), Ok(()));
+        assert_eq!(check_spend(&p, 600, 2, 4_500), Err(SpendError::ExceedsPeriodLimit));
+    }
+
+    /// Replayed authorization: approvals do not bypass the per-tx cap on a
+    /// replayed large spend.
+    #[test]
+    fn denies_replayed_authorization_over_per_tx_cap() {
+        assert_eq!(check_spend(&policy(), 1_500, 2, 0), Err(SpendError::ExceedsPerTxLimit));
+    }
 }

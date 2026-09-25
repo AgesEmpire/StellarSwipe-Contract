@@ -207,3 +207,173 @@ impl SignalRegistry {
         env.storage().persistent().set(&key, record);
     }
 }
+
+#[cfg(test)]
+mod auth_negative_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::{Env, IntoVal, Symbol, TryFromVal, Val};
+
+    fn schedule() -> DecaySchedule {
+        DecaySchedule {
+            decay_rate_bps: 100,
+            decay_interval: 100,
+            grace_period: 0,
+            min_reputation: 0,
+            max_reputation: 10_000,
+        }
+    }
+
+    fn setup() -> (Env, SignalRegistryClient<'static>, Address) {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, SignalRegistry);
+        let client = SignalRegistryClient::new(&env, &contract_id);
+        env.mock_all_auths();
+        client.initialize(&admin, &schedule());
+        (env, client, admin)
+    }
+
+    /// Assert a call fails with the expected stable error category, not a
+    /// brittle message string. Soroban surfaces contract errors as a
+    /// `Result::Err(Status)` whose payload is the `SignalError` variant.
+    fn assert_denied<T, E>(result: Result<T, E>, expected: SignalError)
+    where
+        E: IntoVal<Env, Val> + TryFromVal<Env, Val>,
+    {
+        match result {
+            Err(err) => {
+                let env = Env::default();
+                let val: Val = err.into_val(&env);
+                let decoded = SignalError::try_from_val(&env, &val)
+                    .expect("error must decode to a SignalError variant");
+                assert_eq!(decoded, expected);
+            }
+            Ok(_) => panic!("expected denial with {:?}, but call succeeded", expected),
+        }
+    }
+
+    // --- Unauthorized caller: privileged entrypoint denial -----------------
+
+    #[test]
+    fn set_decay_schedule_denied_for_unauthorized_caller() {
+        let (env, client, _admin) = setup();
+        // No auth mocked: the admin's require_auth() must reject the caller.
+        env.set_auths(&[]);
+        let result = client.try_set_decay_schedule(&schedule());
+        assert!(result.is_err(), "unauthorized caller must be denied");
+    }
+
+    // --- Stale role: admin rotated, old admin no longer privileged ---------
+
+    #[test]
+    fn set_decay_schedule_denied_for_stale_admin_role() {
+        let (env, client, _admin) = setup();
+        let stale = Address::generate(&env);
+        // Only the stale address authorizes; the stored admin is different.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &stale,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_decay_schedule",
+                args: (schedule(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = client.try_set_decay_schedule(&schedule());
+        assert!(result.is_err(), "stale role must not be privileged");
+    }
+
+    // --- Malformed arguments: invalid schedule rejected --------------------
+
+    #[test]
+    fn set_decay_schedule_denied_for_malformed_schedule() {
+        let (_env, client, _admin) = setup();
+        let bad = DecaySchedule {
+            decay_rate_bps: 20_000, // > 10_000 bps
+            decay_interval: 100,
+            grace_period: 0,
+            min_reputation: 0,
+            max_reputation: 10_000,
+        };
+        let result = client.try_set_decay_schedule(&bad);
+        assert_denied(result, SignalError::InvalidDecayConfig);
+    }
+
+    #[test]
+    fn initialize_denied_for_malformed_schedule() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, SignalRegistry);
+        let client = SignalRegistryClient::new(&env, &contract_id);
+        env.mock_all_auths();
+        let bad = DecaySchedule {
+            decay_rate_bps: 100,
+            decay_interval: 0, // zero interval is invalid
+            grace_period: 0,
+            min_reputation: 0,
+            max_reputation: 10_000,
+        };
+        let result = client.try_initialize(&admin, &bad);
+        assert_denied(result, SignalError::InvalidDecayConfig);
+    }
+
+    // --- Replayed authorization: re-initialize must be denied --------------
+
+    #[test]
+    fn initialize_denied_on_replay() {
+        let (_env, client, admin) = setup();
+        // Replaying initialize with the same admin must be rejected.
+        let result = client.try_initialize(&admin, &schedule());
+        assert_denied(result, SignalError::AlreadyInitialized);
+    }
+
+    // --- Cross-contract / nested invocation: caller is another contract ----
+
+    #[test]
+    fn set_decay_schedule_denied_for_cross_contract_caller() {
+        let (env, client, _admin) = setup();
+        // Simulate a nested invocation where a different contract address is
+        // the caller and does not hold the admin role.
+        let other_contract = env.register_contract(None, SignalRegistry);
+        env.set_auths(&[]);
+        let result = client.try_set_decay_schedule(&schedule());
+        assert!(result.is_err(), "cross-contract caller must be denied");
+        // The nested contract's own privileged entrypoint is likewise denied.
+        let nested = SignalRegistryClient::new(&env, &other_contract);
+        let nested_result = nested.try_set_decay_schedule(&schedule());
+        assert!(nested_result.is_err(), "nested caller must be denied");
+    }
+
+    // --- Not-initialized denial for privileged entrypoint ------------------
+
+    #[test]
+    fn set_decay_schedule_denied_when_not_initialized() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SignalRegistry);
+        let client = SignalRegistryClient::new(&env, &contract_id);
+        env.mock_all_auths();
+        let result = client.try_set_decay_schedule(&schedule());
+        assert_denied(result, SignalError::NotInitialized);
+    }
+
+    // --- Sanity: authorized admin succeeds (positive control) --------------
+
+    #[test]
+    fn set_decay_schedule_allowed_for_admin() {
+        let (_env, client, _admin) = setup();
+        let updated = DecaySchedule {
+            decay_rate_bps: 200,
+            decay_interval: 50,
+            grace_period: 10,
+            min_reputation: 0,
+            max_reputation: 5_000,
+        };
+        client.set_decay_schedule(&updated);
+        assert_eq!(client.get_decay_schedule(), updated);
+    }
+
+    // Silence unused-import warnings for helpers used conditionally.
+    #[allow(dead_code)]
+    fn _touch(_: Symbol) {}
+}
