@@ -5,6 +5,20 @@
 //! stale activity loses impact over time. Decay points are computed directly
 //! from stored timestamps and configuration values, keeping the behavior
 //! verifiable on-chain.
+//!
+//! ## TTL bump strategy
+//!
+//! Contract instance and persistent storage entries are extended using an
+//! explicit, configurable strategy so active state never expires during
+//! normal use while avoiding unnecessary rent spend. Thresholds and extension
+//! amounts are stored in [`TtlConfig`] and can be updated by the admin via
+//! [`SignalRegistry::set_ttl_config`].
+//!
+//! An operational maintenance job (off-chain keeper) should periodically call
+//! [`SignalRegistry::bump_ttl`] for each active provider. The expected budget
+//! is bounded by `persistent_extend_to` ledgers of rent per active entry per
+//! bump, and bumps only occur once the remaining TTL drops below
+//! `persistent_threshold` (or `instance_threshold` for the instance).
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
 
@@ -18,6 +32,7 @@ pub enum SignalError {
     Unauthorized = 3,
     InvalidDecayConfig = 4,
     InvalidReputationUpdate = 5,
+    InvalidTtlConfig = 6,
 }
 
 /// Configuration-driven reputation decay schedule.
@@ -33,6 +48,23 @@ pub struct DecaySchedule {
     pub grace_period: u64,
     pub min_reputation: i128,
     pub max_reputation: i128,
+}
+
+/// Explicit, configurable TTL bump strategy for contract instance and
+/// persistent storage entries.
+///
+/// `instance_threshold` / `instance_extend_to` control the contract instance
+/// entry. `persistent_threshold` / `persistent_extend_to` control persistent
+/// entries (e.g. reputation records). A bump is only performed when the
+/// remaining TTL is at or below the corresponding threshold, and it extends
+/// the entry so that its remaining TTL becomes `extend_to` ledgers.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TtlConfig {
+    pub instance_threshold: u32,
+    pub instance_extend_to: u32,
+    pub persistent_threshold: u32,
+    pub persistent_extend_to: u32,
 }
 
 /// Stored reputation record for a provider.
@@ -52,7 +84,18 @@ pub struct DataKey {
 
 const ADMIN_KEY: &str = "admin";
 const SCHEDULE_KEY: &str = "schedule";
+const TTL_KEY: &str = "ttl";
 const REPUTATION_KEY: &str = "reputation";
+
+/// Default TTL strategy: bump instance when below ~1 day of ledgers and
+/// extend to ~7 days; bump persistent entries when below ~7 days and extend
+/// to ~30 days (assuming ~5s ledgers).
+const DEFAULT_TTL_CONFIG: TtlConfig = TtlConfig {
+    instance_threshold: 17_280,
+    instance_extend_to: 120_960,
+    persistent_threshold: 120_960,
+    persistent_extend_to: 518_400,
+};
 
 #[contract]
 pub struct SignalRegistry;
@@ -67,6 +110,8 @@ impl SignalRegistry {
         Self::validate_schedule(&schedule)?;
         env.storage().instance().set(&ADMIN_KEY, &admin);
         env.storage().instance().set(&SCHEDULE_KEY, &schedule);
+        env.storage().instance().set(&TTL_KEY, &DEFAULT_TTL_CONFIG);
+        Self::bump_instance_ttl(&env, &DEFAULT_TTL_CONFIG);
         Ok(())
     }
 
@@ -89,6 +134,53 @@ impl SignalRegistry {
             .instance()
             .get(&SCHEDULE_KEY)
             .ok_or(SignalError::NotInitialized)
+    }
+
+    /// Update the TTL bump strategy. Only the admin may call this.
+    pub fn set_ttl_config(env: Env, config: TtlConfig) -> Result<(), SignalError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(SignalError::NotInitialized)?;
+        admin.require_auth();
+        Self::validate_ttl_config(&config)?;
+        env.storage().instance().set(&TTL_KEY, &config);
+        Self::bump_instance_ttl(&env, &config);
+        Ok(())
+    }
+
+    /// Read the currently configured TTL bump strategy.
+    pub fn get_ttl_config(env: Env) -> Result<TtlConfig, SignalError> {
+        env.storage()
+            .instance()
+            .get(&TTL_KEY)
+            .ok_or(SignalError::NotInitialized)
+    }
+
+    /// Extend the contract instance TTL if it is at or below the configured
+    /// threshold. Safe to call repeatedly; no-op when already extended.
+    pub fn bump_instance(env: Env) -> Result<(), SignalError> {
+        let config = Self::load_ttl_config(&env)?;
+        Self::bump_instance_ttl(&env, &config);
+        Ok(())
+    }
+
+    /// Extend the TTL of a provider's persistent reputation entry if it is at
+    /// or below the configured threshold. Intended to be driven by an
+    /// operational maintenance job. No-op when the entry is already extended
+    /// or does not exist.
+    pub fn bump_ttl(env: Env, provider: Address) -> Result<(), SignalError> {
+        let config = Self::load_ttl_config(&env)?;
+        let key = (REPUTATION_KEY, provider.clone());
+        let storage = env.storage().persistent();
+        if !storage.has(&key) {
+            return Ok(());
+        }
+        let remaining = env.ledger().sequence();
+        let _ = remaining;
+        storage.extend_ttl(&key, config.persistent_threshold, config.persistent_extend_to);
+        Ok(())
     }
 
     /// Apply a reputation update for a provider, first decaying the stored
@@ -189,6 +281,33 @@ impl SignalRegistry {
             return Err(SignalError::InvalidDecayConfig);
         }
         Ok(())
+    }
+
+    /// Validate a TTL configuration before it is stored or applied.
+    fn validate_ttl_config(config: &TtlConfig) -> Result<(), SignalError> {
+        if config.instance_extend_to <= config.instance_threshold {
+            return Err(SignalError::InvalidTtlConfig);
+        }
+        if config.persistent_extend_to <= config.persistent_threshold {
+            return Err(SignalError::InvalidTtlConfig);
+        }
+        Ok(())
+    }
+
+    fn load_ttl_config(env: &Env) -> Result<TtlConfig, SignalError> {
+        env.storage()
+            .instance()
+            .get(&TTL_KEY)
+            .ok_or(SignalError::NotInitialized)
+    }
+
+    /// Extend the instance TTL when it is at or below the configured
+    /// threshold. `extend_ttl` is a no-op when the remaining TTL already
+    /// exceeds the threshold, so this avoids unnecessary rent spend.
+    fn bump_instance_ttl(env: &Env, config: &TtlConfig) {
+        env.storage()
+            .instance()
+            .extend_ttl(config.instance_threshold, config.instance_extend_to);
     }
 
     fn load_reputation(env: &Env, provider: &Address) -> ReputationRecord {
