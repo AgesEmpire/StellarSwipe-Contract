@@ -16,6 +16,7 @@ This guide provides comprehensive instructions for developing, testing, and depl
 6. [Best Practices](#best-practices)
 7. [Common Patterns](#common-patterns)
 8. [Troubleshooting](#troubleshooting)
+9. [Contract Interface Semver Compatibility Policy](#contract-interface-semver-compatibility-policy)
 
 ---
 
@@ -386,271 +387,252 @@ fn test_contract_interaction() {
     // Test interaction
     let provider = Address::generate(&env);
     stake_client.stake(&provider, &10000);
-    signal_client.register_signal(&provider, &signal_data);
+    signal_client.register_signal(&provider, &1000);
 }
 ```
 
-### Running Tests
+---
+
+## Contract Interface Semver Compatibility Policy
+
+This section defines the semantic versioning rules for the **public interface** of every
+Soroban contract in this repository. The public interface is the contract's ABI as
+consumed by external callers and indexers, and it is versioned independently of internal
+implementation details.
+
+### What counts as the public interface
+
+- **Entrypoints**: exported `#[contractimpl]` function names, their parameter order and
+  types, and their return types.
+- **Argument types**: `#[contracttype]` structs/enums used as parameters, including field
+  names, field order, and field types.
+- **Return values**: the return type of each entrypoint, including nested `#[contracttype]`
+  shapes and `Result<T, E>` error types.
+- **Events**: event topic tuples and the payload `#[contracttype]` shape published via
+  `env.events().publish(...)`.
+- **Errors**: `#[contracterror]` enum variants and their assigned numeric codes.
+- **Storage schemas**: `DataKey` variants and the `#[contracttype]` values stored under
+  them, including persistent/temporary/instance placement.
+
+### Versioning scheme
+
+The interface version is a `MAJOR.MINOR.PATCH` triple recorded in contract metadata
+(see below). It is bumped according to the classification table that follows.
+
+### Breaking vs non-breaking changes
+
+| Change | Classification | Version bump |
+| --- | --- | --- |
+| Remove or rename a public entrypoint | Breaking | MAJOR |
+| Add a required parameter to an entrypoint | Breaking | MAJOR |
+| Change a parameter or return type incompatibly | Breaking | MAJOR |
+| Reorder `#[contracttype]` struct fields | Breaking | MAJOR |
+| Remove or rename a `#[contracttype]` field | Breaking | MAJOR |
+| Change an event topic tuple or payload shape | Breaking | MAJOR |
+| Remove or renumber a `#[contracterror]` variant | Breaking | MAJOR |
+| Change a `DataKey` variant or its stored value type | Breaking | MAJOR |
+| Change storage tier (persistent/temporary/instance) for a key | Breaking | MAJOR |
+| Add a new public entrypoint | Non-breaking | MINOR |
+| Add an optional parameter with a default | Non-breaking | MINOR |
+| Add a new `#[contracttype]` field at the end | Non-breaking | MINOR |
+| Add a new event | Non-breaking | MINOR |
+| Add a new `#[contracterror]` variant with a new code | Non-breaking | MINOR |
+| Add a new `DataKey` variant | Non-breaking | MINOR |
+| Internal refactor with no ABI change | Non-breaking | PATCH |
+| Documentation or comment-only change | Non-breaking | PATCH |
+
+Any change not listed above must be reviewed by a maintainer and classified explicitly
+before merge.
+
+### Recording the interface version in contract metadata
+
+Each contract exposes its interface version through a dedicated read-only entrypoint so
+that tooling and indexers can discover it on-chain:
+
+```rust
+/// Returns the semantic version of this contract's public interface.
+pub fn interface_version(env: Env) -> String {
+    String::from_str(&env, "1.0.0")
+}
+```
+
+When the interface version is bumped, update the string literal in this entrypoint in the
+same pull request as the interface change. The value MUST match the classification table
+above.
+
+### CI detection of unsupported breaking changes
+
+CI compares the current interface against the prior release and fails the build when a
+breaking change is detected without a corresponding MAJOR bump. The check runs as part of
+the contract CI job:
 
 ```bash
-# Run all tests
-cargo test
-
-# Run specific test
-cargo test test_initialization
-
-# Run with output
-cargo test -- --nocapture
-
-# Run with coverage
-cargo tarpaulin --out Html
+# scripts/check-interface-compat.sh
+# Fails if the public interface changed in a breaking way without a MAJOR bump.
+./scripts/check-interface-compat.sh --base "$PRIOR_RELEASE_TAG" --head HEAD
 ```
+
+A breaking change is only accepted when the `interface_version` entrypoint has been bumped
+to a new MAJOR value in the same change set. Otherwise CI reports the offending entrypoint,
+type, event, error, or storage key and blocks the merge.
+
+### Maintainer compatibility review checklist
+
+Before approving any change that touches a contract's public interface, confirm:
+
+- [ ] Every entrypoint, argument type, return value, event, error, and storage key change
+      has been classified as breaking or non-breaking using the table above.
+- [ ] The `interface_version` entrypoint reflects the correct MAJOR/MINOR/PATCH bump.
+- [ ] Breaking changes are accompanied by a MAJOR bump and a migration note for callers.
+- [ ] Non-breaking additions are additive only (no reordering, renaming, or removal).
+- [ ] CI interface-compatibility check passes against the prior release tag.
+- [ ] Downstream consumers (indexers, SDKs, frontends) are notified of breaking changes.
 
 ---
 
 ## Deploying Contracts
 
-### Build Contract
+### Build for Production
 
 ```bash
-# Build for deployment
+# Build optimized WASM
 cargo build --target wasm32-unknown-unknown --release
 
 # Optimize WASM
 soroban contract optimize \
-  --wasm target/wasm32-unknown-unknown/release/contract.wasm
+  --wasm target/wasm32-unknown-unknown/release/my_contract.wasm
 ```
 
 ### Deploy to Testnet
 
 ```bash
-# Configure network
-soroban network add testnet \
-  --rpc-url https://soroban-testnet.stellar.org \
-  --network-passphrase "Test SDF Network ; September 2015"
-
-# Generate identity
-soroban keys generate deployer
-
-# Fund account
-curl "https://friendbot.stellar.org?addr=$(soroban keys address deployer)"
-
 # Deploy contract
 soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/contract.wasm \
-  --source deployer \
+  --wasm target/wasm32-unknown-unknown/release/my_contract.wasm \
+  --source admin \
   --network testnet
 ```
 
-### Initialize Contract
+### Deploy to Mainnet
 
 ```bash
-# Invoke initialize function
-soroban contract invoke \
-  --id CONTRACT_ID \
-  --source deployer \
-  --network testnet \
-  -- initialize \
-  --admin ADMIN_ADDRESS
-```
-
-### Verify Deployment
-
-```bash
-# Check contract info
-soroban contract info \
-  --id CONTRACT_ID \
-  --network testnet
-
-# Test contract call
-soroban contract invoke \
-  --id CONTRACT_ID \
-  --source deployer \
-  --network testnet \
-  -- get_info
+# Deploy with verification
+soroban contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/my_contract.wasm \
+  --source admin \
+  --network mainnet
 ```
 
 ---
 
 ## Best Practices
 
-### Code Quality
+### 1. Always Verify Authorization
 
-**1. Use Clippy**:
-```bash
-cargo clippy --all-targets --all-features
-```
-
-**2. Format Code**:
-```bash
-cargo fmt
-```
-
-**3. Documentation**:
 ```rust
-/// Transfers tokens from one account to another
-///
-/// # Arguments
-/// * `from` - Source address
-/// * `to` - Destination address
-/// * `amount` - Amount to transfer
-///
-/// # Returns
-/// * `Result<(), Error>` - Success or error
-pub fn transfer(
-    env: Env,
-    from: Address,
-    to: Address,
-    amount: i128
-) -> Result<(), Error> {
-    // Implementation
+// Good
+pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+    from.require_auth();
+    // Transfer logic
+}
+
+// Bad - no authorization check
+pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+    // Transfer logic without auth
 }
 ```
 
-### Security
+### 2. Use Custom Errors
 
-**1. Input Validation**:
 ```rust
-pub fn set_value(env: Env, value: i128) -> Result<(), Error> {
-    if value < 0 {
-        return Err(Error::InvalidValue);
-    }
-    if value > MAX_VALUE {
-        return Err(Error::ValueTooLarge);
-    }
-    // Proceed
-}
+// Good
+return Err(Error::InsufficientBalance);
+
+// Bad
+panic!("Insufficient balance");
 ```
 
-**2. Access Control**:
+### 3. Emit Events for State Changes
+
 ```rust
-fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
-    let admin = get_admin(env);
-    if caller != &admin {
-        return Err(Error::Unauthorized);
-    }
-    Ok(())
-}
+// Good
+env.storage().persistent().set(&key, &value);
+env.events().publish(("state_changed",), (key, value));
+
+// Bad - no event
+env.storage().persistent().set(&key, &value);
 ```
 
-**3. Reentrancy Protection**:
+### 4. Validate Inputs
+
 ```rust
-pub fn withdraw(env: Env, caller: Address) -> Result<(), Error> {
-    // Check
-    let balance = get_balance(&env, &caller);
-    
-    // Effect
-    set_balance(&env, &caller, 0);
-    
-    // Interaction
-    transfer_tokens(&env, &caller, balance)?;
-    
-    Ok(())
-}
-```
-
-### Gas Optimization
-
-**1. Minimize Storage Operations**:
-```rust
-// Bad: Multiple reads
-let value1 = env.storage().get(&key);
-let value2 = env.storage().get(&key);
-
-// Good: Single read
-let value = env.storage().get(&key);
-```
-
-**2. Use Efficient Data Structures**:
-```rust
-// Use Vec for ordered data
-let items: Vec<Item> = Vec::new(&env);
-
-// Use Map for key-value pairs
-let balances: Map<Address, i128> = Map::new(&env);
-```
-
-**3. Batch Operations**:
-```rust
-// Bad: Loop with multiple calls
-for user in users {
-    transfer(&env, &user, amount);
+// Good
+if amount <= 0 {
+    return Err(Error::InvalidAmount);
 }
 
-// Good: Batch transfer
-batch_transfer(&env, users, amounts);
+// Bad - no validation
+// Proceed with amount directly
+```
+
+### 5. Use Appropriate Storage Types
+
+```rust
+// Good - temporary for short-lived data
+env.storage().temporary().set(&key, &value, 100);
+
+// Good - persistent for long-term data
+env.storage().persistent().set(&key, &value);
 ```
 
 ---
 
 ## Common Patterns
 
-### Upgradeable Contracts
+### Pattern: Initialization Guard
 
 ```rust
-pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-    let admin = get_admin(&env);
-    admin.require_auth();
-    
-    env.deployer().update_current_contract_wasm(new_wasm_hash);
-}
-```
-
-### Pausable Contracts
-
-```rust
-pub fn pause(env: Env) {
-    require_admin(&env)?;
-    env.storage().instance().set(&DataKey::Paused, &true);
-}
-
-pub fn unpause(env: Env) {
-    require_admin(&env)?;
-    env.storage().instance().set(&DataKey::Paused, &false);
-}
-
-fn require_not_paused(env: &Env) -> Result<(), Error> {
-    let paused = env.storage().instance()
-        .get(&DataKey::Paused)
-        .unwrap_or(false);
-    
-    if paused {
-        return Err(Error::ContractPaused);
+pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+    if env.storage().instance().has(&DataKey::Admin) {
+        return Err(Error::AlreadyInitialized);
     }
+    
+    env.storage().instance().set(&DataKey::Admin, &admin);
     Ok(())
 }
 ```
 
-### Time-Locked Operations
+### Pattern: Access Control
 
 ```rust
-pub fn propose_change(env: Env, change: Change) -> u64 {
-    let proposal_id = get_next_id(&env);
-    let execute_after = env.ledger().timestamp() + TIMELOCK_PERIOD;
+fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+    let admin: Address = env.storage().instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotAuthorized)?;
     
-    env.storage().persistent().set(
-        &DataKey::Proposal(proposal_id),
-        &Proposal {
-            change,
-            execute_after,
-            executed: false,
+    if caller != &admin {
+        return Err(Error::NotAuthorized);
+    }
+    
+    Ok(())
+}
+```
+
+### Pattern: Pagination
+
+```rust
+pub fn get_items(env: Env, start: u32, limit: u32) -> Vec<Item> {
+    let mut items = Vec::new(&env);
+    let total = get_total_count(&env);
+    
+    let end = (start + limit).min(total);
+    for i in start..end {
+        if let Some(item) = get_item(&env, i) {
+            items.push_back(item);
         }
-    );
-    
-    proposal_id
-}
-
-pub fn execute_change(env: Env, proposal_id: u64) -> Result<(), Error> {
-    let proposal = get_proposal(&env, proposal_id)?;
-    
-    if env.ledger().timestamp() < proposal.execute_after {
-        return Err(Error::TimelockNotExpired);
     }
     
-    // Execute change
-    apply_change(&env, &proposal.change)?;
-    
-    Ok(())
+    items
 }
 ```
 
@@ -660,87 +642,49 @@ pub fn execute_change(env: Env, proposal_id: u64) -> Result<(), Error> {
 
 ### Common Issues
 
-**Issue 1: Contract Size Too Large**
-```
-Error: Contract WASM size exceeds limit
-```
+**Issue: Contract fails to deploy**
+- Check WASM size (must be < 64KB)
+- Verify network configuration
+- Ensure sufficient balance for deployment
 
-**Solution**:
-- Remove unused dependencies
-- Optimize code
-- Use `cargo-bloat` to identify large dependencies
-```bash
-cargo install cargo-bloat
-cargo bloat --release --target wasm32-unknown-unknown
-```
+**Issue: Transaction fails with "Unauthorized"**
+- Verify `require_auth()` is called
+- Check caller has proper permissions
+- Ensure auth is mocked in tests
 
-**Issue 2: Storage Access Errors**
-```
-Error: Storage key not found
-```
+**Issue: Storage not persisting**
+- Check storage type (persistent vs temporary)
+- Verify TTL settings
+- Ensure key is correct
 
-**Solution**:
-- Always check if key exists before accessing
-```rust
-let value = env.storage().persistent()
-    .get(&key)
-    .unwrap_or(default_value);
-```
-
-**Issue 3: Authorization Failures**
-```
-Error: Authorization failed
-```
-
-**Solution**:
-- Ensure `require_auth()` is called
-- Check authorization context
-```rust
-caller.require_auth();
-```
+**Issue: Events not appearing**
+- Verify event is published
+- Check event topic format
+- Ensure indexer is running
 
 ### Debugging Tips
 
-**1. Use Logging**:
-```rust
-#[cfg(test)]
-use soroban_sdk::log;
+```bash
+# Enable debug logging
+RUST_LOG=debug soroban contract invoke ...
 
-log!(&env, "Debug value: {}", value);
-```
+# Check contract state
+soroban contract read --id <contract-id> --key <key>
 
-**2. Test Incrementally**:
-- Write tests for each function
-- Test edge cases
-- Use `#[should_panic]` for error cases
-
-**3. Check Events**:
-```rust
-let events = env.events().all();
-assert_eq!(events.len(), 1);
+# Simulate transaction
+soroban contract invoke --id <contract-id> --fn <function> -- --help
 ```
 
 ---
 
 ## Additional Resources
 
-### Documentation
-- [Soroban Docs](https://soroban.stellar.org)
-- [Stellar Docs](https://developers.stellar.org)
-- [Rust Book](https://doc.rust-lang.org/book/)
-
-### Tools
-- [Soroban CLI](https://github.com/stellar/soroban-cli)
-- [Stellar Laboratory](https://laboratory.stellar.org)
-- [Stellar Expert](https://stellar.expert)
-
-### Community
+- [Soroban Documentation](https://soroban.stellar.org/docs)
+- [Stellar Developer Docs](https://developers.stellar.org)
+- [Soroban Examples](https://github.com/stellar/soroban-examples)
 - [Stellar Discord](https://discord.gg/stellar)
-- [Stellar Stack Exchange](https://stellar.stackexchange.com)
-- [GitHub Discussions](https://github.com/stellar/soroban-examples/discussions)
 
 ---
 
-**Document Version**: 1.0.0  
-**Last Updated**: 2026-06-01  
-**Maintained By**: StellarSwipe Core Team
+**Last Updated**: 2024
+**Maintainers**: StellarSwipe Team
