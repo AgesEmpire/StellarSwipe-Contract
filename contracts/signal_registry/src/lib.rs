@@ -6,7 +6,7 @@
 //! from stored timestamps and configuration values, keeping the behavior
 //! verifiable on-chain.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec};
 
 /// Errors returned by the signal registry contract.
 #[contracterror]
@@ -52,6 +52,20 @@ pub struct DataKey {
     pub schedule: DecaySchedule,
 }
 
+/// Canonical inputs that define a Soroban authorization signing domain.
+///
+/// Every authorization path must derive its signing domain from exactly these
+/// fields so that equivalent payloads always hash identically and any altered
+/// field produces a different digest.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthPayload {
+    pub domain: Bytes,
+    pub network: Bytes,
+    pub contract: Address,
+    pub method: Bytes,
+}
+
 /// A single provider relationship entry.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +90,7 @@ pub struct ProviderMembership {
 pub struct Page<T> {
     pub items: Vec<T>,
     pub next_cursor: Option<u32>,
+}
 }
 
 const ADMIN_KEY: &str = "admin";
@@ -166,6 +181,28 @@ impl SignalRegistry {
         let record = Self::load_reputation(&env, &provider);
         let now = env.ledger().timestamp();
         Ok(Self::apply_decay(&record, now, &schedule))
+    }
+
+    /// Canonical helper for hashing Soroban authorization payloads.
+    ///
+    /// Serializes the domain, network, contract, and method into a single
+    /// deterministic byte stream and returns its SHA-256 digest. All
+    /// authorization paths must route through this helper so that equivalent
+    /// payloads hash identically and any altered field yields a distinct hash.
+    pub fn hash_auth_payload(env: Env, payload: AuthPayload) -> BytesN<32> {
+        let mut bytes = Bytes::new(&env);
+        Self::append_field(&mut bytes, &payload.domain);
+        Self::append_field(&mut bytes, &payload.network);
+        Self::append_field(&mut bytes, &payload.contract.to_string().into_bytes());
+        Self::append_field(&mut bytes, &payload.method);
+        env.crypto().sha256(&bytes)
+    }
+
+    /// Length-prefix a field so concatenated fields cannot be re-partitioned
+    /// into a different payload that collides on the same serialized bytes.
+    fn append_field(out: &mut Bytes, field: &Bytes) {
+        out.append(&(field.len() as u32).to_be_bytes().into());
+        out.append(field);
     }
 
     /// Record a provider relationship. Read-only queries below expose these
@@ -281,6 +318,7 @@ impl SignalRegistry {
         let next_cursor = if end < len { Some(end) } else { None };
         Ok(Page { items, next_cursor })
     }
+    }
 
     /// Compute the decayed score for a record at a given timestamp.
     ///
@@ -357,6 +395,93 @@ impl SignalRegistry {
 }
 
 #[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    fn payload(env: &Env, domain: &str, network: &str, method: &str) -> AuthPayload {
+        AuthPayload {
+            domain: Bytes::from_slice(env, domain.as_bytes()),
+            network: Bytes::from_slice(env, network.as_bytes()),
+            contract: Address::generate(env),
+            method: Bytes::from_slice(env, method.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn equivalent_payloads_hash_identically() {
+        let env = Env::default();
+        let contract = Address::generate(&env);
+        let base = AuthPayload {
+            domain: Bytes::from_slice(&env, b"signal-registry"),
+            network: Bytes::from_slice(&env, b"testnet"),
+            contract: contract.clone(),
+            method: Bytes::from_slice(&env, b"update_reputation"),
+        };
+        let same = AuthPayload {
+            domain: Bytes::from_slice(&env, b"signal-registry"),
+            network: Bytes::from_slice(&env, b"testnet"),
+            contract,
+            method: Bytes::from_slice(&env, b"update_reputation"),
+        };
+        assert_eq!(
+            SignalRegistry::hash_auth_payload(env.clone(), base),
+            SignalRegistry::hash_auth_payload(env, same)
+        );
+    }
+
+    #[test]
+    fn altered_fields_change_hash() {
+        let env = Env::default();
+        let contract = Address::generate(&env);
+        let base = AuthPayload {
+            domain: Bytes::from_slice(&env, b"signal-registry"),
+            network: Bytes::from_slice(&env, b"testnet"),
+            contract: contract.clone(),
+            method: Bytes::from_slice(&env, b"update_reputation"),
+        };
+        let base_hash = SignalRegistry::hash_auth_payload(env.clone(), base.clone());
+
+        let mut altered_domain = base.clone();
+        altered_domain.domain = Bytes::from_slice(&env, b"other-domain");
+        assert_ne!(base_hash, SignalRegistry::hash_auth_payload(env.clone(), altered_domain));
+
+        let mut altered_network = base.clone();
+        altered_network.network = Bytes::from_slice(&env, b"mainnet");
+        assert_ne!(base_hash, SignalRegistry::hash_auth_payload(env.clone(), altered_network));
+
+        let mut altered_contract = base.clone();
+        altered_contract.contract = Address::generate(&env);
+        assert_ne!(base_hash, SignalRegistry::hash_auth_payload(env.clone(), altered_contract));
+
+        let mut altered_method = base.clone();
+        altered_method.method = Bytes::from_slice(&env, b"set_decay_schedule");
+        assert_ne!(base_hash, SignalRegistry::hash_auth_payload(env, altered_method));
+    }
+
+    #[test]
+    fn field_boundaries_are_unambiguous() {
+        let env = Env::default();
+        let contract = Address::generate(&env);
+        let a = AuthPayload {
+            domain: Bytes::from_slice(&env, b"ab"),
+            network: Bytes::from_slice(&env, b"c"),
+            contract: contract.clone(),
+            method: Bytes::from_slice(&env, b"m"),
+        };
+        let b = AuthPayload {
+            domain: Bytes::from_slice(&env, b"a"),
+            network: Bytes::from_slice(&env, b"bc"),
+            contract,
+            method: Bytes::from_slice(&env, b"m"),
+        };
+        assert_ne!(
+            SignalRegistry::hash_auth_payload(env.clone(), a),
+            SignalRegistry::hash_auth_payload(env, b)
+        );
+    }
+}
+
 mod auth_cache_tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger as _};
