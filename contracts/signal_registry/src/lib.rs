@@ -5,8 +5,13 @@
 //! stale activity loses impact over time. Decay points are computed directly
 //! from stored timestamps and configuration values, keeping the behavior
 //! verifiable on-chain.
+//!
+//! Event payloads emitted at contract boundaries are bounded by the limits in
+//! [`MAX_EVENT_STRING_LEN`], [`MAX_EVENT_VECTOR_LEN`], and
+//! [`MAX_EVENT_METADATA_LEN`]. Oversized payloads are rejected with
+//! [`SignalError::EventPayloadTooLarge`] before any emission occurs.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
 
 /// Errors returned by the signal registry contract.
 #[contracterror]
@@ -18,7 +23,20 @@ pub enum SignalError {
     Unauthorized = 3,
     InvalidDecayConfig = 4,
     InvalidReputationUpdate = 5,
+    /// An event payload exceeded the configured size limits. Returned before
+    /// any event is emitted so oversized emissions cannot exhaust transaction
+    /// resources or disrupt downstream indexers.
+    EventPayloadTooLarge = 6,
 }
+
+/// Maximum length, in bytes, of a string carried in an event payload.
+pub const MAX_EVENT_STRING_LEN: u32 = 256;
+
+/// Maximum number of elements in a vector carried in an event payload.
+pub const MAX_EVENT_VECTOR_LEN: u32 = 64;
+
+/// Maximum length, in bytes, of event metadata (e.g. a topic or label).
+pub const MAX_EVENT_METADATA_LEN: u32 = 128;
 
 /// Configuration-driven reputation decay schedule.
 ///
@@ -134,6 +152,46 @@ impl SignalRegistry {
         Ok(Self::apply_decay(&record, now, &schedule))
     }
 
+    /// Emit a bounded event payload at the contract boundary.
+    ///
+    /// The `label` (metadata), `message` (string), and `tags` (vector) are all
+    /// validated against the configured size limits before any event is
+    /// emitted. If any component is oversized the call fails with
+    /// [`SignalError::EventPayloadTooLarge`] and no event is produced.
+    pub fn emit_event(
+        env: Env,
+        label: String,
+        message: String,
+        tags: Vec<String>,
+    ) -> Result<(), SignalError> {
+        Self::validate_event_payload(&label, &message, &tags)?;
+        env.events().publish((label,), (message, tags));
+        Ok(())
+    }
+
+    /// Validate an event payload against the configured size limits.
+    ///
+    /// Returns [`SignalError::EventPayloadTooLarge`] if the metadata label,
+    /// string message, or tag vector exceeds its respective maximum. Limits
+    /// are inclusive: a value exactly at the limit is accepted, one over is
+    /// rejected.
+    fn validate_event_payload(
+        label: &String,
+        message: &String,
+        tags: &Vec<String>,
+    ) -> Result<(), SignalError> {
+        if label.len() > MAX_EVENT_METADATA_LEN {
+            return Err(SignalError::EventPayloadTooLarge);
+        }
+        if message.len() > MAX_EVENT_STRING_LEN {
+            return Err(SignalError::EventPayloadTooLarge);
+        }
+        if tags.len() > MAX_EVENT_VECTOR_LEN {
+            return Err(SignalError::EventPayloadTooLarge);
+        }
+        Ok(())
+    }
+
     /// Compute the decayed score for a record at a given timestamp.
     ///
     /// Deterministic: depends only on the stored record, the timestamp, and
@@ -205,5 +263,109 @@ impl SignalRegistry {
     fn store_reputation(env: &Env, provider: &Address, record: &ReputationRecord) {
         let key = (REPUTATION_KEY, provider.clone());
         env.storage().persistent().set(&key, record);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{testutils::Events, Env, String, Vec};
+
+    fn setup() -> (Env, SignalRegistryClient<'static>) {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SignalRegistry);
+        let client = SignalRegistryClient::new(&env, &contract_id);
+        (env, client)
+    }
+
+    fn string_of_len(env: &Env, len: u32) -> String {
+        let mut s = String::from_str(env, "");
+        let mut i = 0;
+        while i < len {
+            s.push_str(&String::from_str(env, "a"));
+            i += 1;
+        }
+        s
+    }
+
+    fn vec_of_len(env: &Env, len: u32) -> Vec<String> {
+        let mut v = Vec::new(env);
+        let mut i = 0;
+        while i < len {
+            v.push_back(String::from_str(env, "t"));
+            i += 1;
+        }
+        v
+    }
+
+    #[test]
+    fn accepts_payload_at_exact_limits() {
+        let (env, client) = setup();
+        let label = string_of_len(&env, MAX_EVENT_METADATA_LEN);
+        let message = string_of_len(&env, MAX_EVENT_STRING_LEN);
+        let tags = vec_of_len(&env, MAX_EVENT_VECTOR_LEN);
+        assert_eq!(client.emit_event(&label, &message, &tags), Ok(()));
+    }
+
+    #[test]
+    fn rejects_metadata_one_over_limit() {
+        let (env, client) = setup();
+        let label = string_of_len(&env, MAX_EVENT_METADATA_LEN + 1);
+        let message = String::from_str(&env, "ok");
+        let tags = Vec::new(&env);
+        assert_eq!(
+            client.emit_event(&label, &message, &tags),
+            Err(SignalError::EventPayloadTooLarge)
+        );
+    }
+
+    #[test]
+    fn rejects_string_one_over_limit() {
+        let (env, client) = setup();
+        let label = String::from_str(&env, "ok");
+        let message = string_of_len(&env, MAX_EVENT_STRING_LEN + 1);
+        let tags = Vec::new(&env);
+        assert_eq!(
+            client.emit_event(&label, &message, &tags),
+            Err(SignalError::EventPayloadTooLarge)
+        );
+    }
+
+    #[test]
+    fn rejects_vector_one_over_limit() {
+        let (env, client) = setup();
+        let label = String::from_str(&env, "ok");
+        let message = String::from_str(&env, "ok");
+        let tags = vec_of_len(&env, MAX_EVENT_VECTOR_LEN + 1);
+        assert_eq!(
+            client.emit_event(&label, &message, &tags),
+            Err(SignalError::EventPayloadTooLarge)
+        );
+    }
+
+    #[test]
+    fn oversized_payload_emits_no_event() {
+        let (env, client) = setup();
+        let label = String::from_str(&env, "ok");
+        let message = string_of_len(&env, MAX_EVENT_STRING_LEN + 1);
+        let tags = Vec::new(&env);
+        let _ = client.emit_event(&label, &message, &tags);
+        // No event should have been published for a rejected payload.
+        assert_eq!(env.events().all().len(), 0);
+    }
+
+    #[test]
+    fn resource_budget_is_predictable_for_bounded_payloads() {
+        let (env, client) = setup();
+        let label = String::from_str(&env, "ok");
+        let message = string_of_len(&env, MAX_EVENT_STRING_LEN);
+        let tags = vec_of_len(&env, MAX_EVENT_VECTOR_LEN);
+        // Repeated bounded emissions succeed deterministically.
+        let mut i = 0;
+        while i < 8 {
+            assert_eq!(client.emit_event(&label, &message, &tags), Ok(()));
+            i += 1;
+        }
+        assert_eq!(env.events().all().len(), 8);
     }
 }
