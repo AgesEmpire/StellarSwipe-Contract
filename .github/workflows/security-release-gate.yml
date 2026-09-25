@@ -173,3 +173,27 @@ jobs:
           fi
 
           echo "OK: contract WASM hashes match ($hash1)."
+
+      # Contract release artifact manifest validation (Issue #1168). Every
+      # deployable Soroban WASM artifact must have a matching contract name,
+      # interface version, checksum, and source revision before release.
+      # Generate a manifest from the built artifacts, then verify it against
+      # the artifacts on disk so incomplete or mismatched manifests and
+      # tampered WASM (checksum mismatch) fail the gate.
+      - name: Generate contract release artifact manifest
+        run: |
+          python3 stellar-swipe/scripts/generate_release_manifest.py \
+            --artifact-dir stellar-swipe/target/wasm32-unknown-unknown/release \
+            --out deployments/release_manifest.json
+
+      - name: Validate contract release artifact manifest
+        run: |
+          python3 stellar-swipe/scripts/validate_release_manifest.py \
+            --manifest deployments/release_manifest.json \
+            --artifact-dir stellar-swipe/target/wasm32-unknown-unknown/release
+          rc=$?
+          if [ $rc -eq 1 ]; then
+            echo "ERROR: contract release artifact manifest is incomplete or mismatched — see output above." >&2
+            echo "See docs/security/release_security_checklist.md for the verification command." >&2
+            exit 1
+          fi
