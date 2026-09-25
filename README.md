@@ -13,3 +13,6 @@
 
 <!-- handsoff-issue-1169 -->
 - #1169: Create cross-contract upgrade compatibility fixtures
+
+<!-- handsoff-issue-1170 -->
+- #1170: Add Soroban authorization payload size regression tests
