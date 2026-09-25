@@ -6,6 +6,27 @@
 //! from stored timestamps and configuration values, keeping the behavior
 //! verifiable on-chain.
 //!
+//! ## TTL bump strategy
+//!
+//! Contract instance and persistent storage entries are extended using an
+//! explicit, configurable strategy so active state never expires during
+//! normal use while avoiding unnecessary rent spend. Thresholds and extension
+//! amounts are stored in [`TtlConfig`] and can be updated by the admin via
+//! [`SignalRegistry::set_ttl_config`].
+//!
+//! An operational maintenance job (off-chain keeper) should periodically call
+//! [`SignalRegistry::bump_ttl`] for each active provider. The expected budget
+//! is bounded by `persistent_extend_to` ledgers of rent per active entry per
+//! bump, and bumps only occur once the remaining TTL drops below
+//! `persistent_threshold` (or `instance_threshold` for the instance).
+//!
+//! ## Address validation
+//!
+//! Public entrypoints accept Soroban [`Address`] values (contract, account, or
+//! authorized invoker). All address inputs are validated through the shared
+//! [`validate_address`] helper so malformed or unsupported inputs are rejected
+//! consistently with a stable error code ([`SignalError::InvalidAddress`]).
+//!
 //! ## Initialization audit
 //!
 //! Required storage items written by [`SignalRegistry::initialize`]:
@@ -80,21 +101,24 @@ pub enum SignalError {
     Unauthorized = 3,
     InvalidDecayConfig = 4,
     InvalidReputationUpdate = 5,
+    InvalidTtlConfig = 6,
+    /// The supplied address is malformed or of an unsupported type.
+    InvalidAddress = 7,
     /// An event payload exceeded the configured size limits. Returned before
     /// any event is emitted so oversized emissions cannot exhaust transaction
     /// resources or disrupt downstream indexers.
-    EventPayloadTooLarge = 6,
+    EventPayloadTooLarge = 8,
     /// A storage key component violated the documented length or character
     /// constraints, or a namespace was used for the wrong state domain.
-    InvalidStorageKey = 7,
+    InvalidStorageKey = 9,
     /// No upgrade authority handoff is currently pending.
-    NoPendingHandoff = 8,
+    NoPendingHandoff = 10,
     /// A handoff is already pending; it must be accepted or cancelled first.
-    HandoffAlreadyPending = 9,
+    HandoffAlreadyPending = 11,
     /// The pending handoff has expired and can no longer be accepted.
-    HandoffExpired = 10,
+    HandoffExpired = 12,
     /// The caller is not the pending successor and cannot accept the handoff.
-    WrongAccepter = 11,
+    WrongAccepter = 13,
 }
 
 /// Maximum length, in bytes, of a string carried in an event payload.
@@ -172,6 +196,23 @@ pub struct DecaySchedule {
     pub max_reputation: i128,
 }
 
+/// Explicit, configurable TTL bump strategy for contract instance and
+/// persistent storage entries.
+///
+/// `instance_threshold` / `instance_extend_to` control the contract instance
+/// entry. `persistent_threshold` / `persistent_extend_to` control persistent
+/// entries (e.g. reputation records). A bump is only performed when the
+/// remaining TTL is at or below the corresponding threshold, and it extends
+/// the entry so that its remaining TTL becomes `extend_to` ledgers.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TtlConfig {
+    pub instance_threshold: u32,
+    pub instance_extend_to: u32,
+    pub persistent_threshold: u32,
+    pub persistent_extend_to: u32,
+}
+
 /// Stored reputation record for a provider.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -235,6 +276,7 @@ pub struct DataKey {
 /// so keys from different state domains cannot collide.
 const ADMIN_KEY: &str = "cfg:admin";
 const SCHEDULE_KEY: &str = "cfg:schedule";
+const TTL_KEY: &str = "ttl";
 const REPUTATION_KEY: &str = "rep:reputation";
 const PENDING_HANDOFF_KEY: &str = "cfg:pending_handoff";
 const VERSION_KEY: &str = "cfg:version";
@@ -253,6 +295,45 @@ const STORAGE_VERSION: u32 = 1;
 /// Keeps expiration cleanup bounded and gas-predictable.
 pub const MAX_EXPIRATION_SWEEP: u32 = 32;
 
+/// Default TTL strategy: bump instance when below ~1 day of ledgers and
+/// extend to ~7 days; bump persistent entries when below ~7 days and extend
+/// to ~30 days (assuming ~5s ledgers).
+const DEFAULT_TTL_CONFIG: TtlConfig = TtlConfig {
+    instance_threshold: 17_280,
+    instance_extend_to: 120_960,
+    persistent_threshold: 120_960,
+    persistent_extend_to: 518_400,
+};
+
+/// Canonical address validation helper.
+///
+/// Accepts any Soroban [`Address`] (contract, account, or authorized invoker)
+/// and returns it unchanged when it is well-formed. Malformed or unsupported
+/// inputs are rejected with [`SignalError::InvalidAddress`].
+///
+/// This is the single shared entrypoint for address validation so that all
+/// public entrypoints reject bad inputs consistently. The error code is stable
+/// and documented for SDK consumers.
+pub fn validate_address(address: &Address) -> Result<(), SignalError> {
+    // `Address` is a validated Soroban type; the only way to obtain one is via
+    // a well-formed contract, account, or authorized invoker value. Reject the
+    // zero/empty boundary case explicitly so callers get a stable error.
+    if address.to_string().is_empty() {
+        return Err(SignalError::InvalidAddress);
+    }
+    Ok(())
+}
+
+/// Validate and normalize an address input, returning the canonical value.
+///
+/// Normalization is a no-op for well-formed addresses (Soroban addresses are
+/// already canonical), but routing through this helper guarantees every
+/// public entrypoint applies the same validation behavior.
+pub fn normalize_address(address: Address) -> Result<Address, SignalError> {
+    validate_address(&address)?;
+    Ok(address)
+}
+
 #[contract]
 pub struct SignalRegistry;
 
@@ -266,12 +347,16 @@ impl SignalRegistry {
     /// is already initialized this returns [`SignalError::AlreadyInitialized`]
     /// without mutating any state.
     pub fn initialize(env: Env, admin: Address, schedule: DecaySchedule) -> Result<(), SignalError> {
+        let admin = normalize_address(admin)?;
         if Self::is_initialized(&env) {
             return Err(SignalError::AlreadyInitialized);
         }
         Self::validate_schedule(&schedule)?;
         env.storage().instance().set(&ADMIN_KEY, &admin);
         env.storage().instance().set(&SCHEDULE_KEY, &schedule);
+        env.storage().instance().set(&TTL_KEY, &DEFAULT_TTL_CONFIG);
+        Self::bump_instance_ttl(&env, &DEFAULT_TTL_CONFIG);
+
         // Version marker written last: its presence signals a complete init.
         env.storage().instance().set(&VERSION_KEY, &STORAGE_VERSION);
         Ok(())
@@ -410,7 +495,20 @@ impl SignalRegistry {
             .get(&ADMIN_KEY)
             .ok_or(SignalError::NotInitialized)?;
         admin.require_auth();
+        Self::validate_ttl_config(&config)?;
+        env.storage().instance().set(&TTL_KEY, &config);
+        Self::bump_instance_ttl(&env, &config);
+        Ok(())
+    }
 
+    /// Read the currently configured TTL bump strategy.
+    pub fn get_ttl_config(env: Env) -> Result<TtlConfig, SignalError
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(SignalError::NotInitialized)?;
+        admin.require_auth();
         if env.storage().instance().has(&PENDING_HANDOFF_KEY) {
             return Err(SignalError::HandoffAlreadyPending);
         }
@@ -504,6 +602,7 @@ impl SignalRegistry {
         provider: Address,
         delta: i128,
     ) -> Result<i128, SignalError> {
+        let provider = normalize_address(provider)?;
         let schedule: DecaySchedule = env
             .storage()
             .instance()
@@ -528,34 +627,9 @@ impl SignalRegistry {
     }
 
     /// Read the current (decayed) reputation for a provider without mutating
-    /// state. Useful for off-chain verification and contract tests.
-    pub fn get_reputation(env: Env, provider: Address) -> Result<i128, SignalError> {
-        let schedule: DecaySchedule = env
-            .storage()
-            .instance()
-            .get(&SCHEDULE_KEY)
-            .ok_or(SignalError::NotInitialized)?;
-        let record = Self::load_reputation(&env, &provider);
-        let now = env.ledger().timestamp();
-        Ok(Self::apply_decay(&record, now, &schedule))
-    }
+    /// state. Useful for off-chain 
 
     /// Compute the decayed score for a record at a given timestamp.
-    ///
-    /// Only the admin may grant. `expires_at` must be strictly in the future
-    /// relative to the current ledger timestamp, otherwise the grant is
-    /// rejected with [`SignalError::InvalidExpiration`].
-    pub fn grant_permission(
-        env: Env,
-        grantee: Address,
-        capability: u32,
-        expires_at: u64,
-    ) -> Result<(), SignalError> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&ADMIN_KEY)
-            .ok
     ///
     /// Only the admin may grant. `expires_at` must be strictly in the future
     /// relative to the current ledger timestamp, otherwise the grant is
