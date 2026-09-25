@@ -18,6 +18,8 @@ pub enum SignalError {
     Unauthorized = 3,
     InvalidDecayConfig = 4,
     InvalidReputationUpdate = 5,
+    InvalidCursor = 6,
+    InvalidPageSize = 7,
 }
 
 /// Configuration-driven reputation decay schedule.
@@ -64,9 +66,42 @@ pub struct AuthPayload {
     pub method: Bytes,
 }
 
+/// A single provider relationship entry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRelationship {
+    pub provider: Address,
+    pub counterparty: Address,
+}
+
+/// A single provider membership entry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderMembership {
+    pub provider: Address,
+    pub group: Address,
+}
+
+/// A bounded page of results plus a stable cursor for the next page.
+///
+/// `next_cursor` is `None` when the caller has reached the final page.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<u32>,
+}
+}
+
 const ADMIN_KEY: &str = "admin";
 const SCHEDULE_KEY: &str = "schedule";
 const REPUTATION_KEY: &str = "reputation";
+const RELATIONSHIP_KEY: &str = "relationship";
+const MEMBERSHIP_KEY: &str = "membership";
+
+/// Maximum number of items a single page may return. Requests above this
+/// bound are rejected with `SignalError::InvalidPageSize`.
+const MAX_PAGE_SIZE: u32 = 100;
 
 #[contract]
 pub struct SignalRegistry;
@@ -168,6 +203,121 @@ impl SignalRegistry {
     fn append_field(out: &mut Bytes, field: &Bytes) {
         out.append(&(field.len() as u32).to_be_bytes().into());
         out.append(field);
+    }
+
+    /// Record a provider relationship. Read-only queries below expose these
+    /// entries in a bounded, cursor-paginated fashion.
+    pub fn add_relationship(
+        env: Env,
+        provider: Address,
+        counterparty: Address,
+    ) -> Result<(), SignalError> {
+        provider.require_auth();
+        let key = (RELATIONSHIP_KEY, provider.clone());
+        let mut list: Vec<ProviderRelationship> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        list.push_back(ProviderRelationship {
+            provider: provider.clone(),
+            counterparty,
+        });
+        env.storage().persistent().set(&key, &list);
+        Ok(())
+    }
+
+    /// Record a provider membership. Read-only queries below expose these
+    /// entries in a bounded, cursor-paginated fashion.
+    pub fn add_membership(
+        env: Env,
+        provider: Address,
+        group: Address,
+    ) -> Result<(), SignalError> {
+        provider.require_auth();
+        let key = (MEMBERSHIP_KEY, provider.clone());
+        let mut list: Vec<ProviderMembership> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        list.push_back(ProviderMembership {
+            provider: provider.clone(),
+            group,
+        });
+        env.storage().persistent().set(&key, &list);
+        Ok(())
+    }
+
+    /// Read a bounded page of provider relationships.
+    ///
+    /// `cursor` is the index of the first item to return; pass `None` for the
+    /// first page. `limit` must be between 1 and `MAX_PAGE_SIZE` inclusive.
+    /// Results are deterministic: the same cursor and limit always return the
+    /// same slice of the stored list. `next_cursor` is `None` on the final
+    /// page. Invalid cursors (past the end) return `SignalError::InvalidCursor`
+    /// and oversized limits return `SignalError::InvalidPageSize`.
+    pub fn get_relationships(
+        env: Env,
+        provider: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Result<Page<ProviderRelationship>, SignalError> {
+        let key = (RELATIONSHIP_KEY, provider.clone());
+        let list: Vec<ProviderRelationship> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        Self::paginate(&env, &list, cursor, limit)
+    }
+
+    /// Read a bounded page of provider memberships.
+    ///
+    /// See `get_relationships` for cursor and limit semantics.
+    pub fn get_memberships(
+        env: Env,
+        provider: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Result<Page<ProviderMembership>, SignalError> {
+        let key = (MEMBERSHIP_KEY, provider.clone());
+        let list: Vec<ProviderMembership> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        Self::paginate(&env, &list, cursor, limit)
+    }
+
+    /// Shared pagination helper: validates the cursor and limit, then returns
+    /// the requested slice plus a stable next cursor.
+    fn paginate<T: Clone>(
+        env: &Env,
+        list: &Vec<T>,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Result<Page<T>, SignalError> {
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+            return Err(SignalError::InvalidPageSize);
+        }
+        let len = list.len();
+        let start = cursor.unwrap_or(0);
+        if start > len {
+            return Err(SignalError::InvalidCursor);
+        }
+        let end = core::cmp::min(start.saturating_add(limit), len);
+        let mut items: Vec<T> = Vec::new(env);
+        let mut i = start;
+        while i < end {
+            if let Some(item) = list.get(i) {
+                items.push_back(item);
+            }
+            i += 1;
+        }
+        let next_cursor = if end < len { Some(end) } else { None };
+        Ok(Page { items, next_cursor })
+    }
     }
 
     /// Compute the decayed score for a record at a given timestamp.
@@ -331,3 +481,30 @@ mod test {
         );
     }
 }
+
+mod auth_cache_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+
+    fn schedule() -> DecaySchedule {
+        DecaySchedule {
+            decay_rate_bps: 0,
+            decay_interval: 1,
+            grace_period: 0,
+            min_reputation: 0,
+            max_reputation: 1_000,
+        }
+    }
+
+    fn setup() -> (Env, SignalRegistryClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SignalRegistry);
+        let client = SignalRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &schedule());
+        (env, client, admin)
+    }
+
+    /// A role change app
+
