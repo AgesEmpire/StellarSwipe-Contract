@@ -5,11 +5,17 @@
 //! Follow-up work: wire sequence assignment into the live analytics emission
 //! path in analytics_engine.rs.
 //!
+//! Determinism safeguards (#1078): Soroban maps have no specified iteration
+//! order, so any calculation whose result, hash, event, or accounting depends
+//! on traversal order must first be reduced to a deterministic key order. The
+//! helpers below provide that canonical ordering and a fold that is invariant
+//! to the order in which equivalent entries were inserted.
+//!
 //! Also enforces bounded event payload sizes at contract boundaries (#1070) so
 //! oversized emissions cannot exhaust transaction resources or disrupt
 //! downstream indexers.
 
-use soroban_sdk::{contracttype, String, Vec};
+use soroban_sdk::{contracttype, Env, Map, String, Vec};
 
 /// Maximum length, in bytes, of a string field carried in an event payload.
 pub const MAX_EVENT_STRING_LEN: u32 = 256;
@@ -117,6 +123,38 @@ pub fn deterministic_sort(mut events: Vec<OrderedEvent>) -> Vec<OrderedEvent> {
     events
 }
 
+/// Returns the keys of a Soroban map in a canonical, deterministic order.
+///
+/// Soroban maps do not guarantee iteration order, so any order-sensitive
+/// calculation (results, hashes, emitted events, accounting) must traverse
+/// keys through this helper rather than iterating the map directly.
+pub fn sorted_keys(env: &Env, map: &Map<u64, u64>) -> Vec<u64> {
+    let mut keys = Vec::new(env);
+    for (key, _) in map.iter() {
+        keys.push_back(key);
+    }
+    keys.sort();
+    keys
+}
+
+/// Folds a Soroban map into a single value in canonical key order.
+///
+/// Because the traversal is sorted by key, the result is identical for any two
+/// maps holding the same entries regardless of the order in which those
+/// entries were inserted. Use this for any accumulator whose value feeds a
+/// result, hash, event, or accounting figure.
+pub fn fold_sorted<F>(env: &Env, map: &Map<u64, u64>, init: u64, mut f: F) -> u64
+where
+    F: FnMut(u64, u64, u64) -> u64,
+{
+    let mut acc = init;
+    for key in sorted_keys(env, map).iter() {
+        let value = map.get(key).unwrap_or(0);
+        acc = f(acc, key, value);
+    }
+    acc
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -167,6 +205,47 @@ mod test {
         let seq_a: Vec<(u64, u64)> = a.iter().map(|e| (e.stream_id, e.sequence)).collect();
         let seq_b: Vec<(u64, u64)> = b.iter().map(|e| (e.stream_id, e.sequence)).collect();
         assert_eq!(seq_a, seq_b);
+    }
+
+    #[test]
+    fn sorted_keys_are_canonical_regardless_of_insertion_order() {
+        let env = Env::default();
+
+        let forward = Map::new(&env);
+        forward.set(1, 10);
+        forward.set(2, 20);
+        forward.set(3, 30);
+
+        let reverse = Map::new(&env);
+        reverse.set(3, 30);
+        reverse.set(2, 20);
+        reverse.set(1, 10);
+
+        let keys_forward: Vec<u64> = sorted_keys(&env, &forward);
+        let keys_reverse: Vec<u64> = sorted_keys(&env, &reverse);
+        assert_eq!(keys_forward, keys_reverse);
+    }
+
+    #[test]
+    fn fold_sorted_is_invariant_to_insertion_order() {
+        let env = Env::default();
+
+        let forward = Map::new(&env);
+        forward.set(1, 10);
+        forward.set(2, 20);
+        forward.set(3, 30);
+
+        let reverse = Map::new(&env);
+        reverse.set(3, 30);
+        reverse.set(2, 20);
+        reverse.set(1, 10);
+
+        // Order-sensitive accumulator: hash-like mix of (key, value) pairs.
+        let mix = |acc: u64, key: u64, value: u64| acc.wrapping_mul(31).wrapping_add(key).wrapping_add(value);
+
+        let acc_forward = fold_sorted(&env, &forward, 0, mix);
+        let acc_reverse = fold_sorted(&env, &reverse, 0, mix);
+        assert_eq!(acc_forward, acc_reverse);
     }
 
     #[test]
@@ -265,5 +344,6 @@ mod test {
         for _ in 0..100 {
             assert_eq!(validate_event_payload(&label, &items, &metadata), Ok(()));
         }
+    }
     }
 }
