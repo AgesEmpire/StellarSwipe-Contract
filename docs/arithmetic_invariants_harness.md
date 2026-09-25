@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the property-based testing harness for fee and PnL arithmetic invariants in the StellarSwipe contracts. The harness uses `proptest` to generate randomized valid input ranges and asserts core arithmetic invariants hold for fee-splitting calculations in `fee_collector` and realized-PnL calculations in `trade_executor`.
+This document describes the property-based testing harness for fee, PnL, and liquidity-pool share arithmetic invariants in the StellarSwipe contracts. The harness uses `proptest` to generate randomized valid input ranges and asserts core arithmetic invariants hold for fee-splitting calculations in `fee_collector`, realized-PnL calculations in `trade_executor`, and share mint/burn conversions in the liquidity pool.
 
 ## Location
 
@@ -124,6 +124,59 @@ The realized-PnL calculation logic in `trade_executor` is tested for the followi
    - `entry_value <= amount * max_price`
    - Ensures calculations stay within realistic bounds
 
+### Liquidity Pool Share Invariants (liquidity_pool)
+
+The share mint/burn conversions in the liquidity pool are tested for the following invariants. Every conversion between assets and shares has a documented rounding direction; the pool always rounds in favor of the pool (never the depositor/withdrawer) so that rounding drift cannot be farmed across repeated operations.
+
+**Rounding direction for every conversion:**
+
+| Conversion | Formula | Rounding | Rationale |
+| --- | --- | --- | --- |
+| Deposit → shares minted | `shares = deposit * total_shares / total_assets` | **floor** | Never mint more shares than the deposit is worth; any dust stays in the pool. |
+| Withdraw → assets returned | `assets = shares * total_assets / total_shares` | **floor** | Never pay out more assets than the shares are worth; any dust stays in the pool. |
+| Initial deposit → shares minted | `shares = deposit` (1:1 bootstrap) | **exact** | First deposit defines the share/asset ratio; no rounding is possible. |
+| Minimum-share guard | `shares >= MIN_LIQUIDITY_SHARES` | **ceil check** | Reject deposits that would mint fewer than the minimum, preventing zero-share mints. |
+
+1. **Share Mint No Overflow**: Share minting never overflows for valid input ranges
+   - `shares = deposit * total_shares / total_assets`
+   - Tested for deposits up to 10^12 and pool sizes up to 10^18
+
+2. **Share Mint Rounds Down**: Minted shares never exceed the exact rational value
+   - `shares * total_assets <= deposit * total_shares`
+   - Guarantees the pool is never diluted by a deposit
+
+3. **Share Burn Rounds Down**: Assets returned never exceed the exact rational value
+   - `assets * total_shares <= shares * total_assets`
+   - Guarantees the pool is never drained by a withdrawal
+
+4. **Conservation Across Repeated Deposits**: For a sequence of deposits, the sum of minted shares equals the shares computed from the aggregate deposit
+   - `sum(mint(d_i)) <= mint(sum(d_i))`
+   - Rounding dust accumulates in the pool, never in the depositor's favor
+
+5. **Conservation Across Repeated Withdrawals**: For a sequence of withdrawals, the sum of returned assets never exceeds the assets computed from the aggregate withdrawal
+   - `sum(burn(s_i)) <= burn(sum(s_i))`
+   - Rounding dust accumulates in the pool, never in the withdrawer's favor
+
+6. **Round-Trip No Value Creation**: Deposit then immediately withdraw never returns more assets than deposited
+   - `burn(mint(deposit)) <= deposit`
+   - Prevents a deposit/withdraw cycle from creating value out of rounding
+
+7. **Minimum-Share Invariant**: A deposit that would mint fewer than `MIN_LIQUIDITY_SHARES` shares is rejected
+   - `mint(deposit) >= MIN_LIQUIDITY_SHARES` for every accepted deposit
+   - Prevents tiny deposits from minting zero shares or being used to grief the pool
+
+8. **Zero-Share Guard**: A deposit that would mint zero shares is rejected rather than silently accepted
+   - `mint(deposit) == 0` is an error, not a no-op
+   - Prevents share-supply manipulation via dust deposits
+
+9. **Monotonic in Deposit**: Larger deposits mint equal or more shares
+   - `deposit_a <= deposit_b => mint(deposit_a) <= mint(deposit_b)`
+   - Prevents perverse incentives
+
+10. **Monotonic in Shares Burned**: Burning more shares returns equal or more assets
+    - `shares_a <= shares_b => burn(shares_a) <= burn(shares_b)`
+    - Prevents perverse incentives
+
 ## Input Constraints
 
 All generated inputs are constrained to realistic, valid ranges reflecting real contract usage:
@@ -138,6 +191,13 @@ All generated inputs are constrained to realistic, valid ranges reflecting real 
 - **Trade amounts**: 1 to 10^12
 - **Entry/exit prices**: 1 to 10^13 (7-decimal precision, Stellar standard)
 - **Entry values**: 0 to 10^18 (realistic bound for amount * price)
+
+### Liquidity Pool Shares
+- **Deposits**: 1 to 10^12 (tiny amounts included to exercise the minimum-share guard)
+- **Total assets**: 1 to 10^18
+- **Total shares**: 1 to 10^18
+- **Shares burned**: 1 to 10^18
+- **Boundary cases**: `i128::MAX` and `i128::MIN` inputs to confirm checked arithmetic rejects overflow instead of wrapping
 
 ## Test Configuration
 
@@ -162,6 +222,10 @@ In addition to property-based tests, the harness includes end-to-end integration
 2. **PnL Calculation End-to-End**: Tests PnL calculation with realistic parameters
    - Verifies invariants hold through the full PnL calculation flow
    - Tests with realistic entry and exit prices
+
+3. **Liquidity Pool Round-Trip End-to-End**: Tests repeated deposit/withdraw cycles with realistic parameters
+   - Verifies conservation and minimum-share invariants hold across many operations
+   - Includes tiny-amount and maximum-integer boundary cases
 
 ## Adding New Invariants
 
@@ -213,31 +277,4 @@ If a property test fails:
 
 ## CI Integration
 
-The test harness is integrated into the CI test suite via the `[[test]]` configuration in `integration_tests/Cargo.toml`:
-
-```toml
-[[test]]
-name = "test_arithmetic_invariants"
-path = "tests/integration/test_arithmetic_invariants.rs"
-```
-
-This ensures the tests run automatically on every CI build.
-
-## Performance Considerations
-
-- **Test cases**: 1,000 cases per property (configurable)
-- **Runtime**: Approximately 1-2 minutes for the full suite
-- **Memory**: Minimal (no large allocations)
-- **CI budget**: Designed to run within reasonable CI time limits
-
-If CI time becomes a concern, you can:
-1. Reduce the number of test cases in `ProptestConfig`
-2. Run specific property tests instead of the full suite
-3. Use proptest's `fork` mode to parallelize tests
-
-## References
-
-- [Proptest Documentation](https://altsysrq.github.io/proptest-book/)
-- [Fee Collector Contract](../stellar-swipe/contracts/fee_collector/)
-- [Trade Executor Contract](../stellar-swipe/contracts/trade_executor/)
-- [Chaos Test Documentation](./chaos_test.md)
+The arithmetic invariant tests run as part of the standard CI pipeline. Any failure blocks the merge, ensuring rounding drift and conservation violations are caught before they reach production.
