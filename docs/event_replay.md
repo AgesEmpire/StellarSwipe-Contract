@@ -1,47 +1,58 @@
-# Event replay (Issue #882)
+# Event Replay and Topic Version Negotiation
 
-Reconstructing protocol state from historical on-chain events, for debugging
-and for validating upgrades against what actually happened on chain.
+This document describes how indexers and off-chain consumers replay contract
+events and how they negotiate event topic schema versions.
 
-## Pipeline
+## Topic Versioning Convention
 
-1. `scripts/replay_events.ts` — fetch raw Soroban events from an RPC endpoint.
-2. `scripts/test_event_parsing.ts` — parse them into the native JSON shape
-   (see `scripts/sample_parsed_events_testnet.json`).
-3. `scripts/replay_state.ts` — fold that parsed stream into a state snapshot.
+Event topics are versioned so that consumers can identify schema changes
+without guessing from payload shape. Each versioned event family emits a
+topic symbol suffixed with a version identifier:
 
-```sh
-cd scripts
-npx tsx replay_state.ts sample_parsed_events_testnet.json
+```
+<event_name>_v<major>
 ```
 
-## What the snapshot contains
+Examples:
 
-| Field | Reconstructed from |
-| --- | --- |
-| `stakes` | `staked` / `unstaked` |
-| `signals` | `trade_executed` (count and cumulative volume per signal) |
-| `feesCollected` | `fee_collected` |
-| `lastOraclePrice` | `oracle_price_submitted` |
-| `unhandledEvents` | any event name with no reducer yet |
+- `signal_registered_v1`
+- `signal_updated_v1`
+- `signal_removed_v1`
 
-Amounts are `bigint`; `serialize()` renders them as decimal strings so a
-snapshot can be diffed or committed as JSON.
+A new topic symbol is introduced whenever the payload schema changes in a
+backwards-incompatible way. Additive, backwards-compatible changes keep the
+same version.
 
-## Determinism
+## Consumer Negotiation
 
-Events are sorted by ledger (then event id) before folding, so a page returned
-out of order by the RPC replays to the same snapshot. `unhandledEvents` makes
-coverage gaps visible instead of silently dropping events — when a contract
-gains a new event, add a reducer case and it disappears from that list.
+Consumers should:
 
-## Fixture test
+1. Subscribe to the topic symbols they understand (e.g. `*_v1`).
+2. Ignore topic symbols for versions they do not recognize rather than
+   attempting to decode them.
+3. Log unknown versions so operators can upgrade indexers before the old
+   version is retired.
 
-`scripts/fixtures/replay_events_fixture.json` is a known-good event stream with
-a deliberately out-of-order ledger and one unhandled event name. The replay is
-asserted against its expected snapshot:
+This lets old and new consumers run side by side: an old consumer keeps
+processing `_v1` events while a new consumer can begin handling `_v2`
+events as soon as they are emitted.
 
-```sh
-cd scripts
-npx tsx --test replay_state.test.ts
-```
+## Migration Guidance
+
+When introducing a new event version:
+
+1. Define the new topic symbol (`<event_name>_v<major+1>`).
+2. Emit the new version from the contract for the affected event family.
+3. Keep emitting the previous version during a transition window if
+   backwards compatibility is required.
+4. Update this document and the event schema documentation with the new
+   topic symbol and payload shape.
+5. Announce the deprecation timeline for the old version so indexers can
+   migrate before it is removed.
+
+## Replay
+
+To replay events, query the ledger range of interest and filter by the
+versioned topic symbols you support. Because versions are encoded in the
+topic, replay tooling can select a specific schema version deterministically
+without inspecting payload contents.
