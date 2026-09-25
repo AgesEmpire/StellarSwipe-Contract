@@ -10,3 +10,6 @@
 - #1074: Add storage footprint growth regression tests
 <!-- handsoff-issue-949 -->
 - #949: Add provider churn risk score integration test covering all risk factors in analytics
+
+<!-- handsoff-issue-1169 -->
+- #1169: Create cross-contract upgrade compatibility fixtures
