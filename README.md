@@ -2,6 +2,8 @@
 
 ## Handsoff notes
 
+<!-- handsoff-issue-1088 -->
+- #1088: Add Soroban contract reentrancy fixture harness
 <!-- handsoff-issue-1074 -->
 - #1074: Add storage footprint growth regression tests
 <!-- handsoff-issue-949 -->

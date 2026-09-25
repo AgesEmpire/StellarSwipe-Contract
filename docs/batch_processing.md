@@ -9,11 +9,12 @@ The StellarSwipe batch processing system optimizes contract operations by groupi
 1. [Architecture](#architecture)
 2. [Core Components](#core-components)
 3. [Batch Execution Modes](#batch-execution-modes)
-4. [Usage Guide](#usage-guide)
-5. [Performance Optimization](#performance-optimization)
-6. [Error Handling](#error-handling)
-7. [Best Practices](#best-practices)
-8. [Integration Examples](#integration-examples)
+4. [Bounded Batch Authorization Verification](#bounded-batch-authorization-verification)
+5. [Usage Guide](#usage-guide)
+6. [Performance Optimization](#performance-optimization)
+7. [Error Handling](#error-handling)
+8. [Best Practices](#best-practices)
+9. [Integration Examples](#integration-examples)
 
 ---
 
@@ -51,6 +52,7 @@ The batch processing system is built on four core pillars:
 - **Automatic Rollback**: State management with savepoints for failure recovery
 - **Size Optimization**: Dynamic batch sizing based on gas costs and performance
 - **Performance Tracking**: Comprehensive metrics and benchmarking tools
+- **Bounded Authorization Verification**: Capped batch verification of repeated authorization checks with per-item failure reporting
 
 ---
 
@@ -245,6 +247,104 @@ if result.failure_count > 0 {
 
 ---
 
+## Bounded Batch Authorization Verification
+
+Repeated authorization checks (e.g. verifying many callers against the same operation) can be batched to reduce per-check overhead. The bounded batch verifier guarantees that batching never weakens the security properties of an individual check.
+
+### Guarantees
+
+1. **Explicit batch cap** — the batch size is capped at `MAX_AUTH_BATCH_SIZE`. Oversized batches are rejected deterministically with `BatchAuthError::BatchTooLarge`; they are never silently truncated.
+2. **Item binding** — every item carries the `operation` and `caller` it was authorized for. Verification re-checks the binding, so an item cannot be replayed against a different operation or caller.
+3. **No silent skips** — each item produces an explicit per-item result. Invalid items appear in `failed` with a reason; they are never dropped from the report.
+4. **Atomicity preserved** — under `AllOrNothing`, any per-item failure rolls back the whole batch; under `BestEffort`, per-item failures are reported individually.
+
+### Types
+
+```rust
+pub const MAX_AUTH_BATCH_SIZE: u32 = 64;
+
+pub struct AuthCheckItem {
+    pub operation: Symbol,
+    pub caller: Address,
+    pub payload_hash: BytesN<32>,
+}
+
+pub enum BatchAuthError {
+    BatchTooLarge,
+    EmptyBatch,
+    OperationMismatch,
+    CallerMismatch,
+    Unauthorized,
+}
+
+pub struct AuthCheckOutcome {
+    pub index: u32,
+    pub result: Result<(), BatchAuthError>,
+}
+
+pub struct BatchAuthResult {
+    pub outcomes: Vec<AuthCheckOutcome>,
+    pub success_count: u32,
+    pub failure_count: u32,
+}
+```
+
+### Verifier
+
+```rust
+pub fn verify_batch_auth(
+    env: &Env,
+    expected_operation: Symbol,
+    expected_caller: Address,
+    items: Vec<AuthCheckItem>,
+    mode: BatchMode,
+) -> Result<BatchAuthResult, BatchAuthError>
+```
+
+**Behavior:**
+- Rejects `items.len() > MAX_AUTH_BATCH_SIZE` with `BatchAuthError::BatchTooLarge`.
+- Rejects an empty batch with `BatchAuthError::EmptyBatch`.
+- For each item, checks `item.operation == expected_operation` and `item.caller == expected_caller`; mismatches yield `OperationMismatch` / `CallerMismatch` for that index.
+- Runs the underlying authorization check; failures yield `Unauthorized` for that index.
+- Under `AllOrNothing`, the first failure aborts the batch and the caller rolls back; under `BestEffort`, all outcomes are returned.
+
+### Example
+
+```rust
+let items = build_auth_items(&env, &callers, operation.clone());
+
+let result = verify_batch_auth(
+    &env,
+    operation.clone(),
+    caller.clone(),
+    items,
+    BatchMode::BestEffort,
+)?;
+
+for outcome in result.outcomes.iter() {
+    match outcome.result {
+        Ok(()) => log_success(outcome.index),
+        Err(reason) => log_failure(outcome.index, reason),
+    }
+}
+```
+
+### Benchmarks
+
+Benchmarks compare batch verification against single-item verification to quantify the resource savings:
+
+- `bench_single_auth_check`: verifies one item at a time.
+- `bench_batch_auth_check`: verifies the same items through `verify_batch_auth`.
+- Reported metrics: CPU instructions and memory bytes per item, plus the batch/single ratio.
+
+Run with:
+
+```
+cargo bench -p batch_processor --bench auth_batch
+```
+
+---
+
 ## Usage Guide
 
 ### Basic Batch Processing
@@ -322,435 +422,3 @@ if result.failure_count > 0 {
     BatchRollbackManager::commit(&env, batch_id);
 }
 ```
-
----
-
-## Performance Optimization
-
-### Recommended Batch Sizes by Operation
-
-| Operation Type | Recommended Size | Rationale |
-|---------------|------------------|-----------|
-| Transfer | 50 | Balanced gas/throughput |
-| Stake | 30 | Higher gas per operation |
-| Unstake | 30 | Higher gas per operation |
-| ClaimRewards | 40 | Moderate complexity |
-| RegisterSignal | 20 | Complex validation |
-| UpdateSignal | 60 | Lower gas cost |
-
-### Dynamic Size Adjustment
-
-The optimizer automatically adjusts batch sizes based on:
-
-1. **Success Rate**
-   - >95% success + fast processing → Increase by 20%
-   - <80% success or slow processing → Decrease by 20%
-
-2. **Processing Time**
-   - <1 second → Consider increasing size
-   - >5 seconds → Consider decreasing size
-
-3. **Gas Efficiency**
-   - Calculate optimal size: `max_gas / avg_gas_per_item`
-   - Clamp to MIN_BATCH_SIZE and MAX_BATCH_SIZE
-
-### Performance Metrics
-
-```rust
-pub struct BatchPerformanceMetrics {
-    pub batch_size: u32,
-    pub processing_time_ms: u64,
-    pub gas_used: u64,
-    pub gas_per_item: u64,
-    pub throughput: u32,        // Items per second
-    pub success_rate: u32,      // Percentage
-    pub efficiency_score: u32,  // 0-100
-}
-```
-
-**Efficiency Score Calculation:**
-- 50% weight: Success rate
-- 30% weight: Gas efficiency
-- 20% weight: Throughput
-
----
-
-## Error Handling
-
-### Error Types
-
-```rust
-pub enum BatchProcessingError {
-    BatchFull = 1,           // Batch reached max size
-    BatchEmpty = 2,          // No items to process
-    InvalidBatchSize = 3,    // Size outside valid range
-    ProcessingFailed = 4,    // Item processing error
-    RollbackFailed = 5,      // Rollback operation failed
-    TimeoutExceeded = 6,     // Batch timeout reached
-}
-```
-
-### Error Information
-
-```rust
-pub struct BatchError {
-    pub index: u32,           // Item index in batch
-    pub error_code: u32,      // Error type code
-    pub error_message: String, // Human-readable message
-}
-```
-
-### Error Handling Patterns
-
-```rust
-// Pattern 1: Check for specific errors
-match result.failed.get(0) {
-    Some(error) if error.error_code == BatchProcessingError::TimeoutExceeded as u32 => {
-        // Handle timeout
-    },
-    Some(error) => {
-        // Handle other errors
-    },
-    None => {
-        // No errors
-    }
-}
-
-// Pattern 2: Retry failed items
-if result.failure_count > 0 {
-    let failed_items = extract_failed_items(&original_items, &result.failed);
-    retry_batch(&env, failed_items);
-}
-
-// Pattern 3: Partial success handling
-if result.success_count > 0 && result.failure_count > 0 {
-    commit_successful(&result.successful);
-    log_failures(&result.failed);
-}
-```
-
----
-
-## Best Practices
-
-### 1. Choose the Right Execution Mode
-
-- **Use AllOrNothing** for financial transactions and critical state updates
-- **Use BestEffort** for bulk operations where partial success is acceptable
-- **Use StopOnError** for sequential operations with dependencies
-
-### 2. Optimize Batch Sizes
-
-- Start with recommended sizes for your operation type
-- Monitor performance metrics and adjust accordingly
-- Consider gas limits and network conditions
-- Use the BatchSizeOptimizer for dynamic adjustment
-
-### 3. Handle Timeouts Appropriately
-
-- Set reasonable timeout values (default: 5 minutes)
-- Process batches before timeout when possible
-- Implement timeout monitoring and alerts
-
-### 4. Implement Proper Error Handling
-
-- Always check `failure_count` in results
-- Log failed items for debugging and retry
-- Implement exponential backoff for retries
-- Monitor error patterns for system issues
-
-### 5. Monitor Performance
-
-- Track gas savings and efficiency scores
-- Monitor success rates and processing times
-- Set up alerts for degraded performance
-- Use benchmarking tools for optimization
-
-### 6. Test Thoroughly
-
-- Test all execution modes
-- Test edge cases (empty batches, single items, max size)
-- Test failure scenarios and rollback
-- Benchmark performance under load
-
----
-
-## Integration Examples
-
-### Example 1: Batch Token Transfers
-
-```rust
-pub fn batch_transfer(
-    env: Env,
-    from: Address,
-    transfers: Vec<TransferItem>,
-) -> BatchResult<()> {
-    // Validate inputs
-    from.require_auth();
-    
-    // Create aggregator
-    let mut aggregator = BatchAggregator::new(&env, get_next_batch_id(), 50);
-    
-    // Add transfers
-    for transfer in transfers.iter() {
-        aggregator.add(transfer)?;
-    }
-    
-    // Execute batch
-    BatchExecutor::execute_batch(
-        &env,
-        aggregator.items,
-        BatchMode::AllOrNothing,
-        |env, item| {
-            // Process individual transfer
-            transfer_tokens(env, &from, &item.to, item.amount)
-        },
-    )
-}
-```
-
-### Example 2: Batch Staking Operations
-
-```rust
-pub fn batch_stake(
-    env: Env,
-    stakers: Vec<StakeRequest>,
-) -> BatchResult<StakeReceipt> {
-    // Optimize batch size
-    let optimizer = BatchSizeOptimizer::new();
-    let batch_size = optimizer.recommend_size(&BatchOperation::Stake);
-    
-    // Create aggregator with optimized size
-    let mut aggregator = BatchAggregator::new(&env, get_next_batch_id(), batch_size);
-    
-    for request in stakers.iter() {
-        aggregator.add(request)?;
-    }
-    
-    // Create savepoint for rollback
-    let savepoint = BatchRollbackManager::create_savepoint(&env, aggregator.batch_id);
-    
-    // Execute batch
-    let result = BatchExecutor::execute_batch(
-        &env,
-        aggregator.items,
-        BatchMode::AllOrNothing,
-        |env, request| {
-            stake_tokens(env, &request.staker, request.amount)
-        },
-    );
-    
-    // Handle result
-    if result.failure_count > 0 {
-        BatchRollbackManager::rollback(&env, &savepoint)?;
-    } else {
-        BatchRollbackManager::commit(&env, aggregator.batch_id);
-    }
-    
-    result
-}
-```
-
-### Example 3: Batch Reward Claims
-
-```rust
-pub fn batch_claim_rewards(
-    env: Env,
-    claimants: Vec<Address>,
-) -> BatchResult<ClaimReceipt> {
-    // Use BestEffort mode for non-critical operations
-    let mut aggregator = BatchAggregator::new(&env, get_next_batch_id(), 40);
-    
-    for claimant in claimants.iter() {
-        aggregator.add(claimant)?;
-    }
-    
-    let result = BatchExecutor::execute_batch(
-        &env,
-        aggregator.items,
-        BatchMode::BestEffort,
-        |env, claimant| {
-            claim_rewards(env, claimant)
-        },
-    );
-    
-    // Log results
-    log_batch_results(&env, &result);
-    
-    result
-}
-```
-
-### Example 4: Batch Signal Updates
-
-```rust
-pub fn batch_update_signals(
-    env: Env,
-    updates: Vec<SignalUpdate>,
-) -> BatchResult<()> {
-    // Use StopOnError for sequential updates
-    let mut aggregator = BatchAggregator::new(&env, get_next_batch_id(), 60);
-    
-    for update in updates.iter() {
-        aggregator.add(update)?;
-    }
-    
-    let result = BatchExecutor::execute_batch(
-        &env,
-        aggregator.items,
-        BatchMode::StopOnError,
-        |env, update| {
-            update_signal(env, &update.signal_id, &update.data)
-        },
-    );
-    
-    // Handle early termination
-    if result.failure_count > 0 {
-        let error = result.failed.get(0).unwrap();
-        handle_update_error(&env, &error);
-    }
-    
-    result
-}
-```
-
-### Example 5: Performance Benchmarking
-
-```rust
-pub fn benchmark_operations(env: Env) {
-    let test_items = generate_test_items(&env, 100);
-    
-    // Benchmark batch processing
-    let metrics = benchmark_batch_processing(
-        &env,
-        test_items,
-        |env, item| process_test_item(env, item),
-    );
-    
-    // Analyze results
-    println!("Batch Size: {}", metrics.batch_size);
-    println!("Processing Time: {}ms", metrics.processing_time_ms);
-    println!("Gas Used: {}", metrics.gas_used);
-    println!("Gas Per Item: {}", metrics.gas_per_item);
-    println!("Throughput: {} items/sec", metrics.throughput);
-    println!("Success Rate: {}%", metrics.success_rate);
-    println!("Efficiency Score: {}/100", metrics.efficiency_score);
-    
-    // Calculate gas savings
-    let individual_cost = metrics.batch_size as u64 * 100000;
-    let savings_percent = ((individual_cost - metrics.gas_used) * 100) / individual_cost;
-    println!("Gas Savings: {}%", savings_percent);
-}
-```
-
----
-
-## Advanced Topics
-
-### Custom Batch Processors
-
-You can create custom processors for specific use cases:
-
-```rust
-pub struct CustomBatchProcessor {
-    pub config: ProcessorConfig,
-}
-
-impl CustomBatchProcessor {
-    pub fn process_with_validation<T, R>(
-        &self,
-        env: &Env,
-        items: Vec<T>,
-        validator: impl Fn(&T) -> bool,
-        processor: impl Fn(&Env, &T) -> Result<R, BatchProcessingError>,
-    ) -> BatchResult<R> {
-        // Filter valid items
-        let valid_items = items.iter()
-            .filter(|item| validator(item))
-            .collect();
-        
-        // Process valid items
-        BatchExecutor::execute_batch(
-            env,
-            valid_items,
-            self.config.mode,
-            processor,
-        )
-    }
-}
-```
-
-### Nested Batch Processing
-
-For complex workflows, you can nest batch operations:
-
-```rust
-pub fn process_nested_batches(env: Env) -> BatchResult<()> {
-    // Outer batch: Process user groups
-    let groups = get_user_groups(&env);
-    
-    BatchExecutor::execute_batch(
-        &env,
-        groups,
-        BatchMode::BestEffort,
-        |env, group| {
-            // Inner batch: Process users in group
-            let users = get_group_users(env, group);
-            
-            let inner_result = BatchExecutor::execute_batch(
-                env,
-                users,
-                BatchMode::BestEffort,
-                |env, user| process_user(env, user),
-            );
-            
-            if inner_result.success_count > 0 {
-                Ok(())
-            } else {
-                Err(BatchProcessingError::ProcessingFailed)
-            }
-        },
-    )
-}
-```
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**Issue: Batch timeout exceeded**
-- Solution: Reduce batch size or increase timeout value
-- Check: Network conditions and processing complexity
-
-**Issue: High failure rate**
-- Solution: Validate items before adding to batch
-- Check: Input data quality and business logic
-
-**Issue: Rollback failures**
-- Solution: Ensure proper savepoint creation
-- Check: State management and storage operations
-
-**Issue: Poor gas efficiency**
-- Solution: Optimize batch size using BatchSizeOptimizer
-- Check: Operation complexity and gas limits
-
-### Performance Tuning
-
-1. **Monitor key metrics**: Success rate, gas usage, throughput
-2. **Adjust batch sizes**: Use optimizer recommendations
-3. **Choose appropriate mode**: Match mode to use case
-4. **Implement caching**: Reduce redundant operations
-5. **Profile operations**: Identify bottlenecks
-
----
-
-## Conclusion
-
-The StellarSwipe batch processing system provides a robust, efficient solution for optimizing contract operations. By following the guidelines and best practices in this document, you can achieve significant gas savings and improved throughput while maintaining reliability and consistency.
-
-For more information, see:
-- [Batch Processing Benchmarks](./batch_processing_benchmarks.md)
-- [Performance Optimization Guide](./protocol23_optimization.md)
-- [Architecture Documentation](./ARCHITECTURE.md)
