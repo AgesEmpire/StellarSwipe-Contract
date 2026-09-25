@@ -89,3 +89,75 @@ const stakeVault = getContractId(loadRegistry(), "testnet", "stake_vault");
 `recordDeployment(network, contract, address)` writes a freshly deployed address
 back into the registry and stamps `deployed_at`, so deploy scripts keep the file
 current instead of leaving addresses scattered across per-run state files.
+
+## Upgrade compatibility manifests (Issue #1102)
+
+`deployments/<network>.compat.json` is a **machine-readable compatibility
+manifest** published for every contract release. Where the deployment manifest
+above describes what a release *should* contain and the registry records what is
+actually live, the compatibility manifest captures everything an operator needs
+to decide whether a candidate release can be safely upgraded over a deployed
+one.
+
+It is generated as part of the release workflow (see
+`.github/workflows/release.yml`) by `scripts/generate_compat_manifest.py`, which
+reads the release's deployment manifest and the compiled contract metadata. Each
+contract entry contains:
+
+- `interface_version` — the contract's public interface version, bumped on any
+  breaking ABI change.
+- `storage_layout` — the ordered list of persistent/instance storage keys with
+  their types, so storage migrations can be diffed between releases.
+- `upgrade_prerequisites` — the minimum `interface_version` and any required
+  migration steps that must run before the upgrade is applied.
+
+Example:
+
+```json
+{
+  "network": "testnet",
+  "release": "v1.4.0",
+  "generated_at": "2024-06-01T00:00:00Z",
+  "contracts": {
+    "stake_vault": {
+      "interface_version": 3,
+      "storage_layout": [
+        { "key": "Admin", "type": "Address" },
+        { "key": "TotalStaked", "type": "i128" }
+      ],
+      "upgrade_prerequisites": {
+        "min_interface_version": 2,
+        "migration_required": false
+      }
+    }
+  }
+}
+```
+
+### CI enforcement
+
+CI runs `scripts/validate_compat_manifest.py` against every
+`deployments/*.compat.json` and against the manifest produced for the candidate
+release. The release is **rejected** if a compatibility manifest is missing for a
+contract that appears in the deployment manifest, or if it is incompatible with
+the currently deployed version — for example a lower `interface_version`, a
+removed storage key, or an unmet `min_interface_version`.
+
+### Comparing deployed and candidate versions
+
+Operators compare the live release against a candidate before upgrading:
+
+```sh
+# Fetch the deployed compatibility manifest for the network
+npx tsx scripts/deployment_registry.ts get testnet stake_vault
+
+# Diff it against the candidate manifest produced by the release workflow
+python3 scripts/validate_compat_manifest.py \
+  deployments/testnet.compat.json \
+  --candidate dist/testnet.compat.json
+```
+
+The validator exits non-zero and prints the specific incompatibility (changed
+storage key, downgraded interface version, or missing prerequisite) when the
+candidate cannot be safely applied, so the same command works both as a manual
+pre-upgrade check and as the CI gate.
