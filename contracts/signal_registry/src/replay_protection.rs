@@ -33,6 +33,41 @@ use std::collections::BTreeSet;
 /// Domain-separation tag mixed into every digest.
 const DOMAIN_TAG: &[u8] = b"signal-replay-v1";
 
+/// Canonical hashing helper for Soroban authorization payloads.
+///
+/// Every authorization path derives its signing domain and serialized bytes
+/// through this single helper so that equivalent payloads always hash
+/// identically and altered fields never collide. The serialization is
+/// length-prefixed with big-endian `u32` lengths and separated by a `0x00`
+/// byte after the domain tag, matching the replay-protection digest format.
+pub struct AuthPayloadHasher;
+
+impl AuthPayloadHasher {
+    /// Hashes a canonical authorization payload.
+    ///
+    /// `domain` is the domain-separation tag (e.g. `"signal-replay-v1"`),
+    /// `network` is the network passphrase / id, `contract` is the contract
+    /// address, `method` is the entrypoint name, and `args` are the serialized
+    /// invocation arguments. Each field is length-prefixed so distinct field
+    /// boundaries can never collide.
+    pub fn hash(
+        domain: &[u8],
+        network: &[u8],
+        contract: &[u8],
+        method: &[u8],
+        args: &[u8],
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        hasher.update([0u8]);
+        for field in [network, contract, method, args] {
+            hasher.update((field.len() as u32).to_be_bytes());
+            hasher.update(field);
+        }
+        hasher.finalize()
+    }
+}
+
 /// Deterministic replay-protection key for a cross-contract signal submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubmissionDigest(pub [u8; 32]);
@@ -61,14 +96,13 @@ impl<'a> SubmissionContext<'a> {
     /// Computes the deterministic digest binding provider, payload, caller and
     /// intended registry.
     pub fn digest(&self) -> SubmissionDigest {
-        let mut hasher = Sha256::new();
-        hasher.update(DOMAIN_TAG);
-        hasher.update([0u8]);
-        for field in [self.provider, self.payload, self.caller, self.registry] {
-            hasher.update((field.len() as u32).to_be_bytes());
-            hasher.update(field);
-        }
-        SubmissionDigest(hasher.finalize())
+        SubmissionDigest(AuthPayloadHasher::hash(
+            DOMAIN_TAG,
+            self.provider,
+            self.payload,
+            self.caller,
+            self.registry,
+        ))
     }
 }
 
@@ -235,13 +269,124 @@ mod tests {
     }
 
     #[test]
-    fn digest_binds_all_fields() {
-        let base = ctx(b"provider-a", b"signal-1", b"caller-1", b"registry-1");
-        let base_digest = base.digest();
+    fn equivalent_payloads_hash_identically() {
+        let a = AuthPayloadHasher::hash(
+            b"signal-replay-v1",
+            b"testnet",
+            b"registry-1",
+            b"submit_signal",
+            b"args-1",
+        );
+        let b = AuthPayloadHasher::hash(
+            b"signal-replay-v1",
+            b"testnet",
+            b"registry-1",
+            b"submit_signal",
+            b"args-1",
+        );
+        assert_eq!(a, b);
+    }
 
-        assert_ne!(base_digest, ctx(b"provider-b", b"signal-1", b"caller-1", b"registry-1").digest());
-        assert_ne!(base_digest, ctx(b"provider-a", b"signal-2", b"caller-1", b"registry-1").digest());
-        assert_ne!(base_digest, ctx(b"provider-a", b"signal-1", b"caller-2", b"registry-1").digest());
-        assert_ne!(base_digest, ctx(b"provider-a", b"signal-1", b"caller-1", b"registry-2").digest());
+    #[test]
+    fn altered_domain_changes_hash() {
+        let base = AuthPayloadHasher::hash(
+            b"signal-replay-v1",
+            b"testnet",
+            b"registry-1",
+            b"submit_signal",
+            b"args-1",
+        );
+        let altered = AuthPayloadHasher::hash(
+            b"signal-replay-v2",
+            b"testnet",
+            b"registry-1",
+            b"submit_signal",
+            b"args-1",
+        );
+        assert_ne!(base, altered);
+    }
+
+    #[test]
+    fn altered_network_changes_hash() {
+        let base = AuthPayloadHasher::hash(
+            b"signal-replay-v1",
+            b"testnet",
+            b"registry-1",
+            b"submit_signal",
+            b"args-1",
+        );
+        let altered = AuthPayloadHasher::hash(
+            b"signal-replay-v1",
+            b"mainnet",
+            b"registry-1",
+            b"submit_signal",
+            b"args-1",
+        );
+        assert_ne!(base, altered);
+    }
+
+    #[test]
+    fn altered_contract_changes_hash() {
+        let base = AuthPayloadHasher::hash(
+            b"signal-replay-v1",
+            b"testnet",
+            b"registry-1",
+            b"submit_signal",
+            b"args-1",
+        );
+        let altered = AuthPayloadHasher::hash(
+            b"signal-replay-v1",
+            b"testnet",
+            b"registry-2",
+            b"submit_signal",
+            b"args-1",
+        );
+        assert_ne!(base, altered);
+    }
+
+    #[test]
+    fn altered_method_changes_hash() {
+        let base = AuthPayloadHasher::hash(
+            b"signal-replay-v1",
+            b"testnet",
+            b"registry-1",
+            b"submit_signal",
+            b"args-1",
+        );
+        let altered = AuthPayloadHasher::hash(
+            b"signal-replay-v1",
+            b"testnet",
+            b"registry-1",
+            b"submit_signal_v2",
+            b"args-1",
+        );
+        assert_ne!(base, altered);
+    }
+
+    #[test]
+    fn altered_args_changes_hash() {
+        let base = AuthPayloadHasher::hash(
+            b"signal-replay-v1",
+            b"testnet",
+            b"registry-1",
+            b"submit_signal",
+            b"args-1",
+        );
+        let altered = AuthPayloadHasher::hash(
+            b"signal-replay-v1",
+            b"testnet",
+            b"registry-1",
+            b"submit_signal",
+            b"args-2",
+        );
+        assert_ne!(base, altered);
+    }
+
+    #[test]
+    fn field_boundaries_do_not_collide() {
+        // Without length prefixes, ("ab", "c") and ("a", "bc") would collide.
+        let a = AuthPayloadHasher::hash(b"d", b"ab", b"c", b"m", b"x");
+        let b = AuthPayloadHasher::hash(b"d", b"a", b"bc", b"m", b"x");
+        assert_ne!(a, b);
     }
 }
