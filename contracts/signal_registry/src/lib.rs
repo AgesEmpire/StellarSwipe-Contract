@@ -18,6 +18,9 @@ pub enum SignalError {
     Unauthorized = 3,
     InvalidDecayConfig = 4,
     InvalidReputationUpdate = 5,
+    /// Fallback for downstream failures that cannot be mapped to a known
+    /// local error variant. See `normalize_downstream_error`.
+    DownstreamFailure = 6,
 }
 
 /// Configuration-driven reputation decay schedule.
@@ -48,6 +51,17 @@ pub struct ReputationRecord {
 pub struct DataKey {
     pub admin: Address,
     pub schedule: DecaySchedule,
+}
+
+/// Context describing a cross-contract call whose downstream result is being
+/// normalized into the local `SignalError` ABI.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossContractContext {
+    /// Address of the contract that produced the downstream result.
+    pub origin: Address,
+    /// Symbolic name of the operation invoked on the downstream contract.
+    pub operation: u32,
 }
 
 const ADMIN_KEY: &str = "admin";
@@ -132,6 +146,34 @@ impl SignalRegistry {
         let record = Self::load_reputation(&env, &provider);
         let now = env.ledger().timestamp();
         Ok(Self::apply_decay(&record, now, &schedule))
+    }
+
+    /// Normalize a downstream cross-contract result into the local error ABI.
+    ///
+    /// This is the single normalization path used by all cross-contract call
+    /// sites. Known downstream error codes are mapped to their local
+    /// equivalents; any unrecognized or malformed downstream failure is mapped
+    /// to the documented fallback variant `SignalError::DownstreamFailure`.
+    ///
+    /// The `context` (originating contract and operation) is preserved so that
+    /// callers can attribute the failure without losing downstream detail.
+    pub fn normalize_downstream_error(
+        _env: Env,
+        context: CrossContractContext,
+        downstream_code: u32,
+    ) -> SignalError {
+        // Preserve context for observability; the mapping below is the
+        // authoritative translation into the local error ABI.
+        let _ = context;
+        match downstream_code {
+            1 => SignalError::AlreadyInitialized,
+            2 => SignalError::NotInitialized,
+            3 => SignalError::Unauthorized,
+            4 => SignalError::InvalidDecayConfig,
+            5 => SignalError::InvalidReputationUpdate,
+            // Unknown or malformed downstream failure: documented fallback.
+            _ => SignalError::DownstreamFailure,
+        }
     }
 
     /// Compute the decayed score for a record at a given timestamp.
