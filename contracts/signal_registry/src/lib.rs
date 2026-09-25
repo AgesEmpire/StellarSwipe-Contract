@@ -5,6 +5,18 @@
 //! stale activity loses impact over time. Decay points are computed directly
 //! from stored timestamps and configuration values, keeping the behavior
 //! verifiable on-chain.
+//!
+//! ## Initialization audit
+//!
+//! Required storage items written by [`SignalRegistry::initialize`]:
+//! - `admin` (instance): the address authorized to mutate configuration.
+//! - `schedule` (instance): the validated decay schedule.
+//! - `version` (instance): the storage schema version marker.
+//!
+//! Initialization is atomic: the version marker is written last, so a partial
+//! or interrupted initialization leaves the contract uninitialized and can be
+//! safely retried. Repeated initialization is rejected with
+//! [`SignalError::AlreadyInitialized`] before any state is mutated.
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
 
@@ -53,6 +65,10 @@ pub struct DataKey {
 const ADMIN_KEY: &str = "admin";
 const SCHEDULE_KEY: &str = "schedule";
 const REPUTATION_KEY: &str = "reputation";
+const VERSION_KEY: &str = "version";
+
+/// Current storage schema version written by `initialize`.
+const STORAGE_VERSION: u32 = 1;
 
 #[contract]
 pub struct SignalRegistry;
@@ -60,14 +76,38 @@ pub struct SignalRegistry;
 #[contractimpl]
 impl SignalRegistry {
     /// Initialize the contract with an admin and a decay schedule.
+    ///
+    /// Writes every required storage item exactly once: `admin`, `schedule`,
+    /// and the `version` marker. The version marker is written last so that an
+    /// interrupted initialization is detectable and retryable. If the contract
+    /// is already initialized this returns [`SignalError::AlreadyInitialized`]
+    /// without mutating any state.
     pub fn initialize(env: Env, admin: Address, schedule: DecaySchedule) -> Result<(), SignalError> {
-        if env.storage().instance().has(&ADMIN_KEY) {
+        if Self::is_initialized(&env) {
             return Err(SignalError::AlreadyInitialized);
         }
         Self::validate_schedule(&schedule)?;
         env.storage().instance().set(&ADMIN_KEY, &admin);
         env.storage().instance().set(&SCHEDULE_KEY, &schedule);
+        // Version marker written last: its presence signals a complete init.
+        env.storage().instance().set(&VERSION_KEY, &STORAGE_VERSION);
         Ok(())
+    }
+
+    /// Returns `true` once initialization has completed.
+    ///
+    /// The version marker is the authoritative signal: it is only written after
+    /// all other required fields, so a partial initialization reports `false`.
+    pub fn is_initialized(env: &Env) -> bool {
+        env.storage().instance().has(&VERSION_KEY)
+    }
+
+    /// Read the stored schema version marker.
+    pub fn get_version(env: Env) -> Result<u32, SignalError> {
+        env.storage()
+            .instance()
+            .get(&VERSION_KEY)
+            .ok_or(SignalError::NotInitialized)
     }
 
     /// Update the decay schedule. Only the admin may call this.

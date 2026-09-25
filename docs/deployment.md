@@ -25,6 +25,28 @@ cd stellar-swipe
 cargo build --workspace --target wasm32-unknown-unknown --release
 ```
 
+## Constructor Initialization Checklist
+
+Every contract must be initialized exactly once. Before deploying, confirm each
+contract's constructor/initialization entrypoint receives all required arguments
+and that repeated initialization is rejected without mutating state.
+
+Required constructor arguments per contract:
+
+| Contract | Required constructor arguments |
+| --- | --- |
+| `signal_registry` | `admin` (address), `version` marker |
+| `oracle` | `admin` (address), `version` marker |
+| `governance` | `admin` (address), `version` marker |
+| `treasury` | `admin` (address), `version` marker |
+
+Initialization rules:
+
+- [ ] All required storage items, roles, parameters, and the version marker are set on first initialization.
+- [ ] A second call to the initialization entrypoint fails with an already-initialized error and leaves state unchanged.
+- [ ] Partial or interrupted initialization (e.g. a failed transaction) does not leave the contract in a half-initialized state; re-run initialization from a clean state.
+- [ ] The version marker written at initialization matches the deployed WASM build.
+
 ## Testnet Deployment (Step-by-Step)
 
 1) Set deployment environment variables:
