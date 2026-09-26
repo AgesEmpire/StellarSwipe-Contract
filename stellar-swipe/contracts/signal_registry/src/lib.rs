@@ -63,9 +63,14 @@ pub use categories::{RiskLevel, SignalCategory};
 /// `contracts/integration_tests`) can pattern-match on contract errors —
 /// including `AdminError::ReentrancyDetected` — without duplicating the enum.
 pub use errors::AdminError;
+pub use expiry::SignalExpiryState;
+pub use migration::{MigrationSnapshot, MigrationVerification, UpgradePreflight, UpgradeReadiness};
 pub use multisig_approvals::CriticalActionPayload;
 pub use types::SignalAction;
 pub use types::{FeeBreakdown, ProviderPerformance, SignalOutcome, SignalStatus};
+/// Re-exported so migration tooling and tests can seed legacy v1 records and
+/// build query arguments.
+pub use types::{SignalV1, SortOption};
 
 use admin::{
     get_admin, get_admin_config, init_admin, is_trading_paused,
@@ -117,7 +122,7 @@ use templates::DEFAULT_TEMPLATE_EXPIRY_HOURS;
 use types::{
     AddressMapping, Asset, CrossChainSignal, ImportResultView, ProviderMonthlyReport,
     RecurrencePattern, RegistryHealthStatus, Signal, SignalDataV2, SignalEditInput,
-    SignalPerformanceView, SignalSummary, SortOption, SyncStatus, TradeExecution,
+    SignalPerformanceView, SignalSummary, SyncStatus, TradeExecution,
 };
 // SignalData is a type alias for SignalDataV2; keep the alias re-export for
 // any external clients compiled against the old name (Issue #568).
@@ -197,6 +202,10 @@ pub enum StorageKey {
     /// Per-provider count of signals created on the current ledger day (issue #778).
     /// Key: (provider, day_bucket) where day_bucket = timestamp / 86400.
     ProviderDailySignalCount(Address, u64),
+    /// Last signal id examined by `cleanup_expired_signals` (issue #1219).
+    ExpiryCleanupCursor,
+    /// Last signal id examined by `archive_old_signals` (issue #1219).
+    ArchiveCursor,
 }
 
 #[contracttype]
@@ -321,6 +330,14 @@ impl SignalRegistry {
     /// mismatch that needs manual review.
     pub fn get_migration_verification(env: Env) -> Option<migration::MigrationVerification> {
         migration::get_migration_verification(&env)
+    }
+
+    /// Read-only upgrade preflight (issue #1223): reports the stored contract
+    /// version, whether `target_version` is accepted, and the v1→v2 migration
+    /// state. Performs no storage writes, emits no events and requires no
+    /// authorization, so operators can simulate it before calling `upgrade`.
+    pub fn upgrade_preflight(env: Env, target_version: u32) -> UpgradePreflight {
+        migration::upgrade_preflight(&env, target_version)
     }
 
     /* =========================
@@ -2650,7 +2667,9 @@ impl SignalRegistry {
         update_leaderboard_index(env, provider.clone(), &stats);
     }
 
-    /// Cleanup expired signals in batches
+    /// Mark expired `Active` signals as `Expired` in bounded, resumable batches
+    /// (at most 100 entries examined per call; see `docs/signal_expiration.md`).
+    /// Open to any caller and safe to retry.
     /// Returns (signals_processed, signals_expired)
     pub fn cleanup_expired_signals(env: Env, limit: u32) -> (u32, u32) {
         let signals = Self::get_signals_map(&env);
@@ -2661,11 +2680,20 @@ impl SignalRegistry {
         (result.signals_processed, result.signals_expired)
     }
 
-    /// Archive old expired signals (30+ days old)
+    /// Archive (remove) signals expired for more than 30 days, in bounded,
+    /// resumable batches. Open to any caller and safe to retry.
     /// Returns number of signals archived
     pub fn archive_old_signals(env: Env, limit: u32) -> u32 {
         let signals = Self::get_signals_map(&env);
         expiry::archive_old_signals(&env, &signals, limit)
+    }
+
+    /// Read-only: where `signal_id` is in the expiry lifecycle (issue #1219).
+    /// `Live` is exactly the set returned by active-signal queries; see
+    /// `docs/signal_expiration.md`.
+    pub fn get_signal_expiry_state(env: Env, signal_id: u64) -> SignalExpiryState {
+        let signals = Self::get_signals_map(&env);
+        expiry::expiry_state(&env, &signals, signal_id)
     }
 
     /// Get count of expired signals

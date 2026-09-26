@@ -226,10 +226,7 @@ fn get_active_signals_internal(
     for i in 0..n_keys {
         if let Some(key) = key_list.get(i) {
             if let Some(signal) = signals_map.get(key) {
-                if signal.expiry > current_time
-                    && signal.status != SignalStatus::Expired
-                    && signal.status != SignalStatus::Executed
-                {
+                if crate::expiry::is_visible_active(&signal, current_time) {
                     let include = if let Some(ref p) = provider_filter {
                         signal.provider == *p
                     } else {

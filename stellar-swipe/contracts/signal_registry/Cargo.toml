@@ -23,6 +23,7 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 stellar_swipe_common = { path = "../common", features = ["testutils"] }
 shared = { path = "../shared", features = ["testutils"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
+serde_json = "1"
 
 
 [lints]
