@@ -2804,3 +2804,123 @@ fn withdraw_stake_budget_regression() {
     let instructions = env.budget().cpu_instruction_cost();
     measure_and_emit("stake_vault.withdraw_stake", 6_000_000, instructions);
 }
+
+// ── Issues #1202–#1204: reward campaigns (contract level, real token) ─────────
+
+mod reward_campaign_contract {
+    use super::*;
+    use crate::reward_campaign::{CampaignStatus, MIN_CLAIM_WINDOW_SECS};
+    use soroban_sdk::testutils::Ledger;
+    use soroban_sdk::token::TokenClient;
+    use soroban_sdk::vec;
+
+    fn setup_campaign(
+        budget: i128,
+    ) -> (
+        Env,
+        StakeVaultContractClient<'static>,
+        Address,
+        Address,
+        u64,
+    ) {
+        let (env, vault_id, _stake_token, admin, _) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let reward = sac_token(&env, &admin);
+        client.add_reward_asset(&reward);
+        let funder = Address::generate(&env);
+        StellarAssetClient::new(&env, &reward).mint(&funder, &budget);
+        let id = client.create_reward_campaign(&funder, &reward, &budget, &MIN_CLAIM_WINDOW_SECS);
+        (env, client, reward, funder, id)
+    }
+
+    #[test]
+    fn full_lifecycle_moves_exactly_the_accounted_funds() {
+        let (env, client, reward, funder, id) = setup_campaign(1_000);
+        let token = TokenClient::new(&env, &reward);
+        assert_eq!(token.balance(&client.address), 1_000);
+
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+        let created = client.distribute_campaign_rewards(
+            &id,
+            &100,
+            &vec![
+                &env,
+                (a.clone(), 1u32),
+                (b.clone(), 1u32),
+                (c.clone(), 1u32),
+            ],
+        );
+        let total: i128 = created.iter().map(|(_, _, amt)| amt).sum();
+        assert_eq!(total, 100);
+
+        // Closure is blocked while allocations are outstanding.
+        let before = client.get_reward_campaign(&id).unwrap();
+        assert_eq!(
+            client.try_close_reward_campaign(&id),
+            Err(Ok(StakeVaultError::CampaignLiabilitiesOutstanding))
+        );
+        assert_eq!(client.get_reward_campaign(&id).unwrap(), before);
+
+        // a and b claim; c lets the allocation expire.
+        for (who, alloc_id, amount) in created.iter() {
+            if who != c {
+                assert_eq!(
+                    client.claim_campaign_rewards(&who, &id, &vec![&env, alloc_id]),
+                    amount
+                );
+                assert_eq!(token.balance(&who), amount);
+            }
+        }
+        let (_, c_alloc, c_amount) = created.iter().find(|(w, _, _)| *w == c).unwrap();
+        assert_eq!(
+            client.try_expire_campaign_allocations(&id, &vec![&env, c_alloc]),
+            Err(Ok(StakeVaultError::TimelockNotElapsed))
+        );
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + MIN_CLAIM_WINDOW_SECS);
+        assert_eq!(
+            client.try_claim_campaign_rewards(&c, &id, &vec![&env, c_alloc]),
+            Err(Ok(StakeVaultError::CampaignAllocationExpired))
+        );
+        assert_eq!(
+            client.expire_campaign_allocations(&id, &vec![&env, c_alloc]),
+            c_amount
+        );
+
+        // Fully settled: closure refunds unallocated + expired to the funder.
+        let refund = client.close_reward_campaign(&id);
+        assert_eq!(refund, 900 + c_amount);
+        assert_eq!(token.balance(&funder), refund);
+        assert_eq!(token.balance(&client.address), 0);
+        assert_eq!(
+            client.get_reward_campaign(&id).unwrap().status,
+            CampaignStatus::Closed
+        );
+        assert_eq!(
+            client.try_close_reward_campaign(&id),
+            Err(Ok(StakeVaultError::CampaignNotOpen))
+        );
+    }
+
+    #[test]
+    fn close_without_any_claims_refunds_budget() {
+        let (env, client, reward, funder, id) = setup_campaign(500);
+        assert_eq!(client.close_reward_campaign(&id), 500);
+        assert_eq!(TokenClient::new(&env, &reward).balance(&funder), 500);
+    }
+
+    #[test]
+    fn campaign_requires_registered_reward_asset() {
+        let (env, vault_id, _stake_token, admin, _) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let unregistered = sac_token(&env, &admin);
+        let funder = Address::generate(&env);
+        assert_eq!(
+            client.try_create_reward_campaign(&funder, &unregistered, &100, &MIN_CLAIM_WINDOW_SECS),
+            Err(Ok(StakeVaultError::Unauthorized))
+        );
+    }
+}
