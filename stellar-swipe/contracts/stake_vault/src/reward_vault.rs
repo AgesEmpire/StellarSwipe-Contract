@@ -74,7 +74,7 @@ fn supported_assets(env: &Env) -> Vec<Address> {
         .unwrap_or_else(|| Vec::new(env))
 }
 
-fn is_supported(env: &Env, asset: &Address) -> bool {
+pub(crate) fn is_supported(env: &Env, asset: &Address) -> bool {
     let assets = supported_assets(env);
     for i in 0..assets.len() {
         if assets.get(i).unwrap() == *asset {
@@ -309,6 +309,7 @@ mod tests {
     // Minimal token mock for testing.
     mod token_mock {
         use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, MuxedAddress};
+        use soroban_sdk::token::Interface as _;
 
         #[contracttype]
         pub enum DataKey {
@@ -327,6 +328,7 @@ mod tests {
             }
         }
 
+        #[contractimpl]
         impl token::Interface for MockToken {
             fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 {
                 0

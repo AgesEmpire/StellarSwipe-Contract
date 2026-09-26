@@ -5,6 +5,9 @@ pub mod events;
 /// Deterministic fee accrual accumulator (Issue #1016).
 pub mod fee_accrual;
 pub mod migration;
+/// Reward campaigns: deterministic splits, claim expiry, guarded closure
+/// (Issues #1202, #1203, #1204).
+pub mod reward_campaign;
 pub mod reward_vault;
 pub mod slash_strategy;
 pub mod storage_version;
@@ -397,6 +400,37 @@ pub enum StakeVaultError {
     /// Rejected before any storage write or token transfer — no partial state
     /// change occurs (unlike the previous silent-clamp-to-`i128::MAX` behavior).
     StakeOverflow = 43,
+    // ── Issue #1001: standardized token/cross-contract error mapping ─────────
+    // Codes 42/43 were originally assigned here but were later reused by
+    // `EmergencyCooldownActive` / `StakeOverflow`; these variants were dropped
+    // in that merge, which left every `map_err(StakeVaultError::from)` call
+    // site uncompilable. Restored with fresh, never-used codes.
+    /// The stake token rejected a transfer/burn for insufficient balance
+    /// (distinct from `NoStake`, which means no tracked stake position
+    /// exists at all).
+    InsufficientTokenBalance = 44,
+    /// The stake token rejected a transfer for insufficient/expired
+    /// allowance.
+    InsufficientTokenAllowance = 45,
+    /// A token or cross-contract invocation failed for a reason other than
+    /// authorization, balance, or allowance (arithmetic overflow, invalid
+    /// request, an unrecognized custom-token error code, or a host-level
+    /// abort). See `shared::token_error` for the classification policy.
+    TokenOperationFailed = 46,
+    // ── Issues #1202–#1204: reward campaigns ──────────────────────────────────
+    // NOTE: Soroban caps a `#[contracterror]` enum at 50 variants in the
+    // contract spec, and this enum is now at that cap.  Other campaign
+    // failures map onto existing codes (see `From<CampaignError>`).
+    /// The reward campaign does not exist or is already closed.
+    CampaignNotOpen = 47,
+    /// The campaign cannot close while allocations remain unclaimed and
+    /// unexpired (outstanding liabilities to recipients).
+    CampaignLiabilitiesOutstanding = 48,
+    /// The campaign allocation's claim deadline has passed.
+    CampaignAllocationExpired = 49,
+    /// Allocation does not exist, belongs to another recipient, or is
+    /// already claimed/expired.
+    CampaignAllocationNotClaimable = 50,
 }
 
 impl StakeVaultError {
@@ -504,6 +538,69 @@ impl StakeVaultError {
             StakeVaultError::StakeOverflow => {
                 "resulting amount would overflow i128; deposit or delegation rejected"
             }
+            StakeVaultError::InsufficientTokenBalance => {
+                "stake token transfer/burn failed: insufficient balance"
+            }
+            StakeVaultError::InsufficientTokenAllowance => {
+                "stake token transfer failed: insufficient or expired allowance"
+            }
+            StakeVaultError::TokenOperationFailed => {
+                "stake token or cross-contract invocation failed"
+            }
+            StakeVaultError::CampaignNotOpen => {
+                "reward campaign does not exist or is already closed"
+            }
+            StakeVaultError::CampaignLiabilitiesOutstanding => {
+                "campaign has unclaimed, unexpired allocations; settle or expire them first"
+            }
+            StakeVaultError::CampaignAllocationExpired => {
+                "campaign allocation claim deadline has passed"
+            }
+            StakeVaultError::CampaignAllocationNotClaimable => {
+                "allocation not found, owned by another recipient, or already settled"
+            }
+        }
+    }
+}
+
+impl From<reward_campaign::CampaignError> for StakeVaultError {
+    fn from(e: reward_campaign::CampaignError) -> Self {
+        use reward_campaign::CampaignError as E;
+        match e {
+            E::CampaignNotFound | E::CampaignClosed => StakeVaultError::CampaignNotOpen,
+            E::OutstandingLiabilities => StakeVaultError::CampaignLiabilitiesOutstanding,
+            E::AllocationExpired => StakeVaultError::CampaignAllocationExpired,
+            E::AllocationNotClaimable => StakeVaultError::CampaignAllocationNotClaimable,
+            // The deadline has not elapsed yet.
+            E::AllocationNotExpired => StakeVaultError::TimelockNotElapsed,
+            E::BatchSizeInvalid => StakeVaultError::BatchSizeInvalid,
+            // Out-of-range inputs: amount, available funds, claim window,
+            // recipient weights/duplicates.
+            E::InvalidAmount
+            | E::InsufficientCampaignFunds
+            | E::InvalidClaimWindow
+            | E::InvalidRecipients => StakeVaultError::InvalidAmount,
+            E::Overflow => StakeVaultError::StakeOverflow,
+        }
+    }
+}
+
+/// Maps the shared token/cross-contract invocation failure classification
+/// (Issue #1001) onto this contract's stable error codes. Every non-success
+/// outcome from a stake-token invocation must flow through here rather than
+/// being treated as `Ok`.
+impl From<shared::TokenFailure> for StakeVaultError {
+    fn from(failure: shared::TokenFailure) -> Self {
+        match failure {
+            shared::TokenFailure::Unauthorized => StakeVaultError::Unauthorized,
+            shared::TokenFailure::InsufficientBalance => StakeVaultError::InsufficientTokenBalance,
+            shared::TokenFailure::InsufficientAllowance => {
+                StakeVaultError::InsufficientTokenAllowance
+            }
+            shared::TokenFailure::InvalidRequest
+            | shared::TokenFailure::Overflow
+            | shared::TokenFailure::OtherContractError(_)
+            | shared::TokenFailure::HostError => StakeVaultError::TokenOperationFailed,
         }
     }
 }
@@ -2932,6 +3029,133 @@ impl StakeVaultContract {
     /// Returns the total deposited amount for `asset` across all providers.
     pub fn get_asset_total_deposited(env: Env, asset: Address) -> i128 {
         reward_vault::get_asset_total_deposited(&env, &asset)
+    }
+
+    // ── Issues #1202–#1204: Reward campaigns ──────────────────────────────────
+    // Policy and accounting rules are documented in `reward_campaign`.
+
+    /// Funder: create a reward campaign and transfer `budget` of `asset` into
+    /// the vault.  `asset` must be a registered reward asset.
+    pub fn create_reward_campaign(
+        env: Env,
+        funder: Address,
+        asset: Address,
+        budget: i128,
+        claim_window_secs: u64,
+    ) -> Result<u64, StakeVaultError> {
+        funder.require_auth();
+        Self::require_not_paused(&env)?;
+        if !reward_vault::is_supported(&env, &asset) {
+            // Same code `deposit_reward` uses for an unregistered asset.
+            return Err(StakeVaultError::Unauthorized);
+        }
+        let campaign_id = reward_campaign::create_campaign(
+            &env,
+            funder.clone(),
+            asset.clone(),
+            budget,
+            claim_window_secs,
+        )?;
+        shared::token_error::map_result(token::Client::new(&env, &asset).try_transfer(
+            &funder,
+            env.current_contract_address(),
+            &budget,
+        ))
+        .map_err(StakeVaultError::from)?;
+        Ok(campaign_id)
+    }
+
+    /// Funder: allocate `total` of the campaign's unallocated funds across
+    /// weighted `recipients` (remainders assigned deterministically, #1202).
+    /// Returns `(recipient, allocation_id, amount)` per allocation created.
+    pub fn distribute_campaign_rewards(
+        env: Env,
+        campaign_id: u64,
+        total: i128,
+        recipients: Vec<(Address, u32)>,
+    ) -> Result<Vec<(Address, u64, i128)>, StakeVaultError> {
+        let campaign = reward_campaign::get_campaign(&env, campaign_id)
+            .ok_or(StakeVaultError::CampaignNotOpen)?;
+        campaign.funder.require_auth();
+        Self::require_not_paused(&env)?;
+        Ok(reward_campaign::distribute(
+            &env,
+            campaign_id,
+            total,
+            recipients,
+        )?)
+    }
+
+    /// Recipient: claim unexpired allocations (all-or-nothing).  Returns the
+    /// amount transferred.
+    pub fn claim_campaign_rewards(
+        env: Env,
+        recipient: Address,
+        campaign_id: u64,
+        allocation_ids: Vec<u64>,
+    ) -> Result<i128, StakeVaultError> {
+        recipient.require_auth();
+        Self::require_not_paused(&env)?;
+        let amount = reward_campaign::claim(&env, campaign_id, &recipient, allocation_ids)?;
+        let campaign = reward_campaign::get_campaign(&env, campaign_id)
+            .ok_or(StakeVaultError::CampaignNotOpen)?;
+        shared::token_error::map_result(token::Client::new(&env, &campaign.asset).try_transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        ))
+        .map_err(StakeVaultError::from)?;
+        Ok(amount)
+    }
+
+    /// Anyone: process expiry of allocations past their deadline (#1203).
+    /// Bounded batch; expired funds return to the campaign's unallocated pool.
+    pub fn expire_campaign_allocations(
+        env: Env,
+        campaign_id: u64,
+        allocation_ids: Vec<u64>,
+    ) -> Result<i128, StakeVaultError> {
+        Ok(reward_campaign::expire_allocations(
+            &env,
+            campaign_id,
+            allocation_ids,
+        )?)
+    }
+
+    /// Funder: close a fully settled campaign and recover its unallocated
+    /// funds (#1204).  Rejected, with no state change, while any allocation
+    /// is still unclaimed and unexpired.
+    pub fn close_reward_campaign(env: Env, campaign_id: u64) -> Result<i128, StakeVaultError> {
+        let campaign = reward_campaign::get_campaign(&env, campaign_id)
+            .ok_or(StakeVaultError::CampaignNotOpen)?;
+        campaign.funder.require_auth();
+        let refund = reward_campaign::close_campaign(&env, campaign_id)?;
+        if refund > 0 {
+            shared::token_error::map_result(
+                token::Client::new(&env, &campaign.asset).try_transfer(
+                    &env.current_contract_address(),
+                    &campaign.funder,
+                    &refund,
+                ),
+            )
+            .map_err(StakeVaultError::from)?;
+        }
+        Ok(refund)
+    }
+
+    pub fn get_reward_campaign(
+        env: Env,
+        campaign_id: u64,
+    ) -> Option<reward_campaign::RewardCampaign> {
+        reward_campaign::get_campaign(&env, campaign_id)
+    }
+
+    pub fn get_campaign_allocation(
+        env: Env,
+        campaign_id: u64,
+        allocation_id: u64,
+    ) -> Option<reward_campaign::CampaignAllocation> {
+        reward_campaign::get_allocation(&env, campaign_id, allocation_id)
     }
 
     // ── Issue #1021: Slash strategy policy thresholds ─────────────────────────
