@@ -178,13 +178,4 @@ change** — CI fails with exit code 1 unless you explicitly acknowledge it:
 
 1. Verify that the migration path covers all existing stored data and
    cross-contract callers.
-2. Create `abi-baselines/<contract>.breaking.txt` with a short reason
-   (one line is fine).
-3. Re-run CI — the script updates the baseline and succeeds.
-4. Commit both the updated `abi-baselines/<contract>.json` and the
-   `.breaking.txt` file together.
-5. Remove `.breaking.txt` in the very next PR so accidental future breaks
-   are still caught.
-
-> The PR comment makes it easy for reviewers to see exactly which exports
-> changed and whether the change was intentional.
+2. Create `

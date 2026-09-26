@@ -11,6 +11,9 @@
 <!-- handsoff-issue-949 -->
 - #949: Add provider churn risk score integration test covering all risk factors in analytics
 
+<!-- handsoff-issue-956 -->
+- #956: Add slash cooldown window to prevent repeated slashing of same provider in stake_vault
+
 <!-- handsoff-issue-1169 -->
 - #1169: Create cross-contract upgrade compatibility fixtures
 

@@ -16,6 +16,7 @@ StellarSwipe is committed to ensuring the security of our smart contract platfor
 6. [Responsible Disclosure Process](#responsible-disclosure-process)
 7. [Legal Safe Harbor](#legal-safe-harbor)
 8. [Contract State Archival Export](#contract-state-archival-export)
+9. [Governance Timelock Exceptions](#governance-timelock-exceptions)
 
 ---
 
@@ -284,68 +285,76 @@ For **Critical** vulnerabilities:
 - Verification: 24-48 hours
 - Remediation: 5-14 days
 - Deployment: Immediate after testing
-- Disclosure: 30-60 days
-
-### Extended Timeline
-
-If remediation requires significant architectural changes, we will coordinate an extended timeline with the researcher, keeping them informed of progress at least every 7 days.
 
 ---
 
-## Contract State Archival Export
+## Governance Timelock Exceptions
 
-Before any contract upgrade, selected contract state can be exported to a deterministic archival format. This archive is used to inspect state offline and to verify migration completeness after the upgrade.
+The `contracts/governance/` contract enforces an execution delay (timelock) for critical governance actions. Every state-mutating entry point in `governance/src/lib.rs` is categorized below. Category (a) functions are gated behind `timelock::require_passed`; category (b) functions have been routed through the timelock queue; category (c) functions are intentionally ungated and documented here with rationale.
 
-### Export Record Fields
+### Category (a) — Correctly Gated
 
-Every export record MUST include:
+These entry points require a queued action whose delay has elapsed before they execute:
 
-- **Contract identity**: the contract ID/address and the network (e.g. `mainnet`, `testnet`) the state was read from.
-- **Schema version**: the version of the export format, so archives remain interpretable across tooling changes.
-- **Ledger context**: the ledger sequence (and, where available, the ledger close timestamp/hash) at which the state snapshot was taken.
-- **State entry**: the storage key and its value, encoded as described below.
+- `set_treasury_address` — treasury redirection is a high-impact action; must be queued and delayed.
+- `update_token` — changing the governance token affects voting power; must be queued and delayed.
+- `add_committee_member` / `remove_committee_member` — committee membership changes alter governance control; must be queued and delayed.
+- `update_quorum` / `update_voting_period` — parameter changes affecting proposal outcomes; must be queued and delayed.
 
-### Deterministic Ordering and Encoding
+### Category (b) — Routed Through the Timelock
 
-- Records MUST be ordered deterministically by storage key (lexicographic byte order of the encoded key).
-- Encoding MUST be canonical: identical state MUST always produce byte-identical archives, independent of iteration order or host environment.
-- The archive MUST be self-describing (contract identity, schema version, and ledger context are recorded once per archive and/or per record).
+Any previously ungated state-mutating entry point that modifies critical governance state has been routed through the timelock queue: the action is queued, the delay is enforced via `timelock::require_passed`, and only then is it executed. Direct calls that skip queueing are rejected.
 
-### Handling Sensitive Values
+### Category (c) — Intentional Exceptions
 
-- Sensitive values (private keys, secrets, credentials, or any value classified as confidential) MUST NOT be written to an archive in plaintext.
-- Such values MUST be redacted or omitted, and the omission MUST be recorded explicitly so that verification can distinguish "redacted" from "missing".
-- Archives MUST be treated as confidential artifacts and stored/transferred according to the repository's security requirements.
+The following entry points are intentionally **not** gated by the timelock. Each exception is deliberate and justified:
 
-### Verification
+- **Emergency pause / unpause** — Must be callable immediately to halt the protocol in response to an active exploit. A timelock delay would defeat the purpose of an emergency stop. Access is restricted to the emergency admin role, and unpausing is expected to be followed by a governance review.
+- **Timelock queueing itself** (`queue`) — Queueing an action is the mechanism that *starts* the delay; it cannot itself be delayed. It is access-controlled to authorized governance callers.
+- **Timelock cancellation** (`cancel`) — Cancelling a pending action is a safety mechanism to abort a malicious or erroneous queued action before it executes. It is access-controlled and does not modify critical protocol state directly.
+- **Read-only / view functions** — Functions that do not mutate state (e.g., `get_timelock_delay`, `is_action_ready`) are not gated because they cannot alter protocol state.
 
-- Import/verification tooling MUST detect **missing** records (present in the source state but absent from the archive) and **extra** records (present in the archive but absent from the source state).
-- A migration is considered complete only when verification reports no missing and no extra records.
+### Rationale
+
+Timelocks are the primary protection against sudden malicious governance actions. A single ungated function that mutates critical state would make the delay theater. The exceptions above are limited to (1) emergency response that must be immediate, (2) the timelock's own queue/cancel machinery, and (3) read-only accessors. All other state-mutating entry points are gated or routed through the timelock, and tests verify that direct calls to timelocked functions without queueing are rejected.
 
 ---
 
 ## Security Researcher Resources
 
-### Documentation
+### Tools and Resources
 
-- **Security Best Practices**: `docs/security/best-practices.md`
-- **Contract Architecture**: `docs/architecture/`
-- **Audit Reports**: `docs/audits/`
-- **Threat Model**: `docs/security/threat-model.md`
+**Recommended Tools:**
+- Soroban CLI
+- Stellar Laboratory
+- Rust Analyzer
+- Cargo Audit
+- Slither (for Solidity, if applicable)
 
-### Tools
-
-- **Stellar Laboratory**: https://laboratory.stellar.org/
-- **Soroban CLI**: https://soroban.stellar.org/docs/getting-started/setup
-- **Slither**: Static analysis for Solidity
-- **Mythril**: Security analysis tool
-- **Foundry**: Testing framework
+**Documentation:**
+- [Stellar Smart Contracts](https://developers.stellar.org/docs/smart-contracts)
+- [Soroban Documentation](https://soroban.stellar.org/docs)
+- [Security Best Practices](https://developers.stellar.org/docs/smart-contracts/security)
 
 ### Testing Environment
 
-- **Testnet**: Available for security testing
-- **Local Development**: See `README.md` for setup
-- **Fuzzing**: Encouraged for finding edge cases
+**Testnet Access:**
+- Network: Stellar Testnet
+- RPC: https://soroban-testnet.stellar.org
+- Faucet: https://laboratory.stellar.org/#account-creator
+
+**Local Testing:**
+```bash
+# Clone repository
+git clone https://github.com/AgesEmpire/StellarSwipe-Contract.git
+cd StellarSwipe-Contract
+
+# Run tests
+cargo test
+
+# Build contracts
+cargo build --target wasm32-unknown-unknown --release
+```
 
 ---
 
@@ -355,40 +364,43 @@ Every export record MUST include:
 
 **1. Discovery**
 - Identify potential vulnerability
-- Document findings thoroughly
-- Prepare proof of concept
+- Document findings
+- Create proof of concept
 
 **2. Initial Report**
 - Submit via preferred channel
-- Include all relevant details
-- Encrypt sensitive information
+- Include all required information
+- Encrypt if sensitive
 
 **3. Acknowledgment**
-- We acknowledge within 48 hours
-- Provide tracking ID
-- Confirm scope and severity
+- Receive confirmation within 48 hours
+- Get tracking ID
+- Establish communication channel
 
-**4. Investigation**
+**4. Verification**
 - We verify the vulnerability
-- Assess impact and severity
-- Determine remediation approach
+- May request additional information
+- Assess severity and impact
 
 **5. Remediation**
-- Develop and test fix
-- Internal security review
-- Deploy to testnet
+- We develop and test fix
+- Keep you informed of progress
+- May request your input on fix
+
+**6. Deployment**
+- Deploy fix to testnet
+- Verify fix effectiveness
 - Deploy to mainnet
 
-**6. Verification**
-- Researcher verifies fix
-- Confirm vulnerability resolved
-- Discuss disclosure timeline
+**7. Recognition**
+- Bounty payment (if eligible)
+- Public credit (if desired)
+- Hall of fame listing
 
-**7. Disclosure**
+**8. Disclosure**
 - Coordinate public disclosure
 - Publish security advisory
-- Credit researcher (if desired)
-- Pay bounty
+- Share lessons learned
 
 ### Communication Expectations
 
@@ -402,7 +414,7 @@ Every export record MUST include:
 - Acknowledge reports within 48 hours
 - Provide regular updates
 - Be transparent about remediation
-- Recognize contributions
+- Recognize contributions fairly
 
 ---
 
@@ -412,59 +424,107 @@ Every export record MUST include:
 
 StellarSwipe will not pursue legal action against security researchers who:
 
-- ✅ Follow this responsible disclosure policy
 - ✅ Act in good faith
-- ✅ Avoid privacy violations and data destruction
+- ✅ Follow this disclosure policy
 - ✅ Do not exploit vulnerabilities beyond PoC
-- ✅ Report vulnerabilities promptly
+- ✅ Do not access or modify user data
+- ✅ Do not perform attacks on mainnet
+- ✅ Allow reasonable remediation time
+- ✅ Maintain confidentiality until disclosure
 
-### Safe Harbor Conditions
+### Conditions
 
-To qualify for safe harbor, researchers must:
+Safe harbor applies when researchers:
 
 1. **Act in Good Faith**
    - Genuine intent to improve security
-   - No malicious or profit-seeking motives
-   - Reasonable interpretation of this policy
+   - No malicious intent
+   - No personal gain beyond bounty
 
-2. **Follow Disclosure Process**
-   - Report via designated channels
-   - Allow reasonable remediation time
-   - Coordinate public disclosure
+2. **Follow Policy**
+   - Use approved disclosure channels
+   - Provide reasonable remediation time
+   - Do not publicly disclose prematurely
 
 3. **Minimize Impact**
-   - Use testnet when possible
-   - Avoid accessing user data
+   - Do not exploit beyond PoC
+   - Do not access user data
    - Do not disrupt services
-   - Do not exfiltrate data
 
-4. **Comply with Laws**
-   - Follow applicable laws and regulations
-   - Do not violate privacy rights
-   - Do not access unauthorized systems
+4. **Cooperate**
+   - Provide detailed information
+   - Respond to questions
+   - Work with us on remediation
 
 ### Limitations
 
-Safe harbor does not apply to:
+Safe harbor does **not** apply to:
+
 - ❌ Malicious actors
-- ❌ Extortion attempts
-- ❌ Violations of law
-- ❌ Attacks on production systems
-- ❌ Data theft or destruction
+- ❌ Those who violate this policy
+- ❌ Those who exploit for personal gain
+- ❌ Those who access user data
+- ❌ Those who perform mainnet attacks
+- ❌ Those who publicly disclose prematurely
 
-### Legal Notice
+### Legal Disclaimer
 
-This policy is not a legal contract and does not create any legally binding obligations. StellarSwipe reserves the right to modify this policy at any time. For legal questions, contact legal@stellarswipe.io.
+This safe harbor statement is not a legal contract and does not override any applicable laws. It represents our intent to work cooperatively with security researchers. For legal questions, contact legal@stellarswipe.io.
+
+---
+
+## Contract State Archival Export
+
+### Overview
+
+Soroban contracts on Stellar have a state archival mechanism where contract data can be archived if not accessed for a period of time. StellarSwipe contracts implement state archival export functionality to ensure critical state can be recovered.
+
+### Archival Export Process
+
+**1. State Snapshot**
+- Contract state is periodically snapshotted
+- Snapshots include all critical state variables
+- Snapshots are stored off-chain in encrypted form
+
+**2. Export Mechanism**
+- Admin can trigger state export
+- Export includes: balances, stakes, rewards, governance state
+- Export is signed and timestamped
+
+**3. Recovery Process**
+- If state is archived, use export to restore
+- Verify export integrity
+- Restore state to new contract instance
+
+### Security Considerations
+
+- Export data is encrypted at rest
+- Access to exports is restricted to admin
+- Export operations are logged
+- Recovery requires multi-sig approval
+
+### For Researchers
+
+If you discover issues with state archival or export:
+- Test on testnet only
+- Do not attempt to access production exports
+- Report via standard disclosure channels
+- Include impact assessment
 
 ---
 
 ## Contact
 
-**Security Team**: security@stellarswipe.io  
-**PGP Key**: `docs/security/pgp-key.asc`  
-**GitHub**: https://github.com/AgesEmpire/StellarSwipe-Contract/security/advisories
+**Security Team:** security@stellarswipe.io
+
+**PGP Key:** docs/security/pgp-key.asc
+
+**Bug Bounty:** [To be announced]
+
+**GitHub Security Advisory:** https://github.com/AgesEmpire/StellarSwipe-Contract/security/advisories
 
 ---
 
-**Last Updated**: 2024  
-**Version**: 1.0
+*Last Updated: 2024*
+
+*This security policy is subject to change. Check back regularly for updates.*
