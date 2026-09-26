@@ -56,8 +56,26 @@ jobs:
             echo "INFO: New compatibility manifest entries detected; commit the updated files."
           fi
 
+      # Event identifiers and topics are consumed by clients and indexers
+      # (issue #1221). The validator enforces the topic uniqueness rule and
+      # compares the schema with docs/event_schema.lock.json: removed events,
+      # changed topics or changed body fields fail unless the schema major
+      # version is bumped with a migration note.
       - name: Validate event schema
-        run: python3 scripts/validate_event_schema.py
+        run: |
+          python3 scripts/validate_event_schema.py
+          python3 -m unittest discover -s scripts/tests -p 'test_validate_event_schema.py'
+
+      # Public #[contracterror] codes are pinned in
+      # stellar-swipe/error-abi/public-error-abi.json (issue #1222). Renumbering,
+      # removing or reusing a code fails unless recorded with a new major
+      # abi_version and a migration note. The fixture is also compared with the
+      # PR base so hand edits cannot hide a break.
+      - name: Check public error ABI compatibility
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref || 'main' }}" || true
+          python3 stellar-swipe/scripts/check_error_abi.py --base-ref FETCH_HEAD
+          python3 -m unittest discover -s stellar-swipe/scripts/tests -p 'test_check_error_abi.py'
 
       # Setup Rust toolchain with required components and target
       - name: Setup Rust
@@ -369,17 +387,3 @@ jobs:
             echo "INFO: New ABI exports detected; baseline files updated."
             echo "Please commit the updated stellar-swipe/abi-baselines/*.json files."
           fi
-     cat /tmp/abi-diff-report.md
-          echo ""
-          echo "---"
-          echo "Exit code: $rc"
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          if [ $rc -eq 1 ]; then
-            echo "ERROR: Breaking ABI change detected — see report above." >&2
-            exit 1
-          fi
-          if [ $rc -eq 2 ]; then
-            echo "INFO: New ABI exports detected; baseline files updated."
-            echo "Please commit the updated stellar-swipe/abi-baselines/*.json files."
-          fi
-
