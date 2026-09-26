@@ -1,117 +1,14 @@
 {
-  "_comment": "Deployment manifest for testnet (Issue #822). Validated by stellar-swipe/scripts/validate_deployment_manifest.py before scripts/deploy_testnet.sh runs, and in CI. 'address' is null until a contract has actually been deployed (see deployments/testnet.json, generated at deploy time) — fill it in once known so later re-validations also check it. 'version' tracks the contract's on-chain version constant (see stellar-swipe/contracts/shared/src/version.rs); 'depends_on' declares the minimum compatible version of another contract in this manifest that this contract calls cross-contract, mirroring the runtime shared::version::validate_callee_version check. 'invariants' (Issue #1086) is the versioned invariant snapshot set read by the deployment smoke tests (stellar-swipe/contracts/smoke_tests) immediately after initialization and after representative mutations; each entry names the invariant, the category it belongs to (authorization, balances, configuration, version), and the expected value so a failure can identify both the violated invariant and the contract address.",
+  "$schema": "./manifest.schema.json",
   "network": "testnet",
-  "admin": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
-  "invariants_version": 1,
-  "contracts": {
-    "stake_vault": {
-      "package": "stake_vault",
-      "address": null,
-      "version": 2,
-      "depends_on": {},
-      "invariants": {
-        "authorization": [
-          { "name": "admin_is_set", "expected": "manifest.admin" },
-          { "name": "non_admin_cannot_withdraw", "expected": "unauthorized" }
-        ],
-        "balances": [
-          { "name": "total_staked_matches_ledger", "expected": 0 },
-          { "name": "vault_balance_non_negative", "expected": 0 }
-        ],
-        "configuration": [
-          { "name": "fee_bps_within_bounds", "expected": "<= 10000" }
-        ],
-        "version": [
-          { "name": "contract_version", "expected": 2 }
-        ]
-      }
-    },
-    "signal_registry": {
-      "package": "signal_registry",
-      "address": null,
-      "version": 2,
-      "depends_on": {},
-      "invariants": {
-        "authorization": [
-          { "name": "admin_is_set", "expected": "manifest.admin" },
-          { "name": "non_admin_cannot_pause", "expected": "unauthorized" }
-        ],
-        "balances": [
-          { "name": "signal_count_matches_ledger", "expected": 0 }
-        ],
-        "configuration": [
-          { "name": "max_signals_per_window_positive", "expected": "> 0" }
-        ],
-        "version": [
-          { "name": "contract_version", "expected": 2 }
-        ]
-      }
-    },
-    "fee_collector": {
-      "package": "fee_collector",
-      "address": null,
-      "version": 2,
-      "depends_on": {},
-      "invariants": {
-        "authorization": [
-          { "name": "admin_is_set", "expected": "manifest.admin" },
-          { "name": "non_admin_cannot_set_fee", "expected": "unauthorized" }
-        ],
-        "balances": [
-          { "name": "collected_fees_match_ledger", "expected": 0 }
-        ],
-        "configuration": [
-          { "name": "fee_bps_within_bounds", "expected": "<= 10000" }
-        ],
-        "version": [
-          { "name": "contract_version", "expected": 2 }
-        ]
-      }
-    },
-    "user_portfolio": {
-      "package": "auto_trade",
-      "address": null,
-      "version": 2,
-      "depends_on": {},
-      "invariants": {
-        "authorization": [
-          { "name": "owner_is_set", "expected": "manifest.admin" },
-          { "name": "non_owner_cannot_rebalance", "expected": "unauthorized" }
-        ],
-        "balances": [
-          { "name": "portfolio_value_non_negative", "expected": 0 },
-          { "name": "sum_of_positions_matches_total", "expected": 0 }
-        ],
-        "configuration": [
-          { "name": "max_positions_positive", "expected": "> 0" }
-        ],
-        "version": [
-          { "name": "contract_version", "expected": 2 }
-        ]
-      }
-    },
-    "trade_executor": {
-      "package": "bridge",
-      "address": null,
-      "version": 1,
-      "depends_on": {
-        "user_portfolio": { "min_version": 2 }
-      },
-      "invariants": {
-        "authorization": [
-          { "name": "admin_is_set", "expected": "manifest.admin" },
-          { "name": "non_admin_cannot_execute", "expected": "unauthorized" }
-        ],
-        "balances": [
-          { "name": "pending_trades_match_ledger", "expected": 0 }
-        ],
-        "configuration": [
-          { "name": "callee_min_version_satisfied", "expected": "user_portfolio >= 2" }
-        ],
-        "version": [
-          { "name": "contract_version", "expected": 1 }
-        ]
-      }
+  "generatedBy": "scripts/generate-release-manifest",
+  "artifacts": [
+    {
+      "contractName": "hello_world",
+      "interfaceVersion": "1.0.0",
+      "wasmPath": "target/wasm32-unknown-unknown/release/hello_world.wasm",
+      "checksum": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "sourceRevision": "0000000000000000000000000000000000000000"
     }
-  }
+  ]
 }
