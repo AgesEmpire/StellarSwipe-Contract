@@ -397,6 +397,256 @@ pub struct GuardianRecoveryEvent {
     pub timestamp: u64,
 }
 
+/// Error returned when a two-step administrator handoff is rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminHandoffError {
+    /// The caller is not the current administrator.
+    NotAdmin,
+    /// The caller is not the nominated successor.
+    NotPendingAdmin,
+    /// No successor has been nominated yet.
+    NoPendingAdmin,
+}
+
+/// Two-step administrator handoff state for a core contract.
+///
+/// The current administrator nominates a successor with [`propose_admin`],
+/// which does **not** change the administrator. The nominated address must
+/// then call [`accept_admin`] to complete the handoff. This prevents an
+/// accidental or unilateral transfer from taking effect immediately.
+///
+/// [`propose_admin`]: AdminHandoff::propose_admin
+/// [`accept_admin`]: AdminHandoff::accept_admin
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminHandoff {
+    /// The address currently holding administrator rights.
+    pub admin: u64,
+    /// The address nominated to become the next administrator, if any.
+    pub pending_admin: Option<u64>,
+}
+
+impl AdminHandoff {
+    /// Create a new handoff state with `admin` as the current administrator.
+    pub fn new(admin: u64) -> Self {
+        Self {
+            admin,
+            pending_admin: None,
+        }
+    }
+
+    /// Nominate `successor` as the next administrator.
+    ///
+    /// Only the current administrator may nominate a successor, and the
+    /// nomination does not take effect until [`accept_admin`] is called.
+    ///
+    /// [`accept_admin`]: AdminHandoff::accept_admin
+    pub fn propose_admin(&mut self, caller: u64, successor: u64) -> Result<(), AdminHandoffError> {
+        if caller != self.admin {
+            return Err(AdminHandoffError::NotAdmin);
+        }
+        self.pending_admin = Some(successor);
+        Ok(())
+    }
+
+    /// Complete a pending handoff, transferring administrator rights to the
+    /// nominated successor.
+    pub fn accept_admin(&mut self, caller: u64) -> Result<(), AdminHandoffError> {
+        match self.pending_admin {
+            None => Err(AdminHandoffError::NoPendingAdmin),
+            Some(pending) if pending != caller => Err(AdminHandoffError::NotPendingAdmin),
+            Some(pending) => {
+                self.admin = pending;
+                self.pending_admin = None;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A narrowly scoped maintenance capability that can be granted to an
+/// operator.
+///
+/// Each capability maps to a defined set of contract entrypoints (see
+/// [`OperatorCapability::entrypoints`]); there is deliberately no broad
+/// administrative catch-all, so an operator holding one capability cannot
+/// invoke entrypoints outside that capability's scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCapability {
+    /// Pause and unpause contract operations.
+    Pause,
+    /// Update the oracle staleness window.
+    OracleConfig,
+    /// Update protocol fee parameters.
+    FeeConfig,
+    /// Rotate signing keys used by the contract.
+    KeyRotation,
+}
+
+impl OperatorCapability {
+    /// Every capability, in a stable order.
+    pub const ALL: [OperatorCapability; 4] = [
+        OperatorCapability::Pause,
+        OperatorCapability::OracleConfig,
+        OperatorCapability::FeeConfig,
+        OperatorCapability::KeyRotation,
+    ];
+
+    /// The contract entrypoints this capability authorizes.
+    ///
+    /// The returned set is exhaustive: an operator granted this capability
+    /// may invoke exactly these entrypoints and nothing else.
+    pub fn entrypoints(&self) -> &'static [&'static str] {
+        match self {
+            OperatorCapability::Pause => &["pause", "unpause"],
+            OperatorCapability::OracleConfig => &["set_oracle_staleness"],
+            OperatorCapability::FeeConfig => &["set_protocol_fee"],
+            OperatorCapability::KeyRotation => &["rotate_signing_key"],
+        }
+    }
+
+    /// Whether this capability authorizes `entrypoint`.
+    pub fn authorizes(&self, entrypoint: &str) -> bool {
+        self.entrypoints().contains(&entrypoint)
+    }
+}
+
+/// Error returned when a capability grant or revocation is rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityError {
+    /// The caller is not authorized to grant or revoke capabilities.
+    Unauthorized,
+    /// The operator already holds the capability.
+    AlreadyGranted,
+    /// The operator does not hold the capability.
+    NotGranted,
+    /// The operator is not permitted to invoke the entrypoint.
+    NotPermitted,
+}
+
+/// Auditable record of a capability grant or revocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityEvent {
+    /// A capability was granted to an operator.
+    Granted {
+        /// The operator that received the capability.
+        operator: u64,
+        /// The capability that was granted.
+        capability: OperatorCapability,
+    },
+    /// A capability was revoked from an operator.
+    Revoked {
+        /// The operator that lost the capability.
+        operator: u64,
+        /// The capability that was revoked.
+        capability: OperatorCapability,
+    },
+}
+
+/// Registry of scoped operator capabilities.
+///
+/// Grants and revocations are authorized against the current administrator
+/// and emit a [`CapabilityEvent`] so every change is auditable. Invocation
+/// checks enforce least privilege: an operator may only invoke entrypoints
+/// covered by a capability it actually holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityRegistry {
+    /// The address authorized to grant and revoke capabilities.
+    pub admin: u64,
+    /// Granted capabilities, as `(operator, capability)` pairs.
+    pub grants: Vec<(u64, OperatorCapability)>,
+    /// Audit log of every grant and revocation, in order.
+    pub events: Vec<CapabilityEvent>,
+}
+
+impl CapabilityRegistry {
+    /// Create an empty registry administered by `admin`.
+    pub fn new(admin: u64) -> Self {
+        Self {
+            admin,
+            grants: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Whether `operator` currently holds `capability`.
+    pub fn has_capability(&self, operator: u64, capability: OperatorCapability) -> bool {
+        self.grants.contains(&(operator, capability))
+    }
+
+    /// Grant `capability` to `operator`.
+    ///
+    /// Only the administrator may grant capabilities, and the grant is
+    /// recorded as an auditable [`CapabilityEvent::Granted`].
+    pub fn grant(
+        &mut self,
+        caller: u64,
+        operator: u64,
+        capability: OperatorCapability,
+    ) -> Result<(), CapabilityError> {
+        if caller != self.admin {
+            return Err(CapabilityError::Unauthorized);
+        }
+        if self.has_capability(operator, capability) {
+            return Err(CapabilityError::AlreadyGranted);
+        }
+        self.grants.push((operator, capability));
+        self.events.push(CapabilityEvent::Granted {
+            operator,
+            capability,
+        });
+        Ok(())
+    }
+
+    /// Revoke `capability` from `operator`.
+    ///
+    /// Only the administrator may revoke capabilities, and the revocation is
+    /// recorded as an auditable [`CapabilityEvent::Revoked`].
+    pub fn revoke(
+        &mut self,
+        caller: u64,
+        operator: u64,
+        capability: OperatorCapability,
+    ) -> Result<(), CapabilityError> {
+        if caller != self.admin {
+            return Err(CapabilityError::Unauthorized);
+        }
+        let index = self
+            .grants
+            .iter()
+            .position(|&(op, cap)| op == operator && cap == capability)
+            .ok_or(CapabilityError::NotGranted)?;
+        self.grants.remove(index);
+        self.events.push(CapabilityEvent::Revoked {
+            operator,
+            capability,
+        });
+        Ok(())
+    }
+
+    /// Authorize `operator` to invoke `entrypoint`.
+    ///
+    /// Succeeds only when the operator holds a capability whose scope covers
+    /// `entrypoint`, enforcing least privilege across capabilities.
+    pub fn authorize_entrypoint(
+        &self,
+        operator: u64,
+        entrypoint: &str,
+    ) -> Result<(), CapabilityError> {
+        let permitted = self.grants.iter().any(|&(op, cap)| {
+            op == operator && cap.authorizes(entrypoint)
+        });
+        if permitted {
+            Ok(())
+        } else {
+            Err(CapabilityError::NotPermitted)
+        }
+    }
+}
+
 #[cfg(test)]
 mod guardian_recovery_tests {
     use super::*;
@@ -484,5 +734,7 @@ mod guardian_recovery_tests {
             req.approve("stranger", &guardians()),
             Err(GuardianRecoveryError::NotAGuardian)
         );
+    }
+}
     }
 }

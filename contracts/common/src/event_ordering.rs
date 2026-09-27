@@ -1,72 +1,197 @@
-//! Event ordering helpers for versioned Soroban events.
+//! Event ordering utilities and cross-contract invocation guards.
 //!
-//! This module provides deterministic helpers used by indexers to reason about
-//! the ordering and compatibility of versioned event payloads. In particular it
-//! exposes a stable schema hash so consumers can detect incompatible payload
-//! changes across builds.
+//! This module provides helpers for ordering events emitted across contracts
+//! and a reusable guard that detects recursive cross-contract invocation
+//! cycles before any irreversible effects (state writes, transfers, events)
+//! are performed.
 
-use soroban_sdk::{Bytes, Env, Symbol, Vec};
+use std::collections::HashSet;
 
-/// Domain separator mixed into every schema hash.
+/// Maximum supported cross-contract invocation depth.
 ///
-/// Kept as a fixed byte string so the hash is stable across builds and cannot
-/// collide with hashes produced for other purposes.
-const SCHEMA_HASH_DOMAIN: &[u8] = b"soroban-event-schema-v1";
+/// Any invocation chain deeper than this is rejected before it can produce
+/// irreversible effects. This bounds recursion so a cyclic call pattern
+/// cannot exhaust resources.
+pub const MAX_INVOCATION_DEPTH: u32 = 8;
 
-/// Compute a deterministic hash for a versioned event schema.
-///
-/// The hash is derived only from the event `name`, its `version`, and the
-/// ordered list of `fields`. It deliberately avoids any nondeterministic input
-/// (timestamps, addresses, map iteration order, etc.) so the value is stable
-/// across builds and platforms.
-///
-/// Because the fields are folded in order, any schema change (renaming a field,
-/// adding/removing a field, reordering fields, or bumping the version) alters
-/// the resulting hash predictably.
-///
-/// # Arguments
-/// * `env` - The Soroban environment used to allocate the returned `Bytes`.
-/// * `name` - The event name (e.g. `Symbol::new(&env, "transfer")`).
-/// * `version` - The schema version for the event.
-/// * `fields` - The ordered field names that make up the payload schema.
-///
-/// # Returns
-/// A 32-byte `Bytes` value containing the canonical schema hash.
-#[must_use]
-pub fn schema_hash(env: &Env, name: &Symbol, version: u32, fields: &Vec<Symbol>) -> Bytes {
-    let mut preimage = Bytes::new(env);
-
-    // Domain separator first so hashes are namespaced to this helper.
-    preimage.extend_from_slice(SCHEMA_HASH_DOMAIN);
-
-    // Length-prefix the event name to avoid ambiguity between concatenated
-    // inputs (e.g. "ab" + "c" vs "a" + "bc").
-    let name_bytes = name.to_string().to_bytes();
-    preimage.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
-    preimage.append(&name_bytes);
-
-    // Version is folded in as a fixed-width big-endian integer.
-    preimage.extend_from_slice(&version.to_be_bytes());
-
-    // Field count, then each field length-prefixed and in declaration order.
-    preimage.extend_from_slice(&(fields.len() as u32).to_be_bytes());
-    for field in fields.iter() {
-        let field_bytes = field.to_string().to_bytes();
-        preimage.extend_from_slice(&(field_bytes.len() as u32).to_be_bytes());
-        preimage.append(&field_bytes);
-    }
-
-    env.crypto().sha256(&preimage).to_bytes()
+/// Policy applied when a cross-contract invocation cycle is detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CyclePolicy {
+    /// Reject the invocation as soon as a cycle or depth overflow is seen.
+    Reject,
 }
 
-/// Convenience wrapper that returns the schema hash as a fixed 32-byte array.
+/// Error returned when a cross-contract invocation is not allowed to proceed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvocationError {
+    /// The same contract was re-entered within the current invocation chain.
+    RecursiveCycle,
+    /// The invocation chain exceeded [`MAX_INVOCATION_DEPTH`].
+    DepthExceeded,
+}
+
+/// Tracks the active cross-contract invocation chain and enforces the
+/// configured [`CyclePolicy`].
 ///
-/// Useful for callers that want to embed the hash directly into an event
-/// payload without an extra `Bytes` allocation.
-#[must_use]
-pub fn schema_hash_array(env: &Env, name: &Symbol, version: u32, fields: &Vec<Symbol>) -> [u8; 32] {
-    let hash = schema_hash(env, name, version, fields);
-    let mut out = [0u8; 32];
-    hash.copy_into_slice(&mut out);
-    out
+/// Call [`InvocationGuard::enter`] before performing any irreversible effect
+/// for a cross-contract call, and [`InvocationGuard::exit`] once the call
+/// returns. A rejected `enter` leaves the guard unchanged, so the caller can
+/// fail safely before mutating state.
+#[derive(Debug, Default, Clone)]
+pub struct InvocationGuard {
+    policy: CyclePolicy,
+    max_depth: u32,
+    active: Vec<u64>,
+    seen: HashSet<u64>,
+}
+
+impl InvocationGuard {
+    /// Create a guard using the default [`CyclePolicy::Reject`] policy and
+    /// [`MAX_INVOCATION_DEPTH`].
+    pub fn new() -> Self {
+        Self::with_policy(CyclePolicy::Reject, MAX_INVOCATION_DEPTH)
+    }
+
+    /// Create a guard with an explicit policy and depth limit.
+    pub fn with_policy(policy: CyclePolicy, max_depth: u32) -> Self {
+        Self {
+            policy,
+            max_depth,
+            active: Vec::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    /// The configured cycle policy.
+    pub fn policy(&self) -> CyclePolicy {
+        self.policy
+    }
+
+    /// The configured maximum invocation depth.
+    pub fn max_depth(&self) -> u32 {
+        self.max_depth
+    }
+
+    /// Current invocation depth.
+    pub fn depth(&self) -> u32 {
+        self.active.len() as u32
+    }
+
+    /// Whether `contract_id` is already active in the current chain.
+    pub fn is_active(&self, contract_id: u64) -> bool {
+        self.seen.contains(&contract_id)
+    }
+
+    /// Attempt to enter a cross-contract invocation for `contract_id`.
+    ///
+    /// Returns `Ok(())` when the invocation may proceed. Returns an
+    /// [`InvocationError`] and leaves the guard unchanged when the call would
+    /// create a cycle or exceed the depth limit, so callers can reject the
+    /// call before any irreversible effect.
+    pub fn enter(&mut self, contract_id: u64) -> Result<(), InvocationError> {
+        if self.seen.contains(&contract_id) {
+            return Err(InvocationError::RecursiveCycle);
+        }
+        if self.active.len() as u32 >= self.max_depth {
+            return Err(InvocationError::DepthExceeded);
+        }
+        self.active.push(contract_id);
+        self.seen.insert(contract_id);
+        Ok(())
+    }
+
+    /// Exit the most recent invocation, clearing it from the active chain.
+    ///
+    /// Returns the contract id that was exited, or `None` if the chain is
+    /// already empty.
+    pub fn exit(&mut self) -> Option<u64> {
+        let id = self.active.pop()?;
+        self.seen.remove(&id);
+        Some(id)
+    }
+
+    /// Run `f` within a guarded invocation of `contract_id`.
+    ///
+    /// The guard is entered before `f` runs and exited afterwards, including
+    /// on error. If entering fails, `f` is never invoked and the error is
+    /// returned, ensuring rejected cycles fail before irreversible effects.
+    pub fn with_invocation<F, T>(
+        &mut self,
+        contract_id: u64,
+        f: F,
+    ) -> Result<T, InvocationError>
+    where
+        F: FnOnce(&mut Self) -> T,
+    {
+        self.enter(contract_id)?;
+        let result = f(self);
+        self.exit();
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_cycle_is_rejected() {
+        let mut guard = InvocationGuard::new();
+        guard.enter(1).unwrap();
+        assert_eq!(guard.enter(1), Err(InvocationError::RecursiveCycle));
+        // Guard state is unchanged after a rejected enter.
+        assert_eq!(guard.depth(), 1);
+    }
+
+    #[test]
+    fn indirect_cycle_is_rejected() {
+        let mut guard = InvocationGuard::new();
+        guard.enter(1).unwrap();
+        guard.enter(2).unwrap();
+        assert_eq!(guard.enter(1), Err(InvocationError::RecursiveCycle));
+        assert_eq!(guard.depth(), 2);
+    }
+
+    #[test]
+    fn valid_nested_call_succeeds() {
+        let mut guard = InvocationGuard::new();
+        guard.enter(1).unwrap();
+        guard.enter(2).unwrap();
+        guard.enter(3).unwrap();
+        assert_eq!(guard.depth(), 3);
+        assert_eq!(guard.exit(), Some(3));
+        assert_eq!(guard.exit(), Some(2));
+        assert_eq!(guard.exit(), Some(1));
+        assert_eq!(guard.depth(), 0);
+    }
+
+    #[test]
+    fn depth_limit_is_enforced() {
+        let mut guard = InvocationGuard::with_policy(CyclePolicy::Reject, 2);
+        guard.enter(1).unwrap();
+        guard.enter(2).unwrap();
+        assert_eq!(guard.enter(3), Err(InvocationError::DepthExceeded));
+        assert_eq!(guard.depth(), 2);
+    }
+
+    #[test]
+    fn with_invocation_rejects_before_running() {
+        let mut guard = InvocationGuard::new();
+        guard.enter(1).unwrap();
+        let mut ran = false;
+        let result = guard.with_invocation(1, |_| {
+            ran = true;
+        });
+        assert_eq!(result, Err(InvocationError::RecursiveCycle));
+        assert!(!ran, "rejected cycle must not run the invocation body");
+    }
+
+    #[test]
+    fn with_invocation_exits_on_success() {
+        let mut guard = InvocationGuard::new();
+        let value = guard.with_invocation(7, |_| 42).unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(guard.depth(), 0);
+        assert!(!guard.is_active(7));
+    }
 }

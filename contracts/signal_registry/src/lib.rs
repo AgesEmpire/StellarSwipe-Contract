@@ -18,6 +18,36 @@
 //! so that indexers and operators can discover them. Each event records the
 //! changed setting, its prior and new values, and the actor that authorized
 //! the change.
+//!
+//! Privileged operations that may be retried after an ambiguous transaction
+//! submission outcome accept an idempotency key. A repeated key never applies
+//! the operation twice: the first successful execution records the key and
+//! subsequent calls with the same key are rejected with
+//! [`SignalError::IdempotencyKeyReused`].
+//!
+//! ## Idempotency key semantics
+//!
+//! * **Scope** — a key is scoped to the privileged operation that consumed it
+//!   and to the caller that submitted it. The same key value may therefore be
+//!   used independently by different callers or for different operations
+//!   without colliding.
+//! * **Retention** — a consumed key is retained for
+//!   [`IDEMPOTENCY_KEY_RETENTION_SECONDS`] from the ledger timestamp at which
+//!   it was consumed. After that window elapses the key may be reused.
+//! * **Collision behavior** — presenting a key that is still within its
+//!   retention window fails closed with [`SignalError::IdempotencyKeyReused`]
+//!   and leaves state untouched. A key is only recorded once the operation it
+//!   guards has completed successfully, so a failed execution does not consume
+//!   the key and the operation may be retried with the same key.
+//!
+//! ## Two-step administrator handoff
+//!
+//! Administrator replacement is a two-step handoff. The current administrator
+//! nominates a successor with [`SignalRegistry::propose_admin`], which records
+//! the pending administrator without changing the active one. Only the
+//! nominated address may then call [`SignalRegistry::accept_admin`] to complete
+//! the handoff and become the administrator. Unrelated callers can neither
+//! nominate nor accept, and nomination alone never transfers the role.
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
@@ -37,6 +67,9 @@ pub enum SignalError {
     IdentifierTombstoned = 9,
     TombstoneNotExpired = 10,
     InvalidBatchSize = 11,
+    IdempotencyKeyReused = 12,
+    NoPendingAdmin = 13,
+    NotPendingAdmin = 14,
 }
 
 /// Maximum accepted length, in bytes, of provider metadata.
@@ -52,6 +85,10 @@ pub const TOMBSTONE_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 /// Upper bound on the number of expired tombstones purged per cleanup call.
 pub const MAX_TOMBSTONE_PURGE: u32 = 100;
+
+/// Documented retention period, in seconds, during which a consumed
+/// idempotency key remains non-reusable.
+pub const IDEMPOTENCY_KEY_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 
 /// Configuration-driven reputation decay schedule.
 ///
@@ -97,6 +134,17 @@ pub struct Tombstone {
     pub expires_at: u64,
 }
 
+/// Recorded consumption of an idempotency key.
+///
+/// `operation` scopes the key to the privileged operation that consumed it and
+/// `expires_at` bounds how long the key remains non-reusable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdempotencyRecord {
+    pub operation: String,
+    pub expires_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataKey {
@@ -118,10 +166,12 @@ pub struct ConfigChanged {
 }
 
 const ADMIN_KEY: &str = "admin";
+const PENDING_ADMIN_KEY: &str = "pending_admin";
 const SCHEDULE_KEY: &str = "schedule";
 const REPUTATION_KEY: &str = "reputation";
 const METADATA_KEY: &str = "metadata";
 const TOMBSTONE_KEY: &str = "tombstone";
+const IDEMPOTENCY_KEY: &str = "idempotency";
 
 #[contract]
 pub struct SignalRegistry;
@@ -139,18 +189,62 @@ impl SignalRegistry {
         Ok(())
     }
 
-    /// Update the decay schedule. Only the admin may call this.
+    /// Nominate a successor administrator. Only the current administrator may
+    /// call this.
     ///
-    /// On success an auditable [`ConfigChanged`] event is emitted carrying the
-    /// prior and new schedules along with the authorizing admin. Rejected
-    /// updates (unauthorized or invalid) emit no event.
-    pub fn set_decay_schedule(env: Env, schedule: DecaySchedule) -> Result<(), SignalError> {
+    /// The nomination is recorded as the pending administrator and does **not**
+    /// change the active administrator. The handoff only completes when the
+    /// nominated address calls [`Self::accept_admin`].
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), SignalError> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&ADMIN_KEY)
             .ok_or(SignalError::NotInitialized)?;
         admin.require_auth();
+        env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+        Ok(())
+    }
+
+    /// Accept a pending administrator nomination, completing the handoff.
+    ///
+    /// Only the address previously nominated via [`Self::propose_admin`] may
+    /// call this. On success the caller becomes the administrator and the
+    /// pending nomination is cleared.
+    pub fn accept_admin(env: Env) -> Result<(), SignalError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN_KEY)
+            .ok_or(SignalError::NoPendingAdmin)?;
+        pending.require_auth();
+        env.storage().instance().set(&ADMIN_KEY, &pending);
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        Ok(())
+    }
+
+    /// Read the currently pending administrator nomination, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&PENDING_ADMIN_KEY)
+    }
+
+    /// Update the decay schedule. Only the admin may call this.
+    ///
+    /// `idempotency_key` makes the call replay-safe: a key that is still within
+    /// its retention window is rejected with [`SignalError::IdempotencyKeyReused`]
+    /// and the schedule is left unchanged.
+    pub fn set_decay_schedule(
+        env: Env,
+        schedule: DecaySchedule,
+        idempotency_key: String,
+    ) -> Result<(), SignalError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(SignalError::NotInitialized)?;
+        admin.require_auth();
+        Self::consume_idempotency_key(&env, &admin, "set_decay_schedule", &idempotency_key)?;
         Self::validate_schedule(&schedule)?;
         let old_value: DecaySchedule = env
             .storage()
@@ -200,9 +294,7 @@ impl SignalRegistry {
 
     /// Read the stored metadata for a provider, if any.
     pub fn get_provider_metadata(env: Env, provider: Address) -> Option<String> {
-        let key = (METADATA_KEY, provider);
-        env.storage().persistent().get(&key)
-    }
+        let key = (
 
     /// Remove a provider's metadata, leaving a tombstone that keeps the
     /// identifier non-reusable for [`TOMBSTONE_RETENTION_SECONDS`].
@@ -255,5 +347,3 @@ impl SignalRegistry {
         let now = env.ledger().timestamp();
         let mut purged: u32 = 0;
         for provider in providers
-
-/* … truncated 6101 chars — edit only what you need near the top … */

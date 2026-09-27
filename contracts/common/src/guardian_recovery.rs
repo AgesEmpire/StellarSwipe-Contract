@@ -4,6 +4,7 @@
 //! Also provides deposit retry protection for failed ledger writes (#1029).
 //! Also provides a shared append-only emergency action journal (#1166).
 //! Also provides delayed guardian recovery for lost administrator access (#1183).
+//! Also provides scoped operator capabilities for contract maintenance actions (#1182).
 //! Follow-up work: wire into the live pause-handling contract storage/auth and add
 //! integration tests against real contract state.
 

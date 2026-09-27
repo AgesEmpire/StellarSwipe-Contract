@@ -11,11 +11,21 @@
 //!   cannot be replayed against a different operation or caller.
 //! - Invalid items produce explicit per-item failure results and are never
 //!   silently skipped.
+//! - Cross-contract invocation depth is explicitly capped
+//!   ([`MAX_INVOCATION_DEPTH`]) and re-entrant/cyclic call patterns are
+//!   rejected before any irreversible effects occur.
 
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, Env, Vec};
 
 /// Hard cap on the number of items accepted in a single batch.
 pub const MAX_BATCH_SIZE: u32 = 32;
+
+/// Hard cap on the supported cross-contract invocation depth.
+///
+/// A call chain deeper than this is rejected deterministically. This bounds
+/// recursion so cyclic cross-contract patterns cannot recurse until resource
+/// exhaustion.
+pub const MAX_INVOCATION_DEPTH: u32 = 8;
 
 /// Errors surfaced by the batch verifier.
 #[contracterror]
@@ -28,6 +38,10 @@ pub enum BatchError {
     EmptyBatch = 2,
     /// An item's binding did not match the expected operation/caller.
     BindingMismatch = 3,
+    /// A cross-contract invocation cycle was detected.
+    InvocationCycle = 4,
+    /// The cross-contract invocation depth exceeded [`MAX_INVOCATION_DEPTH`].
+    InvocationDepthExceeded = 5,
 }
 
 /// A single authorization check bound to its intended operation and caller.
@@ -115,5 +129,54 @@ impl BatchVerifier {
             }
         }
         Ok(())
+    }
+}
+
+/// Reusable guard enforcing the cross-contract invocation depth and cycle
+/// policy.
+///
+/// Call sites push the contract identifier they are about to invoke onto the
+/// `stack` before performing the call. The guard rejects the invocation when
+/// the identifier is already present on the stack (a direct `A->A` or
+/// indirect `A->B->A` cycle) or when the resulting depth would exceed
+/// [`MAX_INVOCATION_DEPTH`]. Because the guard runs before the call is made,
+/// rejected cycles fail before any irreversible effects (state writes,
+/// transfers, events) occur.
+pub struct InvocationGuard;
+
+impl InvocationGuard {
+    /// Check whether invoking `contract_id` from the current `stack` is
+    /// permitted.
+    ///
+    /// Returns [`BatchError::InvocationCycle`] if `contract_id` is already on
+    /// the stack, or [`BatchError::InvocationDepthExceeded`] if pushing it
+    /// would exceed [`MAX_INVOCATION_DEPTH`]. On success the caller may push
+    /// `contract_id` onto the stack and proceed with the invocation.
+    pub fn check(stack: &Vec<BytesN<32>>, contract_id: &BytesN<32>) -> Result<(), BatchError> {
+        let len = stack.len();
+        for i in 0..len {
+            if stack.get_unchecked(i) == *contract_id {
+                return Err(BatchError::InvocationCycle);
+            }
+        }
+        if len >= MAX_INVOCATION_DEPTH {
+            return Err(BatchError::InvocationDepthExceeded);
+        }
+        Ok(())
+    }
+
+    /// Check and record an invocation in one step, returning the updated
+    /// stack. Rejected invocations return an error and leave the caller's
+    /// stack untouched, so no irreversible effects are performed.
+    pub fn enter(
+        env: &Env,
+        stack: &Vec<BytesN<32>>,
+        contract_id: &BytesN<32>,
+    ) -> Result<Vec<BytesN<32>>, BatchError> {
+        Self::check(stack, contract_id)?;
+        let mut next = stack.clone();
+        next.push_back(contract_id.clone());
+        let _ = env;
+        Ok(next)
     }
 }
