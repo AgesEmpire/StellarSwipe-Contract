@@ -19,3 +19,6 @@
 
 <!-- handsoff-issue-1170 -->
 - #1170: Add Soroban authorization payload size regression tests
+
+<!-- handsoff-issue-1197 -->
+- #1197: Reject unsupported fee-on-transfer tokens during asset registration
