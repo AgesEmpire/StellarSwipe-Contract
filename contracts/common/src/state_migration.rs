@@ -1,7 +1,386 @@
 // State Migration Framework for Contract Upgrades
 // Provides robust migration with backward compatibility
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec, Bytes, Map};
+
+// ============================================================================
+// Archival Export/Restore Verification
+// ============================================================================
+
+/// Current archival export schema version
+pub const ARCHIVAL_EXPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Archival export record as defined in STATE_MIGRATION_SUMMARY.md
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ArchivalExportRecord {
+    pub contract_id: String,
+    pub schema_version: u32,
+    pub ledger_sequence: u32,
+    pub ledger_close_time: u64,
+    pub network_passphrase: String,
+    pub key: String,
+    pub value: String,
+}
+
+/// Full archival export containing records and metadata
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ArchivalExport {
+    pub records: Vec<ArchivalExportRecord>,
+    pub export_timestamp: u64,
+    pub export_checksum: u64,
+    pub format_version: u32,
+}
+
+/// Result of restore validation
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct RestoreValidationResult {
+    pub valid: bool,
+    pub format_version_valid: bool,
+    pub checksum_valid: bool,
+    pub invariants_valid: bool,
+    pub record_count: u32,
+    pub errors: Vec<String>,
+}
+
+/// Verifier for archival export restoration
+pub struct ArchivalRestoreVerifier;
+
+impl ArchivalRestoreVerifier {
+    /// Compute checksum for a set of records
+    pub fn compute_checksum(records: &Vec<ArchivalExportRecord>) -> u64 {
+        let mut hasher = ChecksumHasher::new();
+        for record in records.iter() {
+            hasher.update(&record.contract_id);
+            hasher.update_u32(record.schema_version);
+            hasher.update_u32(record.ledger_sequence);
+            hasher.update_u64(record.ledger_close_time);
+            hasher.update(&record.network_passphrase);
+            hasher.update(&record.key);
+            hasher.update(&record.value);
+        }
+        hasher.finalize()
+    }
+
+    /// Validate archival export before restore
+    pub fn validate_export(
+        env: &Env,
+        export: &ArchivalExport,
+    ) -> RestoreValidationResult {
+        let mut errors = Vec::new(env);
+        
+        // Check format version
+        let format_version_valid = export.format_version == ARCHIVAL_EXPORT_SCHEMA_VERSION;
+        if !format_version_valid {
+            errors.push_back(String::from_str(
+                env,
+                &format!("Invalid format version: expected {}, got {}", ARCHIVAL_EXPORT_SCHEMA_VERSION, export.format_version),
+            ));
+        }
+
+        // Check checksum
+        let computed_checksum = Self::compute_checksum(&export.records);
+        let checksum_valid = computed_checksum == export.export_checksum;
+        if !checksum_valid {
+            errors.push_back(String::from_str(
+                env,
+                &format!("Checksum mismatch: expected {}, computed {}", export.export_checksum, computed_checksum),
+            ));
+        }
+
+        // Check required invariants
+        let invariants_valid = Self::validate_invariants(env, export, &mut errors);
+
+        // Overall validity - all checks must pass
+        let valid = format_version_valid && checksum_valid && invariants_valid;
+
+        RestoreValidationResult {
+            valid,
+            format_version_valid,
+            checksum_valid,
+            invariants_valid,
+            record_count: export.records.len(),
+            errors,
+        }
+    }
+
+    /// Validate required invariants on the export
+    fn validate_invariants(
+        env: &Env,
+        export: &ArchivalExport,
+        errors: &mut Vec<String>,
+    ) -> bool {
+        let mut all_valid = true;
+
+        // Invariant 1: All records must have same schema version
+        if export.records.len() > 0 {
+            let expected_schema_version = export.records.get(0).unwrap().schema_version;
+            for record in export.records.iter() {
+                if record.schema_version != expected_schema_version {
+                    errors.push_back(String::from_str(
+                        env,
+                        &format!("Schema version mismatch in records: expected {}, got {}", expected_schema_version, record.schema_version),
+                    ));
+                    all_valid = false;
+                }
+            }
+        }
+
+        // Invariant 2: All records must have same network passphrase
+        if export.records.len() > 0 {
+            let expected_network = export.records.get(0).unwrap().network_passphrase.clone();
+            for record in export.records.iter() {
+                if record.network_passphrase != expected_network {
+                    errors.push_back(String::from_str(
+                        env,
+                        &format!("Network passphrase mismatch in records"),
+                    ));
+                    all_valid = false;
+                }
+            }
+        }
+
+        // Invariant 3: Records must be sorted by (contract_id, key)
+        let mut prev_contract_id = String::from_str(env, "");
+        let mut prev_key = String::from_str(env, "");
+        let mut first = true;
+        for record in export.records.iter() {
+            if !first {
+                let cmp = Self::compare_keys(&prev_contract_id, &prev_key, &record.contract_id, &record.key);
+                if cmp > 0 {
+                    errors.push_back(String::from_str(
+                        env,
+                        &format!("Records not sorted: {}:{} should come before {}:{}", 
+                            record.contract_id, record.key, prev_contract_id, prev_key),
+                    ));
+                    all_valid = false;
+                }
+            }
+            prev_contract_id = record.contract_id.clone();
+            prev_key = record.key.clone();
+            first = false;
+        }
+
+        // Invariant 4: No duplicate keys
+        let mut seen_keys = Map::new(env);
+        for record in export.records.iter() {
+            let composite_key = (record.contract_id.clone(), record.key.clone());
+            if seen_keys.get(composite_key.clone()).is_some() {
+                errors.push_back(String::from_str(
+                    env,
+                    &format!("Duplicate key found: {}:{}", record.contract_id, record.key),
+                ));
+                all_valid = false;
+            } else {
+                seen_keys.set(composite_key, true);
+            }
+        }
+
+        // Invariant 5: Export timestamp must be reasonable (not in future, not too old)
+        let current_time = env.ledger().timestamp();
+        if export.export_timestamp > current_time {
+            errors.push_back(String::from_str(
+                env,
+                &format!("Export timestamp is in the future: {} > {}", export.export_timestamp, current_time),
+            ));
+            all_valid = false;
+        }
+        // Allow exports up to ~1 year old
+        if current_time.saturating_sub(export.export_timestamp) > 365 * 24 * 60 * 60 {
+            errors.push_back(String::from_str(
+                env,
+                &format!("Export timestamp is too old: {} (current: {})", export.export_timestamp, current_time),
+            ));
+            all_valid = false;
+        }
+
+        all_valid
+    }
+
+    /// Compare composite keys for sorting
+    fn compare_keys(
+        contract_id_a: &String,
+        key_a: &String,
+        contract_id_b: &String,
+        key_b: &String,
+    ) -> i32 {
+        // Compare contract_id first
+        let cid_cmp = contract_id_a.to_string().cmp(&contract_id_b.to_string());
+        if cid_cmp != std::cmp::Ordering::Equal {
+            return if cid_cmp == std::cmp::Ordering::Less { -1 } else { 1 };
+        }
+        // Then compare key
+        let key_cmp = key_a.to_string().cmp(&key_b.to_string());
+        if key_cmp == std::cmp::Ordering::Less { -1 } else if key_cmp == std::cmp::Ordering::Greater { 1 } else { 0 }
+    }
+
+    /// Restore state from validated export (atomic - all or nothing)
+    pub fn restore_from_export(
+        env: &Env,
+        export: &ArchivalExport,
+    ) -> Result<RestoreResult, RestoreError> {
+        // First validate the export
+        let validation = Self::validate_export(env, export);
+        if !validation.valid {
+            return Err(RestoreError::ValidationFailed(validation.errors));
+        }
+
+        // Perform atomic restore - collect all writes first, then apply
+        let mut writes = Vec::new(env);
+        for record in export.records.iter() {
+            writes.push_back(RestoreWrite {
+                contract_id: record.contract_id.clone(),
+                key: record.key.clone(),
+                value: record.value.clone(),
+            });
+        }
+
+        // Apply all writes atomically (in Soroban, this means we do them sequentially
+        // but if any fails, we return error - the caller should handle rollback)
+        for write in writes.iter() {
+            // In a real implementation, this would write to the target contract's storage
+            // For this framework, we store the restored data in a restore namespace
+            let restore_key = DataKey::RestoredState(write.contract_id.clone(), write.key.clone());
+            env.storage().instance().set(&restore_key, &write.value);
+        }
+
+        Ok(RestoreResult {
+            success: true,
+            records_restored: export.records.len(),
+            export_timestamp: export.export_timestamp,
+        })
+    }
+
+    /// Verify restored state matches export
+    pub fn verify_restored_state(
+        env: &Env,
+        export: &ArchivalExport,
+    ) -> Result<VerificationResult, RestoreError> {
+        let mut mismatches = Vec::new(env);
+        let mut verified_count = 0u32;
+
+        for record in export.records.iter() {
+            let restore_key = DataKey::RestoredState(record.contract_id.clone(), record.key.clone());
+            let stored_value: String = env.storage().instance().get(&restore_key).unwrap_or(String::from_str(env, ""));
+            
+            if stored_value != record.value {
+                mismatches.push_back(RestoreMismatch {
+                    contract_id: record.contract_id.clone(),
+                    key: record.key.clone(),
+                    expected: record.value.clone(),
+                    actual: stored_value,
+                });
+            } else {
+                verified_count += 1;
+            }
+        }
+
+        Ok(VerificationResult {
+            verified: mismatches.len() == 0,
+            verified_count,
+            mismatch_count: mismatches.len(),
+            mismatches,
+        })
+    }
+}
+
+/// Simple checksum hasher
+struct ChecksumHasher {
+    hash: u64,
+}
+
+impl ChecksumHasher {
+    fn new() -> Self {
+        Self { hash: 0x9e3779b97f4a7c15 } // Golden ratio
+    }
+
+    fn update(&mut self, s: &String) {
+        let bytes = s.to_bytes();
+        for i in 0..bytes.len() {
+            self.hash = self.hash.wrapping_mul(31).wrapping_add(bytes.get(i) as u64);
+        }
+    }
+
+    fn update_u32(&mut self, v: u32) {
+        self.hash = self.hash.wrapping_mul(31).wrapping_add(v as u64);
+    }
+
+    fn update_u64(&mut self, v: u64) {
+        self.hash = self.hash.wrapping_mul(31).wrapping_add(v);
+    }
+
+    fn finalize(self) -> u64 {
+        // Final avalanche
+        let mut h = self.hash;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51afd7ed558ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
+        h ^= h >> 33;
+        h
+    }
+}
+
+/// Write operation for atomic restore
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct RestoreWrite {
+    pub contract_id: String,
+    pub key: String,
+    pub value: String,
+}
+
+/// Result of restore operation
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct RestoreResult {
+    pub success: bool,
+    pub records_restored: u32,
+    pub export_timestamp: u64,
+}
+
+/// Result of verification after restore
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct VerificationResult {
+    pub verified: bool,
+    pub verified_count: u32,
+    pub mismatch_count: u32,
+    pub mismatches: Vec<RestoreMismatch>,
+}
+
+/// Mismatch detail
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct RestoreMismatch {
+    pub contract_id: String,
+    pub key: String,
+    pub expected: String,
+    pub actual: String,
+}
+
+/// Restore error types
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum RestoreError {
+    ValidationFailed(Vec<String>),
+    WriteFailed(String),
+    VerificationFailed,
+    InvalidFormat,
+}
+
+/// Extended storage keys for restore
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey {
+    CurrentVersion,
+    MigrationCounter,
+    MigrationStatus(u64),
+    Snapshot(u64),
+    RestoredState(String, String), // contract_id, key
+}
 
 // ============================================================================
 // Migration Abstraction Layer
@@ -1072,5 +1451,458 @@ mod tests {
         assert_eq!(path[0], 2);
         assert_eq!(path[1], 3);
         assert_eq!(path[2], 4);
+    }
+
+    // ============================================================================
+    // Archival Export/Restore Tests
+    // ============================================================================
+
+    /// Create a test environment
+    fn test_env() -> Env {
+        Env::default()
+    }
+
+    /// Create a valid test export
+    fn create_valid_export(env: &Env) -> ArchivalExport {
+        let mut records = Vec::new(env);
+        
+        // Add test records sorted by (contract_id, key)
+        let record1 = ArchivalExportRecord {
+            contract_id: String::from_str(env, "contract_A"),
+            schema_version: 1,
+            ledger_sequence: 100,
+            ledger_close_time: 1000000,
+            network_passphrase: String::from_str(env, "Test Network"),
+            key: String::from_str(env, "key1"),
+            value: String::from_str(env, "value1"),
+        };
+        let record2 = ArchivalExportRecord {
+            contract_id: String::from_str(env, "contract_A"),
+            schema_version: 1,
+            ledger_sequence: 100,
+            ledger_close_time: 1000000,
+            network_passphrase: String::from_str(env, "Test Network"),
+            key: String::from_str(env, "key2"),
+            value: String::from_str(env, "value2"),
+        };
+        let record3 = ArchivalExportRecord {
+            contract_id: String::from_str(env, "contract_B"),
+            schema_version: 1,
+            ledger_sequence: 100,
+            ledger_close_time: 1000000,
+            network_passphrase: String::from_str(env, "Test Network"),
+            key: String::from_str(env, "key1"),
+            value: String::from_str(env, "value3"),
+        };
+        
+        records.push_back(record1);
+        records.push_back(record2);
+        records.push_back(record3);
+        
+        let checksum = ArchivalRestoreVerifier::compute_checksum(&records);
+        
+        ArchivalExport {
+            records,
+            export_timestamp: env.ledger().timestamp(),
+            export_checksum: checksum,
+            format_version: ARCHIVAL_EXPORT_SCHEMA_VERSION,
+        }
+    }
+
+    #[test]
+    fn test_compute_checksum() {
+        let env = test_env();
+        let export = create_valid_export(&env);
+        
+        // Verify checksum is deterministic
+        let checksum1 = ArchivalRestoreVerifier::compute_checksum(&export.records);
+        let checksum2 = ArchivalRestoreVerifier::compute_checksum(&export.records);
+        assert_eq!(checksum1, checksum2);
+        assert_eq!(checksum1, export.export_checksum);
+    }
+
+    #[test]
+    fn test_checksum_changes_with_data() {
+        let env = test_env();
+        let export = create_valid_export(&env);
+        
+        // Modify a record value
+        let mut modified_records = export.records.clone();
+        let mut record = modified_records.get(0).unwrap();
+        record.value = String::from_str(&env, "modified_value");
+        modified_records.set(0, record);
+        
+        let new_checksum = ArchivalRestoreVerifier::compute_checksum(&modified_records);
+        assert_ne!(new_checksum, export.export_checksum);
+    }
+
+    #[test]
+    fn test_validate_export_valid() {
+        let env = test_env();
+        let export = create_valid_export(&env);
+        
+        let result = ArchivalRestoreVerifier::validate_export(&env, &export);
+        
+        assert!(result.valid);
+        assert!(result.format_version_valid);
+        assert!(result.checksum_valid);
+        assert!(result.invariants_valid);
+        assert_eq!(result.record_count, 3);
+        assert_eq!(result.errors.len(), 0);
+    }
+
+    #[test]
+    fn test_validate_export_invalid_format_version() {
+        let env = test_env();
+        let mut export = create_valid_export(&env);
+        export.format_version = 999; // Invalid version
+        
+        let result = ArchivalRestoreVerifier::validate_export(&env, &export);
+        
+        assert!(!result.valid);
+        assert!(!result.format_version_valid);
+        assert!(result.checksum_valid); // Checksum still valid
+        assert!(!result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_validate_export_corrupted_checksum() {
+        let env = test_env();
+        let mut export = create_valid_export(&env);
+        export.export_checksum = export.export_checksum.wrapping_add(1); // Corrupt checksum
+        
+        let result = ArchivalRestoreVerifier::validate_export(&env, &export);
+        
+        assert!(!result.valid);
+        assert!(result.format_version_valid);
+        assert!(!result.checksum_valid);
+        assert!(!result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_validate_export_schema_version_mismatch() {
+        let env = test_env();
+        let mut export = create_valid_export(&env);
+        
+        // Modify one record to have different schema version
+        let mut records = export.records.clone();
+        let mut record = records.get(1).unwrap();
+        record.schema_version = 2;
+        records.set(1, record);
+        export.records = records;
+        // Don't update checksum - should fail on both checksum and invariant
+        
+        let result = ArchivalRestoreVerifier::validate_export(&env, &export);
+        
+        assert!(!result.valid);
+        assert!(!result.checksum_valid);
+        assert!(!result.invariants_valid);
+    }
+
+    #[test]
+    fn test_validate_export_network_passphrase_mismatch() {
+        let env = test_env();
+        let mut export = create_valid_export(&env);
+        
+        // Modify one record to have different network passphrase
+        let mut records = export.records.clone();
+        let mut record = records.get(1).unwrap();
+        record.network_passphrase = String::from_str(&env, "Different Network");
+        records.set(1, record);
+        export.records = records;
+        // Recompute checksum since we modified data
+        export.export_checksum = ArchivalRestoreVerifier::compute_checksum(&export.records);
+        
+        let result = ArchivalRestoreVerifier::validate_export(&env, &export);
+        
+        assert!(!result.valid);
+        assert!(!result.invariants_valid);
+    }
+
+    #[test]
+    fn test_validate_export_unsorted_records() {
+        let env = test_env();
+        let mut export = create_valid_export(&env);
+        
+        // Swap records to make them unsorted
+        let mut records = export.records.clone();
+        let record0 = records.get(0).unwrap();
+        let record1 = records.get(1).unwrap();
+        records.set(0, record1);
+        records.set(1, record0);
+        export.records = records;
+        // Recompute checksum since we modified order
+        export.export_checksum = ArchivalRestoreVerifier::compute_checksum(&export.records);
+        
+        let result = ArchivalRestoreVerifier::validate_export(&env, &export);
+        
+        assert!(!result.valid);
+        assert!(!result.invariants_valid);
+    }
+
+    #[test]
+    fn test_validate_export_duplicate_keys() {
+        let env = test_env();
+        let mut export = create_valid_export(&env);
+        
+        // Add duplicate record
+        let mut records = export.records.clone();
+        let duplicate = ArchivalExportRecord {
+            contract_id: String::from_str(&env, "contract_A"),
+            schema_version: 1,
+            ledger_sequence: 100,
+            ledger_close_time: 1000000,
+            network_passphrase: String::from_str(&env, "Test Network"),
+            key: String::from_str(&env, "key1"), // Same as first record
+            value: String::from_str(&env, "duplicate_value"),
+        };
+        records.push_back(duplicate);
+        export.records = records;
+        export.export_checksum = ArchivalRestoreVerifier::compute_checksum(&export.records);
+        
+        let result = ArchivalRestoreVerifier::validate_export(&env, &export);
+        
+        assert!(!result.valid);
+        assert!(!result.invariants_valid);
+    }
+
+    #[test]
+    fn test_validate_export_future_timestamp() {
+        let env = test_env();
+        let mut export = create_valid_export(&env);
+        export.export_timestamp = env.ledger().timestamp() + 1000; // Future timestamp
+        
+        let result = ArchivalRestoreVerifier::validate_export(&env, &export);
+        
+        assert!(!result.valid);
+        assert!(!result.invariants_valid);
+    }
+
+    #[test]
+    fn test_validate_export_too_old_timestamp() {
+        let env = test_env();
+        let mut export = create_valid_export(&env);
+        export.export_timestamp = env.ledger().timestamp() - (400 * 24 * 60 * 60); // > 1 year old
+        
+        let result = ArchivalRestoreVerifier::validate_export(&env, &export);
+        
+        assert!(!result.valid);
+        assert!(!result.invariants_valid);
+    }
+
+    #[test]
+    fn test_restore_from_export_valid() {
+        let env = test_env();
+        let export = create_valid_export(&env);
+        
+        let result = ArchivalRestoreVerifier::restore_from_export(&env, &export);
+        
+        assert!(result.is_ok());
+        let restore_result = result.unwrap();
+        assert!(restore_result.success);
+        assert_eq!(restore_result.records_restored, 3);
+        assert_eq!(restore_result.export_timestamp, export.export_timestamp);
+    }
+
+    #[test]
+    fn test_restore_from_export_invalid_rejected() {
+        let env = test_env();
+        let mut export = create_valid_export(&env);
+        export.export_checksum = export.export_checksum.wrapping_add(1); // Corrupt
+        
+        let result = ArchivalRestoreVerifier::restore_from_export(&env, &export);
+        
+        assert!(result.is_err());
+        match result {
+            Err(RestoreError::ValidationFailed(errors)) => {
+                assert!(!errors.is_empty());
+            }
+            _ => panic!("Expected ValidationFailed error"),
+        }
+    }
+
+    #[test]
+    fn test_restore_from_export_atomic_no_partial_writes() {
+        let env = test_env();
+        let mut export = create_valid_export(&env);
+        
+        // Add a record that will cause validation to fail (duplicate key)
+        // but first let's test that valid export restores all records
+        let result = ArchivalRestoreVerifier::restore_from_export(&env, &export);
+        assert!(result.is_ok());
+        
+        // Verify all records were restored
+        let verify_result = ArchivalRestoreVerifier::verify_restored_state(&env, &export).unwrap();
+        assert!(verify_result.verified);
+        assert_eq!(verify_result.verified_count, 3);
+        assert_eq!(verify_result.mismatch_count, 0);
+        
+        // Now test invalid export - should not have written anything
+        // We need a fresh env for this test since the previous restore wrote data
+        let env2 = test_env();
+        let mut bad_export = create_valid_export(&env2);
+        bad_export.export_checksum = bad_export.export_checksum.wrapping_add(1);
+        
+        let result2 = ArchivalRestoreVerifier::restore_from_export(&env2, &bad_export);
+        assert!(result2.is_err());
+        
+        // Verify nothing was written in the failed restore attempt
+        for record in bad_export.records.iter() {
+            let restore_key = DataKey::RestoredState(record.contract_id.clone(), record.key.clone());
+            let stored: String = env2.storage().instance().get(&restore_key).unwrap_or(String::from_str(&env2, ""));
+            assert_eq!(stored.len(), 0); // Should be empty/default
+        }
+    }
+
+    #[test]
+    fn test_verify_restored_state_valid() {
+        let env = test_env();
+        let export = create_valid_export(&env);
+        
+        // Restore
+        ArchivalRestoreVerifier::restore_from_export(&env, &export).unwrap();
+        
+        // Verify
+        let result = ArchivalRestoreVerifier::verify_restored_state(&env, &export).unwrap();
+        
+        assert!(result.verified);
+        assert_eq!(result.verified_count, 3);
+        assert_eq!(result.mismatch_count, 0);
+    }
+
+    #[test]
+    fn test_verify_restored_state_detects_mismatch() {
+        let env = test_env();
+        let export = create_valid_export(&env);
+        
+        // Restore
+        ArchivalRestoreVerifier::restore_from_export(&env, &export).unwrap();
+        
+        // Manually corrupt one restored value
+        let record = export.records.get(0).unwrap();
+        let restore_key = DataKey::RestoredState(record.contract_id.clone(), record.key.clone());
+        env.storage().instance().set(&restore_key, &String::from_str(&env, "corrupted_value"));
+        
+        // Verify should detect mismatch
+        let result = ArchivalRestoreVerifier::verify_restored_state(&env, &export).unwrap();
+        
+        assert!(!result.verified);
+        assert_eq!(result.verified_count, 2);
+        assert_eq!(result.mismatch_count, 1);
+        assert_eq!(result.mismatches.len(), 1);
+        assert_eq!(result.mismatches.get(0).unwrap().expected, String::from_str(&env, "value1"));
+        assert_eq!(result.mismatches.get(0).unwrap().actual, String::from_str(&env, "corrupted_value"));
+    }
+
+    #[test]
+    fn test_restore_round_trip() {
+        let env = test_env();
+        
+        // Create export
+        let export = create_valid_export(&env);
+        
+        // Restore
+        let restore_result = ArchivalRestoreVerifier::restore_from_export(&env, &export).unwrap();
+        assert!(restore_result.success);
+        
+        // Verify
+        let verify_result = ArchivalRestoreVerifier::verify_restored_state(&env, &export).unwrap();
+        assert!(verify_result.verified);
+        
+        // Validate export again (should still be valid)
+        let validation = ArchivalRestoreVerifier::validate_export(&env, &export);
+        assert!(validation.valid);
+    }
+
+    #[test]
+    fn test_truncated_export_rejected() {
+        let env = test_env();
+        let mut export = create_valid_export(&env);
+        
+        // Truncate records (remove last record but keep original checksum)
+        let mut records = export.records.clone();
+        records.pop_back();
+        export.records = records;
+        // Note: we DON'T update checksum - simulating truncation
+        
+        let result = ArchivalRestoreVerifier::validate_export(&env, &export);
+        
+        assert!(!result.valid);
+        assert!(!result.checksum_valid);
+    }
+
+    #[test]
+    fn test_empty_export() {
+        let env = test_env();
+        let records = Vec::new(&env);
+        let checksum = ArchivalRestoreVerifier::compute_checksum(&records);
+        
+        let export = ArchivalExport {
+            records,
+            export_timestamp: env.ledger().timestamp(),
+            export_checksum: checksum,
+            format_version: ARCHIVAL_EXPORT_SCHEMA_VERSION,
+        };
+        
+        let result = ArchivalRestoreVerifier::validate_export(&env, &export);
+        
+        // Empty export should be valid (no data to verify)
+        assert!(result.valid);
+        assert_eq!(result.record_count, 0);
+    }
+
+    #[test]
+    fn test_checksum_deterministic_across_runs() {
+        let env = test_env();
+        let export = create_valid_export(&env);
+        
+        // Compute checksum multiple times
+        let c1 = ArchivalRestoreVerifier::compute_checksum(&export.records);
+        let c2 = ArchivalRestoreVerifier::compute_checksum(&export.records);
+        let c3 = ArchivalRestoreVerifier::compute_checksum(&export.records);
+        
+        assert_eq!(c1, c2);
+        assert_eq!(c2, c3);
+        assert_eq!(c1, export.export_checksum);
+    }
+
+    #[test]
+    fn test_record_ordering_in_checksum() {
+        let env = test_env();
+        
+        // Create two exports with same records but different order
+        let mut records1 = Vec::new(&env);
+        let mut records2 = Vec::new(&env);
+        
+        let record_a = ArchivalExportRecord {
+            contract_id: String::from_str(&env, "contract_A"),
+            schema_version: 1,
+            ledger_sequence: 100,
+            ledger_close_time: 1000000,
+            network_passphrase: String::from_str(&env, "Test Network"),
+            key: String::from_str(&env, "key1"),
+            value: String::from_str(&env, "value1"),
+        };
+        let record_b = ArchivalExportRecord {
+            contract_id: String::from_str(&env, "contract_A"),
+            schema_version: 1,
+            ledger_sequence: 100,
+            ledger_close_time: 1000000,
+            network_passphrase: String::from_str(&env, "Test Network"),
+            key: String::from_str(&env, "key2"),
+            value: String::from_str(&env, "value2"),
+        };
+        
+        records1.push_back(record_a.clone());
+        records1.push_back(record_b.clone());
+        
+        records2.push_back(record_b.clone());
+        records2.push_back(record_a.clone());
+        
+        let checksum1 = ArchivalRestoreVerifier::compute_checksum(&records1);
+        let checksum2 = ArchivalRestoreVerifier::compute_checksum(&records2);
+        
+        // Different order should produce different checksums
+        assert_ne!(checksum1, checksum2);
     }
 }
