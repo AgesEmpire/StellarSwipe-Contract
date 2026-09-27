@@ -234,159 +234,260 @@ impl LedgerSnapshot {
     }
 }
 
-/// A single planned change produced by a migration.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Error returned when a storage key does not belong to a registered namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MigrationOp {
-    /// A new key will be written.
-    Insert,
-    /// An existing key will be overwritten.
-    Update,
-    /// An existing key will be removed.
-    Delete,
+pub enum NamespaceError {
+    /// The key does not carry a namespace prefix.
+    MissingNamespace,
+    /// The key's namespace prefix is not registered.
+    UnknownNamespace,
+    /// The namespace was declared more than once in the registry.
+    DuplicateNamespace,
 }
 
-/// A planned key change, with the before/after values.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlannedChange {
-    /// Storage key affected by the change.
-    pub key: String,
-    /// Operation that would be applied.
-    pub op: MigrationOp,
-    /// Value before the migration (`None` for inserts).
-    pub before: Option<String>,
-    /// Value after the migration (`None` for deletes).
-    pub after: Option<String>,
-}
-
-/// A migration invariant that failed during a dry-run.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InvariantFailure {
-    /// Stable identifier of the invariant that failed.
-    pub invariant: String,
-    /// Human-readable explanation of the failure.
-    pub detail: String,
-}
-
-/// Deterministic, machine-readable report produced by a migration dry-run.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MigrationDryRunReport {
-    /// Always `true`; a dry-run never commits state.
-    pub dry_run: bool,
-    /// Checksum of the input snapshot.
-    pub snapshot_checksum: String,
-    /// Planned key changes, in canonical key order.
-    pub changes: Vec<PlannedChange>,
-    /// Number of planned inserts.
-    pub inserts: usize,
-    /// Number of planned updates.
-    pub updates: usize,
-    /// Number of planned deletes.
-    pub deletes: usize,
-    /// Invariants that failed; empty when the migration is clean.
-    pub invariant_failures: Vec<InvariantFailure>,
-}
-
-impl MigrationDryRunReport {
-    /// Whether the dry-run completed without any invariant failures.
-    pub fn is_clean(&self) -> bool {
-        self.invariant_failures.is_empty()
-    }
-
-    /// Render the report as deterministic, machine-readable JSON.
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("migration dry-run report is always serializable")
-    }
-}
-
-/// A migration that can be dry-run against a captured ledger snapshot.
+/// A reserved storage key namespace.
 ///
-/// Implementations must be pure: `plan` only reads the snapshot and returns
-/// the changes it *would* apply, never mutating ledger state.
-pub trait StorageMigration {
-    /// Compute the planned changes for `snapshot` without committing them.
-    fn plan(&self, snapshot: &LedgerSnapshot) -> Vec<PlannedChange>;
-
-    /// Check invariants over the planned changes.
-    ///
-    /// The default implementation reports no failures.
-    fn check_invariants(
-        &self,
-        _snapshot: &LedgerSnapshot,
-        _changes: &[PlannedChange],
-    ) -> Vec<InvariantFailure> {
-        Vec::new()
-    }
+/// Every storage key is expected to be of the form `"<namespace>:<rest>"`,
+/// where `<namespace>` is one of the entries declared in
+/// [`StorageNamespaceRegistry::canonical`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageNamespace {
+    /// Namespace prefix, without the trailing `:` separator.
+    pub name: &'static str,
+    /// Human-readable description of what the namespace owns.
+    pub description: &'static str,
 }
 
-/// Run a migration in dry-run mode against a captured ledger snapshot.
+/// Central registry of every reserved storage key namespace.
 ///
-/// This is read-only: it never writes to ledger state. The returned report is
-/// deterministic for a given snapshot and migration, and can be serialized to
-/// stable JSON via [`MigrationDryRunReport::to_json`].
-pub fn dry_run_migration<M: StorageMigration>(
-    migration: &M,
-    snapshot: &LedgerSnapshot,
-) -> MigrationDryRunReport {
-    let mut changes = migration.plan(snapshot);
-    changes.sort_by(|a, b| a.key.cmp(&b.key));
+/// This is the single source of truth for namespace prefixes: contracts must
+/// not hard-code their own prefixes, they should validate keys against this
+/// registry instead. Declaring the same namespace twice is rejected by
+/// [`StorageNamespaceRegistry::validate`], which is exercised by CI tests so
+/// duplicate declarations fail the build.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageNamespaceRegistry {
+    /// All reserved namespaces, in a stable order.
+    pub namespaces: Vec<StorageNamespace>,
+}
 
-    let mut inserts = 0;
-    let mut updates = 0;
-    let mut deletes = 0;
-    for change in &changes {
-        match change.op {
-            MigrationOp::Insert => inserts += 1,
-            MigrationOp::Update => updates += 1,
-            MigrationOp::Delete => deletes += 1,
+impl StorageNamespaceRegistry {
+    /// Build the canonical registry of reserved storage namespaces.
+    pub fn canonical() -> Self {
+        Self {
+            namespaces: vec![
+                StorageNamespace {
+                    name: "param",
+                    description: "Protocol parameter values and their metadata.",
+                },
+                StorageNamespace {
+                    name: "state",
+                    description: "Generic contract state entries.",
+                },
+                StorageNamespace {
+                    name: "migration",
+                    description: "Migration bookkeeping and applied-version markers.",
+                },
+                StorageNamespace {
+                    name: "oracle",
+                    description: "Oracle price feeds and staleness metadata.",
+                },
+                StorageNamespace {
+                    name: "admin",
+                    description: "Admin roles, ownership and pause flags.",
+                },
+            ],
         }
     }
 
-    let invariant_failures = migration.check_invariants(snapshot, &changes);
+    /// Look up a namespace by its prefix.
+    pub fn get(&self, name: &str) -> Option<&StorageNamespace> {
+        self.namespaces.iter().find(|n| n.name == name)
+    }
 
-    MigrationDryRunReport {
-        dry_run: true,
-        snapshot_checksum: state_checksum(&snapshot.entries),
-        changes,
-        inserts,
-        updates,
-        deletes,
-        invariant_failures,
+    /// Return `true` if `name` is a registered namespace.
+    pub fn is_registered(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// Validate the registry itself, rejecting duplicate declarations.
+    ///
+    /// CI runs this against [`StorageNamespaceRegistry::canonical`] so that a
+    /// duplicated namespace fails the build instead of silently colliding.
+    pub fn validate(&self) -> Result<(), NamespaceError> {
+        for (i, ns) in self.namespaces.iter().enumerate() {
+            if self.namespaces[i + 1..].iter().any(|other| other.name == ns.name) {
+                return Err(NamespaceError::DuplicateNamespace);
+            }
+        }
+        Ok(())
+    }
+
+    /// Split a storage key into its namespace prefix and remainder.
+    pub fn split_key(key: &str) -> Result<(&str, &str), NamespaceError> {
+        match key.split_once(':') {
+            Some((namespace, rest)) if !namespace.is_empty() => Ok((namespace, rest)),
+            _ => Err(NamespaceError::MissingNamespace),
+        }
+    }
+
+    /// Validate that `key` belongs to a registered namespace.
+    ///
+    /// Returns the namespace prefix on success, or a [`NamespaceError`] when
+    /// the key is malformed or uses an unknown namespace.
+    pub fn validate_key(&self, key: &str) -> Result<&str, NamespaceError> {
+        let (namespace, _) = Self::split_key(key)?;
+        if self.is_registered(namespace) {
+            Ok(namespace)
+        } else {
+            Err(NamespaceError::UnknownNamespace)
+        }
+    }
+
+    /// Build a namespaced storage key from a registered namespace and suffix.
+    pub fn make_key(&self, namespace: &str, suffix: &str) -> Result<String, NamespaceError> {
+        if !self.is_registered(namespace) {
+            return Err(NamespaceError::UnknownNamespace);
+        }
+        Ok(format!("{}:{}", namespace, suffix))
     }
 }
 
-/// Compute a deterministic checksum over the provided state entries.
+/// Legacy storage keys that predate the namespace registry.
 ///
-/// The caller is responsible for supplying `entries` in a canonical order.
-/// Equivalent states (same entries, same order) always yield the same digest,
-/// regardless of unrelated storage or map iteration order.
-///
-/// Returns the digest as a lowercase hexadecimal string.
-pub fn state_checksum(entries: &[StateEntry]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(CHECKSUM_DOMAIN);
-
-    for entry in entries {
-        let key = entry.key.as_bytes();
-        hasher.update((key.len() as u32).to_be_bytes());
-        hasher.update(key);
-
-        let value = entry.value.as_bytes();
-        hasher.update((value.len() as u32).to_be_bytes());
-        hasher.update(value);
-    }
-
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{:02x}", byte));
-    }
-    out
+/// Migration fixtures use this list to assert that old, un-namespaced keys are
+/// still readable and can be rewritten into their namespaced equivalents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyKeyFixture {
+    /// The old, un-namespaced storage key.
+    pub legacy_key: &'static str,
+    /// The namespace the key should migrate into.
+    pub namespace: &'static str,
+    /// The namespaced key the legacy key maps to.
+    pub migrated_key: &'static str,
 }
 
-/// Validates and normalizes an address for the given `kind`.
-///
-/// Normalization currently returns the address unchanged, but centralizing
-/// it here lets callers
+impl LegacyKeyFixture {
+    /// Canonical fixtures covering the legacy keys seen in production.
+    pub fn canonical() -> Vec<Self> {
+        vec![
+            LegacyKeyFixture {
+                legacy_key: "min_collateral_ratio",
+                namespace: "param",
+                migrated_key: "param:min_collateral_ratio",
+            },
+            LegacyKeyFixture {
+                legacy_key: "liquidation_penalty",
+                namespace: "param",
+                migrated_key: "param:liquidation_penalty",
+            },
+            LegacyKeyFixture {
+                legacy_key: "interest_rate",
+                namespace: "param",
+                migrated_key: "param:interest_rate",
+            },
+            LegacyKeyFixture {
+                legacy_key: "max_oracle_staleness",
+                namespace: "oracle",
+                migrated_key: "oracle:max_oracle_staleness",
+            },
+            LegacyKeyFixture {
+                legacy_key: "protocol_fee",
+                namespace: "param",
+                migrated_key: "param:protocol_fee",
+            },
+            LegacyKeyFixture {
+                legacy_key: "chain_id",
+                namespace: "param",
+                migrated_key: "param:chain_id",
+            },
+            LegacyKeyFixture {
+                legacy_key: "admin",
+                namespace: "admin",
+                migrated_key: "admin:admin",
+            },
+            LegacyKeyFixture {
+                legacy_key: "paused",
+                namespace: "admin",
+                migrated_key: "admin:paused",
+            },
+        ]
+    }
 
-/* … truncated 11497 chars — edit only what you need near the top … */
+    /// Validate that every fixture maps into a registered namespace and that
+    /// the migrated key round-trips through the registry.
+    pub fn validate_all(
+        &self,
+        registry: &StorageNamespaceRegistry,
+    ) -> Result<(), NamespaceError> {
+        if !registry.is_registered(self.namespace) {
+            return Err(NamespaceError::UnknownNamespace);
+        }
+        let expected = registry.make_key(self.namespace, self.legacy_key)?;
+        if expected != self.migrated_key {
+            return Err(NamespaceError::UnknownNamespace);
+        }
+        registry.validate_key(self.migrated_key).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_registry_has_no_duplicates() {
+        let registry = StorageNamespaceRegistry::canonical();
+        assert_eq!(registry.validate(), Ok(()));
+    }
+
+    #[test]
+    fn duplicate_namespace_is_rejected() {
+        let registry = StorageNamespaceRegistry {
+            namespaces: vec![
+                StorageNamespace {
+                    name: "param",
+                    description: "first",
+                },
+                StorageNamespace {
+                    name: "param",
+                    description: "duplicate",
+                },
+            ],
+        };
+        assert_eq!(registry.validate(), Err(NamespaceError::DuplicateNamespace));
+    }
+
+    #[test]
+    fn unknown_namespace_is_rejected() {
+        let registry = StorageNamespaceRegistry::canonical();
+        assert_eq!(
+            registry.validate_key("bogus:key"),
+            Err(NamespaceError::UnknownNamespace)
+        );
+        assert_eq!(
+            registry.validate_key("no_separator"),
+            Err(NamespaceError::MissingNamespace)
+        );
+    }
+
+    #[test]
+    fn registered_namespace_is_accepted() {
+        let registry = StorageNamespaceRegistry::canonical();
+        assert_eq!(registry.validate_key("param:interest_rate"), Ok("param"));
+        assert_eq!(registry.make_key("param", "interest_rate").as_deref(), Ok("param:interest_rate"));
+        assert_eq!(
+            registry.make_key("bogus", "x"),
+            Err(NamespaceError::UnknownNamespace)
+        );
+    }
+
+    #[test]
+    fn legacy_fixtures_migrate_into_registered_namespaces() {
+        let registry = StorageNamespaceRegistry::canonical();
+        for fixture in LegacyKeyFixture::canonical() {
+            assert_eq!(fixture.validate_all(&registry), Ok(()));
+        }
+    }
+}
