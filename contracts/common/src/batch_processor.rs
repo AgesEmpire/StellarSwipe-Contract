@@ -14,6 +14,8 @@
 //! - Cross-contract invocation depth is explicitly capped
 //!   ([`MAX_INVOCATION_DEPTH`]) and re-entrant/cyclic call patterns are
 //!   rejected before any irreversible effects occur.
+//! - Escrow liabilities are reconciled against the tokens actually held for
+//!   escrowed user positions ([`EscrowLedger`]).
 
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, Env, Vec};
 
@@ -42,6 +44,8 @@ pub enum BatchError {
     InvocationCycle = 4,
     /// The cross-contract invocation depth exceeded [`MAX_INVOCATION_DEPTH`].
     InvocationDepthExceeded = 5,
+    /// Escrow liabilities did not reconcile against held token balances.
+    EscrowImbalance = 6,
 }
 
 /// A single authorization check bound to its intended operation and caller.
@@ -178,5 +182,158 @@ impl InvocationGuard {
         next.push_back(contract_id.clone());
         let _ = env;
         Ok(next)
+    }
+}
+
+/// A single escrowed user position tracked by the ledger.
+///
+/// `liability` is the amount the contract owes the user for this position;
+/// `held` is the amount of the token actually held on the contract's behalf
+/// for this position. The invariant requires `held >= liability` for every
+/// position so escrowed funds are always fully backed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowPosition {
+    /// Identifier of the escrowed position.
+    pub id: BytesN<32>,
+    /// Token the position is denominated in.
+    pub token: Address,
+    /// Amount owed to the user for this position.
+    pub liability: i128,
+    /// Amount of `token` actually held for this position.
+    pub held: i128,
+}
+
+/// Diagnostic report produced by [`EscrowLedger::reconcile`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowReconciliation {
+    /// Total liabilities across all escrowed positions.
+    pub total_liability: i128,
+    /// Total tokens held across all escrowed positions.
+    pub total_held: i128,
+    /// Whether the invariant holds (`total_held >= total_liability` and every
+    /// individual position is fully backed).
+    pub balanced: bool,
+    /// Index of the first position that violated the invariant, if any.
+    pub first_violation: u32,
+}
+
+/// Escrow liability ledger enforcing that escrowed user positions are always
+/// backed by the tokens actually held.
+///
+/// Every escrow creation and release path must go through [`EscrowLedger`]
+/// so the invariant is preserved:
+/// - [`EscrowLedger::create`] records a new position only when the tokens
+///   backing it are already held.
+/// - [`EscrowLedger::release`] reduces both the liability and the held amount
+///   by the same released quantity, so a partial settlement, cancellation, or
+///   failed downstream execution cannot leave liabilities exceeding held
+///   tokens.
+/// - [`EscrowLedger::reconcile`] is the checkable diagnostic entrypoint that
+///   verifies the invariant across all positions.
+pub struct EscrowLedger;
+
+impl EscrowLedger {
+    /// Record a newly escrowed position.
+    ///
+    /// The position is only accepted when the tokens backing it are already
+    /// held (`held >= liability`), preserving the invariant at creation time.
+    pub fn create(
+        env: &Env,
+        positions: &Vec<EscrowPosition>,
+        position: &EscrowPosition,
+    ) -> Result<Vec<EscrowPosition>, BatchError> {
+        if position.liability < 0 || position.held < position.liability {
+            return Err(BatchError::EscrowImbalance);
+        }
+        let mut next = positions.clone();
+        next.push_back(position.clone());
+        let _ = env;
+        Ok(next)
+    }
+
+    /// Release `amount` of a position's liability and held tokens together.
+    ///
+    /// Used by settlement, cancellation, and failed downstream execution
+    /// paths. Both `liability` and `held` are reduced by the same `amount`,
+    /// so the invariant is preserved for partial releases. Releasing more
+    /// than the position's liability is rejected.
+    pub fn release(
+        env: &Env,
+        positions: &Vec<EscrowPosition>,
+        id: &BytesN<32>,
+        amount: i128,
+    ) -> Result<Vec<EscrowPosition>, BatchError> {
+        if amount < 0 {
+            return Err(BatchError::EscrowImbalance);
+        }
+        let len = positions.len();
+        let mut next: Vec<EscrowPosition> = Vec::new(env);
+        let mut found = false;
+        for i in 0..len {
+            let mut position = positions.get_unchecked(i);
+            if position.id == *id {
+                found = true;
+                if amount > position.liability {
+                    return Err(BatchError::EscrowImbalance);
+                }
+                position.liability -= amount;
+                position.held -= amount;
+                if position.held < position.liability {
+                    return Err(BatchError::EscrowImbalance);
+                }
+            }
+            next.push_back(position);
+        }
+        if !found {
+            return Err(BatchError::EscrowImbalance);
+        }
+        Ok(next)
+    }
+
+    /// Checkable diagnostic entrypoint reconciling escrow liabilities against
+    /// the tokens actually held for escrowed user positions.
+    ///
+    /// Returns an [`EscrowReconciliation`] report. `balanced` is true only
+    /// when every position is fully backed and the aggregate held amount
+    /// covers the aggregate liability. `first_violation` identifies the first
+    /// offending position index, or `0` when balanced.
+    pub fn reconcile(positions: &Vec<EscrowPosition>) -> EscrowReconciliation {
+        let len = positions.len();
+        let mut total_liability: i128 = 0;
+        let mut total_held: i128 = 0;
+        let mut balanced = true;
+        let mut first_violation: u32 = 0;
+        for i in 0..len {
+            let position = positions.get_unchecked(i);
+            total_liability += position.liability;
+            total_held += position.held;
+            if position.held < position.liability {
+                if balanced {
+                    first_violation = i;
+                }
+                balanced = false;
+            }
+        }
+        if total_held < total_liability {
+            balanced = false;
+        }
+        EscrowReconciliation {
+            total_liability,
+            total_held,
+            balanced,
+            first_violation,
+        }
+    }
+
+    /// Enforce the invariant, returning [`BatchError::EscrowImbalance`] when
+    /// liabilities are not fully backed by held tokens.
+    pub fn assert_balanced(positions: &Vec<EscrowPosition>) -> Result<(), BatchError> {
+        if Self::reconcile(positions).balanced {
+            Ok(())
+        } else {
+            Err(BatchError::EscrowImbalance)
+        }
     }
 }
