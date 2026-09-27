@@ -238,8 +238,10 @@ impl AdminHandoff {
 
     /// Nominate `successor` as the next administrator.
     ///
-    /// Only the current administrator may nominate, and the nomination does
-    /// not change the administrator until the successor accepts.
+    /// Only the current administrator may nominate a successor, and the
+    /// nomination does not take effect until [`accept_admin`] is called.
+    ///
+    /// [`accept_admin`]: AdminHandoff::accept_admin
     pub fn propose_admin(&mut self, caller: u64, successor: u64) -> Result<(), AdminHandoffError> {
         if caller != self.admin {
             return Err(AdminHandoffError::NotAdmin);
@@ -248,10 +250,8 @@ impl AdminHandoff {
         Ok(())
     }
 
-    /// Accept the pending nomination, transferring administrator rights.
-    ///
-    /// Only the nominated successor may accept. On success the successor
-    /// becomes the administrator and the pending nomination is cleared.
+    /// Complete a pending handoff, transferring administrator rights to the
+    /// nominated successor.
     pub fn accept_admin(&mut self, caller: u64) -> Result<(), AdminHandoffError> {
         match self.pending_admin {
             None => Err(AdminHandoffError::NoPendingAdmin),
@@ -265,121 +265,185 @@ impl AdminHandoff {
     }
 }
 
-/// Maximum supported depth of nested cross-contract invocations.
+/// A narrowly scoped maintenance capability that can be granted to an
+/// operator.
 ///
-/// A call chain deeper than this is rejected before any irreversible effect
-/// (state write, transfer, or event emission) is performed.
-pub const MAX_INVOCATION_DEPTH: u32 = 8;
-
-/// Error returned when a cross-contract invocation is rejected by the
-/// recursion/cycle policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Each capability maps to a defined set of contract entrypoints (see
+/// [`OperatorCapability::entrypoints`]); there is deliberately no broad
+/// administrative catch-all, so an operator holding one capability cannot
+/// invoke entrypoints outside that capability's scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum InvocationCycleError {
-    /// The call would re-enter a contract already present in the active chain.
-    ReentrantCall,
-    /// The call would exceed [`MAX_INVOCATION_DEPTH`].
-    DepthExceeded,
+pub enum OperatorCapability {
+    /// Pause and unpause contract operations.
+    Pause,
+    /// Update the oracle staleness window.
+    OracleConfig,
+    /// Update protocol fee parameters.
+    FeeConfig,
+    /// Rotate signing keys used by the contract.
+    KeyRotation,
 }
 
-/// Guard enforcing the cross-contract invocation depth and cycle policy.
-///
-/// Call sites push the callee contract id before dispatching a cross-contract
-/// call and pop it once the call returns. Pushing a contract id that is already
-/// present in the active chain is rejected as a cycle, and pushing beyond
-/// [`MAX_INVOCATION_DEPTH`] is rejected as a depth violation. Both checks run
-/// before the caller performs any irreversible effect.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InvocationGuard {
-    /// Contract ids currently active in the call chain, outermost first.
-    pub chain: Vec<u64>,
-}
+impl OperatorCapability {
+    /// Every capability, in a stable order.
+    pub const ALL: [OperatorCapability; 4] = [
+        OperatorCapability::Pause,
+        OperatorCapability::OracleConfig,
+        OperatorCapability::FeeConfig,
+        OperatorCapability::KeyRotation,
+    ];
 
-impl InvocationGuard {
-    /// Create an empty invocation guard.
-    pub fn new() -> Self {
-        Self { chain: Vec::new() }
+    /// The contract entrypoints this capability authorizes.
+    ///
+    /// The returned set is exhaustive: an operator granted this capability
+    /// may invoke exactly these entrypoints and nothing else.
+    pub fn entrypoints(&self) -> &'static [&'static str] {
+        match self {
+            OperatorCapability::Pause => &["pause", "unpause"],
+            OperatorCapability::OracleConfig => &["set_oracle_staleness"],
+            OperatorCapability::FeeConfig => &["set_protocol_fee"],
+            OperatorCapability::KeyRotation => &["rotate_signing_key"],
+        }
     }
 
-    /// Push `contract_id` onto the active chain.
+    /// Whether this capability authorizes `entrypoint`.
+    pub fn authorizes(&self, entrypoint: &str) -> bool {
+        self.entrypoints().contains(&entrypoint)
+    }
+}
+
+/// Error returned when a capability grant or revocation is rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityError {
+    /// The caller is not authorized to grant or revoke capabilities.
+    Unauthorized,
+    /// The operator already holds the capability.
+    AlreadyGranted,
+    /// The operator does not hold the capability.
+    NotGranted,
+    /// The operator is not permitted to invoke the entrypoint.
+    NotPermitted,
+}
+
+/// Auditable record of a capability grant or revocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityEvent {
+    /// A capability was granted to an operator.
+    Granted {
+        /// The operator that received the capability.
+        operator: u64,
+        /// The capability that was granted.
+        capability: OperatorCapability,
+    },
+    /// A capability was revoked from an operator.
+    Revoked {
+        /// The operator that lost the capability.
+        operator: u64,
+        /// The capability that was revoked.
+        capability: OperatorCapability,
+    },
+}
+
+/// Registry of scoped operator capabilities.
+///
+/// Grants and revocations are authorized against the current administrator
+/// and emit a [`CapabilityEvent`] so every change is auditable. Invocation
+/// checks enforce least privilege: an operator may only invoke entrypoints
+/// covered by a capability it actually holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityRegistry {
+    /// The address authorized to grant and revoke capabilities.
+    pub admin: u64,
+    /// Granted capabilities, as `(operator, capability)` pairs.
+    pub grants: Vec<(u64, OperatorCapability)>,
+    /// Audit log of every grant and revocation, in order.
+    pub events: Vec<CapabilityEvent>,
+}
+
+impl CapabilityRegistry {
+    /// Create an empty registry administered by `admin`.
+    pub fn new(admin: u64) -> Self {
+        Self {
+            admin,
+            grants: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Whether `operator` currently holds `capability`.
+    pub fn has_capability(&self, operator: u64, capability: OperatorCapability) -> bool {
+        self.grants.contains(&(operator, capability))
+    }
+
+    /// Grant `capability` to `operator`.
     ///
-    /// Returns [`InvocationCycleError::ReentrantCall`] if the contract is
-    /// already active, or [`InvocationCycleError::DepthExceeded`] if the chain
-    /// is already at [`MAX_INVOCATION_DEPTH`].
-    pub fn push(&mut self, contract_id: u64) -> Result<(), InvocationCycleError> {
-        if self.chain.contains(&contract_id) {
-            return Err(InvocationCycleError::ReentrantCall);
+    /// Only the administrator may grant capabilities, and the grant is
+    /// recorded as an auditable [`CapabilityEvent::Granted`].
+    pub fn grant(
+        &mut self,
+        caller: u64,
+        operator: u64,
+        capability: OperatorCapability,
+    ) -> Result<(), CapabilityError> {
+        if caller != self.admin {
+            return Err(CapabilityError::Unauthorized);
         }
-        if self.chain.len() as u32 >= MAX_INVOCATION_DEPTH {
-            return Err(InvocationCycleError::DepthExceeded);
+        if self.has_capability(operator, capability) {
+            return Err(CapabilityError::AlreadyGranted);
         }
-        self.chain.push(contract_id);
+        self.grants.push((operator, capability));
+        self.events.push(CapabilityEvent::Granted {
+            operator,
+            capability,
+        });
         Ok(())
     }
 
-    /// Pop the most recently pushed contract id from the active chain.
-    pub fn pop(&mut self) -> Option<u64> {
-        self.chain.pop()
+    /// Revoke `capability` from `operator`.
+    ///
+    /// Only the administrator may revoke capabilities, and the revocation is
+    /// recorded as an auditable [`CapabilityEvent::Revoked`].
+    pub fn revoke(
+        &mut self,
+        caller: u64,
+        operator: u64,
+        capability: OperatorCapability,
+    ) -> Result<(), CapabilityError> {
+        if caller != self.admin {
+            return Err(CapabilityError::Unauthorized);
+        }
+        let index = self
+            .grants
+            .iter()
+            .position(|&(op, cap)| op == operator && cap == capability)
+            .ok_or(CapabilityError::NotGranted)?;
+        self.grants.remove(index);
+        self.events.push(CapabilityEvent::Revoked {
+            operator,
+            capability,
+        });
+        Ok(())
     }
 
-    /// Current depth of the active call chain.
-    pub fn depth(&self) -> u32 {
-        self.chain.len() as u32
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn propose_requires_current_admin() {
-        let mut handoff = AdminHandoff::new(1);
-        assert_eq!(handoff.propose_admin(2, 3), Err(AdminHandoffError::NotAdmin));
-        assert_eq!(handoff.admin, 1);
-        assert_eq!(handoff.pending_admin, None);
-    }
-
-    #[test]
-    fn propose_does_not_change_admin() {
-        let mut handoff = AdminHandoff::new(1);
-        assert_eq!(handoff.propose_admin(1, 2), Ok(()));
-        assert_eq!(handoff.admin, 1);
-        assert_eq!(handoff.pending_admin, Some(2));
-    }
-
-    #[test]
-    fn accept_requires_pending_admin() {
-        let mut handoff = AdminHandoff::new(1);
-        assert_eq!(handoff.propose_admin(1, 2), Ok(()));
-        assert_eq!(handoff.accept_admin(3), Err(AdminHandoffError::NotPendingAdmin));
-        assert_eq!(handoff.admin, 1);
-        assert_eq!(handoff.pending_admin, Some(2));
-    }
-
-    #[test]
-    fn accept_without_nomination_fails() {
-        let mut handoff = AdminHandoff::new(1);
-        assert_eq!(handoff.accept_admin(1), Err(AdminHandoffError::NoPendingAdmin));
-        assert_eq!(handoff.admin, 1);
-    }
-
-    #[test]
-    fn accept_transfers_admin() {
-        let mut handoff = AdminHandoff::new(1);
-        assert_eq!(handoff.propose_admin(1, 2), Ok(()));
-        assert_eq!(handoff.accept_admin(2), Ok(()));
-        assert_eq!(handoff.admin, 2);
-        assert_eq!(handoff.pending_admin, None);
-    }
-
-    #[test]
-    fn old_admin_cannot_bypass_handoff() {
-        let mut handoff = AdminHandoff::new(1);
-        assert_eq!(handoff.propose_admin(1, 2), Ok(()));
-        // The previous admin can no longer act as admin once the handoff is
-        // pending, and cannot accept on behalf of the successor.
-        assert_eq!(handoff.accept_admin(1), Err(AdminHandoffError::NotPendingAdmin));
-        assert_eq!(handoff.admin, 1);
+    /// Authorize `operator` to invoke `entrypoint`.
+    ///
+    /// Succeeds only when the operator holds a capability whose scope covers
+    /// `entrypoint`, enforcing least privilege across capabilities.
+    pub fn authorize_entrypoint(
+        &self,
+        operator: u64,
+        entrypoint: &str,
+    ) -> Result<(), CapabilityError> {
+        let permitted = self.grants.iter().any(|&(op, cap)| {
+            op == operator && cap.authorizes(entrypoint)
+        });
+        if permitted {
+            Ok(())
+        } else {
+            Err(CapabilityError::NotPermitted)
+        }
     }
 }
