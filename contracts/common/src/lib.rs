@@ -198,6 +198,109 @@ impl ProtocolParamSchema {
     }
 }
 
+/// Version of the normalized TTL renewal outcome event schema.
+///
+/// Bump this whenever the fields of [`TtlRenewalOutcome`] change so that
+/// off-chain consumers can detect incompatible event payloads.
+pub const TTL_RENEWAL_OUTCOME_EVENT_VERSION: u32 = 1;
+
+/// Normalized outcome of a single storage TTL renewal attempt.
+///
+/// Every shared TTL caller emits this event instead of ad-hoc per-caller
+/// emissions, so off-chain indexers observe one deterministic shape for
+/// skipped, renewed, and failed renewals.
+///
+/// Fields:
+/// - `version`: schema version, see [`TTL_RENEWAL_OUTCOME_EVENT_VERSION`].
+/// - `key`: storage key whose TTL was considered for renewal.
+/// - `result`: normalized outcome of the attempt.
+/// - `current_ttl`: TTL (in ledgers) observed before the attempt.
+/// - `threshold`: TTL (in ledgers) below which renewal is attempted.
+/// - `extend_to`: TTL (in ledgers) requested when a renewal is performed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TtlRenewalOutcome {
+    /// Schema version of this event payload.
+    pub version: u32,
+    /// Storage key whose TTL was considered for renewal.
+    pub key: String,
+    /// Normalized outcome of the renewal attempt.
+    pub result: TtlRenewalResult,
+    /// TTL observed before the attempt, in ledgers.
+    pub current_ttl: u32,
+    /// TTL below which renewal is attempted, in ledgers.
+    pub threshold: u32,
+    /// TTL requested when a renewal is performed, in ledgers.
+    pub extend_to: u32,
+}
+
+/// Normalized result of a storage TTL renewal attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TtlRenewalResult {
+    /// The entry was already expired; renewal is impossible.
+    Expired,
+    /// The entry's TTL was above the threshold; no renewal was needed.
+    Skipped,
+    /// The entry's TTL was extended to `extend_to`.
+    Renewed,
+    /// The renewal attempt failed.
+    Failed,
+}
+
+impl TtlRenewalOutcome {
+    /// Build a normalized outcome for a renewal attempt.
+    ///
+    /// The result is derived deterministically from the observed TTL:
+    /// an already-expired entry (`current_ttl == 0`) yields
+    /// [`TtlRenewalResult::Expired`], an entry at or above `threshold`
+    /// yields [`TtlRenewalResult::Skipped`], and anything else yields
+    /// [`TtlRenewalResult::Renewed`].
+    pub fn new(
+        key: impl Into<String>,
+        current_ttl: u32,
+        threshold: u32,
+        extend_to: u32,
+    ) -> Self {
+        let result = if current_ttl == 0 {
+            TtlRenewalResult::Expired
+        } else if current_ttl >= threshold {
+            TtlRenewalResult::Skipped
+        } else {
+            TtlRenewalResult::Renewed
+        };
+        Self {
+            version: TTL_RENEWAL_OUTCOME_EVENT_VERSION,
+            key: key.into(),
+            result,
+            current_ttl,
+            threshold,
+            extend_to,
+        }
+    }
+
+    /// Build a normalized outcome for a failed renewal attempt.
+    pub fn failed(
+        key: impl Into<String>,
+        current_ttl: u32,
+        threshold: u32,
+        extend_to: u32,
+    ) -> Self {
+        Self {
+            version: TTL_RENEWAL_OUTCOME_EVENT_VERSION,
+            key: key.into(),
+            result: TtlRenewalResult::Failed,
+            current_ttl,
+            threshold,
+            extend_to,
+        }
+    }
+
+    /// Whether this outcome represents an actual TTL extension.
+    pub fn is_renewed(&self) -> bool {
+        self.result == TtlRenewalResult::Renewed
+    }
+}
+
 /// A single key/value entry in contract storage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateEntry {
@@ -231,118 +334,5 @@ impl LedgerSnapshot {
             .iter()
             .find(|e| e.key == key)
             .map(|e| e.value.as_str())
-    }
-}
-
-/// Kind of emergency action recorded in the shared journal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EmergencyActionKind {
-    /// The protocol was paused.
-    Pause,
-    /// The protocol was recovered from a paused state.
-    Recovery,
-    /// A position was force-settled.
-    ForcedSettlement,
-}
-
-/// Error returned when a journal write is rejected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EmergencyJournalError {
-    /// The caller is not authorized to append to the journal.
-    Unauthorized,
-    /// The requested query bound is invalid (e.g. zero limit).
-    InvalidBound,
-}
-
-/// A single append-only record in the emergency action journal.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EmergencyJournalRecord {
-    /// Monotonic sequence number assigned on append.
-    pub sequence: u64,
-    /// Kind of emergency action that was performed.
-    pub kind: EmergencyActionKind,
-    /// Actor that performed the action.
-    pub actor: String,
-    /// Human-readable reason for the action.
-    pub reason: String,
-    /// Ledger timestamp at which the action was recorded.
-    pub timestamp: u64,
-}
-
-/// Shared append-only journal of emergency actions.
-///
-/// Records are stored in append order and each append assigns the next
-/// monotonic sequence number, so queries are ordered by sequence.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EmergencyJournal {
-    /// Records in append order.
-    records: Vec<EmergencyJournalRecord>,
-}
-
-impl EmergencyJournal {
-    /// Create an empty journal.
-    pub fn new() -> Self {
-        Self {
-            records: Vec::new(),
-        }
-    }
-
-    /// Append exactly one record, assigning the next sequence number.
-    ///
-    /// The write is atomic: the record is only pushed once all fields have
-    /// been validated, so a rejected write leaves the journal unchanged.
-    pub fn append(
-        &mut self,
-        kind: EmergencyActionKind,
-        actor: &str,
-        reason: &str,
-        timestamp: u64,
-        authorized: bool,
-    ) -> Result<u64, EmergencyJournalError> {
-        if !authorized {
-            return Err(EmergencyJournalError::Unauthorized);
-        }
-        let sequence = self.records.len() as u64;
-        self.records.push(EmergencyJournalRecord {
-            sequence,
-            kind,
-            actor: actor.to_string(),
-            reason: reason.to_string(),
-            timestamp,
-        });
-        Ok(sequence)
-    }
-
-    /// Number of records currently stored.
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    /// Whether the journal is empty.
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-
-    /// Fetch a single record by its sequence number.
-    pub fn get(&self, sequence: u64) -> Option<&EmergencyJournalRecord> {
-        self.records.get(sequence as usize)
-    }
-
-    /// Query a bounded, ordered window of records.
-    ///
-    /// Records are returned in ascending sequence order starting at `offset`
-    /// and containing at most `limit` entries. A zero `limit` is rejected so
-    /// callers cannot request an unbounded scan.
-    pub fn query(
-        &self,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<&EmergencyJournalRecord>, EmergencyJournalError> {
-        if limit == 0 {
-            return Err(EmergencyJournalError::InvalidBound);
-        }
-        Ok(self.records.iter().skip(offset).take(limit).collect())
     }
 }
