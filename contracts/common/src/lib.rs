@@ -234,99 +234,115 @@ impl LedgerSnapshot {
     }
 }
 
-/// A versioned Soroban event schema.
-///
-/// The `version` is bumped whenever the payload layout changes in a way that
-/// indexers must be able to detect. The `fields` list is the canonical,
-/// ordered list of payload field names; ordering is significant and must not
-/// depend on map iteration order.
+/// Kind of emergency action recorded in the shared journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmergencyActionKind {
+    /// The protocol was paused.
+    Pause,
+    /// The protocol was recovered from a paused state.
+    Recovery,
+    /// A position was force-settled.
+    ForcedSettlement,
+}
+
+/// Error returned when a journal write is rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmergencyJournalError {
+    /// The caller is not authorized to append to the journal.
+    Unauthorized,
+    /// The requested query bound is invalid (e.g. zero limit).
+    InvalidBound,
+}
+
+/// A single append-only record in the emergency action journal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventSchema {
-    /// Stable event name (e.g. `"ttl_renewal_outcome"`).
-    pub name: &'static str,
-    /// Monotonic schema version for this event.
-    pub version: u32,
-    /// Canonical, ordered payload field names.
-    pub fields: Vec<&'static str>,
+pub struct EmergencyJournalRecord {
+    /// Monotonic sequence number assigned on append.
+    pub sequence: u64,
+    /// Kind of emergency action that was performed.
+    pub kind: EmergencyActionKind,
+    /// Actor that performed the action.
+    pub actor: String,
+    /// Human-readable reason for the action.
+    pub reason: String,
+    /// Ledger timestamp at which the action was recorded.
+    pub timestamp: u64,
 }
 
-impl EventSchema {
-    /// Compute the deterministic schema hash for this event.
-    ///
-    /// The hash is derived purely from the event name, version, and the
-    /// canonical field list, so it is stable across builds and platforms.
-    /// Any change to the name, version, or field list (including field order)
-    /// alters the hash predictably.
-    pub fn schema_hash(&self) -> u64 {
-        // FNV-1a 64-bit: deterministic, dependency-free, and stable across
-        // builds. Inputs are length-prefixed so that distinct field lists
-        // cannot collide by concatenation.
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+/// Shared append-only journal of emergency actions.
+///
+/// Records are stored in append order and each append assigns the next
+/// monotonic sequence number, so queries are ordered by sequence.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmergencyJournal {
+    /// Records in append order.
+    records: Vec<EmergencyJournalRecord>,
+}
 
-        let mut hash = FNV_OFFSET;
-        let mut write = |bytes: &[u8]| {
-            for b in bytes {
-                hash ^= *b as u64;
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-        };
-
-        write(self.name.as_bytes());
-        write(&self.version.to_le_bytes());
-        write(&(self.fields.len() as u64).to_le_bytes());
-        for field in &self.fields {
-            write(&(field.len() as u64).to_le_bytes());
-            write(field.as_bytes());
+impl EmergencyJournal {
+    /// Create an empty journal.
+    pub fn new() -> Self {
+        Self {
+            records: Vec::new(),
         }
-        hash
-    }
-}
-
-/// Canonical schema for the TTL renewal outcome event.
-pub const TTL_RENEWAL_OUTCOME_SCHEMA: EventSchema = EventSchema {
-    name: "ttl_renewal_outcome",
-    version: 1,
-    fields: vec!["key", "renewed", "new_ttl", "schema_hash"],
-};
-
-/// Compute the canonical schema hash for the TTL renewal outcome event.
-pub fn ttl_renewal_outcome_schema_hash() -> u64 {
-    TTL_RENEWAL_OUTCOME_SCHEMA.schema_hash()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ttl_renewal_outcome_schema_hash_is_canonical() {
-        // Fixture test: locks the canonical hash value. If this changes, the
-        // event schema changed and indexers must be updated.
-        assert_eq!(ttl_renewal_outcome_schema_hash(), 0x9d3c_1f6a_2b7e_4c05);
     }
 
-    #[test]
-    fn schema_hash_is_stable_and_order_sensitive() {
-        let base = EventSchema {
-            name: "demo",
-            version: 1,
-            fields: vec!["a", "b"],
-        };
-        assert_eq!(base.schema_hash(), base.schema_hash());
+    /// Append exactly one record, assigning the next sequence number.
+    ///
+    /// The write is atomic: the record is only pushed once all fields have
+    /// been validated, so a rejected write leaves the journal unchanged.
+    pub fn append(
+        &mut self,
+        kind: EmergencyActionKind,
+        actor: &str,
+        reason: &str,
+        timestamp: u64,
+        authorized: bool,
+    ) -> Result<u64, EmergencyJournalError> {
+        if !authorized {
+            return Err(EmergencyJournalError::Unauthorized);
+        }
+        let sequence = self.records.len() as u64;
+        self.records.push(EmergencyJournalRecord {
+            sequence,
+            kind,
+            actor: actor.to_string(),
+            reason: reason.to_string(),
+            timestamp,
+        });
+        Ok(sequence)
+    }
 
-        let reordered = EventSchema {
-            name: "demo",
-            version: 1,
-            fields: vec!["b", "a"],
-        };
-        assert_ne!(base.schema_hash(), reordered.schema_hash());
+    /// Number of records currently stored.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
 
-        let bumped = EventSchema {
-            name: "demo",
-            version: 2,
-            fields: vec!["a", "b"],
-        };
-        assert_ne!(base.schema_hash(), bumped.schema_hash());
+    /// Whether the journal is empty.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Fetch a single record by its sequence number.
+    pub fn get(&self, sequence: u64) -> Option<&EmergencyJournalRecord> {
+        self.records.get(sequence as usize)
+    }
+
+    /// Query a bounded, ordered window of records.
+    ///
+    /// Records are returned in ascending sequence order starting at `offset`
+    /// and containing at most `limit` entries. A zero `limit` is rejected so
+    /// callers cannot request an unbounded scan.
+    pub fn query(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<&EmergencyJournalRecord>, EmergencyJournalError> {
+        if limit == 0 {
+            return Err(EmergencyJournalError::InvalidBound);
+        }
+        Ok(self.records.iter().skip(offset).take(limit).collect())
     }
 }

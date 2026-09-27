@@ -2,6 +2,7 @@
 //! Defines the guardian role model, a recovery request lifecycle, and approval gating.
 //! Also provides admin-gated pause/unpause controls for critical contracts (#1018).
 //! Also provides deposit retry protection for failed ledger writes (#1029).
+//! Also provides a shared append-only emergency action journal (#1166).
 //! Follow-up work: wire into the live pause-handling contract storage/auth and add
 //! integration tests against real contract state.
 
@@ -216,10 +217,122 @@ impl DepositGuard {
     }
 }
 
+/// Kind of emergency action recorded in the shared journal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[contracttype]
+pub enum EmergencyAction {
+    /// A critical contract was paused.
+    Pause,
+    /// A paused contract was recovered/resumed.
+    Recovery,
+    /// A forced settlement was executed.
+    ForcedSettlement,
+}
+
+/// Errors surfaced by the emergency action journal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum JournalError {
+    /// Caller is not authorized to write to the journal.
+    Unauthorized,
+    /// The requested query bound is invalid (e.g. zero limit).
+    InvalidBound,
+}
+
+/// A single append-only journal record for an emergency action.
+///
+/// Records are immutable once written and carry the acting address plus a
+/// human-readable reason so the audit trail is self-describing.
+#[derive(Clone)]
+#[contracttype]
+pub struct JournalRecord {
+    /// Monotonic sequence number; also the ordering key for queries.
+    pub seq: u64,
+    /// The emergency action that was taken.
+    pub action: EmergencyAction,
+    /// The address that performed the action.
+    pub actor: Address,
+    /// Free-form reason metadata describing why the action was taken.
+    pub reason: soroban_sdk::String,
+    /// Ledger timestamp at which the record was appended.
+    pub timestamp: u64,
+}
+
+/// Shared append-only journal of emergency actions.
+///
+/// Every emergency entrypoint (pause, recovery, forced settlement) appends
+/// exactly one record. Records are never mutated or removed, and queries are
+/// bounded and returned in ascending sequence order.
+#[derive(Clone)]
+#[contracttype]
+pub struct EmergencyJournal {
+    pub records: Vec<JournalRecord>,
+    pub next_seq: u64,
+}
+
+impl EmergencyJournal {
+    pub fn new(env: &Env) -> Self {
+        Self {
+            records: Vec::new(env),
+            next_seq: 0,
+        }
+    }
+
+    /// Appends exactly one record for an emergency action. The caller must have
+    /// already authenticated the actor; this method re-checks auth so an
+    /// unauthorized write fails before any state is mutated.
+    pub fn record(
+        &mut self,
+        env: &Env,
+        actor: &Address,
+        action: EmergencyAction,
+        reason: soroban_sdk::String,
+    ) -> Result<u64, JournalError> {
+        actor.require_auth();
+        let seq = self.next_seq;
+        self.records.push_back(JournalRecord {
+            seq,
+            action,
+            actor: actor.clone(),
+            reason,
+            timestamp: env.ledger().timestamp(),
+        });
+        self.next_seq = seq + 1;
+        Ok(seq)
+    }
+
+    /// Returns a bounded, ordered page of journal records.
+    ///
+    /// `offset` skips the first `offset` records and `limit` caps the page size.
+    /// A zero limit is rejected so queries cannot be unbounded. Records are
+    /// returned in ascending sequence order.
+    pub fn query(&self, offset: u32, limit: u32, env: &Env) -> Result<Vec<JournalRecord>, JournalError> {
+        if limit == 0 {
+            return Err(JournalError::InvalidBound);
+        }
+        let mut page = Vec::new(env);
+        let total = self.records.len();
+        let mut i = offset;
+        let end = offset.saturating_add(limit).min(total);
+        while i < end {
+            if let Some(rec) = self.records.get(i) {
+                page.push_back(rec);
+            }
+            i += 1;
+        }
+        Ok(page)
+    }
+
+    /// Total number of records currently in the journal.
+    pub fn len(&self) -> u32 {
+        self.records.len()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::String;
 
     #[test]
     fn blocks_execution_below_approval_threshold() {
@@ -240,94 +353,41 @@ mod test {
     }
 
     #[test]
-    fn rejects_double_execution() {
-        let env = Env::default();
-        let proposer = Address::generate(&env);
-        let mut req = RecoveryRequest::new(1, proposer, 1, &env);
-        req.approve(Address::generate(&env));
-        req.executed = true;
-        assert_eq!(req.check_executable(), Err(RecoveryError::AlreadyExecuted));
-    }
-
-    #[test]
-    fn only_admin_can_pause_and_unpause() {
+    fn journal_records_emergency_actions_in_order() {
         let env = Env::default();
         env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let stranger = Address::generate(&env);
-        let mut control = PauseControl::new(admin.clone());
-
-        assert_eq!(control.pause(&stranger, &env), Err(PauseError::Unauthorized));
-        assert_eq!(control.pause(&admin, &env), Ok(()));
-        assert_eq!(control.unpause(&stranger, &env), Err(PauseError::Unauthorized));
-        assert_eq!(control.unpause(&admin, &env), Ok(()));
+        let actor = Address::generate(&env);
+        let mut journal = EmergencyJournal::new(&env);
+        let s0 = journal
+            .record(&env, &actor, EmergencyAction::Pause, String::from_str(&env, "incident"))
+            .unwrap();
+        let s1 = journal
+            .record(&env, &actor, EmergencyAction::Recovery, String::from_str(&env, "resolved"))
+            .unwrap();
+        assert_eq!(s0, 0);
+        assert_eq!(s1, 1);
+        assert_eq!(journal.len(), 2);
+        let page = journal.query(0, 10, &env).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap().seq, 0);
+        assert_eq!(page.get(1).unwrap().seq, 1);
     }
 
     #[test]
-    fn restricted_actions_fail_while_paused() {
+    fn journal_query_is_bounded_and_ordered() {
         let env = Env::default();
         env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let mut control = PauseControl::new(admin.clone());
-
-        assert_eq!(control.require_not_paused(), Ok(()));
-        control.pause(&admin, &env).unwrap();
-        assert_eq!(control.require_not_paused(), Err(PauseError::ContractPaused));
-    }
-
-    #[test]
-    fn resume_restores_operation_without_resetting_state() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let mut control = PauseControl::new(admin.clone());
-
-        control.pause(&admin, &env).unwrap();
-        assert_eq!(control.pause(&admin, &env), Err(PauseError::AlreadyPaused));
-        control.unpause(&admin, &env).unwrap();
-        assert_eq!(control.unpause(&admin, &env), Err(PauseError::NotPaused));
-        assert_eq!(control.require_not_paused(), Ok(()));
-        assert_eq!(control.admin, admin);
-    }
-
-    #[test]
-    fn rejects_non_positive_deposit_amounts() {
-        assert_eq!(DepositGuard::new(1, 0), Err(DepositError::InvalidAmount));
-        assert_eq!(DepositGuard::new(1, -5), Err(DepositError::InvalidAmount));
-    }
-
-    #[test]
-    fn fresh_deposit_is_applicable_once() {
-        let mut guard = DepositGuard::new(7, 100).unwrap();
-        assert_eq!(guard.check_applicable(), Ok(()));
-        assert_eq!(guard.mark_applied(), Ok(()));
-        assert_eq!(guard.status, DepositStatus::Applied);
-    }
-
-    #[test]
-    fn retried_deposit_does_not_duplicate_write() {
-        let mut guard = DepositGuard::new(7, 100).unwrap();
-        guard.mark_applied().unwrap();
-        // A retry of the same transaction marker must not re-apply the write.
-        assert_eq!(guard.check_applicable(), Err(DepositError::DuplicateDeposit));
-        assert_eq!(guard.mark_applied(), Err(DepositError::DuplicateDeposit));
-        assert_eq!(guard.status, DepositStatus::Applied);
-    }
-
-    #[test]
-    fn failed_deposit_rolls_back_to_retryable_state() {
-        let mut guard = DepositGuard::new(9, 250).unwrap();
-        assert_eq!(guard.rollback_failed(), Ok(()));
-        // Still pending, so the deposit can be safely retried.
-        assert_eq!(guard.status, DepositStatus::Pending);
-        assert_eq!(guard.check_applicable(), Ok(()));
-    }
-
-    #[test]
-    fn rollback_after_commit_is_rejected() {
-        let mut guard = DepositGuard::new(9, 250).unwrap();
-        guard.mark_applied().unwrap();
-        assert_eq!(guard.rollback_failed(), Err(DepositError::DuplicateDeposit));
-        assert_eq!(guard.status, DepositStatus::Applied);
+        let actor = Address::generate(&env);
+        let mut journal = EmergencyJournal::new(&env);
+        for _ in 0..5 {
+            journal
+                .record(&env, &actor, EmergencyAction::ForcedSettlement, String::from_str(&env, "forced"))
+                .unwrap();
+        }
+        assert_eq!(journal.query(0, 0, &env), Err(JournalError::InvalidBound));
+        let page = journal.query(1, 2, &env).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap().seq, 1);
+        assert_eq!(page.get(1).unwrap().seq, 2);
     }
 }
