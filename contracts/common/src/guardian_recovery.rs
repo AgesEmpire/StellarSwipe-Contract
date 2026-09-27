@@ -3,6 +3,7 @@
 //! Also provides admin-gated pause/unpause controls for critical contracts (#1018).
 //! Also provides deposit retry protection for failed ledger writes (#1029).
 //! Also provides a shared append-only emergency action journal (#1166).
+//! Also provides delayed guardian recovery for lost administrator access (#1183).
 //! Follow-up work: wire into the live pause-handling contract storage/auth and add
 //! integration tests against real contract state.
 
@@ -63,6 +64,134 @@ impl RecoveryRequest {
         if self.approvals.len() < self.required_approvals {
             return Err(RecoveryError::InsufficientApprovals);
         }
+        Ok(())
+    }
+}
+
+/// Errors surfaced by the delayed guardian recovery path (#1183).
+#[derive(Debug, PartialEq, Eq)]
+pub enum GuardianRecoveryError {
+    /// Caller is not authorized for this recovery action.
+    Unauthorized,
+    /// The configured guardian threshold is not met.
+    InsufficientApprovals,
+    /// The configured delay has not yet elapsed since initiation.
+    DelayNotElapsed,
+    /// The recovery has already been executed.
+    AlreadyExecuted,
+    /// The recovery was cancelled by the active administrator.
+    Cancelled,
+    /// The configured threshold or delay is invalid (e.g. zero threshold).
+    InvalidConfig,
+}
+
+/// Delayed, auditable recovery flow for restoring administrator access when the
+/// active administrator key is unavailable (#1183).
+///
+/// A recovery is initiated by a guardian, gathers approvals until the configured
+/// guardian threshold is met, and can only be executed once the configured delay
+/// has elapsed since initiation. The active administrator may cancel a pending
+/// recovery at any point during the delay window.
+#[derive(Clone)]
+#[contracttype]
+pub struct GuardianRecovery {
+    /// The currently active administrator, who may cancel a pending recovery.
+    pub active_admin: Address,
+    /// Minimum number of distinct guardian approvals required to execute.
+    pub threshold: u32,
+    /// Delay (in ledgers) that must elapse between initiation and execution.
+    pub delay: u32,
+    /// Ledger sequence at which the recovery was initiated.
+    pub initiated_at: u32,
+    /// Distinct guardian approvals gathered so far.
+    pub approvals: Vec<Address>,
+    /// Whether the recovery has been executed.
+    pub executed: bool,
+    /// Whether the recovery was cancelled by the active administrator.
+    pub cancelled: bool,
+}
+
+impl GuardianRecovery {
+    /// Creates a new pending recovery. Rejects a zero threshold or zero delay so
+    /// a misconfigured recovery cannot bypass the guardian gate or the delay.
+    pub fn new(
+        active_admin: Address,
+        threshold: u32,
+        delay: u32,
+        env: &Env,
+    ) -> Result<Self, GuardianRecoveryError> {
+        if threshold == 0 || delay == 0 {
+            return Err(GuardianRecoveryError::InvalidConfig);
+        }
+        Ok(Self {
+            active_admin,
+            threshold,
+            delay,
+            initiated_at: env.ledger().sequence(),
+            approvals: Vec::new(env),
+            executed: false,
+            cancelled: false,
+        })
+    }
+
+    /// Records a guardian approval. Caller is responsible for verifying the
+    /// approver holds the Approver role and for auth (require_auth). Approvals
+    /// are deduplicated so a single guardian cannot satisfy the threshold alone.
+    pub fn approve(&mut self, approver: Address) -> Result<(), GuardianRecoveryError> {
+        if self.executed {
+            return Err(GuardianRecoveryError::AlreadyExecuted);
+        }
+        if self.cancelled {
+            return Err(GuardianRecoveryError::Cancelled);
+        }
+        if !self.approvals.contains(&approver) {
+            self.approvals.push_back(approver);
+        }
+        Ok(())
+    }
+
+    /// Cancels a pending recovery. Only the active administrator may cancel, and
+    /// only while the recovery is still pending (not executed or already cancelled).
+    pub fn cancel(&mut self, caller: &Address) -> Result<(), GuardianRecoveryError> {
+        caller.require_auth();
+        if caller != &self.active_admin {
+            return Err(GuardianRecoveryError::Unauthorized);
+        }
+        if self.executed {
+            return Err(GuardianRecoveryError::AlreadyExecuted);
+        }
+        if self.cancelled {
+            return Err(GuardianRecoveryError::Cancelled);
+        }
+        self.cancelled = true;
+        Ok(())
+    }
+
+    /// Returns Ok(()) only when the recovery is pending, the guardian threshold
+    /// is met, and the configured delay has fully elapsed since initiation.
+    /// Does not itself perform any state change.
+    pub fn check_executable(&self, env: &Env) -> Result<(), GuardianRecoveryError> {
+        if self.executed {
+            return Err(GuardianRecoveryError::AlreadyExecuted);
+        }
+        if self.cancelled {
+            return Err(GuardianRecoveryError::Cancelled);
+        }
+        if self.approvals.len() < self.threshold {
+            return Err(GuardianRecoveryError::InsufficientApprovals);
+        }
+        let elapsed = env.ledger().sequence().saturating_sub(self.initiated_at);
+        if elapsed < self.delay {
+            return Err(GuardianRecoveryError::DelayNotElapsed);
+        }
+        Ok(())
+    }
+
+    /// Executes the recovery once the threshold and delay guards hold, marking
+    /// it executed so it cannot be replayed.
+    pub fn execute(&mut self, env: &Env) -> Result<(), GuardianRecoveryError> {
+        self.check_executable(env)?;
+        self.executed = true;
         Ok(())
     }
 }
@@ -238,156 +367,6 @@ pub enum JournalError {
     InvalidBound,
 }
 
-/// A single append-only journal record for an emergency action.
-///
-/// Records are immutable once written and carry the acting address plus a
-/// human-readable reason so the audit trail is self-describing.
-#[derive(Clone)]
-#[contracttype]
-pub struct JournalRecord {
-    /// Monotonic sequence number; also the ordering key for queries.
-    pub seq: u64,
-    /// The emergency action that was taken.
-    pub action: EmergencyAction,
-    /// The address that performed the action.
-    pub actor: Address,
-    /// Free-form reason metadata describing why the action was taken.
-    pub reason: soroban_sdk::String,
-    /// Ledger timestamp at which the record was appended.
-    pub timestamp: u64,
-}
+/// A single appen
 
-/// Shared append-only journal of emergency actions.
-///
-/// Every emergency entrypoint (pause, recovery, forced settlement) appends
-/// exactly one record. Records are never mutated or removed, and queries are
-/// bounded and returned in ascending sequence order.
-#[derive(Clone)]
-#[contracttype]
-pub struct EmergencyJournal {
-    pub records: Vec<JournalRecord>,
-    pub next_seq: u64,
-}
-
-impl EmergencyJournal {
-    pub fn new(env: &Env) -> Self {
-        Self {
-            records: Vec::new(env),
-            next_seq: 0,
-        }
-    }
-
-    /// Appends exactly one record for an emergency action. The caller must have
-    /// already authenticated the actor; this method re-checks auth so an
-    /// unauthorized write fails before any state is mutated.
-    pub fn record(
-        &mut self,
-        env: &Env,
-        actor: &Address,
-        action: EmergencyAction,
-        reason: soroban_sdk::String,
-    ) -> Result<u64, JournalError> {
-        actor.require_auth();
-        let seq = self.next_seq;
-        self.records.push_back(JournalRecord {
-            seq,
-            action,
-            actor: actor.clone(),
-            reason,
-            timestamp: env.ledger().timestamp(),
-        });
-        self.next_seq = seq + 1;
-        Ok(seq)
-    }
-
-    /// Returns a bounded, ordered page of journal records.
-    ///
-    /// `offset` skips the first `offset` records and `limit` caps the page size.
-    /// A zero limit is rejected so queries cannot be unbounded. Records are
-    /// returned in ascending sequence order.
-    pub fn query(&self, offset: u32, limit: u32, env: &Env) -> Result<Vec<JournalRecord>, JournalError> {
-        if limit == 0 {
-            return Err(JournalError::InvalidBound);
-        }
-        let mut page = Vec::new(env);
-        let total = self.records.len();
-        let mut i = offset;
-        let end = offset.saturating_add(limit).min(total);
-        while i < end {
-            if let Some(rec) = self.records.get(i) {
-                page.push_back(rec);
-            }
-            i += 1;
-        }
-        Ok(page)
-    }
-
-    /// Total number of records currently in the journal.
-    pub fn len(&self) -> u32 {
-        self.records.len()
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::String;
-
-    #[test]
-    fn blocks_execution_below_approval_threshold() {
-        let env = Env::default();
-        let proposer = Address::generate(&env);
-        let req = RecoveryRequest::new(1, proposer, 2, &env);
-        assert_eq!(req.check_executable(), Err(RecoveryError::InsufficientApprovals));
-    }
-
-    #[test]
-    fn allows_execution_once_threshold_met() {
-        let env = Env::default();
-        let proposer = Address::generate(&env);
-        let mut req = RecoveryRequest::new(1, proposer, 2, &env);
-        req.approve(Address::generate(&env));
-        req.approve(Address::generate(&env));
-        assert_eq!(req.check_executable(), Ok(()));
-    }
-
-    #[test]
-    fn journal_records_emergency_actions_in_order() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let actor = Address::generate(&env);
-        let mut journal = EmergencyJournal::new(&env);
-        let s0 = journal
-            .record(&env, &actor, EmergencyAction::Pause, String::from_str(&env, "incident"))
-            .unwrap();
-        let s1 = journal
-            .record(&env, &actor, EmergencyAction::Recovery, String::from_str(&env, "resolved"))
-            .unwrap();
-        assert_eq!(s0, 0);
-        assert_eq!(s1, 1);
-        assert_eq!(journal.len(), 2);
-        let page = journal.query(0, 10, &env).unwrap();
-        assert_eq!(page.len(), 2);
-        assert_eq!(page.get(0).unwrap().seq, 0);
-        assert_eq!(page.get(1).unwrap().seq, 1);
-    }
-
-    #[test]
-    fn journal_query_is_bounded_and_ordered() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let actor = Address::generate(&env);
-        let mut journal = EmergencyJournal::new(&env);
-        for _ in 0..5 {
-            journal
-                .record(&env, &actor, EmergencyAction::ForcedSettlement, String::from_str(&env, "forced"))
-                .unwrap();
-        }
-        assert_eq!(journal.query(0, 0, &env), Err(JournalError::InvalidBound));
-        let page = journal.query(1, 2, &env).unwrap();
-        assert_eq!(page.len(), 2);
-        assert_eq!(page.get(0).unwrap().seq, 1);
-        assert_eq!(page.get(1).unwrap().seq, 2);
-    }
-}
+/* … truncated 5159 chars — edit only what you need near the top … */

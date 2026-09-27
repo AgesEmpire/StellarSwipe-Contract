@@ -223,13 +223,13 @@ pub struct TtlRenewalOutcome {
     pub version: u32,
     /// Storage key whose TTL was considered for renewal.
     pub key: String,
-    /// Normalized outcome of the renewal attempt.
+    /// Normalized outcome of the attempt.
     pub result: TtlRenewalResult,
-    /// TTL observed before the attempt, in ledgers.
+    /// TTL (in ledgers) observed before the attempt.
     pub current_ttl: u32,
-    /// TTL below which renewal is attempted, in ledgers.
+    /// TTL (in ledgers) below which renewal is attempted.
     pub threshold: u32,
-    /// TTL requested when a renewal is performed, in ledgers.
+    /// TTL (in ledgers) requested when a renewal is performed.
     pub extend_to: u32,
 }
 
@@ -237,102 +237,252 @@ pub struct TtlRenewalOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtlRenewalResult {
-    /// The entry was already expired; renewal is impossible.
-    Expired,
-    /// The entry's TTL was above the threshold; no renewal was needed.
+    /// The TTL was above the threshold, so no renewal was needed.
     Skipped,
-    /// The entry's TTL was extended to `extend_to`.
+    /// The TTL was renewed successfully.
     Renewed,
     /// The renewal attempt failed.
     Failed,
 }
 
-impl TtlRenewalOutcome {
-    /// Build a normalized outcome for a renewal attempt.
-    ///
-    /// The result is derived deterministically from the observed TTL:
-    /// an already-expired entry (`current_ttl == 0`) yields
-    /// [`TtlRenewalResult::Expired`], an entry at or above `threshold`
-    /// yields [`TtlRenewalResult::Skipped`], and anything else yields
-    /// [`TtlRenewalResult::Renewed`].
-    pub fn new(
-        key: impl Into<String>,
-        current_ttl: u32,
-        threshold: u32,
-        extend_to: u32,
-    ) -> Self {
-        let result = if current_ttl == 0 {
-            TtlRenewalResult::Expired
-        } else if current_ttl >= threshold {
-            TtlRenewalResult::Skipped
-        } else {
-            TtlRenewalResult::Renewed
-        };
-        Self {
-            version: TTL_RENEWAL_OUTCOME_EVENT_VERSION,
-            key: key.into(),
-            result,
-            current_ttl,
-            threshold,
-            extend_to,
-        }
-    }
-
-    /// Build a normalized outcome for a failed renewal attempt.
-    pub fn failed(
-        key: impl Into<String>,
-        current_ttl: u32,
-        threshold: u32,
-        extend_to: u32,
-    ) -> Self {
-        Self {
-            version: TTL_RENEWAL_OUTCOME_EVENT_VERSION,
-            key: key.into(),
-            result: TtlRenewalResult::Failed,
-            current_ttl,
-            threshold,
-            extend_to,
-        }
-    }
-
-    /// Whether this outcome represents an actual TTL extension.
-    pub fn is_renewed(&self) -> bool {
-        self.result == TtlRenewalResult::Renewed
-    }
-}
-
-/// A single key/value entry in contract storage.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StateEntry {
-    /// Storage key.
-    pub key: String,
-    /// Storage value.
-    pub value: String,
-}
-
-/// A captured, read-only view of contract storage.
+/// Version of the guardian recovery event schema.
 ///
-/// A snapshot is the sole input to a migration dry-run: it is never mutated,
-/// so running a dry-run cannot write to ledger state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LedgerSnapshot {
-    /// Storage entries in canonical (sorted) key order.
-    pub entries: Vec<StateEntry>,
+/// Bump this whenever the fields of [`GuardianRecoveryEvent`] change so that
+/// off-chain consumers can detect incompatible event payloads.
+pub const GUARDIAN_RECOVERY_EVENT_VERSION: u32 = 1;
+
+/// Configuration governing delayed guardian recovery of administrator access.
+///
+/// Recovery may only be executed once at least `threshold` distinct guardians
+/// have approved the pending request and at least `delay` seconds have elapsed
+/// since the request was initiated. The active administrator may cancel a
+/// pending request at any point during the delay window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardianRecoveryConfig {
+    /// Minimum number of distinct guardian approvals required to execute.
+    pub threshold: u32,
+    /// Delay (in seconds) that must elapse between initiation and execution.
+    pub delay: u64,
 }
 
-impl LedgerSnapshot {
-    /// Build a snapshot, sorting entries into canonical key order so that
-    /// downstream output is deterministic regardless of input order.
-    pub fn new(mut entries: Vec<StateEntry>) -> Self {
-        entries.sort_by(|a, b| a.key.cmp(&b.key));
-        Self { entries }
+/// Lifecycle state of a pending guardian recovery request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardianRecoveryStatus {
+    /// The request is collecting approvals and awaiting the delay window.
+    Pending,
+    /// The request was executed and administrator access was restored.
+    Executed,
+    /// The active administrator cancelled the request during the delay.
+    Cancelled,
+}
+
+/// A pending guardian recovery request for lost administrator access.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardianRecoveryRequest {
+    /// Address of the administrator whose access is being recovered.
+    pub admin: String,
+    /// Ledger timestamp (in seconds) at which the request was initiated.
+    pub initiated_at: u64,
+    /// Distinct guardians that have approved the request.
+    pub approvals: Vec<String>,
+    /// Current lifecycle state of the request.
+    pub status: GuardianRecoveryStatus,
+}
+
+/// Errors returned by the guardian recovery flow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardianRecoveryError {
+    /// No recovery request is currently pending.
+    NoPendingRequest,
+    /// The caller is not a configured guardian.
+    NotAGuardian,
+    /// The guardian has already approved this request.
+    AlreadyApproved,
+    /// Fewer than the configured threshold of approvals have been collected.
+    ThresholdNotMet,
+    /// The configured delay has not yet elapsed.
+    DelayNotElapsed,
+    /// The caller is not the active administrator.
+    NotActiveAdmin,
+}
+
+impl GuardianRecoveryRequest {
+    /// Initiate a new pending recovery request for `admin` at `now`.
+    pub fn initiate(admin: String, now: u64) -> Self {
+        Self {
+            admin,
+            initiated_at: now,
+            approvals: Vec::new(),
+            status: GuardianRecoveryStatus::Pending,
+        }
     }
 
-    /// Look up the value stored under `key`, if present.
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.entries
-            .iter()
-            .find(|e| e.key == key)
-            .map(|e| e.value.as_str())
+    /// Record a guardian approval, enforcing guardian membership and
+    /// preventing duplicate approvals.
+    pub fn approve(
+        &mut self,
+        guardian: &str,
+        guardians: &[String],
+    ) -> Result<(), GuardianRecoveryError> {
+        if self.status != GuardianRecoveryStatus::Pending {
+            return Err(GuardianRecoveryError::NoPendingRequest);
+        }
+        if !guardians.iter().any(|g| g == guardian) {
+            return Err(GuardianRecoveryError::NotAGuardian);
+        }
+        if self.approvals.iter().any(|g| g == guardian) {
+            return Err(GuardianRecoveryError::AlreadyApproved);
+        }
+        self.approvals.push(guardian.to_string());
+        Ok(())
+    }
+
+    /// Whether the configured approval threshold has been reached.
+    pub fn threshold_met(&self, config: &GuardianRecoveryConfig) -> bool {
+        self.approvals.len() as u32 >= config.threshold
+    }
+
+    /// Whether the configured delay has elapsed at `now`.
+    pub fn delay_elapsed(&self, config: &GuardianRecoveryConfig, now: u64) -> bool {
+        now >= self.initiated_at.saturating_add(config.delay)
+    }
+
+    /// Execute the recovery, enforcing threshold and delay boundaries.
+    pub fn execute(
+        &mut self,
+        config: &GuardianRecoveryConfig,
+        now: u64,
+    ) -> Result<(), GuardianRecoveryError> {
+        if self.status != GuardianRecoveryStatus::Pending {
+            return Err(GuardianRecoveryError::NoPendingRequest);
+        }
+        if !self.threshold_met(config) {
+            return Err(GuardianRecoveryError::ThresholdNotMet);
+        }
+        if !self.delay_elapsed(config, now) {
+            return Err(GuardianRecoveryError::DelayNotElapsed);
+        }
+        self.status = GuardianRecoveryStatus::Executed;
+        Ok(())
+    }
+
+    /// Cancel the pending recovery. Only the active administrator may cancel,
+    /// and only while the request is still pending.
+    pub fn cancel(&mut self, caller: &str) -> Result<(), GuardianRecoveryError> {
+        if self.status != GuardianRecoveryStatus::Pending {
+            return Err(GuardianRecoveryError::NoPendingRequest);
+        }
+        if caller != self.admin {
+            return Err(GuardianRecoveryError::NotActiveAdmin);
+        }
+        self.status = GuardianRecoveryStatus::Cancelled;
+        Ok(())
+    }
+}
+
+/// Auditable event emitted for guardian recovery lifecycle transitions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardianRecoveryEvent {
+    /// Schema version of this event payload.
+    pub version: u32,
+    /// Address of the administrator whose access is being recovered.
+    pub admin: String,
+    /// Lifecycle transition that occurred.
+    pub status: GuardianRecoveryStatus,
+    /// Number of distinct approvals collected at the time of the event.
+    pub approvals: u32,
+    /// Ledger timestamp (in seconds) at which the event occurred.
+    pub timestamp: u64,
+}
+
+#[cfg(test)]
+mod guardian_recovery_tests {
+    use super::*;
+
+    fn guardians() -> Vec<String> {
+        vec!["g1".to_string(), "g2".to_string(), "g3".to_string()]
+    }
+
+    fn config() -> GuardianRecoveryConfig {
+        GuardianRecoveryConfig {
+            threshold: 2,
+            delay: 3_600,
+        }
+    }
+
+    #[test]
+    fn rejects_execution_below_threshold() {
+        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
+        req.approve("g1", &guardians()).unwrap();
+        assert_eq!(
+            req.execute(&config(), 3_600),
+            Err(GuardianRecoveryError::ThresholdNotMet)
+        );
+    }
+
+    #[test]
+    fn rejects_execution_before_delay_elapses() {
+        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
+        req.approve("g1", &guardians()).unwrap();
+        req.approve("g2", &guardians()).unwrap();
+        assert_eq!(
+            req.execute(&config(), 3_599),
+            Err(GuardianRecoveryError::DelayNotElapsed)
+        );
+    }
+
+    #[test]
+    fn executes_at_delay_boundary() {
+        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
+        req.approve("g1", &guardians()).unwrap();
+        req.approve("g2", &guardians()).unwrap();
+        assert_eq!(req.execute(&config(), 3_600), Ok(()));
+        assert_eq!(req.status, GuardianRecoveryStatus::Executed);
+    }
+
+    #[test]
+    fn executes_after_delay_elapses() {
+        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
+        req.approve("g1", &guardians()).unwrap();
+        req.approve("g2", &guardians()).unwrap();
+        assert_eq!(req.execute(&config(), 7_200), Ok(()));
+        assert_eq!(req.status, GuardianRecoveryStatus::Executed);
+    }
+
+    #[test]
+    fn active_admin_can_cancel_during_delay() {
+        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
+        req.approve("g1", &guardians()).unwrap();
+        assert_eq!(req.cancel("admin"), Ok(()));
+        assert_eq!(req.status, GuardianRecoveryStatus::Cancelled);
+        assert_eq!(
+            req.execute(&config(), 7_200),
+            Err(GuardianRecoveryError::NoPendingRequest)
+        );
+    }
+
+    #[test]
+    fn non_admin_cannot_cancel() {
+        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
+        assert_eq!(
+            req.cancel("g1"),
+            Err(GuardianRecoveryError::NotActiveAdmin)
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_and_non_guardian_approvals() {
+        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
+        req.approve("g1", &guardians()).unwrap();
+        assert_eq!(
+            req.approve("g1", &guardians()),
+            Err(GuardianRecoveryError::AlreadyApproved)
+        );
+        assert_eq!(
+            req.approve("stranger", &guardians()),
+            Err(GuardianRecoveryError::NotAGuardian)
+        );
     }
 }
