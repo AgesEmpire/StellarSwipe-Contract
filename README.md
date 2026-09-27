@@ -19,3 +19,6 @@
 
 <!-- handsoff-issue-1170 -->
 - #1170: Add Soroban authorization payload size regression tests
+
+<!-- handsoff-issue-1216 -->
+- #1216: Bind bridge message signatures to source and destination domains
