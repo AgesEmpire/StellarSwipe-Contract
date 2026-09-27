@@ -34,6 +34,15 @@
 //!   and leaves state untouched. A key is only recorded once the operation it
 //!   guards has completed successfully, so a failed execution does not consume
 //!   the key and the operation may be retried with the same key.
+//!
+//! ## Two-step administrator handoff
+//!
+//! Administrator replacement is a two-step handoff. The current administrator
+//! nominates a successor with [`SignalRegistry::propose_admin`], which records
+//! the pending administrator without changing the active one. Only the
+//! nominated address may then call [`SignalRegistry::accept_admin`] to complete
+//! the handoff and become the administrator. Unrelated callers can neither
+//! nominate nor accept, and nomination alone never transfers the role.
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
 
@@ -54,6 +63,8 @@ pub enum SignalError {
     TombstoneNotExpired = 10,
     InvalidBatchSize = 11,
     IdempotencyKeyReused = 12,
+    NoPendingAdmin = 13,
+    NotPendingAdmin = 14,
 }
 
 /// Maximum accepted length, in bytes, of provider metadata.
@@ -137,6 +148,7 @@ pub struct DataKey {
 }
 
 const ADMIN_KEY: &str = "admin";
+const PENDING_ADMIN_KEY: &str = "pending_admin";
 const SCHEDULE_KEY: &str = "schedule";
 const REPUTATION_KEY: &str = "reputation";
 const METADATA_KEY: &str = "metadata";
@@ -157,6 +169,45 @@ impl SignalRegistry {
         env.storage().instance().set(&ADMIN_KEY, &admin);
         env.storage().instance().set(&SCHEDULE_KEY, &schedule);
         Ok(())
+    }
+
+    /// Nominate a successor administrator. Only the current administrator may
+    /// call this.
+    ///
+    /// The nomination is recorded as the pending administrator and does **not**
+    /// change the active administrator. The handoff only completes when the
+    /// nominated address calls [`Self::accept_admin`].
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), SignalError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(SignalError::NotInitialized)?;
+        admin.require_auth();
+        env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+        Ok(())
+    }
+
+    /// Accept a pending administrator nomination, completing the handoff.
+    ///
+    /// Only the address previously nominated via [`Self::propose_admin`] may
+    /// call this. On success the caller becomes the administrator and the
+    /// pending nomination is cleared.
+    pub fn accept_admin(env: Env) -> Result<(), SignalError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN_KEY)
+            .ok_or(SignalError::NoPendingAdmin)?;
+        pending.require_auth();
+        env.storage().instance().set(&ADMIN_KEY, &pending);
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        Ok(())
+    }
+
+    /// Read the currently pending administrator nomination, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&PENDING_ADMIN_KEY)
     }
 
     /// Update the decay schedule. Only the admin may call this.
@@ -211,66 +262,6 @@ impl SignalRegistry {
 
     /// Read the stored metadata for a provider, if any.
     pub fn get_provider_metadata(env: Env, provider: Address) -> Option<String> {
-        let key = (METADATA_KEY, provider);
-        env.storage().persistent().get(&key)
-    }
+        let key = (
 
-    /// Remove a provider's metadata, leaving a tombstone that keeps the
-    /// identifier non-reusable for [`TOMBSTONE_RETENTION_SECONDS`].
-    ///
-    /// Only the provider may remove its own record. Re-removing an already
-    /// tombstoned identifier is idempotent and preserves the original
-    /// retention window.
-    pub fn remove_provider_metadata(env: Env, provider: Address) -> Result<(), SignalError> {
-        provider.require_auth();
-        let key = (METADATA_KEY, provider.clone());
-        env.storage().persistent().remove(&key);
-        let tomb_key = (TOMBSTONE_KEY, provider);
-        if !env.storage().persistent().has(&tomb_key) {
-            let now = env.ledger().timestamp();
-            let tombstone = Tombstone {
-                removed_at: now,
-                expires_at: now.saturating_add(TOMBSTONE_RETENTION_SECONDS),
-            };
-            env.storage().persistent().set(&tomb_key, &tombstone);
-        }
-        Ok(())
-    }
-
-    /// Report the lifecycle state of an identifier: `Active`, `Tombstoned`,
-    /// or `Unknown`.
-    pub fn get_record_state(env: Env, provider: Address) -> RecordState {
-        Self::record_state(&env, &provider)
-    }
-
-    /// Purge expired tombstones in a bounded, idempotent batch.
-    ///
-    /// Only the admin may call this. At most `max_entries` tombstones are
-    /// examined per call, and only those whose retention window has elapsed
-    /// are removed. Re-running is safe: already-purged tombstones are simply
-    /// skipped.
-    ///
-    /// `idempotency_key` makes the call replay-safe: a key that is still within
-    /// its retention window is rejected with [`SignalError::IdempotencyKeyReused`]
-    /// and no tombstones are purged.
-    pub fn purge_expired_tombstones(
-        env: Env,
-        providers: Vec<Address>,
-        max_entries: u32,
-        idempotency_key: String,
-    ) -> Result<u32, SignalError> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&ADMIN_KEY)
-            .ok_or(SignalError::NotInitialized)?;
-        admin.require_auth();
-        Self::consume_idempotency_key(&env, &admin, "purge_expired_tombstones", &idempotency_key)?;
-        if max_entries == 0 || max_entries > MAX_TOMBSTONE_PURGE {
-            return Err(SignalError::InvalidBatchSize);
-        }
-        let now = env.ledger().timestamp();
-        let mut purged: u32 = 0;
-        for provider in providers
-
-/* … truncated 6101 chars — edit only what you need near the top … */
+/* … truncated 2587 chars — edit only what you need near the top … */

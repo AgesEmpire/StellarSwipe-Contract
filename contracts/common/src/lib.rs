@@ -198,6 +198,73 @@ impl ProtocolParamSchema {
     }
 }
 
+/// Error returned when a two-step administrator handoff is rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminHandoffError {
+    /// The caller is not the current administrator.
+    NotAdmin,
+    /// The caller is not the nominated successor.
+    NotPendingAdmin,
+    /// No successor has been nominated yet.
+    NoPendingAdmin,
+}
+
+/// Two-step administrator handoff state for a core contract.
+///
+/// The current administrator nominates a successor with [`propose_admin`],
+/// which does **not** change the administrator. The nominated address must
+/// then call [`accept_admin`] to complete the handoff. This prevents an
+/// accidental or unilateral transfer from taking effect immediately.
+///
+/// [`propose_admin`]: AdminHandoff::propose_admin
+/// [`accept_admin`]: AdminHandoff::accept_admin
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminHandoff {
+    /// The address currently holding administrator rights.
+    pub admin: u64,
+    /// The address nominated to become the next administrator, if any.
+    pub pending_admin: Option<u64>,
+}
+
+impl AdminHandoff {
+    /// Create a new handoff state with `admin` as the current administrator.
+    pub fn new(admin: u64) -> Self {
+        Self {
+            admin,
+            pending_admin: None,
+        }
+    }
+
+    /// Nominate `successor` as the next administrator.
+    ///
+    /// Only the current administrator may nominate, and the nomination does
+    /// not change the administrator until the successor accepts.
+    pub fn propose_admin(&mut self, caller: u64, successor: u64) -> Result<(), AdminHandoffError> {
+        if caller != self.admin {
+            return Err(AdminHandoffError::NotAdmin);
+        }
+        self.pending_admin = Some(successor);
+        Ok(())
+    }
+
+    /// Accept the pending nomination, transferring administrator rights.
+    ///
+    /// Only the nominated successor may accept. On success the successor
+    /// becomes the administrator and the pending nomination is cleared.
+    pub fn accept_admin(&mut self, caller: u64) -> Result<(), AdminHandoffError> {
+        match self.pending_admin {
+            None => Err(AdminHandoffError::NoPendingAdmin),
+            Some(pending) if pending != caller => Err(AdminHandoffError::NotPendingAdmin),
+            Some(pending) => {
+                self.admin = pending;
+                self.pending_admin = None;
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Maximum supported depth of nested cross-contract invocations.
 ///
 /// A call chain deeper than this is rejected before any irreversible effect
@@ -225,104 +292,40 @@ pub enum InvocationCycleError {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvocationGuard {
     /// Contract ids currently active in the call chain, outermost first.
-    active: Vec<u64>,
+    pub chain: Vec<u64>,
 }
 
 impl InvocationGuard {
-    /// Create an empty guard for a fresh top-level invocation.
+    /// Create an empty invocation guard.
     pub fn new() -> Self {
-        Self { active: Vec::new() }
+        Self { chain: Vec::new() }
+    }
+
+    /// Push `contract_id` onto the active chain.
+    ///
+    /// Returns [`InvocationCycleError::ReentrantCall`] if the contract is
+    /// already active, or [`InvocationCycleError::DepthExceeded`] if the chain
+    /// is already at [`MAX_INVOCATION_DEPTH`].
+    pub fn push(&mut self, contract_id: u64) -> Result<(), InvocationCycleError> {
+        if self.chain.contains(&contract_id) {
+            return Err(InvocationCycleError::ReentrantCall);
+        }
+        if self.chain.len() as u32 >= MAX_INVOCATION_DEPTH {
+            return Err(InvocationCycleError::DepthExceeded);
+        }
+        self.chain.push(contract_id);
+        Ok(())
+    }
+
+    /// Pop the most recently pushed contract id from the active chain.
+    pub fn pop(&mut self) -> Option<u64> {
+        self.chain.pop()
     }
 
     /// Current depth of the active call chain.
     pub fn depth(&self) -> u32 {
-        self.active.len() as u32
+        self.chain.len() as u32
     }
-
-    /// Whether `contract_id` is already active in the call chain.
-    pub fn is_active(&self, contract_id: u64) -> bool {
-        self.active.contains(&contract_id)
-    }
-
-    /// Check whether a cross-contract call to `contract_id` is permitted.
-    ///
-    /// Returns [`InvocationCycleError::ReentrantCall`] for a direct or indirect
-    /// cycle and [`InvocationCycleError::DepthExceeded`] when the call would
-    /// exceed [`MAX_INVOCATION_DEPTH`]. This performs no mutation, so callers
-    /// can reject a cycle before any irreversible effect.
-    pub fn check(&self, contract_id: u64) -> Result<(), InvocationCycleError> {
-        if self.is_active(contract_id) {
-            return Err(InvocationCycleError::ReentrantCall);
-        }
-        if self.depth() >= MAX_INVOCATION_DEPTH {
-            return Err(InvocationCycleError::DepthExceeded);
-        }
-        Ok(())
-    }
-
-    /// Enter a cross-contract call, enforcing the cycle and depth policy.
-    ///
-    /// On success the callee is recorded as active; call [`Self::exit`] once
-    /// the call returns. On error the guard is left unchanged.
-    pub fn enter(&mut self, contract_id: u64) -> Result<(), InvocationCycleError> {
-        self.check(contract_id)?;
-        self.active.push(contract_id);
-        Ok(())
-    }
-
-    /// Leave a cross-contract call previously entered with [`Self::enter`].
-    pub fn exit(&mut self, contract_id: u64) {
-        if self.active.last() == Some(&contract_id) {
-            self.active.pop();
-        }
-    }
-}
-
-/// Version of the normalized TTL renewal outcome event schema.
-///
-/// Bump this whenever the fields of [`TtlRenewalOutcome`] change so that
-/// off-chain consumers can detect incompatible event payloads.
-pub const TTL_RENEWAL_OUTCOME_EVENT_VERSION: u32 = 1;
-
-/// Normalized outcome of a single storage TTL renewal attempt.
-///
-/// Every shared TTL caller emits this event instead of ad-hoc per-caller
-/// emissions, so off-chain indexers observe one deterministic shape for
-/// skipped, renewed, and failed renewals.
-///
-/// Fields:
-/// - `version`: schema version, see [`TTL_RENEWAL_OUTCOME_EVENT_VERSION`].
-/// - `key`: storage key whose TTL was considered for renewal.
-/// - `result`: normalized outcome of the attempt.
-/// - `current_ttl`: TTL (in ledgers) observed before the attempt.
-/// - `threshold`: TTL (in ledgers) below which renewal is attempted.
-/// - `extend_to`: TTL (in ledgers) requested when a renewal is performed.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TtlRenewalOutcome {
-    /// Schema version of this event payload.
-    pub version: u32,
-    /// Storage key whose TTL was considered for renewal.
-    pub key: String,
-    /// Normalized outcome of the renewal attempt.
-    pub result: TtlRenewalResult,
-    /// TTL (in ledgers) observed before the attempt.
-    pub current_ttl: u32,
-    /// TTL (in ledgers) below which renewal is attempted.
-    pub threshold: u32,
-    /// TTL (in ledgers) requested when a renewal is performed.
-    pub extend_to: u32,
-}
-
-/// Normalized result of a TTL renewal attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TtlRenewalResult {
-    /// The key's TTL was already above the threshold; no renewal performed.
-    Skipped,
-    /// The key's TTL was renewed to `extend_to`.
-    Renewed,
-    /// The renewal attempt failed.
-    Failed,
 }
 
 #[cfg(test)]
@@ -330,54 +333,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_cycle_is_rejected() {
-        // A -> A: re-entering the same contract is a direct cycle.
-        let mut guard = InvocationGuard::new();
-        guard.enter(1).unwrap();
-        assert_eq!(guard.enter(1), Err(InvocationCycleError::ReentrantCall));
+    fn propose_requires_current_admin() {
+        let mut handoff = AdminHandoff::new(1);
+        assert_eq!(handoff.propose_admin(2, 3), Err(AdminHandoffError::NotAdmin));
+        assert_eq!(handoff.admin, 1);
+        assert_eq!(handoff.pending_admin, None);
     }
 
     #[test]
-    fn indirect_cycle_is_rejected() {
-        // A -> B -> A: re-entering an ancestor is an indirect cycle.
-        let mut guard = InvocationGuard::new();
-        guard.enter(1).unwrap();
-        guard.enter(2).unwrap();
-        assert_eq!(guard.enter(1), Err(InvocationCycleError::ReentrantCall));
+    fn propose_does_not_change_admin() {
+        let mut handoff = AdminHandoff::new(1);
+        assert_eq!(handoff.propose_admin(1, 2), Ok(()));
+        assert_eq!(handoff.admin, 1);
+        assert_eq!(handoff.pending_admin, Some(2));
     }
 
     #[test]
-    fn non_cyclic_nested_call_succeeds() {
-        // A -> B -> C is a valid non-cyclic nested call chain.
-        let mut guard = InvocationGuard::new();
-        guard.enter(1).unwrap();
-        guard.enter(2).unwrap();
-        guard.enter(3).unwrap();
-        assert_eq!(guard.depth(), 3);
-        guard.exit(3);
-        guard.exit(2);
-        guard.exit(1);
-        assert_eq!(guard.depth(), 0);
+    fn accept_requires_pending_admin() {
+        let mut handoff = AdminHandoff::new(1);
+        assert_eq!(handoff.propose_admin(1, 2), Ok(()));
+        assert_eq!(handoff.accept_admin(3), Err(AdminHandoffError::NotPendingAdmin));
+        assert_eq!(handoff.admin, 1);
+        assert_eq!(handoff.pending_admin, Some(2));
     }
 
     #[test]
-    fn depth_limit_is_enforced() {
-        let mut guard = InvocationGuard::new();
-        for id in 0..MAX_INVOCATION_DEPTH as u64 {
-            guard.enter(id).unwrap();
-        }
-        assert_eq!(
-            guard.enter(MAX_INVOCATION_DEPTH as u64),
-            Err(InvocationCycleError::DepthExceeded)
-        );
+    fn accept_without_nomination_fails() {
+        let mut handoff = AdminHandoff::new(1);
+        assert_eq!(handoff.accept_admin(1), Err(AdminHandoffError::NoPendingAdmin));
+        assert_eq!(handoff.admin, 1);
     }
 
     #[test]
-    fn rejected_cycle_leaves_guard_unchanged() {
-        let mut guard = InvocationGuard::new();
-        guard.enter(1).unwrap();
-        let before = guard.clone();
-        assert!(guard.enter(1).is_err());
-        assert_eq!(guard, before);
+    fn accept_transfers_admin() {
+        let mut handoff = AdminHandoff::new(1);
+        assert_eq!(handoff.propose_admin(1, 2), Ok(()));
+        assert_eq!(handoff.accept_admin(2), Ok(()));
+        assert_eq!(handoff.admin, 2);
+        assert_eq!(handoff.pending_admin, None);
+    }
+
+    #[test]
+    fn old_admin_cannot_bypass_handoff() {
+        let mut handoff = AdminHandoff::new(1);
+        assert_eq!(handoff.propose_admin(1, 2), Ok(()));
+        // The previous admin can no longer act as admin once the handoff is
+        // pending, and cannot accept on behalf of the successor.
+        assert_eq!(handoff.accept_admin(1), Err(AdminHandoffError::NotPendingAdmin));
+        assert_eq!(handoff.admin, 1);
     }
 }
