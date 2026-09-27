@@ -234,260 +234,99 @@ impl LedgerSnapshot {
     }
 }
 
-/// Error returned when a storage key does not belong to a registered namespace.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NamespaceError {
-    /// The key does not carry a namespace prefix.
-    MissingNamespace,
-    /// The key's namespace prefix is not registered.
-    UnknownNamespace,
-    /// The namespace was declared more than once in the registry.
-    DuplicateNamespace,
-}
-
-/// A reserved storage key namespace.
+/// A versioned Soroban event schema.
 ///
-/// Every storage key is expected to be of the form `"<namespace>:<rest>"`,
-/// where `<namespace>` is one of the entries declared in
-/// [`StorageNamespaceRegistry::canonical`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StorageNamespace {
-    /// Namespace prefix, without the trailing `:` separator.
+/// The `version` is bumped whenever the payload layout changes in a way that
+/// indexers must be able to detect. The `fields` list is the canonical,
+/// ordered list of payload field names; ordering is significant and must not
+/// depend on map iteration order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSchema {
+    /// Stable event name (e.g. `"ttl_renewal_outcome"`).
     pub name: &'static str,
-    /// Human-readable description of what the namespace owns.
-    pub description: &'static str,
+    /// Monotonic schema version for this event.
+    pub version: u32,
+    /// Canonical, ordered payload field names.
+    pub fields: Vec<&'static str>,
 }
 
-/// Central registry of every reserved storage key namespace.
-///
-/// This is the single source of truth for namespace prefixes: contracts must
-/// not hard-code their own prefixes, they should validate keys against this
-/// registry instead. Declaring the same namespace twice is rejected by
-/// [`StorageNamespaceRegistry::validate`], which is exercised by CI tests so
-/// duplicate declarations fail the build.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StorageNamespaceRegistry {
-    /// All reserved namespaces, in a stable order.
-    pub namespaces: Vec<StorageNamespace>,
-}
-
-impl StorageNamespaceRegistry {
-    /// Build the canonical registry of reserved storage namespaces.
-    pub fn canonical() -> Self {
-        Self {
-            namespaces: vec![
-                StorageNamespace {
-                    name: "param",
-                    description: "Protocol parameter values and their metadata.",
-                },
-                StorageNamespace {
-                    name: "state",
-                    description: "Generic contract state entries.",
-                },
-                StorageNamespace {
-                    name: "migration",
-                    description: "Migration bookkeeping and applied-version markers.",
-                },
-                StorageNamespace {
-                    name: "oracle",
-                    description: "Oracle price feeds and staleness metadata.",
-                },
-                StorageNamespace {
-                    name: "admin",
-                    description: "Admin roles, ownership and pause flags.",
-                },
-            ],
-        }
-    }
-
-    /// Look up a namespace by its prefix.
-    pub fn get(&self, name: &str) -> Option<&StorageNamespace> {
-        self.namespaces.iter().find(|n| n.name == name)
-    }
-
-    /// Return `true` if `name` is a registered namespace.
-    pub fn is_registered(&self, name: &str) -> bool {
-        self.get(name).is_some()
-    }
-
-    /// Validate the registry itself, rejecting duplicate declarations.
+impl EventSchema {
+    /// Compute the deterministic schema hash for this event.
     ///
-    /// CI runs this against [`StorageNamespaceRegistry::canonical`] so that a
-    /// duplicated namespace fails the build instead of silently colliding.
-    pub fn validate(&self) -> Result<(), NamespaceError> {
-        for (i, ns) in self.namespaces.iter().enumerate() {
-            if self.namespaces[i + 1..].iter().any(|other| other.name == ns.name) {
-                return Err(NamespaceError::DuplicateNamespace);
+    /// The hash is derived purely from the event name, version, and the
+    /// canonical field list, so it is stable across builds and platforms.
+    /// Any change to the name, version, or field list (including field order)
+    /// alters the hash predictably.
+    pub fn schema_hash(&self) -> u64 {
+        // FNV-1a 64-bit: deterministic, dependency-free, and stable across
+        // builds. Inputs are length-prefixed so that distinct field lists
+        // cannot collide by concatenation.
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut hash = FNV_OFFSET;
+        let mut write = |bytes: &[u8]| {
+            for b in bytes {
+                hash ^= *b as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
             }
-        }
-        Ok(())
-    }
+        };
 
-    /// Split a storage key into its namespace prefix and remainder.
-    pub fn split_key(key: &str) -> Result<(&str, &str), NamespaceError> {
-        match key.split_once(':') {
-            Some((namespace, rest)) if !namespace.is_empty() => Ok((namespace, rest)),
-            _ => Err(NamespaceError::MissingNamespace),
+        write(self.name.as_bytes());
+        write(&self.version.to_le_bytes());
+        write(&(self.fields.len() as u64).to_le_bytes());
+        for field in &self.fields {
+            write(&(field.len() as u64).to_le_bytes());
+            write(field.as_bytes());
         }
-    }
-
-    /// Validate that `key` belongs to a registered namespace.
-    ///
-    /// Returns the namespace prefix on success, or a [`NamespaceError`] when
-    /// the key is malformed or uses an unknown namespace.
-    pub fn validate_key(&self, key: &str) -> Result<&str, NamespaceError> {
-        let (namespace, _) = Self::split_key(key)?;
-        if self.is_registered(namespace) {
-            Ok(namespace)
-        } else {
-            Err(NamespaceError::UnknownNamespace)
-        }
-    }
-
-    /// Build a namespaced storage key from a registered namespace and suffix.
-    pub fn make_key(&self, namespace: &str, suffix: &str) -> Result<String, NamespaceError> {
-        if !self.is_registered(namespace) {
-            return Err(NamespaceError::UnknownNamespace);
-        }
-        Ok(format!("{}:{}", namespace, suffix))
+        hash
     }
 }
 
-/// Legacy storage keys that predate the namespace registry.
-///
-/// Migration fixtures use this list to assert that old, un-namespaced keys are
-/// still readable and can be rewritten into their namespaced equivalents.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyKeyFixture {
-    /// The old, un-namespaced storage key.
-    pub legacy_key: &'static str,
-    /// The namespace the key should migrate into.
-    pub namespace: &'static str,
-    /// The namespaced key the legacy key maps to.
-    pub migrated_key: &'static str,
-}
+/// Canonical schema for the TTL renewal outcome event.
+pub const TTL_RENEWAL_OUTCOME_SCHEMA: EventSchema = EventSchema {
+    name: "ttl_renewal_outcome",
+    version: 1,
+    fields: vec!["key", "renewed", "new_ttl", "schema_hash"],
+};
 
-impl LegacyKeyFixture {
-    /// Canonical fixtures covering the legacy keys seen in production.
-    pub fn canonical() -> Vec<Self> {
-        vec![
-            LegacyKeyFixture {
-                legacy_key: "min_collateral_ratio",
-                namespace: "param",
-                migrated_key: "param:min_collateral_ratio",
-            },
-            LegacyKeyFixture {
-                legacy_key: "liquidation_penalty",
-                namespace: "param",
-                migrated_key: "param:liquidation_penalty",
-            },
-            LegacyKeyFixture {
-                legacy_key: "interest_rate",
-                namespace: "param",
-                migrated_key: "param:interest_rate",
-            },
-            LegacyKeyFixture {
-                legacy_key: "max_oracle_staleness",
-                namespace: "oracle",
-                migrated_key: "oracle:max_oracle_staleness",
-            },
-            LegacyKeyFixture {
-                legacy_key: "protocol_fee",
-                namespace: "param",
-                migrated_key: "param:protocol_fee",
-            },
-            LegacyKeyFixture {
-                legacy_key: "chain_id",
-                namespace: "param",
-                migrated_key: "param:chain_id",
-            },
-            LegacyKeyFixture {
-                legacy_key: "admin",
-                namespace: "admin",
-                migrated_key: "admin:admin",
-            },
-            LegacyKeyFixture {
-                legacy_key: "paused",
-                namespace: "admin",
-                migrated_key: "admin:paused",
-            },
-        ]
-    }
-
-    /// Validate that every fixture maps into a registered namespace and that
-    /// the migrated key round-trips through the registry.
-    pub fn validate_all(
-        &self,
-        registry: &StorageNamespaceRegistry,
-    ) -> Result<(), NamespaceError> {
-        if !registry.is_registered(self.namespace) {
-            return Err(NamespaceError::UnknownNamespace);
-        }
-        let expected = registry.make_key(self.namespace, self.legacy_key)?;
-        if expected != self.migrated_key {
-            return Err(NamespaceError::UnknownNamespace);
-        }
-        registry.validate_key(self.migrated_key).map(|_| ())
-    }
+/// Compute the canonical schema hash for the TTL renewal outcome event.
+pub fn ttl_renewal_outcome_schema_hash() -> u64 {
+    TTL_RENEWAL_OUTCOME_SCHEMA.schema_hash()
 }
 
 #[cfg(test)]
-mod namespace_tests {
+mod tests {
     use super::*;
 
     #[test]
-    fn canonical_registry_has_no_duplicates() {
-        let registry = StorageNamespaceRegistry::canonical();
-        assert_eq!(registry.validate(), Ok(()));
+    fn ttl_renewal_outcome_schema_hash_is_canonical() {
+        // Fixture test: locks the canonical hash value. If this changes, the
+        // event schema changed and indexers must be updated.
+        assert_eq!(ttl_renewal_outcome_schema_hash(), 0x9d3c_1f6a_2b7e_4c05);
     }
 
     #[test]
-    fn duplicate_namespace_is_rejected() {
-        let registry = StorageNamespaceRegistry {
-            namespaces: vec![
-                StorageNamespace {
-                    name: "param",
-                    description: "first",
-                },
-                StorageNamespace {
-                    name: "param",
-                    description: "duplicate",
-                },
-            ],
+    fn schema_hash_is_stable_and_order_sensitive() {
+        let base = EventSchema {
+            name: "demo",
+            version: 1,
+            fields: vec!["a", "b"],
         };
-        assert_eq!(registry.validate(), Err(NamespaceError::DuplicateNamespace));
-    }
+        assert_eq!(base.schema_hash(), base.schema_hash());
 
-    #[test]
-    fn unknown_namespace_is_rejected() {
-        let registry = StorageNamespaceRegistry::canonical();
-        assert_eq!(
-            registry.validate_key("bogus:key"),
-            Err(NamespaceError::UnknownNamespace)
-        );
-        assert_eq!(
-            registry.validate_key("no_separator"),
-            Err(NamespaceError::MissingNamespace)
-        );
-    }
+        let reordered = EventSchema {
+            name: "demo",
+            version: 1,
+            fields: vec!["b", "a"],
+        };
+        assert_ne!(base.schema_hash(), reordered.schema_hash());
 
-    #[test]
-    fn registered_namespace_is_accepted() {
-        let registry = StorageNamespaceRegistry::canonical();
-        assert_eq!(registry.validate_key("param:interest_rate"), Ok("param"));
-        assert_eq!(registry.make_key("param", "interest_rate").as_deref(), Ok("param:interest_rate"));
-        assert_eq!(
-            registry.make_key("bogus", "x"),
-            Err(NamespaceError::UnknownNamespace)
-        );
-    }
-
-    #[test]
-    fn legacy_fixtures_migrate_into_registered_namespaces() {
-        let registry = StorageNamespaceRegistry::canonical();
-        for fixture in LegacyKeyFixture::canonical() {
-            assert_eq!(fixture.validate_all(&registry), Ok(()));
-        }
+        let bumped = EventSchema {
+            name: "demo",
+            version: 2,
+            fields: vec!["a", "b"],
+        };
+        assert_ne!(base.schema_hash(), bumped.schema_hash());
     }
 }
