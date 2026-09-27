@@ -1347,6 +1347,7 @@ version = "0.0.0"
 dependencies = [
  "dlmalloc",
  "proptest",
+ "serde_json",
  "shared",
  "soroban-sdk",
  "stellar_swipe_common",

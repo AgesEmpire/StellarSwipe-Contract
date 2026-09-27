@@ -198,6 +198,109 @@ impl ProtocolParamSchema {
     }
 }
 
+/// Version of the normalized TTL renewal outcome event schema.
+///
+/// Bump this whenever the fields of [`TtlRenewalOutcome`] change so that
+/// off-chain consumers can detect incompatible event payloads.
+pub const TTL_RENEWAL_OUTCOME_EVENT_VERSION: u32 = 1;
+
+/// Normalized outcome of a single storage TTL renewal attempt.
+///
+/// Every shared TTL caller emits this event instead of ad-hoc per-caller
+/// emissions, so off-chain indexers observe one deterministic shape for
+/// skipped, renewed, and failed renewals.
+///
+/// Fields:
+/// - `version`: schema version, see [`TTL_RENEWAL_OUTCOME_EVENT_VERSION`].
+/// - `key`: storage key whose TTL was considered for renewal.
+/// - `result`: normalized outcome of the attempt.
+/// - `current_ttl`: TTL (in ledgers) observed before the attempt.
+/// - `threshold`: TTL (in ledgers) below which renewal is attempted.
+/// - `extend_to`: TTL (in ledgers) requested when a renewal is performed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TtlRenewalOutcome {
+    /// Schema version of this event payload.
+    pub version: u32,
+    /// Storage key whose TTL was considered for renewal.
+    pub key: String,
+    /// Normalized outcome of the renewal attempt.
+    pub result: TtlRenewalResult,
+    /// TTL observed before the attempt, in ledgers.
+    pub current_ttl: u32,
+    /// TTL below which renewal is attempted, in ledgers.
+    pub threshold: u32,
+    /// TTL requested when a renewal is performed, in ledgers.
+    pub extend_to: u32,
+}
+
+/// Normalized result of a storage TTL renewal attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TtlRenewalResult {
+    /// The entry was already expired; renewal is impossible.
+    Expired,
+    /// The entry's TTL was above the threshold; no renewal was needed.
+    Skipped,
+    /// The entry's TTL was extended to `extend_to`.
+    Renewed,
+    /// The renewal attempt failed.
+    Failed,
+}
+
+impl TtlRenewalOutcome {
+    /// Build a normalized outcome for a renewal attempt.
+    ///
+    /// The result is derived deterministically from the observed TTL:
+    /// an already-expired entry (`current_ttl == 0`) yields
+    /// [`TtlRenewalResult::Expired`], an entry at or above `threshold`
+    /// yields [`TtlRenewalResult::Skipped`], and anything else yields
+    /// [`TtlRenewalResult::Renewed`].
+    pub fn new(
+        key: impl Into<String>,
+        current_ttl: u32,
+        threshold: u32,
+        extend_to: u32,
+    ) -> Self {
+        let result = if current_ttl == 0 {
+            TtlRenewalResult::Expired
+        } else if current_ttl >= threshold {
+            TtlRenewalResult::Skipped
+        } else {
+            TtlRenewalResult::Renewed
+        };
+        Self {
+            version: TTL_RENEWAL_OUTCOME_EVENT_VERSION,
+            key: key.into(),
+            result,
+            current_ttl,
+            threshold,
+            extend_to,
+        }
+    }
+
+    /// Build a normalized outcome for a failed renewal attempt.
+    pub fn failed(
+        key: impl Into<String>,
+        current_ttl: u32,
+        threshold: u32,
+        extend_to: u32,
+    ) -> Self {
+        Self {
+            version: TTL_RENEWAL_OUTCOME_EVENT_VERSION,
+            key: key.into(),
+            result: TtlRenewalResult::Failed,
+            current_ttl,
+            threshold,
+            extend_to,
+        }
+    }
+
+    /// Whether this outcome represents an actual TTL extension.
+    pub fn is_renewed(&self) -> bool {
+        self.result == TtlRenewalResult::Renewed
+    }
+}
+
 /// A single key/value entry in contract storage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateEntry {
@@ -233,160 +336,3 @@ impl LedgerSnapshot {
             .map(|e| e.value.as_str())
     }
 }
-
-/// A single planned change produced by a migration.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MigrationOp {
-    /// A new key will be written.
-    Insert,
-    /// An existing key will be overwritten.
-    Update,
-    /// An existing key will be removed.
-    Delete,
-}
-
-/// A planned key change, with the before/after values.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlannedChange {
-    /// Storage key affected by the change.
-    pub key: String,
-    /// Operation that would be applied.
-    pub op: MigrationOp,
-    /// Value before the migration (`None` for inserts).
-    pub before: Option<String>,
-    /// Value after the migration (`None` for deletes).
-    pub after: Option<String>,
-}
-
-/// A migration invariant that failed during a dry-run.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InvariantFailure {
-    /// Stable identifier of the invariant that failed.
-    pub invariant: String,
-    /// Human-readable explanation of the failure.
-    pub detail: String,
-}
-
-/// Deterministic, machine-readable report produced by a migration dry-run.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MigrationDryRunReport {
-    /// Always `true`; a dry-run never commits state.
-    pub dry_run: bool,
-    /// Checksum of the input snapshot.
-    pub snapshot_checksum: String,
-    /// Planned key changes, in canonical key order.
-    pub changes: Vec<PlannedChange>,
-    /// Number of planned inserts.
-    pub inserts: usize,
-    /// Number of planned updates.
-    pub updates: usize,
-    /// Number of planned deletes.
-    pub deletes: usize,
-    /// Invariants that failed; empty when the migration is clean.
-    pub invariant_failures: Vec<InvariantFailure>,
-}
-
-impl MigrationDryRunReport {
-    /// Whether the dry-run completed without any invariant failures.
-    pub fn is_clean(&self) -> bool {
-        self.invariant_failures.is_empty()
-    }
-
-    /// Render the report as deterministic, machine-readable JSON.
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("migration dry-run report is always serializable")
-    }
-}
-
-/// A migration that can be dry-run against a captured ledger snapshot.
-///
-/// Implementations must be pure: `plan` only reads the snapshot and returns
-/// the changes it *would* apply, never mutating ledger state.
-pub trait StorageMigration {
-    /// Compute the planned changes for `snapshot` without committing them.
-    fn plan(&self, snapshot: &LedgerSnapshot) -> Vec<PlannedChange>;
-
-    /// Check invariants over the planned changes.
-    ///
-    /// The default implementation reports no failures.
-    fn check_invariants(
-        &self,
-        _snapshot: &LedgerSnapshot,
-        _changes: &[PlannedChange],
-    ) -> Vec<InvariantFailure> {
-        Vec::new()
-    }
-}
-
-/// Run a migration in dry-run mode against a captured ledger snapshot.
-///
-/// This is read-only: it never writes to ledger state. The returned report is
-/// deterministic for a given snapshot and migration, and can be serialized to
-/// stable JSON via [`MigrationDryRunReport::to_json`].
-pub fn dry_run_migration<M: StorageMigration>(
-    migration: &M,
-    snapshot: &LedgerSnapshot,
-) -> MigrationDryRunReport {
-    let mut changes = migration.plan(snapshot);
-    changes.sort_by(|a, b| a.key.cmp(&b.key));
-
-    let mut inserts = 0;
-    let mut updates = 0;
-    let mut deletes = 0;
-    for change in &changes {
-        match change.op {
-            MigrationOp::Insert => inserts += 1,
-            MigrationOp::Update => updates += 1,
-            MigrationOp::Delete => deletes += 1,
-        }
-    }
-
-    let invariant_failures = migration.check_invariants(snapshot, &changes);
-
-    MigrationDryRunReport {
-        dry_run: true,
-        snapshot_checksum: state_checksum(&snapshot.entries),
-        changes,
-        inserts,
-        updates,
-        deletes,
-        invariant_failures,
-    }
-}
-
-/// Compute a deterministic checksum over the provided state entries.
-///
-/// The caller is responsible for supplying `entries` in a canonical order.
-/// Equivalent states (same entries, same order) always yield the same digest,
-/// regardless of unrelated storage or map iteration order.
-///
-/// Returns the digest as a lowercase hexadecimal string.
-pub fn state_checksum(entries: &[StateEntry]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(CHECKSUM_DOMAIN);
-
-    for entry in entries {
-        let key = entry.key.as_bytes();
-        hasher.update((key.len() as u32).to_be_bytes());
-        hasher.update(key);
-
-        let value = entry.value.as_bytes();
-        hasher.update((value.len() as u32).to_be_bytes());
-        hasher.update(value);
-    }
-
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{:02x}", byte));
-    }
-    out
-}
-
-/// Validates and normalizes an address for the given `kind`.
-///
-/// Normalization currently returns the address unchanged, but centralizing
-/// it here lets callers
-
-/* … truncated 11497 chars — edit only what you need near the top … */

@@ -1,14 +1,51 @@
-use soroban_sdk::{Address, Env, Map, Vec};
+//! Signal expiration and archive behavior (issue #1219).
+//!
+//! The full specification lives in `docs/signal_expiration.md`. In short:
+//!
+//! - **Expiry boundary.** A signal is live through its `expiry` second and
+//!   expired strictly after it (`now > expiry`, see [`is_expired`]).
+//! - **Query visibility is time-derived.** [`is_visible_active`] is the single
+//!   predicate every active-signal query uses. It checks the ledger clock, so
+//!   an expired signal is hidden whether or not cleanup has run yet.
+//! - **Cleanup is bounded and resumable.** [`cleanup_expired_signals`] and
+//!   [`archive_old_signals`] each examine at most `MAX_CLEANUP_BATCH_SIZE`
+//!   entries per call, resuming from a persisted cursor, and are idempotent.
+//!   Cleanup only ever moves a signal *away* from `Active`, so it cannot make
+//!   an expired signal visible.
+
+use soroban_sdk::{contracttype, Address, Env, Map, Vec};
 use stellar_swipe_common::{SECONDS_PER_30_DAY_MONTH, SECONDS_PER_DAY};
 
-use crate::events::{emit_signal_expired, emit_signals_pruned};
+use crate::categories::SignalCategory;
+use crate::events::{emit_signal_expired, emit_signals_archived, emit_signals_pruned};
 use crate::types::{Signal, SignalStatus};
+use crate::StorageKey;
 
 use shared::Expirable;
 
 pub const DEFAULT_EXPIRY_SECONDS: u64 = SECONDS_PER_DAY; // 24 hours
 pub const MAX_CLEANUP_BATCH_SIZE: u32 = 100; // Process max 100 signals per cleanup call
 pub const ARCHIVE_THRESHOLD_SECONDS: u64 = SECONDS_PER_30_DAY_MONTH; // 30 days
+
+/// Lifecycle of a signal id with respect to expiry, as reported by
+/// `get_signal_expiry_state`. Derived on read; never stored.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalExpiryState {
+    /// The id was never allocated.
+    Unknown,
+    /// Returned by active-signal queries.
+    Live,
+    /// Past expiry but cleanup has not flipped its status yet. Already hidden
+    /// from active queries.
+    ExpiredPendingCleanup,
+    /// Status is `Expired`. Kept in storage until the archive threshold.
+    Expired,
+    /// Status is `Executed`; hidden from active queries regardless of expiry.
+    Closed,
+    /// The id was allocated but its record was archived or pruned.
+    Removed,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CleanupResult {
@@ -32,15 +69,125 @@ pub fn is_expired(env: &Env, signal: &Signal) -> bool {
     signal.is_expired(env.ledger().timestamp())
 }
 
+/// The one visibility rule for active-signal queries.
+///
+/// A signal is visible iff its status is not `Expired`/`Executed` **and** it
+/// is not past expiry at `now`. Because the time check does not depend on the
+/// stored status, a signal whose cleanup has not run yet is still hidden.
+pub fn is_visible_active(signal: &Signal, now: u64) -> bool {
+    signal.status != SignalStatus::Expired
+        && signal.status != SignalStatus::Executed
+        && !signal.is_expired(now)
+}
+
+/// A signal may be archived (removed from the signals map) once it is expired
+/// — either marked `Expired`, or still `Active` but past expiry because
+/// cleanup has not run — and more than [`ARCHIVE_THRESHOLD_SECONDS`] have
+/// elapsed since its expiry. Other terminal statuses are kept as history.
+pub fn is_archivable(signal: &Signal, now: u64) -> bool {
+    let expired = match signal.status {
+        SignalStatus::Expired => true,
+        SignalStatus::Active => signal.is_expired(now),
+        _ => false,
+    };
+    expired && now.saturating_sub(signal.expiry) > ARCHIVE_THRESHOLD_SECONDS
+}
+
 /// Check if signal should be archived (expired for more than 30 days)
 pub fn should_archive(env: &Env, signal: &Signal) -> bool {
-    if signal.status != SignalStatus::Expired {
-        return false;
-    }
+    is_archivable(signal, env.ledger().timestamp())
+}
 
-    let current_time = env.ledger().timestamp();
-    let time_since_expiry = current_time.saturating_sub(signal.expiry);
-    time_since_expiry > ARCHIVE_THRESHOLD_SECONDS
+/// Classify `signal_id` without mutating storage.
+pub fn expiry_state(
+    env: &Env,
+    signals_map: &Map<u64, Signal>,
+    signal_id: u64,
+) -> SignalExpiryState {
+    let Some(signal) = signals_map.get(signal_id) else {
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SignalCounter)
+            .unwrap_or(0);
+        return if signal_id >= 1 && signal_id <= counter {
+            SignalExpiryState::Removed
+        } else {
+            SignalExpiryState::Unknown
+        };
+    };
+    let now = env.ledger().timestamp();
+    match signal.status {
+        SignalStatus::Expired => SignalExpiryState::Expired,
+        SignalStatus::Executed => SignalExpiryState::Closed,
+        _ if signal.is_expired(now) => SignalExpiryState::ExpiredPendingCleanup,
+        _ => SignalExpiryState::Live,
+    }
+}
+
+fn clamp_batch(limit: u32) -> u32 {
+    if limit == 0 || limit > MAX_CLEANUP_BATCH_SIZE {
+        MAX_CLEANUP_BATCH_SIZE
+    } else {
+        limit
+    }
+}
+
+/// Last signal id examined by a cursor-driven sweep; 0 before the first run.
+pub fn get_cursor(env: &Env, key: &StorageKey) -> u64 {
+    env.storage().instance().get(key).unwrap_or(0)
+}
+
+/// The ids a sweep examines this call: at most `budget` of `keys` (sorted
+/// ascending, as `Map::keys` returns them), starting strictly after `cursor`
+/// and wrapping to the lowest id. No id appears twice. The cursor may name an
+/// id that has since been removed; the sweep resumes at the next larger id.
+fn cursor_window(env: &Env, keys: &Vec<u64>, cursor: u64, budget: u32) -> Vec<u64> {
+    let mut window = Vec::new(env);
+    let n = keys.len();
+    if n == 0 || budget == 0 {
+        return window;
+    }
+    let start = match keys.binary_search(cursor) {
+        Ok(i) => i + 1,
+        Err(i) => i,
+    };
+    let take = if budget < n { budget } else { n };
+    for k in 0..take {
+        window.push_back(keys.get_unchecked((start + k) % n));
+    }
+    window
+}
+
+/// Drop removed signals from the active-signal indexes. Signals still marked
+/// `Active` release the provider's active-signal slot and emit
+/// `signal_expired`, since cleanup never got to announce them.
+fn release_removed_signals(env: &Env, removed: &Vec<Signal>) {
+    let mut cat_map: Map<SignalCategory, Vec<u64>> = env
+        .storage()
+        .instance()
+        .get(&StorageKey::ActiveSignalsByCategory)
+        .unwrap_or(Map::new(env));
+    let mut cat_changed = false;
+    for signal in removed.iter() {
+        if signal.status == SignalStatus::Active {
+            crate::validation::decrement_provider_active_count(env, &signal.provider);
+            emit_signal_expired(env, signal.id, signal.provider.clone(), signal.expiry);
+        }
+        if let Some(list) = cat_map.get(signal.category.clone()) {
+            if let Some(pos) = list.first_index_of(signal.id) {
+                let mut list = list;
+                list.remove(pos);
+                cat_map.set(signal.category.clone(), list);
+                cat_changed = true;
+            }
+        }
+    }
+    if cat_changed {
+        env.storage()
+            .instance()
+            .set(&StorageKey::ActiveSignalsByCategory, &cat_map);
+    }
 }
 
 /// Update signal to expired status if it has passed expiry time
@@ -102,11 +249,7 @@ pub fn get_active_signals(env: &Env, signals_map: &Map<u64, Signal>) -> Vec<Sign
     for i in 0..keys.len() {
         let key = keys.get(i).unwrap();
         if let Some(signal) = signals_map.get(key) {
-            // Only include non-expired signals
-            if signal.expiry > current_time
-                && signal.status != SignalStatus::Expired
-                && signal.status != SignalStatus::Executed
-            {
+            if is_visible_active(&signal, current_time) {
                 active_signals.push_back(signal);
             }
         }
@@ -146,67 +289,63 @@ pub fn get_active_signals_filtered(
     filtered
 }
 
-/// Cleanup expired signals in batches
-/// Returns number of signals processed and expired
+/// Mark expired `Active` signals as `Expired`, examining at most
+/// `limit` entries (clamped to `1..=MAX_CLEANUP_BATCH_SIZE`; 0 means the max).
+///
+/// The sweep resumes after the id stored in
+/// [`StorageKey::ExpiryCleanupCursor`] and wraps around, so repeated calls
+/// visit every signal even when the lowest ids are long-lived. Every examined
+/// entry counts toward the budget, whatever its status, so the per-call work
+/// is bounded. Re-running over an already-swept range is a no-op, so a
+/// failed or repeated call can simply be retried.
+///
+/// `signals_processed` is the number of entries examined; `signals_expired`
+/// the number moved to `Expired` (each emits `signal_expired`).
 pub fn cleanup_expired_signals(
     env: &Env,
     signals_map: &Map<u64, Signal>,
     limit: u32,
 ) -> CleanupResult {
-    let batch_size = if limit == 0 || limit > MAX_CLEANUP_BATCH_SIZE {
-        MAX_CLEANUP_BATCH_SIZE
-    } else {
-        limit
-    };
-
     let current_time = env.ledger().timestamp();
     let mut signals_processed = 0u32;
     let mut signals_expired = 0u32;
     let mut expired_signals = Vec::new(env);
     let mut updated_map = signals_map.clone();
 
-    // Collect all keys first
-    let mut keys = Vec::new(env);
-    for i in 0..signals_map.len() {
-        if let Some(key) = signals_map.keys().get(i) {
-            keys.push_back(key);
-        }
-    }
+    let window = cursor_window(
+        env,
+        &signals_map.keys(),
+        get_cursor(env, &StorageKey::ExpiryCleanupCursor),
+        clamp_batch(limit),
+    );
 
-    // Iterate through keys
-    for i in 0..keys.len() {
-        if signals_processed >= batch_size {
-            break;
-        }
-
-        let signal_id = keys.get(i).unwrap();
+    for signal_id in window.iter() {
+        signals_processed += 1;
         if let Some(mut signal) = signals_map.get(signal_id) {
             // Only active signals consume provider capacity and can transition
             // to Expired in this cleanup path.
-            if signal.status != SignalStatus::Active {
-                continue;
-            }
-
-            signals_processed += 1;
-
-            // Check if expired
-            if signal.expiry < current_time {
+            if signal.status == SignalStatus::Active && signal.is_expired(current_time) {
                 signal.status = SignalStatus::Expired;
                 updated_map.set(signal_id, signal.clone());
                 signals_expired += 1;
                 expired_signals.push_back(signal.clone());
 
-                // Emit expiry event
                 emit_signal_expired(env, signal.id, signal.provider.clone(), signal.expiry);
             }
         }
+    }
+
+    if let Some(last) = window.last() {
+        env.storage()
+            .instance()
+            .set(&StorageKey::ExpiryCleanupCursor, &last);
     }
 
     // Save updated map if any changes were made
     if signals_expired > 0 {
         env.storage()
             .instance()
-            .set(&crate::StorageKey::Signals, &updated_map);
+            .set(&StorageKey::Signals, &updated_map);
     }
 
     CleanupResult {
@@ -282,62 +421,52 @@ pub fn count_prunable_signals(env: &Env, signals_map: &Map<u64, Signal>) -> u32 
     count
 }
 
-/// Archive old expired signals (optional - removes from active storage)
-/// Returns number of signals archived
+/// Remove signals that satisfy [`is_archivable`] from the signals map,
+/// examining at most `limit` entries (same clamping as
+/// [`cleanup_expired_signals`]) from the [`StorageKey::ArchiveCursor`]
+/// position. Returns the number of signals removed.
+///
+/// Archived ids are dropped from the category index. Signals archived while
+/// still `Active` (cleanup never ran) also release the provider's
+/// active-signal slot and emit `signal_expired`. When anything is removed, a
+/// single `signals_archived` event is emitted. After archiving,
+/// `get_signal_expiry_state` reports the id as `Removed`.
 pub fn archive_old_signals(env: &Env, signals_map: &Map<u64, Signal>, limit: u32) -> u32 {
-    let batch_size = if limit == 0 || limit > MAX_CLEANUP_BATCH_SIZE {
-        MAX_CLEANUP_BATCH_SIZE
-    } else {
-        limit
-    };
-
     let current_time = env.ledger().timestamp();
-    let mut archived_count = 0u32;
     let mut updated_map = signals_map.clone();
+    let mut archived = Vec::new(env);
 
-    // Collect signal IDs to archive
-    let mut to_archive = Vec::new(env);
+    let window = cursor_window(
+        env,
+        &signals_map.keys(),
+        get_cursor(env, &StorageKey::ArchiveCursor),
+        clamp_batch(limit),
+    );
 
-    // Collect all keys first
-    let mut keys = Vec::new(env);
-    for i in 0..signals_map.len() {
-        if let Some(key) = signals_map.keys().get(i) {
-            keys.push_back(key);
-        }
-    }
-
-    for i in 0..keys.len() {
-        if archived_count >= batch_size {
-            break;
-        }
-
-        let signal_id = keys.get(i).unwrap();
+    for signal_id in window.iter() {
         if let Some(signal) = signals_map.get(signal_id) {
-            // Only archive signals expired for more than 30 days
-            if signal.status == SignalStatus::Expired {
-                let time_since_expiry = current_time.saturating_sub(signal.expiry);
-                if time_since_expiry > ARCHIVE_THRESHOLD_SECONDS {
-                    to_archive.push_back(signal_id);
-                    archived_count += 1;
-                }
+            if is_archivable(&signal, current_time) {
+                updated_map.remove(signal_id);
+                archived.push_back(signal);
             }
         }
     }
 
-    // Remove archived signals from active storage
-    for i in 0..to_archive.len() {
-        let signal_id = to_archive.get(i).unwrap();
-        updated_map.remove(signal_id);
-    }
-
-    // Save updated map if any signals were archived
-    if archived_count > 0 {
+    if let Some(last) = window.last() {
         env.storage()
             .instance()
-            .set(&crate::StorageKey::Signals, &updated_map);
+            .set(&StorageKey::ArchiveCursor, &last);
     }
 
-    archived_count
+    if !archived.is_empty() {
+        env.storage()
+            .instance()
+            .set(&StorageKey::Signals, &updated_map);
+        release_removed_signals(env, &archived);
+        emit_signals_archived(env, archived.len(), current_time);
+    }
+
+    archived.len()
 }
 
 /// Get count of expired signals

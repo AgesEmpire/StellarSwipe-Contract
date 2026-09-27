@@ -87,6 +87,16 @@ pub const TOPIC_REWARD_BATCH_CLAIMED: fn() -> Symbol = || Symbol::short("rwdbatc
 pub const TOPIC_REWARD_DEPOSITED: fn() -> Symbol = || Symbol::short("rwddep");
 pub const TOPIC_REWARD_ASSET_ADDED: fn() -> Symbol = || Symbol::short("rwdasset");
 
+// ── Reward campaign sub-topics (#1202, #1203, #1204) ──────────────────────────
+pub const TOPIC_CAMPAIGN_CREATED: fn() -> Symbol = || Symbol::short("rcmpnew");
+pub const TOPIC_CAMPAIGN_ALLOCATED: fn() -> Symbol = || Symbol::short("rcmpallo");
+pub const TOPIC_CAMPAIGN_CLAIMED: fn() -> Symbol = || Symbol::short("rcmpclm");
+pub const TOPIC_CAMPAIGN_EXPIRED: fn() -> Symbol = || Symbol::short("rcmpexp");
+pub const TOPIC_CAMPAIGN_CLOSED: fn() -> Symbol = || Symbol::short("rcmpcls");
+
+// ── Fee accrual slash settlement (#1205) ──────────────────────────────────────
+pub const TOPIC_FEE_SLASH_SETTLED: fn() -> Symbol = || Symbol::short("fee_slsh");
+
 // ── Slash strategy sub-topics (#1021) ─────────────────────────────────────────
 pub const TOPIC_SLASH_STRATEGY_SET: fn() -> Symbol = || Symbol::short("slhstrat");
 
@@ -174,6 +184,12 @@ mod tests {
         let _ = TOPIC_REWARD_BATCH_CLAIMED();
         let _ = TOPIC_REWARD_DEPOSITED();
         let _ = TOPIC_REWARD_ASSET_ADDED();
+        let _ = TOPIC_CAMPAIGN_CREATED();
+        let _ = TOPIC_CAMPAIGN_ALLOCATED();
+        let _ = TOPIC_CAMPAIGN_CLAIMED();
+        let _ = TOPIC_CAMPAIGN_EXPIRED();
+        let _ = TOPIC_CAMPAIGN_CLOSED();
+        let _ = TOPIC_FEE_SLASH_SETTLED();
         let _ = TOPIC_SLASH_STRATEGY_SET();
         let _ = TOPIC_STORAGE_VERSION_SET();
         let _ = TOPIC_UPGRADE_BLOCKED();

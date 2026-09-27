@@ -432,6 +432,94 @@ pub fn migrate_signals_v1_to_v2(
     Ok(())
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Issue #1223: read-only upgrade preflight
+// ═══════════════════════════════════════════════════════════════════
+//
+// Operators need to know, before submitting `upgrade`, whether the stored
+// contract version accepts the target version and whether the v1→v2 signal
+// migration still has work left. `upgrade_preflight` answers that from
+// storage reads only: it writes nothing, emits nothing, and requires no
+// authorization, so any caller can simulate it.
+
+/// Overall verdict of [`upgrade_preflight`], in precedence order: the first
+/// matching condition wins.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpgradeReadiness {
+    /// The stored schema version is not one this code understands
+    /// (`verify_storage_layout` would reject it). Do not upgrade or migrate.
+    IncompatibleSchema,
+    /// `target_version` is lower than the stored version; `upgrade` would
+    /// reject it as a downgrade.
+    IncompatibleVersion,
+    /// The last completed migration failed its invariant reconciliation
+    /// (`get_migration_verification().verified == false`). Needs manual review.
+    MigrationUnverified,
+    /// Legacy v1 signal records remain. Run `migrate_signals_v1_to_v2` until
+    /// none remain before upgrading.
+    MigrationRequired,
+    /// `target_version` equals the stored version and storage is ready; there
+    /// is nothing to upgrade.
+    Current,
+    /// `target_version` is newer than the stored version and storage is ready.
+    Upgradeable,
+}
+
+/// Snapshot of version and migration state returned by [`upgrade_preflight`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradePreflight {
+    pub readiness: UpgradeReadiness,
+    /// Contract version currently stored on-chain.
+    pub current_version: u32,
+    /// Version the operator intends to upgrade to (echoed back).
+    pub target_version: u32,
+    /// Stored signal storage schema version (see [`get_schema_version`]).
+    pub schema_version: u32,
+    /// Schema version this contract code writes ([`SIGNAL_SCHEMA_V2`]).
+    pub supported_schema_version: u32,
+    /// Legacy v1 signal records not yet migrated.
+    pub pending_v1_records: u32,
+    /// Next signal id the v1→v2 migration will scan.
+    pub migration_cursor: u64,
+    /// Result of the last completed migration's reconciliation, if any.
+    pub migration_verified: Option<bool>,
+}
+
+/// Report upgrade readiness for `target_version` without touching storage.
+pub fn upgrade_preflight(env: &Env, target_version: u32) -> UpgradePreflight {
+    let current_version = shared::version::get_contract_version(env);
+    let schema_version = get_schema_version(env);
+    let pending_v1_records = get_v1_map(env).len();
+    let migration_verified = get_migration_verification(env).map(|v| v.verified);
+
+    let readiness = if schema_version != SIGNAL_SCHEMA_V1 && schema_version != SIGNAL_SCHEMA_V2 {
+        UpgradeReadiness::IncompatibleSchema
+    } else if target_version < current_version {
+        UpgradeReadiness::IncompatibleVersion
+    } else if migration_verified == Some(false) {
+        UpgradeReadiness::MigrationUnverified
+    } else if pending_v1_records > 0 {
+        UpgradeReadiness::MigrationRequired
+    } else if target_version == current_version {
+        UpgradeReadiness::Current
+    } else {
+        UpgradeReadiness::Upgradeable
+    };
+
+    UpgradePreflight {
+        readiness,
+        current_version,
+        target_version,
+        schema_version,
+        supported_schema_version: SIGNAL_SCHEMA_V2,
+        pending_v1_records,
+        migration_cursor: get_migration_cursor(env),
+        migration_verified,
+    }
+}
+
 /// Test helper: only compiled for unit tests. Seeds v1, clears v2, resets migration metadata.
 #[cfg(test)]
 pub(crate) fn test_seed_v1_signals(env: &Env, count: u64) {
