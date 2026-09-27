@@ -13,8 +13,13 @@
 //! their identifiers cannot be reused during the documented retention period.
 //! Expired tombstones may be purged by the admin in bounded, idempotent
 //! batches once the retention window has elapsed.
+//!
+//! Material contract configuration changes emit structured, auditable events
+//! so that indexers and operators can discover them. Each event records the
+//! changed setting, its prior and new values, and the actor that authorized
+//! the change.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
 /// Errors returned by the signal registry contract.
 #[contracterror]
@@ -99,6 +104,19 @@ pub struct DataKey {
     pub schedule: DecaySchedule,
 }
 
+/// Auditable event emitted when a material contract configuration setting
+/// changes. Records the changed setting, its prior and new values, and the
+/// actor that authorized the change so indexers and operators can discover
+/// configuration drift.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigChanged {
+    pub setting: Symbol,
+    pub old_value: DecaySchedule,
+    pub new_value: DecaySchedule,
+    pub actor: Address,
+}
+
 const ADMIN_KEY: &str = "admin";
 const SCHEDULE_KEY: &str = "schedule";
 const REPUTATION_KEY: &str = "reputation";
@@ -122,6 +140,10 @@ impl SignalRegistry {
     }
 
     /// Update the decay schedule. Only the admin may call this.
+    ///
+    /// On success an auditable [`ConfigChanged`] event is emitted carrying the
+    /// prior and new schedules along with the authorizing admin. Rejected
+    /// updates (unauthorized or invalid) emit no event.
     pub fn set_decay_schedule(env: Env, schedule: DecaySchedule) -> Result<(), SignalError> {
         let admin: Address = env
             .storage()
@@ -130,7 +152,21 @@ impl SignalRegistry {
             .ok_or(SignalError::NotInitialized)?;
         admin.require_auth();
         Self::validate_schedule(&schedule)?;
+        let old_value: DecaySchedule = env
+            .storage()
+            .instance()
+            .get(&SCHEDULE_KEY)
+            .ok_or(SignalError::NotInitialized)?;
         env.storage().instance().set(&SCHEDULE_KEY, &schedule);
+        env.events().publish(
+            (Symbol::new(&env, "config_changed"), Symbol::new(&env, "schedule")),
+            ConfigChanged {
+                setting: Symbol::new(&env, "schedule"),
+                old_value,
+                new_value: schedule,
+                actor: admin,
+            },
+        );
         Ok(())
     }
 
@@ -218,173 +254,6 @@ impl SignalRegistry {
         }
         let now = env.ledger().timestamp();
         let mut purged: u32 = 0;
-        for provider in providers.iter() {
-            if purged >= max_entries {
-                break;
-            }
-            let tomb_key = (TOMBSTONE_KEY, provider.clone());
-            if let Some(tombstone) = env
-                .storage()
-                .persistent()
-                .get::<(_, Address), Tombstone>(&tomb_key)
-            {
-                if now >= tombstone.expires_at {
-                    env.storage().persistent().remove(&tomb_key);
-                    purged += 1;
-                }
-            }
-        }
-        Ok(purged)
-    }
+        for provider in providers
 
-    /// Apply a reputation update for a provider, first decaying the stored
-    /// score according to the configured schedule.
-    pub fn update_reputation(
-        env: Env,
-        provider: Address,
-        delta: i128,
-    ) -> Result<i128, SignalError> {
-        let schedule: DecaySchedule = env
-            .storage()
-            .instance()
-            .get(&SCHEDULE_KEY)
-            .ok_or(SignalError::NotInitialized)?;
-
-        let now = env.ledger().timestamp();
-        let record = Self::load_reputation(&env, &provider);
-
-        // Decay the existing score based on elapsed time since last update.
-        let decayed = Self::apply_decay(&record, now, &schedule);
-
-        // Apply the new delta and clamp to configured thresholds.
-        let updated = Self::clamp(decayed.saturating_add(delta), &schedule);
-
-        let new_record = ReputationRecord {
-            score: updated,
-            last_updated: now,
-        };
-        Self::store_reputation(&env, &provider, &new_record);
-        Ok(updated)
-    }
-
-    /// Read the current (decayed) reputation for a provider without mutating
-    /// state. Useful for off-chain verification and contract tests.
-    pub fn get_reputation(env: Env, provider: Address) -> Result<i128, SignalError> {
-        let schedule: DecaySchedule = env
-            .storage()
-            .instance()
-            .get(&SCHEDULE_KEY)
-            .ok_or(SignalError::NotInitialized)?;
-        let record = Self::load_reputation(&env, &provider);
-        let now = env.ledger().timestamp();
-        Ok(Self::apply_decay(&record, now, &schedule))
-    }
-
-    /// Classify an identifier as active, tombstoned, or unknown.
-    ///
-    /// A tombstone whose retention window has elapsed is treated as unknown,
-    /// so the identifier becomes reusable once the documented period passes.
-    fn record_state(env: &Env, provider: &Address) -> RecordState {
-        let meta_key = (METADATA_KEY, provider.clone());
-        if env.storage().persistent().has(&meta_key) {
-            return RecordState::Active;
-        }
-        let tomb_key = (TOMBSTONE_KEY, provider.clone());
-        if let Some(tombstone) = env
-            .storage()
-            .persistent()
-            .get::<(_, Address), Tombstone>(&tomb_key)
-        {
-            if env.ledger().timestamp() < tombstone.expires_at {
-                return RecordState::Tombstoned;
-            }
-        }
-        RecordState::Unknown
-    }
-
-    /// Compute the decayed score for a record at a given timestamp.
-    ///
-    /// Deterministic: depends only on the stored record, the timestamp, and
-    /// the configured schedule.
-    fn apply_decay(record: &ReputationRecord, now: u64, schedule: &DecaySchedule) -> i128 {
-        if now <= record.last_updated {
-            return record.score;
-        }
-        let elapsed = now - record.last_updated;
-        if elapsed <= schedule.grace_period {
-            return record.score;
-        }
-        let decayable = elapsed - schedule.grace_period;
-        if schedule.decay_interval == 0 {
-            return record.score;
-        }
-        let intervals = decayable / schedule.decay_interval;
-        if intervals == 0 {
-            return record.score;
-        }
-        // Points lost = score * rate_bps * intervals / 10_000, computed with
-        // saturating arithmetic to remain deterministic on-chain.
-        let rate = schedule.decay_rate_bps as i128;
-        let lost = record
-            .score
-            .saturating_mul(rate)
-            .saturating_mul(intervals as i128)
-            / 10_000;
-        let decayed = record.score.saturating_sub(lost);
-        Self::clamp(decayed, schedule)
-    }
-
-    /// Clamp a reputation value to the configured thresholds.
-    fn clamp(value: i128, schedule: &DecaySchedule) -> i128 {
-        if value < schedule.min_reputation {
-            schedule.min_reputation
-        } else if value > schedule.max_reputation {
-            schedule.max_reputation
-        } else {
-            value
-        }
-    }
-
-    /// Validate a decay schedule before it is stored or applied.
-    fn validate_schedule(schedule: &DecaySchedule) -> Result<(), SignalError> {
-        if schedule.decay_rate_bps > 10_000 {
-            return Err(SignalError::InvalidDecayConfig);
-        }
-        if schedule.decay_interval == 0 {
-            return Err(SignalError::InvalidDecayConfig);
-        }
-        if schedule.min_reputation > schedule.max_reputation {
-            return Err(SignalError::InvalidDecayConfig);
-        }
-        Ok(())
-    }
-
-    /// Validate provider metadata before it is stored.
-    fn validate_metadata(metadata: &String) -> Result<(), SignalError> {
-        if metadata.len() == 0 {
-            return Err(SignalError::EmptyMetadata);
-        }
-        if metadata.len() > MAX_METADATA_LEN {
-            return Err(SignalError::MetadataTooLong);
-        }
-        Ok(())
-    }
-
-    /// Load the stored reputation record for a provider, defaulting to zero.
-    fn load_reputation(env: &Env, provider: &Address) -> ReputationRecord {
-        let key = (REPUTATION_KEY, provider.clone());
-        env.storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(ReputationRecord {
-                score: 0,
-                last_updated: env.ledger().timestamp(),
-            })
-    }
-
-    /// Persist a reputation record for a provider.
-    fn store_reputation(env: &Env, provider: &Address, record: &ReputationRecord) {
-        let key = (REPUTATION_KEY, provider.clone());
-        env.storage().persistent().set(&key, record);
-    }
-}
+/* … truncated 6101 chars — edit only what you need near the top … */

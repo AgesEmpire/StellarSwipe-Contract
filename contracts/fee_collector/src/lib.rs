@@ -33,6 +33,20 @@ pub struct DustSwept {
     pub amount: i128,
 }
 
+/// Auditable record of a material contract configuration change.
+///
+/// Emitted whenever a configuration setting is updated so indexers and
+/// operators can discover the change, the prior value, the new value, and the
+/// actor that authorized it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigChanged {
+    pub setting: Symbol,
+    pub old_value: Address,
+    pub new_value: Address,
+    pub actor: Address,
+}
+
 #[contract]
 pub struct FeeCollector;
 
@@ -42,6 +56,42 @@ impl FeeCollector {
     pub fn initialize(env: Env, admin: Address) {
         env.storage().instance().set(&ADMIN_KEY, &admin);
         env.storage().instance().set(&BALANCE_KEY, &0i128);
+    }
+
+    /// Update the collector's admin authority.
+    ///
+    /// Only the current admin may rotate the admin role. The change is recorded
+    /// in a [`ConfigChanged`] event capturing the setting, prior admin, new
+    /// admin, and the authorizing actor.
+    pub fn set_admin(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), FeeCollectorError> {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(FeeCollectorError::NotInitialized)?;
+        if caller != admin {
+            return Err(FeeCollectorError::Unauthorized);
+        }
+
+        env.storage().instance().set(&ADMIN_KEY, &new_admin);
+
+        env.events().publish(
+            (symbol_short!("config_changed"),),
+            ConfigChanged {
+                setting: ADMIN_KEY,
+                old_value: admin,
+                new_value: new_admin,
+                actor: caller,
+            },
+        );
+
+        Ok(())
     }
 
     /// Record collected fees into the collector balance.
@@ -113,7 +163,7 @@ impl FeeCollector {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events as _};
 
     fn setup(env: &Env) -> (FeeCollectorClient, Address) {
         let contract_id = env.register(FeeCollector, ());
@@ -179,6 +229,50 @@ mod test {
         assert_eq!(
             client.try_sweep_dust(&admin, &destination, &DUST_THRESHOLD),
             Err(Ok(FeeCollectorError::AmountNotDust))
+        );
+    }
+
+    #[test]
+    fn emits_config_changed_on_admin_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        client.set_admin(&admin, &new_admin);
+
+        let events = env.events().all();
+        let expected = ConfigChanged {
+            setting: ADMIN_KEY,
+            old_value: admin.clone(),
+            new_value: new_admin.clone(),
+            actor: admin.clone(),
+        };
+        assert!(
+            events.iter().any(|(_, _, data)| {
+                ConfigChanged::try_from_val(&env, &data).map_or(false, |e| e == expected)
+            }),
+            "expected a ConfigChanged event for the admin setting"
+        );
+    }
+
+    #[test]
+    fn emits_no_config_changed_on_rejected_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        let attacker = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        let result = client.try_set_admin(&attacker, &new_admin);
+        assert_eq!(result, Err(Ok(FeeCollectorError::Unauthorized)));
+
+        let events = env.events().all();
+        assert!(
+            !events.iter().any(|(_, _, data)| {
+                ConfigChanged::try_from_val(&env, &data).is_ok()
+            }),
+            "no ConfigChanged event should be emitted for a rejected update"
         );
     }
 }
