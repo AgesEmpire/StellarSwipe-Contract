@@ -22,3 +22,6 @@
 
 <!-- handsoff-issue-1197 -->
 - #1197: Reject unsupported fee-on-transfer tokens during asset registration
+
+<!-- handsoff-issue-1198 -->
+- #1198: Update contract accounting state before invoking token callbacks
