@@ -23,6 +23,10 @@ soroban-sdk = { version = "23", features = ["testutils"] }
 name = "token_transfer_authorization"
 path = "tests/token_transfer_authorization.rs"
 
+[[test]]
+name = "token_response_compatibility"
+path = "tests/token_response_compatibility.rs"
+
 [[bench]]
 name = "batch_authorization"
 harness = false
