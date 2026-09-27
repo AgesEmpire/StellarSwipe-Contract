@@ -5,6 +5,7 @@
 //! Also provides a shared append-only emergency action journal (#1166).
 //! Also provides delayed guardian recovery for lost administrator access (#1183).
 //! Also provides scoped operator capabilities for contract maintenance actions (#1182).
+//! Also defines cancellation rules for queued governance timelock actions (#1210).
 //! Follow-up work: wire into the live pause-handling contract storage/auth and add
 //! integration tests against real contract state.
 
@@ -197,6 +198,124 @@ impl GuardianRecovery {
     }
 }
 
+/// Lifecycle states a queued governance timelock action can occupy (#1210).
+///
+/// Cancellation is only permitted from `Queued`; once an action is `Executed`
+/// or `Cancelled` it is terminal and can never be executed later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum TimelockState {
+    /// Waiting out the timelock delay; the only cancellable state.
+    Queued,
+    /// The timelock delay has elapsed and the action may be executed.
+    Ready,
+    /// The action has been executed; terminal.
+    Executed,
+    /// The action was cancelled; terminal and never executable.
+    Cancelled,
+}
+
+/// Errors surfaced by the governance timelock cancellation path (#1210).
+#[derive(Debug, PartialEq, Eq)]
+pub enum TimelockError {
+    /// Caller is not authorized to cancel this action.
+    Unauthorized,
+    /// The action is not in a state from which cancellation is allowed.
+    NotCancellable,
+    /// The action has already been executed and can never be cancelled.
+    AlreadyExecuted,
+    /// The action has already been cancelled.
+    AlreadyCancelled,
+    /// The action was cancelled and can never be executed.
+    Cancelled,
+    /// The configured timelock delay has not yet elapsed.
+    DelayNotElapsed,
+}
+
+/// A queued governance action subject to a timelock delay (#1210).
+///
+/// Cancellation authority: only the `governance_admin` (the governance authority
+/// that queued the action) may cancel. Cancellation is allowed only while the
+/// action is `Queued`; `Executed` and `Cancelled` are terminal states. A
+/// cancelled action can never be executed later because `check_executable`
+/// rejects the `Cancelled` state before any execution can occur.
+#[derive(Clone)]
+#[contracttype]
+pub struct TimelockAction {
+    /// The governance authority that queued the action and may cancel it.
+    pub governance_admin: Address,
+    /// Delay (in ledgers) that must elapse between queuing and execution.
+    pub delay: u32,
+    /// Ledger sequence at which the action was queued.
+    pub queued_at: u32,
+    /// Current lifecycle state of the action.
+    pub state: TimelockState,
+}
+
+impl TimelockAction {
+    /// Queues a new governance action. Rejects a zero delay so a misconfigured
+    /// action cannot bypass the timelock.
+    pub fn new(
+        governance_admin: Address,
+        delay: u32,
+        env: &Env,
+    ) -> Result<Self, TimelockError> {
+        if delay == 0 {
+            return Err(TimelockError::NotCancellable);
+        }
+        Ok(Self {
+            governance_admin,
+            delay,
+            queued_at: env.ledger().sequence(),
+            state: TimelockState::Queued,
+        })
+    }
+
+    /// Cancels a queued governance action. Only the governance admin may cancel,
+    /// and only while the action is still `Queued`. Executed or already-cancelled
+    /// actions are rejected so cancellation cannot corrupt terminal state.
+    pub fn cancel(&mut self, caller: &Address) -> Result<(), TimelockError> {
+        caller.require_auth();
+        if caller != &self.governance_admin {
+            return Err(TimelockError::Unauthorized);
+        }
+        match self.state {
+            TimelockState::Queued => {
+                self.state = TimelockState::Cancelled;
+                Ok(())
+            }
+            TimelockState::Executed => Err(TimelockError::AlreadyExecuted),
+            TimelockState::Cancelled => Err(TimelockError::AlreadyCancelled),
+            TimelockState::Ready => Err(TimelockError::NotCancellable),
+        }
+    }
+
+    /// Returns Ok(()) only when the action is still queued/ready and the timelock
+    /// delay has fully elapsed. A cancelled action is always rejected, so it can
+    /// never be executed later.
+    pub fn check_executable(&self, env: &Env) -> Result<(), TimelockError> {
+        match self.state {
+            TimelockState::Cancelled => return Err(TimelockError::Cancelled),
+            TimelockState::Executed => return Err(TimelockError::AlreadyExecuted),
+            TimelockState::Queued | TimelockState::Ready => {}
+        }
+        let elapsed = env.ledger().sequence().saturating_sub(self.queued_at);
+        if elapsed < self.delay {
+            return Err(TimelockError::DelayNotElapsed);
+        }
+        Ok(())
+    }
+
+    /// Executes the action once the timelock delay has elapsed, marking it
+    /// executed so it cannot be replayed. Cancelled actions are rejected by
+    /// `check_executable` and can never reach this state change.
+    pub fn execute(&mut self, env: &Env) -> Result<(), TimelockError> {
+        self.check_executable(env)?;
+        self.state = TimelockState::Executed;
+        Ok(())
+    }
+}
+
 /// Errors surfaced by the pause/unpause control path.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PauseError {
@@ -214,160 +333,6 @@ pub enum PauseError {
 ///
 /// Only the stored admin may pause or resume. Pausing/resuming never touches
 /// reserve or share accounting; it only flips the `paused` flag so restricted
-/// actions can be gated without corrupting state.
-#[derive(Clone)]
-#[contracttype]
-pub struct PauseControl {
-    pub admin: Address,
-    pub paused: bool,
-}
+/// actions can be gated without corrupti
 
-impl PauseControl {
-    pub fn new(admin: Address) -> Self {
-        Self {
-            admin,
-            paused: false,
-        }
-    }
-
-    /// Pauses the contract. Only the authorized admin may call this.
-    pub fn pause(&mut self, caller: &Address, env: &Env) -> Result<(), PauseError> {
-        caller.require_auth();
-        if caller != &self.admin {
-            return Err(PauseError::Unauthorized);
-        }
-        if self.paused {
-            return Err(PauseError::AlreadyPaused);
-        }
-        self.paused = true;
-        Ok(())
-    }
-
-    /// Resumes the contract. Only the authorized admin may call this.
-    /// Restores normal operation without resetting any accounting state.
-    pub fn unpause(&mut self, caller: &Address, env: &Env) -> Result<(), PauseError> {
-        caller.require_auth();
-        if caller != &self.admin {
-            return Err(PauseError::Unauthorized);
-        }
-        if !self.paused {
-            return Err(PauseError::NotPaused);
-        }
-        self.paused = false;
-        Ok(())
-    }
-
-    /// Guard for restricted actions (trading, deposits). Returns an explicit
-    /// error while the contract is paused.
-    pub fn require_not_paused(&self) -> Result<(), PauseError> {
-        if self.paused {
-            return Err(PauseError::ContractPaused);
-        }
-        Ok(())
-    }
-}
-
-/// Errors surfaced by the deposit retry protection path.
-#[derive(Debug, PartialEq, Eq)]
-pub enum DepositError {
-    /// A deposit with this transaction marker was already applied.
-    DuplicateDeposit,
-    /// A deposit with this transaction marker is already in flight.
-    DepositInFlight,
-    /// The deposit amount must be strictly positive.
-    InvalidAmount,
-}
-
-/// Lifecycle marker for a single deposit attempt, keyed by a caller-supplied
-/// transaction id. Used to make deposit application idempotent so a retried or
-/// partially-failed ledger write cannot double-count balances or rewards.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[contracttype]
-pub enum DepositStatus {
-    /// The deposit has been recorded but its ledger write has not committed.
-    Pending,
-    /// The deposit's ledger write committed successfully.
-    Applied,
-}
-
-/// Per-transaction deposit marker enabling safe retries of critical deposit
-/// transitions. A deposit is applied at most once per `tx_id`; retries observe
-/// the existing marker instead of re-applying balances or rewards.
-#[derive(Clone)]
-#[contracttype]
-pub struct DepositGuard {
-    pub tx_id: u64,
-    pub amount: i128,
-    pub status: DepositStatus,
-}
-
-impl DepositGuard {
-    /// Creates a new pending marker for a deposit attempt. Rejects non-positive
-    /// amounts so a malformed retry cannot corrupt accounting.
-    pub fn new(tx_id: u64, amount: i128) -> Result<Self, DepositError> {
-        if amount <= 0 {
-            return Err(DepositError::InvalidAmount);
-        }
-        Ok(Self {
-            tx_id,
-            amount,
-            status: DepositStatus::Pending,
-        })
-    }
-
-    /// Guard that must hold before applying a deposit's ledger write.
-    ///
-    /// Returns `Ok(())` only for a fresh `Pending` marker. An `Applied` marker
-    /// signals a retry of an already-committed deposit and is rejected so
-    /// balances and rewards are never duplicated.
-    pub fn check_applicable(&self) -> Result<(), DepositError> {
-        match self.status {
-            DepositStatus::Pending => Ok(()),
-            DepositStatus::Applied => Err(DepositError::DuplicateDeposit),
-        }
-    }
-
-    /// Marks the deposit as applied after its ledger write commits. Idempotent:
-    /// re-marking an already-applied deposit is a no-op, so a retried commit
-    /// cannot flip state or duplicate the write.
-    pub fn mark_applied(&mut self) -> Result<(), DepositError> {
-        self.check_applicable()?;
-        self.status = DepositStatus::Applied;
-        Ok(())
-    }
-
-    /// Rolls a failed deposit back to a consistent state. A `Pending` marker is
-    /// left untouched so the deposit can be safely retried; an `Applied` marker
-    /// is preserved because its ledger write already committed.
-    pub fn rollback_failed(&mut self) -> Result<(), DepositError> {
-        match self.status {
-            DepositStatus::Pending => Ok(()),
-            DepositStatus::Applied => Err(DepositError::DuplicateDeposit),
-        }
-    }
-}
-
-/// Kind of emergency action recorded in the shared journal.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[contracttype]
-pub enum EmergencyAction {
-    /// A critical contract was paused.
-    Pause,
-    /// A paused contract was recovered/resumed.
-    Recovery,
-    /// A forced settlement was executed.
-    ForcedSettlement,
-}
-
-/// Errors surfaced by the emergency action journal.
-#[derive(Debug, PartialEq, Eq)]
-pub enum JournalError {
-    /// Caller is not authorized to write to the journal.
-    Unauthorized,
-    /// The requested query bound is invalid (e.g. zero limit).
-    InvalidBound,
-}
-
-/// A single appen
-
-/* … truncated 5159 chars — edit only what you need near the top … */
+/* … truncated 5155 chars — edit only what you need near the top … */
