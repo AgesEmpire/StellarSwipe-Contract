@@ -198,6 +198,86 @@ impl ProtocolParamSchema {
     }
 }
 
+/// Maximum supported depth of nested cross-contract invocations.
+///
+/// A call chain deeper than this is rejected before any irreversible effect
+/// (state write, transfer, or event emission) is performed.
+pub const MAX_INVOCATION_DEPTH: u32 = 8;
+
+/// Error returned when a cross-contract invocation is rejected by the
+/// recursion/cycle policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationCycleError {
+    /// The call would re-enter a contract already present in the active chain.
+    ReentrantCall,
+    /// The call would exceed [`MAX_INVOCATION_DEPTH`].
+    DepthExceeded,
+}
+
+/// Guard enforcing the cross-contract invocation depth and cycle policy.
+///
+/// Call sites push the callee contract id before dispatching a cross-contract
+/// call and pop it once the call returns. Pushing a contract id that is already
+/// present in the active chain is rejected as a cycle, and pushing beyond
+/// [`MAX_INVOCATION_DEPTH`] is rejected as a depth violation. Both checks run
+/// before the caller performs any irreversible effect.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvocationGuard {
+    /// Contract ids currently active in the call chain, outermost first.
+    active: Vec<u64>,
+}
+
+impl InvocationGuard {
+    /// Create an empty guard for a fresh top-level invocation.
+    pub fn new() -> Self {
+        Self { active: Vec::new() }
+    }
+
+    /// Current depth of the active call chain.
+    pub fn depth(&self) -> u32 {
+        self.active.len() as u32
+    }
+
+    /// Whether `contract_id` is already active in the call chain.
+    pub fn is_active(&self, contract_id: u64) -> bool {
+        self.active.contains(&contract_id)
+    }
+
+    /// Check whether a cross-contract call to `contract_id` is permitted.
+    ///
+    /// Returns [`InvocationCycleError::ReentrantCall`] for a direct or indirect
+    /// cycle and [`InvocationCycleError::DepthExceeded`] when the call would
+    /// exceed [`MAX_INVOCATION_DEPTH`]. This performs no mutation, so callers
+    /// can reject a cycle before any irreversible effect.
+    pub fn check(&self, contract_id: u64) -> Result<(), InvocationCycleError> {
+        if self.is_active(contract_id) {
+            return Err(InvocationCycleError::ReentrantCall);
+        }
+        if self.depth() >= MAX_INVOCATION_DEPTH {
+            return Err(InvocationCycleError::DepthExceeded);
+        }
+        Ok(())
+    }
+
+    /// Enter a cross-contract call, enforcing the cycle and depth policy.
+    ///
+    /// On success the callee is recorded as active; call [`Self::exit`] once
+    /// the call returns. On error the guard is left unchanged.
+    pub fn enter(&mut self, contract_id: u64) -> Result<(), InvocationCycleError> {
+        self.check(contract_id)?;
+        self.active.push(contract_id);
+        Ok(())
+    }
+
+    /// Leave a cross-contract call previously entered with [`Self::enter`].
+    pub fn exit(&mut self, contract_id: u64) {
+        if self.active.last() == Some(&contract_id) {
+            self.active.pop();
+        }
+    }
+}
+
 /// Version of the normalized TTL renewal outcome event schema.
 ///
 /// Bump this whenever the fields of [`TtlRenewalOutcome`] change so that
@@ -225,114 +305,79 @@ pub struct TtlRenewalOutcome {
     pub key: String,
     /// Normalized outcome of the renewal attempt.
     pub result: TtlRenewalResult,
-    /// TTL observed before the attempt, in ledgers.
+    /// TTL (in ledgers) observed before the attempt.
     pub current_ttl: u32,
-    /// TTL below which renewal is attempted, in ledgers.
+    /// TTL (in ledgers) below which renewal is attempted.
     pub threshold: u32,
-    /// TTL requested when a renewal is performed, in ledgers.
+    /// TTL (in ledgers) requested when a renewal is performed.
     pub extend_to: u32,
 }
 
-/// Normalized result of a storage TTL renewal attempt.
+/// Normalized result of a TTL renewal attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtlRenewalResult {
-    /// The entry was already expired; renewal is impossible.
-    Expired,
-    /// The entry's TTL was above the threshold; no renewal was needed.
+    /// The key's TTL was already above the threshold; no renewal performed.
     Skipped,
-    /// The entry's TTL was extended to `extend_to`.
+    /// The key's TTL was renewed to `extend_to`.
     Renewed,
     /// The renewal attempt failed.
     Failed,
 }
 
-impl TtlRenewalOutcome {
-    /// Build a normalized outcome for a renewal attempt.
-    ///
-    /// The result is derived deterministically from the observed TTL:
-    /// an already-expired entry (`current_ttl == 0`) yields
-    /// [`TtlRenewalResult::Expired`], an entry at or above `threshold`
-    /// yields [`TtlRenewalResult::Skipped`], and anything else yields
-    /// [`TtlRenewalResult::Renewed`].
-    pub fn new(
-        key: impl Into<String>,
-        current_ttl: u32,
-        threshold: u32,
-        extend_to: u32,
-    ) -> Self {
-        let result = if current_ttl == 0 {
-            TtlRenewalResult::Expired
-        } else if current_ttl >= threshold {
-            TtlRenewalResult::Skipped
-        } else {
-            TtlRenewalResult::Renewed
-        };
-        Self {
-            version: TTL_RENEWAL_OUTCOME_EVENT_VERSION,
-            key: key.into(),
-            result,
-            current_ttl,
-            threshold,
-            extend_to,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_cycle_is_rejected() {
+        // A -> A: re-entering the same contract is a direct cycle.
+        let mut guard = InvocationGuard::new();
+        guard.enter(1).unwrap();
+        assert_eq!(guard.enter(1), Err(InvocationCycleError::ReentrantCall));
+    }
+
+    #[test]
+    fn indirect_cycle_is_rejected() {
+        // A -> B -> A: re-entering an ancestor is an indirect cycle.
+        let mut guard = InvocationGuard::new();
+        guard.enter(1).unwrap();
+        guard.enter(2).unwrap();
+        assert_eq!(guard.enter(1), Err(InvocationCycleError::ReentrantCall));
+    }
+
+    #[test]
+    fn non_cyclic_nested_call_succeeds() {
+        // A -> B -> C is a valid non-cyclic nested call chain.
+        let mut guard = InvocationGuard::new();
+        guard.enter(1).unwrap();
+        guard.enter(2).unwrap();
+        guard.enter(3).unwrap();
+        assert_eq!(guard.depth(), 3);
+        guard.exit(3);
+        guard.exit(2);
+        guard.exit(1);
+        assert_eq!(guard.depth(), 0);
+    }
+
+    #[test]
+    fn depth_limit_is_enforced() {
+        let mut guard = InvocationGuard::new();
+        for id in 0..MAX_INVOCATION_DEPTH as u64 {
+            guard.enter(id).unwrap();
         }
+        assert_eq!(
+            guard.enter(MAX_INVOCATION_DEPTH as u64),
+            Err(InvocationCycleError::DepthExceeded)
+        );
     }
 
-    /// Build a normalized outcome for a failed renewal attempt.
-    pub fn failed(
-        key: impl Into<String>,
-        current_ttl: u32,
-        threshold: u32,
-        extend_to: u32,
-    ) -> Self {
-        Self {
-            version: TTL_RENEWAL_OUTCOME_EVENT_VERSION,
-            key: key.into(),
-            result: TtlRenewalResult::Failed,
-            current_ttl,
-            threshold,
-            extend_to,
-        }
-    }
-
-    /// Whether this outcome represents an actual TTL extension.
-    pub fn is_renewed(&self) -> bool {
-        self.result == TtlRenewalResult::Renewed
-    }
-}
-
-/// A single key/value entry in contract storage.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StateEntry {
-    /// Storage key.
-    pub key: String,
-    /// Storage value.
-    pub value: String,
-}
-
-/// A captured, read-only view of contract storage.
-///
-/// A snapshot is the sole input to a migration dry-run: it is never mutated,
-/// so running a dry-run cannot write to ledger state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LedgerSnapshot {
-    /// Storage entries in canonical (sorted) key order.
-    pub entries: Vec<StateEntry>,
-}
-
-impl LedgerSnapshot {
-    /// Build a snapshot, sorting entries into canonical key order so that
-    /// downstream output is deterministic regardless of input order.
-    pub fn new(mut entries: Vec<StateEntry>) -> Self {
-        entries.sort_by(|a, b| a.key.cmp(&b.key));
-        Self { entries }
-    }
-
-    /// Look up the value stored under `key`, if present.
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.entries
-            .iter()
-            .find(|e| e.key == key)
-            .map(|e| e.value.as_str())
+    #[test]
+    fn rejected_cycle_leaves_guard_unchanged() {
+        let mut guard = InvocationGuard::new();
+        guard.enter(1).unwrap();
+        let before = guard.clone();
+        assert!(guard.enter(1).is_err());
+        assert_eq!(guard, before);
     }
 }
