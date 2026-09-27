@@ -4,6 +4,8 @@
 
 StellarSwipe is committed to ensuring the security of our smart contract platform and protecting our users' assets. We welcome the security research community to help us maintain the highest security standards.
 
+Use pashov audit to audit the repo.
+
 ---
 
 ## Table of Contents
