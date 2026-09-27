@@ -19,6 +19,10 @@ soroban-sdk = { version = "23", features = [] }
 [dev-dependencies]
 soroban-sdk = { version = "23", features = ["testutils"] }
 
+[[test]]
+name = "token_transfer_authorization"
+path = "tests/token_transfer_authorization.rs"
+
 [[bench]]
 name = "batch_authorization"
 harness = false
