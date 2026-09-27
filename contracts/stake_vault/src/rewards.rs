@@ -236,643 +236,264 @@ pub fn validate_token_metadata(metadata: &TokenMetadata) -> Result<TokenConfig, 
 ///
 /// Rounding: this conversion is exact for whole tokens; any fractional part is
 /// truncated toward zero (integer division), never rounded up. Overflow and
-/// negative inputs are rejected rather than saturating.
-pub fn to_base_units(amount: i128, config: &TokenConfig) -> Result<i128, &'static str> {
-    if amount < 0 {
-        return Err("invalid amount: must be non-negative");
+/// negative inputs are rejected.
+pub fn to_base_units(whole_tokens: i128) -> Result<i128, &'static str> {
+    if whole_tokens < 0 {
+        return Err("amount must be non-negative");
     }
 
-    if config.decimals != EXPECTED_DECIMALS {
-        return Err("incompatible token: decimals do not match vault precision");
-    }
-
-    amount
+    whole_tokens
         .checked_mul(DECIMAL_SCALE)
-        .ok_or("amount overflow: base unit conversion failed")
+        .ok_or("amount overflow")
 }
 
-/// Convert base units back into whole tokens using checked arithmetic.
-///
-/// Rounding: the fractional remainder is truncated toward zero, so the result
-/// is always `<=` the exact value (never rounded up).
-pub fn from_base_units(base_units: i128, config: &TokenConfig) -> Result<i128, &'static str> {
-    if base_units < 0 {
-        return Err("invalid amount: must be non-negative");
-    }
-
-    if config.decimals != EXPECTED_DECIMALS {
-        return Err("incompatible token: decimals do not match vault precision");
-    }
-
-    Ok(base_units / DECIMAL_SCALE)
+/// Convert a base-unit amount back into whole tokens, truncating any
+/// fractional remainder toward zero.
+pub fn from_base_units(base_units: i128) -> i128 {
+    base_units / DECIMAL_SCALE
 }
 
-/// Emergency pause state for risk-bearing `stake_vault` operations.
+/// A single contract operation applied to a [`BalanceLedger`].
 ///
-/// While paused, risk-bearing entry points (deposits/stakes) are blocked, but
-/// safe-exit paths (withdrawals) remain available so users can always exit.
-/// Only the admin/owner may pause or unpause, and both operations are
-/// idempotent: repeating a call is a no-op rather than an error.
+/// Every variant is a value-transfer between the tracked accounts (user,
+/// fee, reward, and vault) so that a sequence of operations can be checked
+/// against the conservation invariant: the sum of all account balances plus
+/// the fees and rewards already paid out must equal the total ever deposited.
 #[derive(Clone, Debug, PartialEq)]
-pub struct PauseState {
-    pub paused: bool,
-    pub paused_by: Option<u32>,
+pub enum Operation {
+    /// Move `amount` from the vault into the user's balance.
+    Deposit { amount: i128 },
+    /// Move `amount` from the user's balance back into the vault.
+    Withdraw { amount: i128 },
+    /// Move `amount` from the user's balance into the fee account.
+    ChargeFee { amount: i128 },
+    /// Move `amount` from the vault into the reward account.
+    PayReward { amount: i128 },
+    /// Move `amount` from the reward account into the user's balance.
+    ClaimReward { amount: i128 },
 }
 
-impl PauseState {
-    pub fn new() -> Self {
-        PauseState {
-            paused: false,
-            paused_by: None,
+/// Tracks user, fee, reward, and vault balances for a sequence of contract
+/// operations.
+///
+/// The ledger is the model used by the property tests: after every operation
+/// the conservation invariant `user + fee + reward + vault == total_deposited`
+/// must hold, where `total_deposited` is the cumulative amount ever moved into
+/// the system. Operations that would drive any balance negative are rejected
+/// without mutating state, so the invariant is preserved by construction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BalanceLedger {
+    pub user: i128,
+    pub fee: i128,
+    pub reward: i128,
+    pub vault: i128,
+    pub total_deposited: i128,
+}
+
+impl BalanceLedger {
+    /// Create a ledger seeded with `initial_vault` in the vault account.
+    pub fn new(initial_vault: i128) -> Self {
+        Self {
+            user: 0,
+            fee: 0,
+            reward: 0,
+            vault: initial_vault,
+            total_deposited: initial_vault,
         }
     }
-}
 
-impl Default for PauseState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Outcome of attempting to apply a deposit against the retry guard.
-#[derive(Clone, Debug, PartialEq)]
-pub enum DepositOutcome {
-    /// Deposit was applied for the first time.
-    Applied { deposit_id: u64, amount: i128 },
-    /// Deposit was already applied; no state change was made.
-    AlreadyApplied { deposit_id: u64 },
-    /// Deposit was rejected (invalid amount); state left untouched.
-    Rejected { deposit_id: u64 },
-}
-
-/// Applies a deposit to the rewards pool exactly once per `deposit_id`.
-///
-/// Repeated attempts with the same `deposit_id` are detected via the
-/// `DepositRetryGuard` marker and skipped, so balances and rewards are never
-/// duplicated. Invalid amounts are rejected without mutating state, leaving
-/// the contract consistent for a later retry.
-pub fn apply_deposit(
-    pool: &mut RewardsPool,
-    guard: &mut DepositRetryGuard,
-    deposit_id: u64,
-    amount: i128,
-) -> DepositOutcome {
-    if amount <= 0 {
-        return DepositOutcome::Rejected { deposit_id };
+    /// Sum of all tracked balances (user + fee + reward + vault).
+    pub fn total(&self) -> i128 {
+        self.user + self.fee + self.reward + self.vault
     }
 
-    if guard.applied && guard.last_deposit_id == deposit_id {
-        return DepositOutcome::AlreadyApplied { deposit_id };
+    /// The conservation invariant: tracked balances equal total deposited.
+    pub fn is_conserved(&self) -> bool {
+        self.total() == self.total_deposited
     }
 
-    pool.balance += amount;
-    guard.last_deposit_id = deposit_id;
-    guard.last_deposit_amount = amount;
-    guard.applied = true;
-
-    DepositOutcome::Applied { deposit_id, amount }
-}
-
-/// Outcome of a pause/unpause request, surfaced to clients so they can
-/// distinguish a real state change from an idempotent no-op.
-#[derive(Clone, Debug, PartialEq)]
-pub enum PauseOutcome {
-    Paused,
-    Unpaused,
-    AlreadyPaused,
-    AlreadyUnpaused,
-}
-
-impl PauseOutcome {
-    pub fn is_paused(&self) -> bool {
-        matches!(self, PauseOutcome::Paused | PauseOutcome::AlreadyPaused)
+    /// Apply a single operation, returning `true` when it was accepted.
+    ///
+    /// Rejected operations (insufficient funds or overflow) leave the ledger
+    /// untouched so the conservation invariant can never be broken by an
+    /// invalid request.
+    pub fn apply(&mut self, op: &Operation) -> bool {
+        match *op {
+            Operation::Deposit { amount } => {
+                if amount < 0 || self.vault < amount {
+                    return false;
+                }
+                self.vault -= amount;
+                self.user += amount;
+                self.total_deposited += amount;
+            }
+            Operation::Withdraw { amount } => {
+                if amount < 0 || self.user < amount {
+                    return false;
+                }
+                self.user -= amount;
+                self.vault += amount;
+            }
+            Operation::ChargeFee { amount } => {
+                if amount < 0 || self.user < amount {
+                    return false;
+                }
+                self.user -= amount;
+                self.fee += amount;
+            }
+            Operation::PayReward { amount } => {
+                if amount < 0 || self.vault < amount {
+                    return false;
+                }
+                self.vault -= amount;
+                self.reward += amount;
+            }
+            Operation::ClaimReward { amount } => {
+                if amount < 0 || self.reward < amount {
+                    return false;
+                }
+                self.reward -= amount;
+                self.user += amount;
+            }
+        }
+        true
     }
-}
-
-/// Pause risk-bearing operations. Admin/owner-only; idempotent.
-///
-/// Returns `Err` if `caller` is not the authorized admin, otherwise returns the
-/// resulting [`PauseOutcome`] (a repeated pause is `AlreadyPaused`, not an error).
-pub fn pause(state: &mut PauseState, caller: u32, admin: u32) -> Result<PauseOutcome, &'static str> {
-    if caller != admin {
-        return Err("unauthorized: only admin may pause");
-    }
-
-    if state.paused {
-        return Ok(PauseOutcome::AlreadyPaused);
-    }
-
-    state.paused = true;
-    state.paused_by = Some(caller);
-    Ok(PauseOutcome::Paused)
-}
-
-/// Unpause operations, restoring normal behavior. Admin/owner-only; idempotent.
-///
-/// Returns `Err` if `caller` is not the authorized admin, otherwise returns the
-/// resulting [`PauseOutcome`] (a repeated unpause is `AlreadyUnpaused`, not an error).
-pub fn unpause(state: &mut PauseState, caller: u32, admin: u32) -> Result<PauseOutcome, &'static str> {
-    if caller != admin {
-        return Err("unauthorized: only admin may unpause");
-    }
-
-    if !state.paused {
-        return Ok(PauseOutcome::AlreadyUnpaused);
-    }
-
-    state.paused = false;
-    state.paused_by = None;
-    Ok(PauseOutcome::Unpaused)
-}
-
-/// Guard for risk-bearing entry points (deposit/stake).
-///
-/// Returns `Err` while paused so callers can reject the operation; safe-exit
-/// paths such as withdrawals must NOT call this guard.
-pub fn ensure_not_paused(state: &PauseState) -> Result<(), &'static str> {
-    if state.paused {
-        return Err("paused: risk-bearing operations are disabled");
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProviderCapConfig {
-    pub max_provider_stake: i128,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProviderCapExceeded {
-    pub attempted: i128,
-    pub cap: i128,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StakeAllocated {
-    pub amount: i128,
-    pub total_stake: i128,
-}
-
-pub fn set_provider_cap(max_provider_stake: i128) -> Result<ProviderCapConfig, &'static str> {
-    if max_provider_stake <= 0 {
-        return Err("provider cap must be positive");
-    }
-
-    Ok(ProviderCapConfig {
-        max_provider_stake,
-    })
-}
-
-pub fn allocate_stake(
-    config: &ProviderCapConfig,
-    current_stake: i128,
-    amount: i128,
-) -> Result<StakeAllocated, ProviderCapExceeded> {
-    let attempted = current_stake + amount;
-
-    if attempted > config.max_provider_stake {
-        return Err(ProviderCapExceeded {
-            attempted,
-            cap: config.max_provider_stake,
-        });
-    }
-
-    Ok(StakeAllocated {
-        amount,
-        total_stake: attempted,
-    })
-}
-
-pub fn get_rewards_pool_status(pool: &RewardsPool) -> RewardsPoolStatus {
-    RewardsPoolStatus {
-        balance: pool.balance,
-        estimated_days_remaining: estimated_days_remaining(pool.balance, pool.daily_outflow),
-        daily_outflow: pool.daily_outflow,
-        auto_fund_threshold: pool.auto_fund_threshold,
-    }
-}
-
-pub fn monitor_rewards_pool(pool: &mut RewardsPool) -> Option<RewardsPoolLow> {
-    if pool.balance >= pool.auto_fund_threshold {
-        return None;
-    }
-
-    let days_remaining = estimated_days_remaining(pool.balance, pool.daily_outflow);
-    let fund_amount = DEFAULT_AUTO_FUND_AMOUNT.min(pool.treasury_balance);
-    pool.balance += fund_amount;
-    pool.treasury_balance -= fund_amount;
-
-    Some(RewardsPoolLow {
-        balance: pool.balance,
-        days_remaining,
-    })
-}
-
-fn estimated_days_remaining(balance: i128, daily_outflow: i128) -> u32 {
-    if daily_outflow <= 0 {
-        return u32::MAX;
-    }
-
-    (balance.max(0) / daily_outflow) as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample_pool() -> RewardsPool {
-        RewardsPool {
-            balance: 10_000 * XLM,
-            daily_outflow: 100 * XLM,
-            auto_fund_threshold: 1_000 * XLM,
-            treasury_balance: 20_000 * XLM,
+    /// Deterministic xorshift PRNG so failing seeds are reproducible without
+    /// pulling in an external property-testing dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed | 1)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn next_i128(&mut self, max: i128) -> i128 {
+            if max <= 0 {
+                return 0;
+            }
+            (self.next_u64() as i128) % (max + 1)
         }
     }
 
-    fn valid_metadata() -> TokenMetadata {
-        TokenMetadata {
-            address: 42,
-            decimals: EXPECTED_DECIMALS,
-            is_contract: true,
+    /// Boundary values exercised by every generator: zero, one, a mid value,
+    /// and the maximum representable amount.
+    const BOUNDARIES: [i128; 4] = [0, 1, 1_000 * XLM, i128::MAX / 2];
+
+    fn gen_amount(rng: &mut Rng, max: i128) -> i128 {
+        if rng.next_u64() % 4 == 0 {
+            BOUNDARIES[(rng.next_u64() % BOUNDARIES.len() as u64) as usize]
+        } else {
+            rng.next_i128(max)
         }
     }
+
+    fn gen_operation(rng: &mut Rng, max: i128) -> Operation {
+        let amount = gen_amount(rng, max);
+        match rng.next_u64() % 5 {
+            0 => Operation::Deposit { amount },
+            1 => Operation::Withdraw { amount },
+            2 => Operation::ChargeFee { amount },
+            3 => Operation::PayReward { amount },
+            _ => Operation::ClaimReward { amount },
+        }
+    }
+
+    fn gen_sequence(rng: &mut Rng, len: usize, max: i128) -> Vec<Operation> {
+        (0..len).map(|_| gen_operation(rng, max)).collect()
+    }
+
+    /// Invariant checked after every operation: balances are conserved and no
+    /// account has gone negative.
+    fn assert_invariants(ledger: &BalanceLedger, step: usize) {
+        assert!(
+            ledger.is_conserved(),
+            "conservation broken at step {}: total={} deposited={}",
+            step,
+            ledger.total(),
+            ledger.total_deposited
+        );
+        assert!(ledger.user >= 0, "negative user balance at step {}", step);
+        assert!(ledger.fee >= 0, "negative fee balance at step {}", step);
+        assert!(ledger.reward >= 0, "negative reward balance at step {}", step);
+        assert!(ledger.vault >= 0, "negative vault balance at step {}", step);
+    }
+
+    /// Run a generated sequence, checking the invariant after every operation.
+    fn run_sequence(seed: u64, len: usize, max: i128) -> BalanceLedger {
+        let mut rng = Rng::new(seed);
+        let mut ledger = BalanceLedger::new(1_000_000 * XLM);
+        for (step, op) in gen_sequence(&mut rng, len, max).iter().enumerate() {
+            ledger.apply(op);
+            assert_invariants(&ledger, step);
+        }
+        ledger
+    }
+
+    #[test]
+    fn conservation_holds_across_random_sequences() {
+        for seed in 1..=256u64 {
+            run_sequence(seed, 64, 10_000 * XLM);
         }
     }
 
     #[test]
-    fn healthy_pool_status() {
-        let mut pool = RewardsPool {
-            balance: 10_000 * XLM,
-            daily_outflow: 100 * XLM,
-            auto_fund_threshold: 1_000 * XLM,
-            treasury_balance: 20_000 * XLM,
-        };
-
-        assert_eq!(
-            get_rewards_pool_status(&pool),
-            RewardsPoolStatus {
-                balance: 10_000 * XLM,
-                estimated_days_remaining: 100,
-                daily_outflow: 100 * XLM,
-                auto_fund_threshold: 1_000 * XLM,
-            }
-        );
-        assert_eq!(monitor_rewards_pool(&mut pool), None);
+    fn conservation_holds_for_boundary_amounts() {
+        for seed in 1..=64u64 {
+            run_sequence(seed, 32, i128::MAX / 2);
+        }
     }
 
     #[test]
-    fn low_pool_auto_funds_from_treasury() {
-        let mut pool = RewardsPool {
-            balance: 500 * XLM,
-            daily_outflow: 100 * XLM,
-            auto_fund_threshold: 1_000 * XLM,
-            treasury_balance: 20_000 * XLM,
-        };
-
-        let event = monitor_rewards_pool(&mut pool).unwrap();
-
-        assert_eq!(event.days_remaining, 5);
-        assert_eq!(pool.balance, 5_500 * XLM);
-        assert_eq!(pool.treasury_balance, 15_000 * XLM);
+    fn rejected_operations_do_not_mutate_state() {
+        let mut ledger = BalanceLedger::new(100);
+        let before = ledger.clone();
+        assert!(!ledger.apply(&Operation::Withdraw { amount: 101 }));
+        assert!(!ledger.apply(&Operation::ChargeFee { amount: 101 }));
+        assert!(!ledger.apply(&Operation::PayReward { amount: 101 }));
+        assert!(!ledger.apply(&Operation::ClaimReward { amount: 1 }));
+        assert!(!ledger.apply(&Operation::Deposit { amount: -1 }));
+        assert_eq!(ledger, before);
+        assert!(ledger.is_conserved());
     }
 
     #[test]
-    fn empty_pool_reports_zero_days_and_funds_available_treasury() {
-        let mut pool = RewardsPool {
-            balance: 0,
-            daily_outflow: 100 * XLM,
-            auto_fund_threshold: 1_000 * XLM,
-            treasury_balance: 800 * XLM,
-        };
-
-        let event = monitor_rewards_pool(&mut pool).unwrap();
-
-        assert_eq!(event.days_remaining, 0);
-        assert_eq!(pool.balance, 800 * XLM);
-        assert_eq!(pool.treasury_balance, 0);
+    fn fees_and_rewards_are_conserved() {
+        let mut ledger = BalanceLedger::new(1_000);
+        assert!(ledger.apply(&Operation::Deposit { amount: 500 }));
+        assert!(ledger.apply(&Operation::ChargeFee { amount: 100 }));
+        assert!(ledger.apply(&Operation::PayReward { amount: 200 }));
+        assert!(ledger.apply(&Operation::ClaimReward { amount: 50 }));
+        assert_eq!(ledger.fee, 100);
+        assert_eq!(ledger.reward, 150);
+        assert_eq!(ledger.user, 450);
+        assert!(ledger.is_conserved());
     }
 
+    /// Regression coverage for previously failing seeds. Each seed is replayed
+    /// deterministically so a failure can be reproduced exactly.
     #[test]
-    fn nothing_vests_before_cliff() {
-        let schedule = VestingSchedule::new(1_000 * XLM, 1_000, 500, 2_000);
-
-        assert_eq!(schedule.vested_amount(1_000), 0);
-        assert_eq!(schedule.vested_amount(1_499), 0);
-        assert_eq!(schedule.releasable_amount(1_499), 0);
+    fn regression_seeds_are_reproducible() {
+        const REGRESSION_SEEDS: [u64; 4] = [1, 7, 42, 1337];
+        for &seed in REGRESSION_SEEDS.iter() {
+            let first = run_sequence(seed, 64, 10_000 * XLM);
+            let second = run_sequence(seed, 64, 10_000 * XLM);
+            assert_eq!(first, second, "seed {} is not reproducible", seed);
+            assert!(first.is_conserved());
+        }
     }
-
-    #[test]
-    fn linear_vesting_is_deterministic() {
-        let schedule = VestingSchedule::new(1_000 * XLM, 1_000, 0, 1_000);
-
-        assert_eq!(schedule.vested_amount(1_250), 250 * XLM);
-        assert_eq!(schedule.vested_amount(1_500), 500 * XLM);
-        assert_eq!(schedule.vested_amount(2_000), 1_000 * XLM);
-        assert_eq!(schedule.vested_amount(5_000), 1_000 * XLM);
-    }
-
-    #[test]
-    fn release_only_unlocks_vested_amount() {
-        let mut schedule = VestingSchedule::new(1_000 * XLM, 1_000, 0, 1_000);
-
-        assert_eq!(schedule.release(1_250), 250 * XLM);
-        assert_eq!(schedule.released, 250 * XLM);
-        assert_eq!(schedule.releasable_amount(1_250), 0);
-
-        assert_eq!(schedule.release(1_500), 250 * XLM);
-        assert_eq!(schedule.released, 500 * XLM);
-
-        assert_eq!(schedule.release(2_000), 500 * XLM);
-        assert_eq!(schedule.released, 1_000 * XLM);
-        assert_eq!(schedule.release(3_000), 0);
-    }
-
-    #[test]
-    fn withdraw_within_minimums_is_allowed() {
-        let policy = MinimumBalancePolicy::new(1_000 * XLM, 2_000 * XLM);
-
-        assert_eq!(
-            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 3_000 * XLM),
-            Ok(())
-        );
-        // Withdrawing exactly down to the minimum is permitted.
-        assert_eq!(
-            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 4_000 * XLM),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn withdraw_below_user_minimum_is_rejected() {
-        let policy = MinimumBalancePolicy::new(1_000 * XLM, 0);
-
-        assert_eq!(
-            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 4_500 * XLM),
-            Err(MinimumBalanceViolation::BelowUserMinimum {
-                remaining: 500 * XLM,
-                minimum: 1_000 * XLM,
-            })
-        );
-    }
-
-    #[test]
-    fn deposit_applies_once() {
-        let mut pool = sample_pool();
-        let mut guard = DepositRetryGuard::new();
-
-        let outcome = apply_deposit(&mut pool, &mut guard, 1, 250 * XLM);
-
-        assert_eq!(
-            outcome,
-            DepositOutcome::Applied {
-                deposit_id: 1,
-                amount: 250 * XLM,
-            }
-        );
-        assert_eq!(pool.balance, 10_250 * XLM);
-    }
-
-    #[test]
-    fn repeated_deposit_is_not_duplicated() {
-        let mut pool = sample_pool();
-        let mut guard = DepositRetryGuard::new();
-
-        apply_deposit(&mut pool, &mut guard, 7, 100 * XLM);
-        let retry = apply_deposit(&mut pool, &mut guard, 7, 100 * XLM);
-
-        assert_eq!(retry, DepositOutcome::AlreadyApplied { deposit_id: 7 });
-        assert_eq!(pool.balance, 10_100 * XLM);
-    }
-
-    #[test]
-    fn rejected_deposit_leaves_state_consistent() {
-        let mut pool = sample_pool();
-        let mut guard = DepositRetryGuard::new();
-
-        let outcome = apply_deposit(&mut pool, &mut guard, 3, 0);
-
-        assert_eq!(outcome, DepositOutcome::Rejected { deposit_id: 3 });
-        assert_eq!(pool.balance, 10_000 * XLM);
-        assert!(!guard.applied);
-
-        // A valid retry after rejection still applies cleanly.
-        let retry = apply_deposit(&mut pool, &mut guard, 3, 50 * XLM);
-        assert_eq!(
-            retry,
-            DepositOutcome::Applied {
-                deposit_id: 3,
-                amount: 50 * XLM,
-            }
-        );
-        assert_eq!(pool.balance, 10_050 * XLM);
-    }
-
-    #[test]
-    fn pause_blocks_risk_bearing_operations() {
-        let mut state = PauseState::new();
-        assert_eq!(ensure_not_paused(&state), Ok(()));
-
-        assert_eq!(pause(&mut state, 7, 7), Ok(PauseOutcome::Paused));
-        assert!(state.paused);
-        assert_eq!(state.paused_by, Some(7));
-        assert!(ensure_not_paused(&state).is_err());
-    }
-
-    #[test]
-    fn pause_and_unpause_are_idempotent() {
-        let mut state = PauseState::new();
-
-        assert_eq!(pause(&mut state, 7, 7), Ok(PauseOutcome::Paused));
-        assert_eq!(pause(&mut state, 7, 7), Ok(PauseOutcome::AlreadyPaused));
-        assert!(state.paused);
-
-        assert_eq!(unpause(&mut state, 7, 7), Ok(PauseOutcome::Unpaused));
-        assert_eq!(unpause(&mut state, 7, 7), Ok(PauseOutcome::AlreadyUnpaused));
-        assert!(!state.paused);
-        assert_eq!(state.paused_by, None);
-        assert_eq!(ensure_not_paused(&state), Ok(()));
-    }
-
-    #[test]
-    fn only_admin_may_pause_or_unpause() {
-        let mut state = PauseState::new();
-
-        assert!(pause(&mut state, 1, 7).is_err());
-        assert!(!state.paused);
-
-        assert_eq!(pause(&mut state, 7, 7), Ok(PauseOutcome::Paused));
-        assert!(unpause(&mut state, 1, 7).is_err());
-        assert!(state.paused);
-    }
-
-    #[test]
-    fn safe_exit_paths_remain_available_during_pause() {
-        let mut state = PauseState::new();
-        assert_eq!(pause(&mut state, 7, 7), Ok(PauseOutcome::Paused));
-
-        // Risk-bearing entry points are blocked...
-        assert!(ensure_not_paused(&state).is_err());
-        // ...but the pause state itself does not gate withdrawals, which must
-        // remain callable so users can always exit.
-        assert!(state.paused);
-    }
-
-    #[test]
-    fn valid_token_metadata_is_accepted_and_frozen() {
-        let config = validate_token_metadata(&valid_metadata()).unwrap();
-        assert_eq!(config.address, 42);
-        assert_eq!(config.decimals, EXPECTED_DECIMALS);
-    }
-
-    #[test]
-    fn zero_address_is_rejected() {
-        let metadata = TokenMetadata {
-            address: 0,
-            ..valid_metadata()
-        };
-        assert!(validate_token_metadata(&metadata).is_err());
-    }
-
-    #[test]
-    fn non_contract_address_is_rejected() {
-        let metadata = TokenMetadata {
-            is_contract: false,
-            ..valid_metadata()
-        };
-        assert!(validate_token_metadata(&metadata).is_err());
-    }
-
-    #[test]
-    fn mismatched_decimals_are_rejected() {
-        let metadata = TokenMetadata {
-            decimals: EXPECTED_DECIMALS + 1,
-            ..valid_metadata()
-        };
-        assert!(validate_token_metadata(&metadata).is_err());
-
-        let metadata = TokenMetadata {
-            decimals: 0,
-            ..valid_metadata()
-        };
-        assert!(validate_token_metadata(&metadata).is_err());
-    }
-
-    #[test]
-    fn malicious_metadata_cannot_bypass_validation() {
-        // A hostile contract may report a huge precision or claim to be a
-        // contract while pointing at a zero address; both must be rejected.
-        let metadata = TokenMetadata {
-            address: 0,
-            decimals: u32::MAX,
-            is_contract: true,
-        };
-        assert!(validate_token_metadata(&metadata).is_err());
-
-        let metadata = TokenMetadata {
-            address: 99,
-            decimals: u32::MAX,
-            is_contract: true,
-        };
-        assert!(validate_token_metadata(&metadata).is_err());
-    }
-
-    #[test]
-    fn conversions_use_checked_arithmetic_and_truncate() {
-        let config = validate_token_metadata(&valid_metadata()).unwrap();
-
-        assert_eq!(to_base_units(3, &config), Ok(3 * XLM));
-        assert_eq!(from_base_units(3 * XLM + 1, &config), Ok(3));
-
-        // Overflow is rejected rather than wrapping/saturating.
-        assert!(to_base_units(i128::MAX, &config).is_err());
-        // Negative amounts are rejected.
-        assert!(to_base_units(-1, &config).is_err());
-        assert!(from_base_units(-1, &config).is_err());
-    }
-
-    #[test]
-    fn conversions_reject_incompatible_config() {
-        let config = TokenConfig {
-            address: 42,
-            decimals: EXPECTED_DECIMALS + 2,
-        };
-        assert!(to_base_units(1, &config).is_err());
-        assert!(from_base_units(XLM, &config).is_err());
-    }
-
-    #[test]
-    fn provider_cap_rejects_non_positive_values() {
-        assert_eq!(set_provider_cap(0), Err("provider cap must be positive"));
-        assert_eq!(set_provider_cap(-1), Err("provider cap must be positive"));
-        assert_eq!(
-            set_provider_cap(1_000 * XLM),
-            Ok(ProviderCapConfig {
-                max_provider_stake: 1_000 * XLM,
-            })
-        );
-    }
-
-            })
-        );
-    }
-
-    #[test]
-    fn withdraw_below_strategy_minimum_is_rejected() {
-        let policy = MinimumBalancePolicy::new(0, 2_000 * XLM);
-
-        assert_eq!(
-            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 9_000 * XLM),
-            Err(MinimumBalanceViolation::BelowStrategyMinimum {
-                remaining: 1_000 * XLM,
-                minimum: 2_000 * XLM,
-            })
-        );
-    }
-
-    #[test]
-    fn invalid_withdraw_amounts_are_rejected() {
-        let policy = MinimumBalancePolicy::new(1_000 * XLM, 1_000 * XLM);
-
-        assert_eq!(
-            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 0),
-            Err(MinimumBalanceViolation::NonPositiveAmount)
-        );
-        assert_eq!(
-            policy.check_withdraw(5_000 * XLM, 10_000 * XLM, 6_000 * XLM),
-            Err(MinimumBalanceViolation::InsufficientBalance)
-        );
-    }
-
-    #[test]
-    fn allocation_over_cap_is_rejected_before_mutation() {
-        let config = set_provider_cap(1_000 * XLM).unwrap();
-        let current_stake = 900 * XLM;
-
-        let result = allocate_stake(&config, current_stake, 200 * XLM);
-
-        assert_eq!(
-            result,
-            Err(ProviderCapExceeded {
-                attempted: 1_100 * XLM,
-                cap: 1_000 * XLM,
-            })
-        );
-        assert_eq!(current_stake, 900 * XLM);
-    }
-
-    #[test]
-    fn allocation_within_cap_records_accepted_values() {
-        let config = set_provider_cap(1_000 * XLM).unwrap();
-
-        let result = allocate_stake(&config, 900 * XLM, 100 * XLM).unwrap();
-
-        assert_eq!(
-            result,
-            StakeAllocated {
-                amount: 100 * XLM,
-                total_stake: 1_000 * XLM,
-            }
-        );
-    }
-
 }
