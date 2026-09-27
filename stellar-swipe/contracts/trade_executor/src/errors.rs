@@ -110,6 +110,14 @@ pub enum ContractError {
     UnsupportedPair = 37,
     /// No asset registry is configured, so the pair cannot be validated (Issue #992).
     AssetRegistryNotConfigured = 38,
+    /// Issue #1001: a token or cross-contract invocation (router
+    /// approve/swap) failed for a reason other than authorization, balance,
+    /// or allowance. See `shared::token_error` for the classification
+    /// policy.
+    TokenOperationFailed = 39,
+    /// Issue #1001: an allowance the executor granted to a router (or a
+    /// router-required allowance) was insufficient or expired.
+    InsufficientAllowance = 40,
 }
 
 impl ContractError {
@@ -214,6 +222,30 @@ impl ContractError {
             ContractError::AssetRegistryNotConfigured => {
                 "no asset registry is configured; cannot validate the asset pair"
             }
+            ContractError::TokenOperationFailed => {
+                "token or router invocation failed (invalid request, overflow, or host abort)"
+            }
+            ContractError::InsufficientAllowance => {
+                "token allowance granted to the router was insufficient or expired"
+            }
+        }
+    }
+}
+
+/// Maps the shared token/cross-contract invocation failure classification
+/// (Issue #1001) onto this contract's stable error codes. Every non-success
+/// outcome from a token or router invocation must flow through here rather
+/// than being treated as `Ok`.
+impl From<shared::TokenFailure> for ContractError {
+    fn from(failure: shared::TokenFailure) -> Self {
+        match failure {
+            shared::TokenFailure::Unauthorized => ContractError::Unauthorized,
+            shared::TokenFailure::InsufficientBalance => ContractError::InsufficientBalance,
+            shared::TokenFailure::InsufficientAllowance => ContractError::InsufficientAllowance,
+            shared::TokenFailure::InvalidRequest
+            | shared::TokenFailure::Overflow
+            | shared::TokenFailure::OtherContractError(_)
+            | shared::TokenFailure::HostError => ContractError::TokenOperationFailed,
         }
     }
 }

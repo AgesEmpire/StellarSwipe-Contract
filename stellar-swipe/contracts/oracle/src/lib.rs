@@ -13,6 +13,7 @@ mod external_adapter;
 mod freshness_policy;
 mod history;
 mod multi_hop;
+mod observation;
 mod price_cb;
 mod quorum;
 mod reputation;
@@ -472,10 +473,23 @@ impl OracleContract {
             oracle: oracle.clone(),
             price,
             timestamp: env.ledger().timestamp(),
+            ledger_sequence: env.ledger().sequence(),
         };
 
+        // #1212: one sample per source per round, identified by
+        // (oracle, ledger_sequence). A replay is rejected; a later
+        // observation supersedes the source's earlier one.
         let mut submissions = Self::get_price_submissions(&env);
-        submissions.push_back(submission);
+        match observation::admit(
+            submissions
+                .iter()
+                .map(|s| (s.oracle, s.ledger_sequence as u64)),
+            &oracle,
+            submission.ledger_sequence as u64,
+        )? {
+            observation::Admission::Append => submissions.push_back(submission),
+            observation::Admission::Replace(i) => submissions.set(i, submission),
+        }
         env.storage()
             .instance()
             .set(&StorageKey::PriceSubmissions, &submissions);
@@ -804,6 +818,7 @@ impl OracleContract {
                 timestamp: feed.timestamp,
                 source: env.current_contract_address(),
                 confidence: 100,
+                ledger_sequence: env.ledger().sequence(),
             });
         }
 
@@ -1031,10 +1046,23 @@ impl OracleContract {
             }
         }
 
+        // #1212: one sample per source, identified by (source, ledger_sequence).
+        // Decided before the deviation check so a replay never influences it.
+        let ledger_sequence = env.ledger().sequence();
+        let admission = observation::admit(
+            fresh.iter().map(|p| (p.source, p.ledger_sequence as u64)),
+            &source,
+            ledger_sequence as u64,
+        )?;
+
         // #864: compute cross-source deviation (including the new quote) and
         // reject before persisting if it exceeds the hard reject threshold.
+        // A superseded observation from the same source is excluded.
         let mut source_prices: Vec<(Address, i128)> = Vec::new(&env);
         for i in 0..fresh.len() {
+            if admission == observation::Admission::Replace(i) {
+                continue;
+            }
             let p = fresh.get(i).unwrap();
             source_prices.push_back((p.source, p.price));
         }
@@ -1047,8 +1075,12 @@ impl OracleContract {
             timestamp: now,
             source,
             confidence,
+            ledger_sequence,
         };
-        fresh.push_back(new_entry);
+        match admission {
+            observation::Admission::Append => fresh.push_back(new_entry),
+            observation::Admission::Replace(i) => fresh.set(i, new_entry),
+        }
 
         // Cache management: Keep prices for the configured freshness window.
         env.storage().temporary().set(&key, &fresh);
@@ -1158,3 +1190,6 @@ mod test_admin_transfer;
 
 #[cfg(test)]
 mod test_price_cb;
+
+#[cfg(test)]
+mod test_observation_integrity;

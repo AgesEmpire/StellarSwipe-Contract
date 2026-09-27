@@ -18,6 +18,9 @@ pub struct PriceSubmission {
     pub oracle: Address,
     pub price: i128,
     pub timestamp: u64,
+    /// Ledger sequence the observation was recorded at. Together with
+    /// `oracle` it uniquely identifies the observation (Issue #1212).
+    pub ledger_sequence: u32,
 }
 
 #[contracttype]
@@ -28,6 +31,9 @@ pub struct PriceData {
     pub timestamp: u64,
     pub source: Address,
     pub confidence: u32,
+    /// Ledger sequence the observation was recorded at. Together with
+    /// `source` it uniquely identifies the observation (Issue #1212).
+    pub ledger_sequence: u32,
 }
 
 #[contracttype]

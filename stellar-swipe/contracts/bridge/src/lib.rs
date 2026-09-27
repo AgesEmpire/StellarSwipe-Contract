@@ -60,6 +60,24 @@ pub enum BridgeError {
     ContractPaused = 20,
     /// Token metadata (decimals, symbol, or name) is invalid or missing.
     InvalidTokenMetadata = 21,
+    /// Message was already consumed on this deployment — replay blocked (Issue #988).
+    MessageAlreadyConsumed = 22,
+    /// Withdrawal exceeds the per-route message cap (Issue #989).
+    PerRouteLimitExceeded = 23,
+    /// Aggregate withdrawal volume within the route window exceeded (Issue #989).
+    AggregateWindowLimitExceeded = 24,
+    /// Caller lacks authority to change withdrawal route limits (Issue #989).
+    LimitChangeUnauthorized = 25,
+    /// Transfer is in a permanently failed state and cannot be retried (Issue #990).
+    TransferPermanentlyFailed = 26,
+    /// Transfer is not in a retryable state (Issue #990).
+    TransferNotRetryable = 27,
+    /// The bridge message's validity window has ended (`ledger timestamp >=
+    /// expires_at`); it can no longer be approved or executed (Issue #1217).
+    MessageExpired = 28,
+    /// The requested message expiry is beyond `MAX_MESSAGE_VALIDITY_SECONDS`
+    /// from the current ledger time (Issue #1217).
+    InvalidMessageExpiry = 29,
 }
 
 impl BridgeError {
@@ -124,6 +142,28 @@ impl BridgeError {
             BridgeError::ContractPaused => "bridge is paused (governance-driven emergency pause)",
             BridgeError::InvalidTokenMetadata => {
                 "token metadata (decimals, symbol, or name) is invalid or missing"
+            }
+            BridgeError::MessageAlreadyConsumed => {
+                "message was already consumed on this deployment; replay rejected"
+            }
+            BridgeError::PerRouteLimitExceeded => {
+                "withdrawal exceeds the per-message limit configured for this route"
+            }
+            BridgeError::AggregateWindowLimitExceeded => {
+                "withdrawal would exceed the aggregate volume limit for this route window"
+            }
+            BridgeError::LimitChangeUnauthorized => {
+                "caller is not authorized to change withdrawal route limits"
+            }
+            BridgeError::TransferPermanentlyFailed => {
+                "transfer is permanently failed and cannot be retried"
+            }
+            BridgeError::TransferNotRetryable => "transfer is not in a retryable state",
+            BridgeError::MessageExpired => {
+                "bridge message validity window has ended; it cannot be approved or executed"
+            }
+            BridgeError::InvalidMessageExpiry => {
+                "requested message expiry exceeds the maximum allowed validity window"
             }
         }
     }
@@ -205,6 +245,13 @@ pub struct BridgeTransfer {
     pub failure_reason: Option<String>,
     /// `true` when the failure is transient and a retry may succeed (Issue #990).
     pub retryable: bool,
+    /// Ledger timestamp (seconds) at which this message stops being valid
+    /// (Issue #1217). Fixed when the message is registered and included in
+    /// [`BridgeContract::get_transfer_digest`], so validator signatures are
+    /// bound to it. The message is executable only while
+    /// `ledger timestamp < expires_at`. `0` means no expiry (outbound
+    /// burn/unlock requests, whose wrapped balance is already burnt).
+    pub expires_at: u64,
 }
 
 #[contracttype]
@@ -257,9 +304,23 @@ pub enum DataKey {
     /// Issue #865: central governance contract address authorized to call
     /// `apply_governance_pause`.
     GovernanceAddress,
+    /// Unique deployment identifier for cross-deployment replay protection (Issue #988).
+    DeploymentId,
+    /// Consumed message hash: (deployment_id, source_chain, source_tx_hash, source_nonce) -> true.
+    ConsumedMessage(String),
+    /// Per-route withdrawal config keyed by route identifier (Issue #989).
+    WithdrawalRouteConfig(ChainId, ChainId, String),
+    /// Rolling withdrawal window for a route (Issue #989).
+    WithdrawalWindow(ChainId, ChainId, String),
 }
 
 const DAY_SECONDS: u64 = 86_400;
+
+/// Validity window applied to inbound lock/mint messages registered without an
+/// explicit expiry (Issue #1217).
+pub const DEFAULT_MESSAGE_VALIDITY_SECONDS: u64 = DAY_SECONDS;
+/// Upper bound on how far in the future a message expiry may be set (Issue #1217).
+pub const MAX_MESSAGE_VALIDITY_SECONDS: u64 = 7 * DAY_SECONDS;
 
 pub mod analytics;
 pub mod fees;
@@ -385,6 +446,8 @@ impl BridgeContract {
         Ok(())
     }
 
+    /// Register an inbound lock/mint message with the default validity window
+    /// (`DEFAULT_MESSAGE_VALIDITY_SECONDS` from the current ledger time).
     pub fn initiate_lock_mint(
         env: Env,
         user: Address,
@@ -397,90 +460,70 @@ impl BridgeContract {
         source_nonce: u64,
         destination_recipient: String,
     ) -> Result<u64, BridgeError> {
-        if is_paused(&env) {
-            return Err(BridgeError::ContractPaused);
-        }
-        if !cfg!(test) {
-            user.require_auth();
-        }
-        // ── #669: allowlist check ─────────────────────────────────────────────
-        ensure_chain_allowed(&env, destination_chain)?;
-        validate_amount_and_limits(&env, amount, source_chain, destination_chain, wrapped_asset.clone())?;
-        ensure_wrapped_asset_exists(&env, wrapped_asset.clone())?;
-
-        // ── #988: domain-separated replay protection ─────────────────────────
-        // Build a message key that includes the deployment identifier so a
-        // payload valid on one deployment cannot be replayed on a sibling.
-        let deployment_id: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::DeploymentId)
-            .expect("deployment id not set");
-        let msg_key = build_consumed_message_key(
-            &env,
-            &deployment_id,
-            source_chain,
-            &source_tx_hash,
-            source_nonce,
-        );
-
-        // Legacy ReplayLock check (backward compat).
-        if env.storage().persistent().has(&DataKey::ReplayLock(
-            source_chain,
-            source_tx_hash.clone(),
-            source_nonce,
-        )) {
-            return Err(BridgeError::ReplayDetected);
-        }
-        // New domain-separated consumed check (Issue #988).
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::ConsumedMessage(msg_key.clone()))
-        {
-            return Err(BridgeError::MessageAlreadyConsumed);
-        }
-
-        let mut config = get_config(&env)?;
-        let transfer_id = config.next_transfer_id;
-        config.next_transfer_id += 1;
-
-        let transfer = BridgeTransfer {
-            id: transfer_id,
-            kind: TransferKind::LockMint,
+        let expires_at = env
+            .ledger()
+            .timestamp()
+            .saturating_add(DEFAULT_MESSAGE_VALIDITY_SECONDS);
+        initiate_lock_mint_inner(
+            env,
             user,
             source_chain,
             destination_chain,
             source_asset,
             wrapped_asset,
             amount,
-            source_tx_hash: source_tx_hash.clone(),
+            source_tx_hash,
             source_nonce,
             destination_recipient,
-            approvals: Vec::new(&env),
-            status: TransferStatus::PendingValidators,
-            created_at: env.ledger().timestamp(),
-            executed_at: None,
-            failure_reason: None,
-            retryable: false,
-        };
+            expires_at,
+        )
+    }
 
-        env.storage().instance().set(&DataKey::Config, &config);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Transfer(transfer_id), &transfer);
-        env.storage().persistent().set(
-            &DataKey::ReplayLock(source_chain, source_tx_hash, source_nonce),
-            &true,
-        );
-
-        #[allow(deprecated)]
-        env.events().publish(
-            (Symbol::new(&env, "lock_mint_initiated"), transfer_id),
+    /// Register an inbound lock/mint message whose expiry comes from the signed
+    /// source-chain message (Issue #1217).
+    ///
+    /// # Errors
+    /// - [`BridgeError::MessageExpired`] — `expires_at <= ledger timestamp`.
+    /// - [`BridgeError::InvalidMessageExpiry`] — `expires_at` is more than
+    ///   `MAX_MESSAGE_VALIDITY_SECONDS` in the future.
+    pub fn initiate_lock_mint_with_expiry(
+        env: Env,
+        user: Address,
+        source_chain: ChainId,
+        destination_chain: ChainId,
+        source_asset: String,
+        wrapped_asset: String,
+        amount: i128,
+        source_tx_hash: String,
+        source_nonce: u64,
+        destination_recipient: String,
+        expires_at: u64,
+    ) -> Result<u64, BridgeError> {
+        initiate_lock_mint_inner(
+            env,
+            user,
+            source_chain,
+            destination_chain,
+            source_asset,
+            wrapped_asset,
             amount,
-        );
+            source_tx_hash,
+            source_nonce,
+            destination_recipient,
+            expires_at,
+        )
+    }
 
-        Ok(transfer_id)
+    /// Canonical digest of a bridge message that validators sign off-chain.
+    /// Covers the deployment id, route, source tx hash/nonce, user, asset,
+    /// amount, recipient and `expires_at`, so an approval cannot be reused
+    /// for the same message with a different validity window (Issue #1217).
+    pub fn get_transfer_digest(
+        env: Env,
+        transfer_id: u64,
+    ) -> Result<soroban_sdk::BytesN<32>, BridgeError> {
+        let transfer = get_transfer(&env, transfer_id)?;
+        Ok(transfer_message_digest(&env, &transfer))
     }
 
     pub fn approve_lock_mint(
@@ -498,6 +541,7 @@ impl BridgeContract {
         if transfer.kind != TransferKind::LockMint || transfer.status == TransferStatus::Completed {
             return Err(BridgeError::InvalidOperation);
         }
+        ensure_not_expired(&env, &transfer)?;
 
         validators::verify_and_record_approval(
             &env,
@@ -548,6 +592,8 @@ impl BridgeContract {
         if transfer.status != TransferStatus::ReadyToExecute {
             return Err(BridgeError::NotEnoughValidatorApprovals);
         }
+        // #1217: an expired message must not mint or touch any accounting.
+        ensure_not_expired(&env, &transfer)?;
 
         let balance_key =
             DataKey::WrappedBalance(transfer.user.clone(), transfer.wrapped_asset.clone());
@@ -657,6 +703,7 @@ impl BridgeContract {
             executed_at: None,
             failure_reason: None,
             retryable: false,
+            expires_at: 0,
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
@@ -1295,6 +1342,164 @@ impl BridgeContract {
         );
         Ok(())
     }
+}
+
+/// Shared body of [`BridgeContract::initiate_lock_mint`] and
+/// [`BridgeContract::initiate_lock_mint_with_expiry`].
+fn initiate_lock_mint_inner(
+    env: Env,
+    user: Address,
+    source_chain: ChainId,
+    destination_chain: ChainId,
+    source_asset: String,
+    wrapped_asset: String,
+    amount: i128,
+    source_tx_hash: String,
+    source_nonce: u64,
+    destination_recipient: String,
+    expires_at: u64,
+) -> Result<u64, BridgeError> {
+    if is_paused(&env) {
+        return Err(BridgeError::ContractPaused);
+    }
+    if !cfg!(test) {
+        user.require_auth();
+    }
+    // ── #1217: reject an already-expired or unbounded validity window before
+    // any limit accounting or replay locks are written.
+    validate_message_expiry(&env, expires_at)?;
+    // ── #669: allowlist check ─────────────────────────────────────────────
+    ensure_chain_allowed(&env, destination_chain)?;
+    validate_amount_and_limits(
+        &env,
+        amount,
+        source_chain,
+        destination_chain,
+        wrapped_asset.clone(),
+    )?;
+    ensure_wrapped_asset_exists(&env, wrapped_asset.clone())?;
+
+    // ── #988: domain-separated replay protection ─────────────────────────
+    // Build a message key that includes the deployment identifier so a
+    // payload valid on one deployment cannot be replayed on a sibling.
+    let deployment_id: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::DeploymentId)
+        .expect("deployment id not set");
+    let msg_key = build_consumed_message_key(
+        &env,
+        &deployment_id,
+        source_chain,
+        &source_tx_hash,
+        source_nonce,
+    );
+
+    // Legacy ReplayLock check (backward compat).
+    if env.storage().persistent().has(&DataKey::ReplayLock(
+        source_chain,
+        source_tx_hash.clone(),
+        source_nonce,
+    )) {
+        return Err(BridgeError::ReplayDetected);
+    }
+    // New domain-separated consumed check (Issue #988).
+    if env
+        .storage()
+        .persistent()
+        .has(&DataKey::ConsumedMessage(msg_key.clone()))
+    {
+        return Err(BridgeError::MessageAlreadyConsumed);
+    }
+
+    let mut config = get_config(&env)?;
+    let transfer_id = config.next_transfer_id;
+    config.next_transfer_id += 1;
+
+    let transfer = BridgeTransfer {
+        id: transfer_id,
+        kind: TransferKind::LockMint,
+        user,
+        source_chain,
+        destination_chain,
+        source_asset,
+        wrapped_asset,
+        amount,
+        source_tx_hash: source_tx_hash.clone(),
+        source_nonce,
+        destination_recipient,
+        approvals: Vec::new(&env),
+        status: TransferStatus::PendingValidators,
+        created_at: env.ledger().timestamp(),
+        executed_at: None,
+        failure_reason: None,
+        retryable: false,
+        expires_at,
+    };
+
+    env.storage().instance().set(&DataKey::Config, &config);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Transfer(transfer_id), &transfer);
+    env.storage().persistent().set(
+        &DataKey::ReplayLock(source_chain, source_tx_hash, source_nonce),
+        &true,
+    );
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (Symbol::new(&env, "lock_mint_initiated"), transfer_id),
+        amount,
+    );
+
+    Ok(transfer_id)
+}
+
+/// Reject a requested expiry that is not strictly in the future or that is
+/// further out than `MAX_MESSAGE_VALIDITY_SECONDS` (Issue #1217).
+fn validate_message_expiry(env: &Env, expires_at: u64) -> Result<(), BridgeError> {
+    let now = env.ledger().timestamp();
+    if expires_at <= now {
+        return Err(BridgeError::MessageExpired);
+    }
+    if expires_at - now > MAX_MESSAGE_VALIDITY_SECONDS {
+        return Err(BridgeError::InvalidMessageExpiry);
+    }
+    Ok(())
+}
+
+/// Fail with [`BridgeError::MessageExpired`] once the ledger time reaches the
+/// transfer's `expires_at` (Issue #1217). Must run before any state mutation.
+fn ensure_not_expired(env: &Env, transfer: &BridgeTransfer) -> Result<(), BridgeError> {
+    if transfer.expires_at != 0 && env.ledger().timestamp() >= transfer.expires_at {
+        return Err(BridgeError::MessageExpired);
+    }
+    Ok(())
+}
+
+/// SHA-256 over the fields a validator attests to, including `expires_at`
+/// (Issue #1217).
+fn transfer_message_digest(env: &Env, transfer: &BridgeTransfer) -> soroban_sdk::BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let deployment_id: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::DeploymentId)
+        .expect("deployment id not set");
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&deployment_id.to_xdr(env));
+    payload.append(&transfer.id.to_xdr(env));
+    payload.append(&(transfer.kind as u32).to_xdr(env));
+    payload.append(&(transfer.source_chain as u32).to_xdr(env));
+    payload.append(&(transfer.destination_chain as u32).to_xdr(env));
+    payload.append(&transfer.source_tx_hash.clone().to_xdr(env));
+    payload.append(&transfer.source_nonce.to_xdr(env));
+    payload.append(&transfer.user.clone().to_xdr(env));
+    payload.append(&transfer.wrapped_asset.clone().to_xdr(env));
+    payload.append(&transfer.amount.to_xdr(env));
+    payload.append(&transfer.destination_recipient.clone().to_xdr(env));
+    payload.append(&transfer.expires_at.to_xdr(env));
+    env.crypto().sha256(&payload).into()
 }
 
 fn get_config(env: &Env) -> Result<BridgeConfig, BridgeError> {
@@ -2371,3 +2576,6 @@ mod test {
 
 #[cfg(test)]
 mod test_health;
+
+#[cfg(test)]
+mod test_message_expiry;

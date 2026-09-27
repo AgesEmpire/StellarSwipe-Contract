@@ -64,6 +64,13 @@ pub enum OracleError {
     LowConfidence = 28,
     /// Issue #864: cross-source deviation exceeded the configured hard reject threshold.
     DeviationRejected = 29,
+    /// An observation with the same `(source, sequence)` identity — or an
+    /// older sequence — was already recorded for this aggregation round, so it
+    /// cannot count as an independent sample (Issue #1212).
+    DuplicateObservation = 30,
+    /// Observation timestamp is later than the current ledger timestamp
+    /// (Issue #1213).
+    FutureTimestamp = 31,
 }
 
 impl OracleError {
@@ -136,6 +143,12 @@ impl OracleError {
             }
             OracleError::DeviationRejected => {
                 "cross-source price deviation exceeded the configured hard reject threshold"
+            }
+            OracleError::DuplicateObservation => {
+                "observation from this source at this sequence was already recorded"
+            }
+            OracleError::FutureTimestamp => {
+                "observation timestamp is later than the current ledger timestamp"
             }
         }
     }

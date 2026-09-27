@@ -2200,14 +2200,14 @@ impl TradeExecutorContract {
     /// - `from_token`: SEP-41 token to sell.
     /// - `to_token`: SEP-41 token to buy.
     /// - `amount`: Amount of `from_token` to sell (must be > 0).
-    /// - `min_received`: Minimum acceptable amount of `to_token` (must be >= 0).
+    /// - `min_received`: Minimum acceptable amount of `to_token` (must be > 0).
     ///
     /// # Returns
     /// Actual amount of `to_token` received.
     ///
     /// # Errors
     /// - [`ContractError::NotInitialized`] — SDEX router not configured.
-    /// - [`ContractError::InvalidAmount`] — amount <= 0 or min_received < 0.
+    /// - [`ContractError::InvalidAmount`] — amount <= 0 or min_received <= 0.
     /// - [`ContractError::SlippageExceeded`] — actual received < min_received.
     /// - [`ContractError::AssetNotRegistered`] — an asset is not in the configured registry.
     /// - [`ContractError::IdenticalAssets`] — both tokens are the same asset.
@@ -2250,7 +2250,8 @@ impl TradeExecutorContract {
     /// Actual amount of `to_token` received.
     ///
     /// # Errors
-    /// - [`ContractError::InvalidAmount`] — amount <= 0 or slippage calculation overflows.
+    /// - [`ContractError::InvalidAmount`] — amount <= 0, slippage calculation overflows,
+    ///   or `max_slippage_bps >= 10_000` (a zero minimum output is not allowed).
     /// - [`ContractError::NotInitialized`] — SDEX router not configured.
     /// - [`ContractError::SlippageExceeded`] — actual received < computed min_received.
     pub fn swap_with_slippage(

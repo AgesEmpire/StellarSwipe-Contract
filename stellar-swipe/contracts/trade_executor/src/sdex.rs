@@ -12,6 +12,13 @@
 //! 3. Verifies **actual** credit on the output SAC via balance delta (not only the
 //!    return value), and reverts with [`crate::errors::ContractError::SlippageExceeded`]
 //!    when `actual_received < min_received`.
+//!
+//! # Minimum output (Issue #1215)
+//! Every settlement requires a caller-provided `min_received > 0`; a zero floor
+//! is rejected with [`crate::errors::ContractError::InvalidAmount`] because it
+//! would let a zero-output fill settle silently. The check runs after the
+//! router call inside the same invocation, so returning `Err` rolls back the
+//! approval, both token transfers and any accounting the caller performed.
 
 use soroban_sdk::{token, Address, Env, IntoVal, Symbol, Val, Vec};
 
@@ -129,6 +136,11 @@ pub fn min_received_from_slippage(amount: i128, max_slippage_bps: u32) -> Option
 ///
 /// The router should `transfer_from` `amount_in` from `pull_from` and `transfer`
 /// output tokens to `recipient`.
+///
+/// # Errors
+/// - [`ContractError::InvalidAmount`] — `amount <= 0` or `min_received <= 0`.
+/// - [`ContractError::SlippageExceeded`] — credited output `< min_received`
+///   (including a zero-output fill).
 pub fn execute_sdex_swap(
     env: &Env,
     sdex_router: &Address,
@@ -137,7 +149,8 @@ pub fn execute_sdex_swap(
     amount: i128,
     min_received: i128,
 ) -> Result<i128, ContractError> {
-    if amount <= 0 || min_received < 0 {
+    // Issue #1215: a caller-provided, strictly positive minimum is mandatory.
+    if amount <= 0 || min_received <= 0 {
         return Err(ContractError::InvalidAmount);
     }
 

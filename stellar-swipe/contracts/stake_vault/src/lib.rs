@@ -397,6 +397,19 @@ pub enum StakeVaultError {
     /// Rejected before any storage write or token transfer — no partial state
     /// change occurs (unlike the previous silent-clamp-to-`i128::MAX` behavior).
     StakeOverflow = 43,
+    // ── Issue #1001: standardized token/cross-contract error mapping ─────────
+    /// The stake token rejected a transfer/burn for insufficient balance
+    /// (distinct from `NoStake`, which means no tracked stake position
+    /// exists at all).
+    InsufficientTokenBalance = 44,
+    /// The stake token rejected a transfer for insufficient/expired
+    /// allowance.
+    InsufficientTokenAllowance = 45,
+    /// A token or cross-contract invocation failed for a reason other than
+    /// authorization, balance, or allowance (arithmetic overflow, invalid
+    /// request, an unrecognized custom-token error code, or a host-level
+    /// abort). See `shared::token_error` for the classification policy.
+    TokenOperationFailed = 46,
 }
 
 impl StakeVaultError {
@@ -504,6 +517,35 @@ impl StakeVaultError {
             StakeVaultError::StakeOverflow => {
                 "resulting amount would overflow i128; deposit or delegation rejected"
             }
+            StakeVaultError::InsufficientTokenBalance => {
+                "stake token transfer/burn failed: insufficient balance"
+            }
+            StakeVaultError::InsufficientTokenAllowance => {
+                "stake token transfer failed: insufficient or expired allowance"
+            }
+            StakeVaultError::TokenOperationFailed => {
+                "stake token or cross-contract invocation failed"
+            }
+        }
+    }
+}
+
+/// Maps the shared token/cross-contract invocation failure classification
+/// (Issue #1001) onto this contract's stable error codes. Every non-success
+/// outcome from a stake-token invocation must flow through here rather than
+/// being treated as `Ok`.
+impl From<shared::TokenFailure> for StakeVaultError {
+    fn from(failure: shared::TokenFailure) -> Self {
+        match failure {
+            shared::TokenFailure::Unauthorized => StakeVaultError::Unauthorized,
+            shared::TokenFailure::InsufficientBalance => StakeVaultError::InsufficientTokenBalance,
+            shared::TokenFailure::InsufficientAllowance => {
+                StakeVaultError::InsufficientTokenAllowance
+            }
+            shared::TokenFailure::InvalidRequest
+            | shared::TokenFailure::Overflow
+            | shared::TokenFailure::OtherContractError(_)
+            | shared::TokenFailure::HostError => StakeVaultError::TokenOperationFailed,
         }
     }
 }
