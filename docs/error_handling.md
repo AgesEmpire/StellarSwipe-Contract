@@ -79,6 +79,57 @@ Integration tests for cross-contract boundaries must cover:
 - **Malformed return** — an undecodable return maps to
   `ExternalDependency::UnknownDownstreamFailure`.
 
+## Unexpected panic behavior at public contract boundaries
+
+Unexpected Rust panics (for example `unwrap`/`expect` on an invariant that
+should never fail, index out of bounds, or arithmetic that panics in debug
+builds) must not leak an unstable, host-dependent failure to callers. At every
+public contract boundary the behavior is normalized as follows.
+
+### Public error mapping
+
+- A panic that escapes a public entrypoint is mapped to the stable public
+error variant `Recovery::UnexpectedPanic`.
+- `Recovery::UnexpectedPanic` is part of the existing `Recovery` category, so
+  off-chain monitoring can treat it as a retryable / manual-intervention
+  condition without introducing a new top-level category.
+- The mapping is applied only to *unexpected* panics. Ordinary validation and
+  authorization failures continue to return their existing, specific error
+  codes unchanged; they are never collapsed into `UnexpectedPanic`.
+
+### Expected error codes are unchanged
+
+Mapping unexpected panics does not alter the ABI or semantics of any existing
+error code. `Validation`, `Authorization`, `ExternalDependency`,
+`Arithmetic`, `Upgrade`, `Network`, and `Recovery` variants keep their current
+codes and meanings. `Recovery::UnexpectedPanic` is additive and is only
+produced on the panic path.
+
+### State rollback semantics
+
+A panic that escapes a public entrypoint aborts the invocation, so all state
+changes made during that invocation are rolled back. Callers therefore observe
+one of two outcomes:
+
+- the call returns a normal `Result` with an expected error code, and any
+  partial state changes are handled by the contract's own logic; or
+- the call panics, is mapped to `Recovery::UnexpectedPanic`, and **no** state
+  changes from the failed invocation are persisted.
+
+There is no partial-commit outcome: a mapped panic always leaves the contract
+state exactly as it was before the invocation.
+
+### Testing expectations
+
+Tests for panic paths must cover:
+
+- **Panic mapping** — an entrypoint that panics surfaces
+  `Recovery::UnexpectedPanic` rather than a raw host trap.
+- **Expected errors preserved** — validation and authorization failures still
+  return their original error codes and are not remapped.
+- **State rollback** — after a mapped panic, contract state (balances,
+  counters, stored error reports) is identical to the pre-invocation state.
+
 ## Stellar token response compatibility
 
 Supported Stellar token contracts (SEP-41 style fungible tokens) are invoked
