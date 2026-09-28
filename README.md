@@ -22,3 +22,22 @@
 
 <!-- handsoff-issue-1186 -->
 - #1186: Verify persistent storage schema checksum during upgrades
+
+<!-- handsoff-issue-1187 -->
+- #1187: Authenticate pagination cursors against contract and query scope
+
+<!-- handsoff-issue-1188 -->
+- #1188: Reject stale pagination cursors after relevant state changes
+
+<!-- handsoff-issue-1197 -->
+- #1197: Reject unsupported fee-on-transfer tokens during asset registration
+
+<!-- handsoff-issue-1198 -->
+- #1198: Update contract accounting state before invoking token callbacks
+
+<!-- handsoff-issue-1216 -->
+- #1216: Bind bridge message signatures to source and destination domains
+
+<!-- handsoff-issue-1220 -->
+- #1220: Require provider authorization for signal revision updates
+

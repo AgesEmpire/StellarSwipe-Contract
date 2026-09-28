@@ -222,7 +222,7 @@ pub struct TtlRenewalOutcome {
     /// Schema version of this event payload.
     pub version: u32,
     /// Storage key whose TTL was considered for renewal.
-    pub key: String,
+    pub key: &'static str,
     /// Normalized outcome of the attempt.
     pub result: TtlRenewalResult,
     /// TTL (in ledgers) observed before the attempt.
@@ -237,504 +237,193 @@ pub struct TtlRenewalOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtlRenewalResult {
-    /// The TTL was above the threshold, so no renewal was needed.
+    /// The key's TTL was already above the threshold; no renewal performed.
     Skipped,
-    /// The TTL was renewed successfully.
+    /// The key's TTL was renewed to `extend_to`.
     Renewed,
     /// The renewal attempt failed.
     Failed,
 }
 
-/// Version of the guardian recovery event schema.
+/// Maximum number of ledgers a rotated bridge validator set may remain
+/// active alongside its successor.
 ///
-/// Bump this whenever the fields of [`GuardianRecoveryEvent`] change so that
-/// off-chain consumers can detect incompatible event payloads.
-pub const GUARDIAN_RECOVERY_EVENT_VERSION: u32 = 1;
+/// A bounded overlap keeps messages signed just before a rotation verifiable
+/// while the new set is being established, without allowing signatures from
+/// arbitrarily old sets to be accepted indefinitely.
+pub const BRIDGE_VALIDATOR_SET_MAX_OVERLAP_LEDGERS: u32 = 17_280;
 
-/// Configuration governing delayed guardian recovery of administrator access.
-///
-/// Recovery may only be executed once at least `threshold` distinct guardians
-/// have approved the pending request and at least `delay` seconds have elapsed
-/// since the request was initiated. The active administrator may cancel a
-/// pending request at any point during the delay window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GuardianRecoveryConfig {
-    /// Minimum number of distinct guardian approvals required to execute.
-    pub threshold: u32,
-    /// Delay (in seconds) that must elapse between initiation and execution.
-    pub delay: u64,
-}
-
-/// Lifecycle state of a pending guardian recovery request.
+/// Error returned when a bridge validator-set rotation is invalid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum GuardianRecoveryStatus {
-    /// The request is collecting approvals and awaiting the delay window.
-    Pending,
-    /// The request was executed and administrator access was restored.
-    Executed,
-    /// The active administrator cancelled the request during the delay.
-    Cancelled,
+pub enum BridgeValidatorSetError {
+    /// The activation ledger is not strictly after the current set's activation.
+    NonMonotonicActivation,
+    /// The retirement ledger is not strictly after the activation ledger.
+    InvalidRetirementBoundary,
+    /// The overlap between the outgoing and incoming sets exceeds the bound.
+    OverlapTooLong,
+    /// The rotation would leave no active validator set.
+    NoActiveSet,
 }
 
-/// A pending guardian recovery request for lost administrator access.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GuardianRecoveryRequest {
-    /// Address of the administrator whose access is being recovered.
-    pub admin: String,
-    /// Ledger timestamp (in seconds) at which the request was initiated.
-    pub initiated_at: u64,
-    /// Distinct guardians that have approved the request.
-    pub approvals: Vec<String>,
-    /// Current lifecycle state of the request.
-    pub status: GuardianRecoveryStatus,
-}
-
-/// Errors returned by the guardian recovery flow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardianRecoveryError {
-    /// No recovery request is currently pending.
-    NoPendingRequest,
-    /// The caller is not a configured guardian.
-    NotAGuardian,
-    /// The guardian has already approved this request.
-    AlreadyApproved,
-    /// Fewer than the configured threshold of approvals have been collected.
-    ThresholdNotMet,
-    /// The configured delay has not yet elapsed.
-    DelayNotElapsed,
-    /// The caller is not the active administrator.
-    NotActiveAdmin,
-}
-
-impl GuardianRecoveryRequest {
-    /// Initiate a new pending recovery request for `admin` at `now`.
-    pub fn initiate(admin: String, now: u64) -> Self {
-        Self {
-            admin,
-            initiated_at: now,
-            approvals: Vec::new(),
-            status: GuardianRecoveryStatus::Pending,
-        }
-    }
-
-    /// Record a guardian approval, enforcing guardian membership and
-    /// preventing duplicate approvals.
-    pub fn approve(
-        &mut self,
-        guardian: &str,
-        guardians: &[String],
-    ) -> Result<(), GuardianRecoveryError> {
-        if self.status != GuardianRecoveryStatus::Pending {
-            return Err(GuardianRecoveryError::NoPendingRequest);
-        }
-        if !guardians.iter().any(|g| g == guardian) {
-            return Err(GuardianRecoveryError::NotAGuardian);
-        }
-        if self.approvals.iter().any(|g| g == guardian) {
-            return Err(GuardianRecoveryError::AlreadyApproved);
-        }
-        self.approvals.push(guardian.to_string());
-        Ok(())
-    }
-
-    /// Whether the configured approval threshold has been reached.
-    pub fn threshold_met(&self, config: &GuardianRecoveryConfig) -> bool {
-        self.approvals.len() as u32 >= config.threshold
-    }
-
-    /// Whether the configured delay has elapsed at `now`.
-    pub fn delay_elapsed(&self, config: &GuardianRecoveryConfig, now: u64) -> bool {
-        now >= self.initiated_at.saturating_add(config.delay)
-    }
-
-    /// Execute the recovery, enforcing threshold and delay boundaries.
-    pub fn execute(
-        &mut self,
-        config: &GuardianRecoveryConfig,
-        now: u64,
-    ) -> Result<(), GuardianRecoveryError> {
-        if self.status != GuardianRecoveryStatus::Pending {
-            return Err(GuardianRecoveryError::NoPendingRequest);
-        }
-        if !self.threshold_met(config) {
-            return Err(GuardianRecoveryError::ThresholdNotMet);
-        }
-        if !self.delay_elapsed(config, now) {
-            return Err(GuardianRecoveryError::DelayNotElapsed);
-        }
-        self.status = GuardianRecoveryStatus::Executed;
-        Ok(())
-    }
-
-    /// Cancel the pending recovery. Only the active administrator may cancel,
-    /// and only while the request is still pending.
-    pub fn cancel(&mut self, caller: &str) -> Result<(), GuardianRecoveryError> {
-        if self.status != GuardianRecoveryStatus::Pending {
-            return Err(GuardianRecoveryError::NoPendingRequest);
-        }
-        if caller != self.admin {
-            return Err(GuardianRecoveryError::NotActiveAdmin);
-        }
-        self.status = GuardianRecoveryStatus::Cancelled;
-        Ok(())
-    }
-}
-
-/// Auditable event emitted for guardian recovery lifecycle transitions.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GuardianRecoveryEvent {
-    /// Schema version of this event payload.
-    pub version: u32,
-    /// Address of the administrator whose access is being recovered.
-    pub admin: String,
-    /// Lifecycle transition that occurred.
-    pub status: GuardianRecoveryStatus,
-    /// Number of distinct approvals collected at the time of the event.
-    pub approvals: u32,
-    /// Ledger timestamp (in seconds) at which the event occurred.
-    pub timestamp: u64,
-}
-
-/// Error returned when a two-step administrator handoff is rejected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AdminHandoffError {
-    /// The caller is not the current administrator.
-    NotAdmin,
-    /// The caller is not the nominated successor.
-    NotPendingAdmin,
-    /// No successor has been nominated yet.
-    NoPendingAdmin,
-}
-
-/// Two-step administrator handoff state for a core contract.
+/// Explicit activation and retirement boundaries for a bridge validator set.
 ///
-/// The current administrator nominates a successor with [`propose_admin`],
-/// which does **not** change the administrator. The nominated address must
-/// then call [`accept_admin`] to complete the handoff. This prevents an
-/// accidental or unilateral transfer from taking effect immediately.
-///
-/// [`propose_admin`]: AdminHandoff::propose_admin
-/// [`accept_admin`]: AdminHandoff::accept_admin
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdminHandoff {
-    /// The address currently holding administrator rights.
-    pub admin: u64,
-    /// The address nominated to become the next administrator, if any.
-    pub pending_admin: Option<u64>,
-}
-
-impl AdminHandoff {
-    /// Create a new handoff state with `admin` as the current administrator.
-    pub fn new(admin: u64) -> Self {
-        Self {
-            admin,
-            pending_admin: None,
-        }
-    }
-
-    /// Nominate `successor` as the next administrator.
-    ///
-    /// Only the current administrator may nominate a successor, and the
-    /// nomination does not take effect until [`accept_admin`] is called.
-    ///
-    /// [`accept_admin`]: AdminHandoff::accept_admin
-    pub fn propose_admin(&mut self, caller: u64, successor: u64) -> Result<(), AdminHandoffError> {
-        if caller != self.admin {
-            return Err(AdminHandoffError::NotAdmin);
-        }
-        self.pending_admin = Some(successor);
-        Ok(())
-    }
-
-    /// Complete a pending handoff, transferring administrator rights to the
-    /// nominated successor.
-    pub fn accept_admin(&mut self, caller: u64) -> Result<(), AdminHandoffError> {
-        match self.pending_admin {
-            None => Err(AdminHandoffError::NoPendingAdmin),
-            Some(pending) if pending != caller => Err(AdminHandoffError::NotPendingAdmin),
-            Some(pending) => {
-                self.admin = pending;
-                self.pending_admin = None;
-                Ok(())
-            }
-        }
-    }
-}
-
-/// A narrowly scoped maintenance capability that can be granted to an
-/// operator.
-///
-/// Each capability maps to a defined set of contract entrypoints (see
-/// [`OperatorCapability::entrypoints`]); there is deliberately no broad
-/// administrative catch-all, so an operator holding one capability cannot
-/// invoke entrypoints outside that capability's scope.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperatorCapability {
-    /// Pause and unpause contract operations.
-    Pause,
-    /// Update the oracle staleness window.
-    OracleConfig,
-    /// Update protocol fee parameters.
-    FeeConfig,
-    /// Rotate signing keys used by the contract.
-    KeyRotation,
-}
-
-impl OperatorCapability {
-    /// Every capability, in a stable order.
-    pub const ALL: [OperatorCapability; 4] = [
-        OperatorCapability::Pause,
-        OperatorCapability::OracleConfig,
-        OperatorCapability::FeeConfig,
-        OperatorCapability::KeyRotation,
-    ];
-
-    /// The contract entrypoints this capability authorizes.
-    ///
-    /// The returned set is exhaustive: an operator granted this capability
-    /// may invoke exactly these entrypoints and nothing else.
-    pub fn entrypoints(&self) -> &'static [&'static str] {
-        match self {
-            OperatorCapability::Pause => &["pause", "unpause"],
-            OperatorCapability::OracleConfig => &["set_oracle_staleness"],
-            OperatorCapability::FeeConfig => &["set_protocol_fee"],
-            OperatorCapability::KeyRotation => &["rotate_signing_key"],
-        }
-    }
-
-    /// Whether this capability authorizes `entrypoint`.
-    pub fn authorizes(&self, entrypoint: &str) -> bool {
-        self.entrypoints().contains(&entrypoint)
-    }
-}
-
-/// Error returned when a capability grant or revocation is rejected.
+/// A set is active for the inclusive ledger range
+/// `[activation_ledger, retirement_ledger]`. The outgoing set's
+/// `retirement_ledger` and the incoming set's `activation_ledger` define the
+/// overlap window during which both sets may verify messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilityError {
-    /// The caller is not authorized to grant or revoke capabilities.
-    Unauthorized,
-    /// The operator already holds the capability.
-    AlreadyGranted,
-    /// The operator does not hold the capability.
-    NotGranted,
-    /// The operator is not permitted to invoke the entrypoint.
-    NotPermitted,
+pub struct BridgeValidatorSetBoundary {
+    /// Ledger at which this set becomes active (inclusive).
+    pub activation_ledger: u32,
+    /// Ledger at which this set is retired (inclusive).
+    pub retirement_ledger: u32,
 }
 
-/// Auditable record of a capability grant or revocation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilityEvent {
-    /// A capability was granted to an operator.
-    Granted {
-        /// The operator that received the capability.
-        operator: u64,
-        /// The capability that was granted.
-        capability: OperatorCapability,
-    },
-    /// A capability was revoked from an operator.
-    Revoked {
-        /// The operator that lost the capability.
-        operator: u64,
-        /// The capability that was revoked.
-        capability: OperatorCapability,
-    },
+impl BridgeValidatorSetBoundary {
+    /// Whether `ledger` falls within this set's active range.
+    pub fn is_active_at(&self, ledger: u32) -> bool {
+        ledger >= self.activation_ledger && ledger <= self.retirement_ledger
+    }
+
+    /// Number of ledgers this set remains active for.
+    pub fn active_span(&self) -> u32 {
+        self.retirement_ledger.saturating_sub(self.activation_ledger)
+    }
 }
 
-/// Registry of scoped operator capabilities.
+/// Validate a rotation from `current` to `next`.
 ///
-/// Grants and revocations are authorized against the current administrator
-/// and emit a [`CapabilityEvent`] so every change is auditable. Invocation
-/// checks enforce least privilege: an operator may only invoke entrypoints
-/// covered by a capability it actually holds.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityRegistry {
-    /// The address authorized to grant and revoke capabilities.
-    pub admin: u64,
-    /// Granted capabilities, as `(operator, capability)` pairs.
-    pub grants: Vec<(u64, OperatorCapability)>,
-    /// Audit log of every grant and revocation, in order.
-    pub events: Vec<CapabilityEvent>,
+/// Enforces explicit, monotonic activation/retirement boundaries and a bounded
+/// overlap so that messages signed before, during, and after the rotation stay
+/// verifiable without accepting signatures from unintended sets.
+///
+/// The overlap is the number of ledgers during which both sets are active,
+/// i.e. `current.retirement_ledger - next.activation_ledger + 1` when the
+/// ranges intersect. It must not exceed
+/// [`BRIDGE_VALIDATOR_SET_MAX_OVERLAP_LEDGERS`].
+///
+/// Returns the overlap length in ledgers on success.
+pub fn validate_bridge_validator_set_rotation(
+    current: BridgeValidatorSetBoundary,
+    next: BridgeValidatorSetBoundary,
+) -> Result<u32, BridgeValidatorSetError> {
+    if next.activation_ledger <= current.activation_ledger {
+        return Err(BridgeValidatorSetError::NonMonotonicActivation);
+    }
+    if next.retirement_ledger <= next.activation_ledger {
+        return Err(BridgeValidatorSetError::InvalidRetirementBoundary);
+    }
+    if current.retirement_ledger < current.activation_ledger {
+        return Err(BridgeValidatorSetError::InvalidRetirementBoundary);
+    }
+
+    // No overlap: the outgoing set retires before the incoming set activates.
+    if current.retirement_ledger < next.activation_ledger {
+        return Ok(0);
+    }
+
+    let overlap = current
+        .retirement_ledger
+        .saturating_sub(next.activation_ledger)
+        .saturating_add(1);
+    if overlap > BRIDGE_VALIDATOR_SET_MAX_OVERLAP_LEDGERS {
+        return Err(BridgeValidatorSetError::OverlapTooLong);
+    }
+    Ok(overlap)
 }
 
-impl CapabilityRegistry {
-    /// Create an empty registry administered by `admin`.
-    pub fn new(admin: u64) -> Self {
-        Self {
-            admin,
-            grants: Vec::new(),
-            events: Vec::new(),
-        }
-    }
-
-    /// Whether `operator` currently holds `capability`.
-    pub fn has_capability(&self, operator: u64, capability: OperatorCapability) -> bool {
-        self.grants.contains(&(operator, capability))
-    }
-
-    /// Grant `capability` to `operator`.
-    ///
-    /// Only the administrator may grant capabilities, and the grant is
-    /// recorded as an auditable [`CapabilityEvent::Granted`].
-    pub fn grant(
-        &mut self,
-        caller: u64,
-        operator: u64,
-        capability: OperatorCapability,
-    ) -> Result<(), CapabilityError> {
-        if caller != self.admin {
-            return Err(CapabilityError::Unauthorized);
-        }
-        if self.has_capability(operator, capability) {
-            return Err(CapabilityError::AlreadyGranted);
-        }
-        self.grants.push((operator, capability));
-        self.events.push(CapabilityEvent::Granted {
-            operator,
-            capability,
-        });
-        Ok(())
-    }
-
-    /// Revoke `capability` from `operator`.
-    ///
-    /// Only the administrator may revoke capabilities, and the revocation is
-    /// recorded as an auditable [`CapabilityEvent::Revoked`].
-    pub fn revoke(
-        &mut self,
-        caller: u64,
-        operator: u64,
-        capability: OperatorCapability,
-    ) -> Result<(), CapabilityError> {
-        if caller != self.admin {
-            return Err(CapabilityError::Unauthorized);
-        }
-        let index = self
-            .grants
-            .iter()
-            .position(|&(op, cap)| op == operator && cap == capability)
-            .ok_or(CapabilityError::NotGranted)?;
-        self.grants.remove(index);
-        self.events.push(CapabilityEvent::Revoked {
-            operator,
-            capability,
-        });
-        Ok(())
-    }
-
-    /// Authorize `operator` to invoke `entrypoint`.
-    ///
-    /// Succeeds only when the operator holds a capability whose scope covers
-    /// `entrypoint`, enforcing least privilege across capabilities.
-    pub fn authorize_entrypoint(
-        &self,
-        operator: u64,
-        entrypoint: &str,
-    ) -> Result<(), CapabilityError> {
-        let permitted = self.grants.iter().any(|&(op, cap)| {
-            op == operator && cap.authorizes(entrypoint)
-        });
-        if permitted {
-            Ok(())
-        } else {
-            Err(CapabilityError::NotPermitted)
-        }
-    }
+/// Whether a message signed at `signed_at` is verifiable by a set whose
+/// boundary is `boundary`.
+///
+/// A message is verifiable only when the signing ledger falls within the
+/// set's explicit active range, so signatures from unintended sets are
+/// rejected.
+pub fn is_message_verifiable_by_set(
+    boundary: BridgeValidatorSetBoundary,
+    signed_at: u32,
+) -> bool {
+    boundary.is_active_at(signed_at)
 }
 
 #[cfg(test)]
-mod guardian_recovery_tests {
+mod bridge_validator_set_rotation_tests {
     use super::*;
 
-    fn guardians() -> Vec<String> {
-        vec!["g1".to_string(), "g2".to_string(), "g3".to_string()]
-    }
-
-    fn config() -> GuardianRecoveryConfig {
-        GuardianRecoveryConfig {
-            threshold: 2,
-            delay: 3_600,
+    fn boundary(activation_ledger: u32, retirement_ledger: u32) -> BridgeValidatorSetBoundary {
+        BridgeValidatorSetBoundary {
+            activation_ledger,
+            retirement_ledger,
         }
     }
 
     #[test]
-    fn rejects_execution_below_threshold() {
-        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
-        req.approve("g1", &guardians()).unwrap();
+    fn message_signed_before_rotation_is_verifiable_by_outgoing_set() {
+        let current = boundary(100, 200);
+        let next = boundary(180, 300);
+        assert_eq!(validate_bridge_validator_set_rotation(current, next), Ok(21));
+        // Signed before the incoming set activates: only the outgoing set verifies.
+        assert!(is_message_verifiable_by_set(current, 150));
+        assert!(!is_message_verifiable_by_set(next, 150));
+    }
+
+    #[test]
+    fn message_signed_during_overlap_is_verifiable_by_both_sets() {
+        let current = boundary(100, 200);
+        let next = boundary(180, 300);
+        assert_eq!(validate_bridge_validator_set_rotation(current, next), Ok(21));
+        // Signed during the overlap window: both sets verify.
+        assert!(is_message_verifiable_by_set(current, 190));
+        assert!(is_message_verifiable_by_set(next, 190));
+    }
+
+    #[test]
+    fn message_signed_after_rotation_is_verifiable_by_incoming_set() {
+        let current = boundary(100, 200);
+        let next = boundary(180, 300);
+        assert_eq!(validate_bridge_validator_set_rotation(current, next), Ok(21));
+        // Signed after the outgoing set retires: only the incoming set verifies.
+        assert!(!is_message_verifiable_by_set(current, 250));
+        assert!(is_message_verifiable_by_set(next, 250));
+    }
+
+    #[test]
+    fn rotation_without_overlap_is_allowed() {
+        let current = boundary(100, 150);
+        let next = boundary(151, 250);
+        assert_eq!(validate_bridge_validator_set_rotation(current, next), Ok(0));
+        assert!(!is_message_verifiable_by_set(current, 151));
+        assert!(is_message_verifiable_by_set(next, 151));
+    }
+
+    #[test]
+    fn overlap_beyond_bound_is_rejected() {
+        let current = boundary(100, 100 + BRIDGE_VALIDATOR_SET_MAX_OVERLAP_LEDGERS + 5);
+        let next = boundary(101, 100 + BRIDGE_VALIDATOR_SET_MAX_OVERLAP_LEDGERS + 10);
         assert_eq!(
-            req.execute(&config(), 3_600),
-            Err(GuardianRecoveryError::ThresholdNotMet)
+            validate_bridge_validator_set_rotation(current, next),
+            Err(BridgeValidatorSetError::OverlapTooLong)
         );
     }
 
     #[test]
-    fn rejects_execution_before_delay_elapses() {
-        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
-        req.approve("g1", &guardians()).unwrap();
-        req.approve("g2", &guardians()).unwrap();
+    fn non_monotonic_activation_is_rejected() {
+        let current = boundary(100, 200);
+        let next = boundary(100, 300);
         assert_eq!(
-            req.execute(&config(), 3_599),
-            Err(GuardianRecoveryError::DelayNotElapsed)
+            validate_bridge_validator_set_rotation(current, next),
+            Err(BridgeValidatorSetError::NonMonotonicActivation)
         );
     }
 
     #[test]
-    fn executes_at_delay_boundary() {
-        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
-        req.approve("g1", &guardians()).unwrap();
-        req.approve("g2", &guardians()).unwrap();
-        assert_eq!(req.execute(&config(), 3_600), Ok(()));
-        assert_eq!(req.status, GuardianRecoveryStatus::Executed);
-    }
-
-    #[test]
-    fn executes_after_delay_elapses() {
-        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
-        req.approve("g1", &guardians()).unwrap();
-        req.approve("g2", &guardians()).unwrap();
-        assert_eq!(req.execute(&config(), 7_200), Ok(()));
-        assert_eq!(req.status, GuardianRecoveryStatus::Executed);
-    }
-
-    #[test]
-    fn active_admin_can_cancel_during_delay() {
-        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
-        req.approve("g1", &guardians()).unwrap();
-        assert_eq!(req.cancel("admin"), Ok(()));
-        assert_eq!(req.status, GuardianRecoveryStatus::Cancelled);
+    fn invalid_retirement_boundary_is_rejected() {
+        let current = boundary(100, 200);
+        let next = boundary(180, 180);
         assert_eq!(
-            req.execute(&config(), 7_200),
-            Err(GuardianRecoveryError::NoPendingRequest)
+            validate_bridge_validator_set_rotation(current, next),
+            Err(BridgeValidatorSetError::InvalidRetirementBoundary)
         );
-    }
-
-    #[test]
-    fn non_admin_cannot_cancel() {
-        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
-        assert_eq!(
-            req.cancel("g1"),
-            Err(GuardianRecoveryError::NotActiveAdmin)
-        );
-    }
-
-    #[test]
-    fn rejects_duplicate_and_non_guardian_approvals() {
-        let mut req = GuardianRecoveryRequest::initiate("admin".to_string(), 0);
-        req.approve("g1", &guardians()).unwrap();
-        assert_eq!(
-            req.approve("g1", &guardians()),
-            Err(GuardianRecoveryError::AlreadyApproved)
-        );
-        assert_eq!(
-            req.approve("stranger", &guardians()),
-            Err(GuardianRecoveryError::NotAGuardian)
-        );
-    }
-}
     }
 }

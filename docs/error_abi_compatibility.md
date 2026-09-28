@@ -1,64 +1,74 @@
-# Public error ABI compatibility
+# Error & ABI Compatibility
 
-Clients decode a failed contract call by its numeric error code. The code of every `#[contracterror]` variant is therefore public ABI: renumbering it, removing it, or giving an old code to a new variant silently changes what clients report.
+This document records the response shapes and failure behavior that the
+contracts in this repository expect from **supported Stellar token
+contracts** (SEP-41 style fungible tokens). It exists so that integrators
+and reviewers can see, in one place, what we assume a token will return and
+how we behave when it does not.
 
-## Fixture
+## Supported token response shapes
 
-`stellar-swipe/error-abi/public-error-abi.json` pins every public error code:
+All token interactions go through the shared token client. The following
+return shapes are considered **supported** and are the only ones the
+contracts are written against.
 
-```json
-{
-  "abi_version": "1.0.0",
-  "crates": { "signal_registry": { "AdminError": { "Unauthorized": 1, "...": 0 } } },
-  "migrations": []
-}
-```
+### `transfer(from, to, amount)`
 
-- The fixture is generated from the Rust source by `stellar-swipe/scripts/check_error_abi.py`. Do not edit it by hand.
-- Test-only crates (`integration_tests`, `stake_vault_kani`) are excluded.
-- If two modules in a crate define an enum with the same name, each key is prefixed with its module (for example `capability::CapabilityError`).
+| Outcome | Expected return | Notes |
+| --- | --- | --- |
+| Success | `Ok(())` (unit / `Void`) | No value is consumed. |
+| Failure | `Err(TokenError)` | Any contract error is propagated as a stable error. |
 
-## What CI checks
+Assumptions:
 
-The **Check public error ABI compatibility** step runs:
+- The token is a standard SEP-41 fungible token: `transfer` returns unit on
+  success and a typed error on failure.
+- The token does **not** take a fee on transfer. A token that credits less
+  than `amount` to `to` is treated as unsupported (see below).
+- The token does not re-enter the calling contract during `transfer`.
 
-```bash
-python3 stellar-swipe/scripts/check_error_abi.py --base-ref FETCH_HEAD
-```
+### `balance(id)`
 
-| Change | Result |
-|---|---|
-| Variant removed, enum removed, code changed, or an old code reused by another variant | **Fails**, unless recorded as an intentional change (below) |
-| Duplicate code within one enum, or a variant without an explicit `= N` | **Fails** |
-| New variant or enum | **Fails until the fixture is regenerated**, so new codes are always pinned in review |
-| Fixture hand-edited to hide a break (compared with the PR base) | **Fails**, unless the break is declared in `migrations` |
+| Outcome | Expected return | Notes |
+| --- | --- | --- |
+| Success | `i128` | Non-negative balance for the queried account. |
+| Failure | `Err(TokenError)` | Propagated as a stable error. |
 
-The Rust test `stellar-swipe/contracts/signal_registry/tests/error_abi.rs` checks the same fixture from the compiled crate. It also checks the code a client actually receives from a failed call.
+### `decimals()`
 
-## Adding error codes
+| Outcome | Expected return | Notes |
+| --- | --- | --- |
+| Success | `u32` | Number of decimal places. |
+| Failure | `Err(TokenError)` | Propagated as a stable error. |
 
-1. Add the variant with a new, unused `= N`.
-2. Run `python3 stellar-swipe/scripts/check_error_abi.py --update`.
-3. For a new `AdminError` variant, also add it to `ADMIN_ERRORS` in `tests/error_abi.rs`.
-4. Commit the updated fixture.
+## Fail-closed behavior
 
-## Intentional breaking changes
+Unexpected token responses must **fail closed**: the calling contract must
+revert rather than silently continue with an unknown state. The following
+cases are treated as unsupported and produce a stable, documented error:
 
-A break needs a new **major** `abi_version` and a migration note for clients:
+1. **Malformed / unexpected return value** — a `transfer` that returns a
+   non-unit value, or a `balance`/`decimals` that returns a value of the
+   wrong type, is rejected.
+2. **Contract error** — any `Err` returned by the token is surfaced as an
+   error; it is never swallowed.
+3. **Fee-on-transfer** — if the recipient balance does not increase by
+   exactly `amount`, the transfer is rejected as unsupported.
 
-```bash
-python3 stellar-swipe/scripts/check_error_abi.py --update \
-  --version 2.0.0 \
-  --note "AdminError::PauseExpired (6) removed; clients should treat 6 as TradingPaused"
-```
+These checks are intentionally strict: a token that does not match the
+supported shapes above is not a supported Stellar asset for this contract.
 
-This appends `{version, note, changes}` to `migrations`, where `changes` lists each break. Without `--version` (with a higher major version) and `--note`, `--update` refuses to write the fixture.
+## Test coverage
 
-## Related: event schema
+The compatibility tests live alongside the token client and cover:
 
-Event identifiers and topics follow the same policy through `scripts/validate_event_schema.py` and `docs/event_schema.lock.json`:
+- **Valid returns** — `transfer` returning unit, `balance` returning `i128`,
+  `decimals` returning `u32`.
+- **Contract errors** — the token returning `Err(TokenError)`; the error is
+  propagated and the call reverts.
+- **Malformed response fixtures** — mock tokens that return unexpected
+  values (e.g. a non-unit `transfer` result, a fee-on-transfer balance
+  delta); the call fails closed with the stable error.
 
-- Within one contract, no two events may publish topic tuples that an indexer could confuse. Two events collide when they have the same number of topics and, at every position, either the literals are equal or at least one side is a data field.
-- Topic literals must be valid Soroban symbols.
-- Removing an event, changing its topics, or removing, renaming, retyping or reordering body fields requires a new major `schema_version` and a `migration_notes` entry for the event.
-- Appending body fields and adding events are allowed. After either, run `python3 scripts/validate_event_schema.py --update-lock` to refresh the lock.
+When adding a new supported token shape, update this document and add a
+matching fixture to the compatibility tests.
