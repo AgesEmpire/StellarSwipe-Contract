@@ -16,11 +16,24 @@
 //!   rejected before any irreversible effects occur.
 //! - Escrow liabilities are reconciled against the tokens actually held for
 //!   escrowed user positions ([`EscrowLedger`]).
+//! - Multi-action governance proposal execution is bounded
+//!   ([`MAX_ACTION_BATCH_SIZE`]) and its progress/retry semantics are
+//!   explicit ([`ActionBatchProgress`]).
+//! - Trade routes are validated for asset continuity before execution, so an
+//!   invalid route fails without performing transfers or state changes.
 
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, Env, Vec};
 
 /// Hard cap on the number of items accepted in a single batch.
 pub const MAX_BATCH_SIZE: u32 = 32;
+
+/// Hard cap on the number of actions executed in a single governance
+/// proposal execution batch.
+///
+/// A proposal carrying more actions than this is rejected deterministically
+/// at creation/execution time rather than being partially executed, keeping
+/// execution within deterministic Soroban resource bounds.
+pub const MAX_ACTION_BATCH_SIZE: u32 = 16;
 
 /// Hard cap on the supported cross-contract invocation depth.
 ///
@@ -44,8 +57,19 @@ pub enum BatchError {
     InvocationCycle = 4,
     /// The cross-contract invocation depth exceeded [`MAX_INVOCATION_DEPTH`].
     InvocationDepthExceeded = 5,
-    /// Escrow liabilities did not reconcile against held token balances.
-    EscrowImbalance = 6,
+    /// A governance proposal carried more actions than
+    /// [`MAX_ACTION_BATCH_SIZE`].
+    ActionBatchTooLarge = 6,
+    /// A governance proposal carried no actions.
+    EmptyActionBatch = 7,
+    /// An action in the batch failed during execution.
+    ActionFailed = 8,
+    /// A trade route hop did not consume the prior hop's output asset.
+    AssetContinuityBroken = 9,
+    /// A trade route did not terminate in the requested asset.
+    RouteTerminalAssetMismatch = 10,
+    /// The trade route was empty.
+    EmptyRoute = 11,
 }
 
 /// A single authorization check bound to its intended operation and caller.
@@ -71,6 +95,38 @@ pub struct BatchItemResult {
     pub ok: bool,
     /// Error code when `ok` is false; `0` when the item passed.
     pub error: u32,
+}
+
+/// Explicit execution progress for a bounded multi-action governance
+/// proposal batch.
+///
+/// `next_index` is the index of the next action to execute. On a partial
+/// failure it points at the failing action, so retrying resumes from that
+/// action without re-executing already-applied actions. `completed` is true
+/// only once every action has executed successfully.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionBatchProgress {
+    /// Total number of actions in the proposal batch.
+    pub total: u32,
+    /// Index of the next action to execute (also the failing index on error).
+    pub next_index: u32,
+    /// Whether all actions have executed successfully.
+    pub completed: bool,
+}
+
+/// A single hop in a trade route.
+///
+/// Each hop consumes `asset_in` and produces `asset_out`. For a route to be
+/// valid, every hop's `asset_in` must equal the prior hop's `asset_out`, and
+/// the final hop's `asset_out` must equal the requested asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteHop {
+    /// The asset consumed by this hop.
+    pub asset_in: BytesN<32>,
+    /// The asset produced by this hop.
+    pub asset_out: BytesN<32>,
 }
 
 /// Bounded batch authorization verifier.
@@ -131,6 +187,116 @@ impl BatchVerifier {
             if !results.get_unchecked(i).ok {
                 return Err(BatchError::BindingMismatch);
             }
+        }
+        Ok(())
+    }
+
+    /// Validate the size of a multi-action governance proposal batch.
+    ///
+    /// Rejects empty batches with [`BatchError::EmptyActionBatch`] and
+    /// batches larger than [`MAX_ACTION_BATCH_SIZE`] with
+    /// [`BatchError::ActionBatchTooLarge`]. Call this at proposal creation
+    /// and again before execution so an oversized batch can never be
+    /// partially executed.
+    pub fn validate_action_batch(action_count: u32) -> Result<(), BatchError> {
+        if action_count == 0 {
+            return Err(BatchError::EmptyActionBatch);
+        }
+        if action_count > MAX_ACTION_BATCH_SIZE {
+            return Err(BatchError::ActionBatchTooLarge);
+        }
+        Ok(())
+    }
+
+    /// Execute a bounded multi-action governance proposal batch.
+    ///
+    /// `action_count` is validated against [`MAX_ACTION_BATCH_SIZE`] before
+    /// any action runs. `execute` is invoked once per action with the action
+    /// index; it returns `true` on success and `false` on failure. Execution
+    /// stops at the first failing action and returns the explicit
+    /// [`ActionBatchProgress`] pointing at that index, so a retry resumes
+    /// from the failing action without re-executing applied actions. On full
+    /// success the returned progress has `completed == true`.
+    pub fn execute_action_batch<F>(
+        action_count: u32,
+        mut execute: F,
+    ) -> Result<ActionBatchProgress, BatchError>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        Self::validate_action_batch(action_count)?;
+        for i in 0..action_count {
+            if !execute(i) {
+                return Err(BatchError::ActionFailed);
+            }
+        }
+        Ok(ActionBatchProgress {
+            total: action_count,
+            next_index: action_count,
+            completed: true,
+        })
+    }
+
+    /// Resume a partially executed multi-action governance proposal batch.
+    ///
+    /// `progress` carries the index of the next action to execute. The
+    /// remaining actions are executed in order; on failure the returned
+    /// progress points at the failing index so the caller can retry again.
+    pub fn resume_action_batch<F>(
+        progress: &ActionBatchProgress,
+        mut execute: F,
+    ) -> Result<ActionBatchProgress, BatchError>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        Self::validate_action_batch(progress.total)?;
+        if progress.completed {
+            return Ok(progress.clone());
+        }
+        for i in progress.next_index..progress.total {
+            if !execute(i) {
+                return Err(BatchError::ActionFailed);
+            }
+        }
+        Ok(ActionBatchProgress {
+            total: progress.total,
+            next_index: progress.total,
+            completed: true,
+        })
+    }
+
+    /// Validate asset continuity across a trade route before execution begins.
+    ///
+    /// Each hop must consume the output asset of the prior hop, and the route
+    /// must terminate in `requested_asset`. An empty route is rejected with
+    /// [`BatchError::EmptyRoute`]. A hop whose `asset_in` does not match the
+    /// prior hop's `asset_out` is rejected with
+    /// [`BatchError::AssetContinuityBroken`]. A route whose final `asset_out`
+    /// does not equal `requested_asset` is rejected with
+    /// [`BatchError::RouteTerminalAssetMismatch`].
+    ///
+    /// This performs no transfers and mutates no state, so an invalid route
+    /// fails before any irreversible effects occur.
+    pub fn validate_route(
+        route: &Vec<RouteHop>,
+        requested_asset: &BytesN<32>,
+    ) -> Result<(), BatchError> {
+        let len = route.len();
+        if len == 0 {
+            return Err(BatchError::EmptyRoute);
+        }
+
+        let mut prev_out = route.get_unchecked(0).asset_in.clone();
+        for i in 0..len {
+            let hop = route.get_unchecked(i);
+            if hop.asset_in != prev_out {
+                return Err(BatchError::AssetContinuityBroken);
+            }
+            prev_out = hop.asset_out.clone();
+        }
+
+        if prev_out != *requested_asset {
+            return Err(BatchError::RouteTerminalAssetMismatch);
         }
         Ok(())
     }
@@ -336,4 +502,187 @@ impl EscrowLedger {
             Err(BatchError::EscrowImbalance)
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::Env;
+
+    #[test]
+    fn validate_action_batch_rejects_empty_and_oversized() {
+        assert_eq!(
+            BatchVerifier::validate_action_batch(0),
+            Err(BatchError::EmptyActionBatch)
+        );
+        assert_eq!(
+            BatchVerifier::validate_action_batch(MAX_ACTION_BATCH_SIZE + 1),
+            Err(BatchError::ActionBatchTooLarge)
+        );
+        assert_eq!(BatchVerifier::validate_action_batch(1), Ok(()));
+        assert_eq!(
+            BatchVerifier::validate_action_batch(MAX_ACTION_BATCH_SIZE),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn execute_action_batch_runs_maximum_batch() {
+        let mut seen = 0u32;
+        let progress = BatchVerifier::execute_action_batch(MAX_ACTION_BATCH_SIZE, |_i| {
+            seen += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(seen, MAX_ACTION_BATCH_SIZE);
+        assert_eq!(progress.total, MAX_ACTION_BATCH_SIZE);
+        assert_eq!(progress.next_index, MAX_ACTION_BATCH_SIZE);
+        assert!(progress.completed);
+    }
+
+    #[test]
+    fn execute_action_batch_rejects_oversized_before_running() {
+        let mut seen = 0u32;
+        let result = BatchVerifier::execute_action_batch(MAX_ACTION_BATCH_SIZE + 1, |_i| {
+            seen += 1;
+            true
+        });
+        assert_eq!(result, Err(BatchError::ActionBatchTooLarge));
+        assert_eq!(seen, 0);
+    }
+
+    #[test]
+    fn execute_action_batch_reports_downstream_failure() {
+        let fail_at = 3u32;
+        let mut seen = 0u32;
+        let result = BatchVerifier::execute_action_batch(MAX_ACTION_BATCH_SIZE, |i| {
+            seen += 1;
+            i != fail_at
+        });
+        assert_eq!(result, Err(BatchError::ActionFailed));
+        assert_eq!(seen, fail_at + 1);
+    }
+
+    #[test]
+    fn resume_action_batch_skips_applied_actions() {
+        let progress = ActionBatchProgress {
+            total: MAX_ACTION_BATCH_SIZE,
+            next_index: 3,
+            completed: false,
+        };
+        let mut first_index = None;
+        let mut seen = 0u32;
+        let done = BatchVerifier::resume_action_batch(&progress, |i| {
+            if first_index.is_none() {
+                first_index = Some(i);
+            }
+            seen += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(first_index, Some(3));
+        assert_eq!(seen, MAX_ACTION_BATCH_SIZE - 3);
+        assert!(done.completed);
+        assert_eq!(done.next_index, MAX_ACTION_BATCH_SIZE);
+    }
+
+    #[test]
+    fn resume_action_batch_is_noop_when_completed() {
+        let progress = ActionBatchProgress {
+            total: 4,
+            next_index: 4,
+            completed: true,
+        };
+        let mut seen = 0u32;
+        let done = BatchVerifier::resume_action_batch(&progress, |_i| {
+            seen += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(seen, 0);
+        assert!(done.completed);
+    }
+
+    #[test]
+    fn verify_rejects_oversized_batch() {
+        let env = Env::default();
+        let caller = Address::generate(&env);
+        let op = BytesN::from_array(&env, &[0u8; 32]);
+        let mut items: Vec<BatchItem> = Vec::new(&env);
+        for _ in 0..(MAX_BATCH_SIZE + 1) {
+            items.push_back(BatchItem {
+                caller: caller.clone(),
+                operation: op.clone(),
+                payload: BytesN::from_array(&env, &[1u8; 32]),
+            });
+        }
+        assert_eq!(
+            BatchVerifier::verify(&env, &caller, &op, &items),
+            Err(BatchError::BatchTooLarge)
+        );
+    }
+
+    fn asset(env: &Env, seed: u8) -> BytesN<32> {
+        BytesN::from_array(env, &[seed; 32])
+    }
+
+    fn hop(env: &Env, asset_in: u8, asset_out: u8) -> RouteHop {
+        RouteHop {
+            asset_in: asset(env, asset_in),
+            asset_out: asset(env, asset_out),
+        }
+    }
+
+    #[test]
+    fn valid_chain_passes() {
+        let env = Env::default();
+        let mut route: Vec<RouteHop> = Vec::new(&env);
+        route.push_back(hop(&env, 1, 2));
+        route.push_back(hop(&env, 2, 3));
+        route.push_back(hop(&env, 3, 4));
+        assert_eq!(BatchVerifier::validate_route(&route, &asset(&env, 4)), Ok(()));
+    }
+
+    #[test]
+    fn single_hop_chain_passes() {
+        let env = Env::default();
+        let mut route: Vec<RouteHop> = Vec::new();
+        route.push_back(hop(&env, 1, 2));
+        assert_eq!(BatchVerifier::validate_route(&route, &asset(&env, 2)), Ok(()));
+    }
+
+    #[test]
+    fn disconnected_hops_fail() {
+        let env = Env::default();
+        let mut route: Vec<RouteHop> = Vec::new();
+        route.push_back(hop(&env, 1, 2));
+        route.push_back(hop(&env, 3, 4));
+        assert_eq!(
+            BatchVerifier::validate_route(&route, &asset(&env, 4)),
+            Err(BatchError::AssetContinuityBroken)
+        );
+    }
+
+    #[test]
+    fn incorrect_final_asset_fails() {
+        let env = Env::default();
+        let mut route: Vec<RouteHop> = Vec::new();
+        route.push_back(hop(&env, 1, 2));
+        route.push_back(hop(&env, 2, 3));
+        assert_eq!(
+            BatchVerifier::validate_route(&route, &asset(&env, 9)),
+            Err(BatchError::RouteTerminalAssetMismatch)
+        );
+    }
+
+    #[test]
+    fn empty_route_fails() {
+        let env = Env::default();
+        let route: Vec<RouteHop> = Vec::new(&env);
+        assert_eq!(
+            BatchVerifier::validate_route(&route, &asset(&env, 1)),
+            Err(BatchError::EmptyRoute)
+        );
+    }
+}
 }
