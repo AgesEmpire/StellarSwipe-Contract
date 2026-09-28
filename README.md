@@ -19,3 +19,6 @@
 
 <!-- handsoff-issue-1170 -->
 - #1170: Add Soroban authorization payload size regression tests
+
+<!-- handsoff-issue-1186 -->
+- #1186: Verify persistent storage schema checksum during upgrades
