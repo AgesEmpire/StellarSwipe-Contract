@@ -19,6 +19,25 @@ soroban-sdk = { version = "23", features = [] }
 [dev-dependencies]
 soroban-sdk = { version = "23", features = ["testutils"] }
 
+[[test]]
+name = "token_transfer_authorization"
+path = "tests/token_transfer_authorization.rs"
+
+[[test]]
+name = "token_response_compatibility"
+path = "tests/token_response_compatibility.rs"
+
 [[bench]]
 name = "batch_authorization"
 harness = false
+
+# Release WASM artifact size ceiling (issue #1193).
+# The release build enforces a documented maximum optimized artifact size so
+# unexpectedly large WASM artifacts cannot silently increase deployment cost
+# or hide dependency growth. Update the value below to change the ceiling;
+# the change is a single, reviewable line.
+[package.metadata.wasm-size-ceiling]
+# Maximum allowed size of the optimized release WASM artifact, in bytes.
+max-bytes = 65536
+# Human-readable form of the ceiling, kept in sync with `max-bytes`.
+max-human = "64 KiB"
