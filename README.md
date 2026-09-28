@@ -25,3 +25,10 @@
 
 <!-- handsoff-issue-1198 -->
 - #1198: Update contract accounting state before invoking token callbacks
+
+<!-- handsoff-issue-1216 -->
+- #1216: Bind bridge message signatures to source and destination domains
+
+<!-- handsoff-issue-1220 -->
+- #1220: Require provider authorization for signal revision updates
+
