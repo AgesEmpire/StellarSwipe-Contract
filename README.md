@@ -23,6 +23,9 @@
 <!-- handsoff-issue-1187 -->
 - #1187: Authenticate pagination cursors against contract and query scope
 
+<!-- handsoff-issue-1188 -->
+- #1188: Reject stale pagination cursors after relevant state changes
+
 <!-- handsoff-issue-1197 -->
 - #1197: Reject unsupported fee-on-transfer tokens during asset registration
 
