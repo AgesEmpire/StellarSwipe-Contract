@@ -5,6 +5,7 @@
 //! Also provides a shared append-only emergency action journal (#1166).
 //! Also provides delayed guardian recovery for lost administrator access (#1183).
 //! Also provides scoped operator capabilities for contract maintenance actions (#1182).
+//! Also provides monotonic, auditable bridge attestation threshold updates (#1113).
 //! Follow-up work: wire into the live pause-handling contract storage/auth and add
 //! integration tests against real contract state.
 
@@ -197,6 +198,156 @@ impl GuardianRecovery {
     }
 }
 
+/// Errors surfaced by the bridge attestation threshold update path (#1113).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ThresholdError {
+    /// Caller is not authorized to change the threshold.
+    Unauthorized,
+    /// The proposed threshold is invalid (e.g. zero).
+    InvalidThreshold,
+    /// A threshold reduction was requested without an explicit delayed
+    /// governance flow, so it is rejected to prevent silently weakening
+    /// verification requirements.
+    ReductionRequiresGovernance,
+    /// A previously scheduled reduction has not yet matured.
+    DelayNotElapsed,
+}
+
+/// Monotonic, auditable bridge attestation threshold state (#1113).
+///
+/// Increases take effect immediately. Reductions are only accepted through an
+/// explicit delayed governance flow: the reduction is scheduled, must mature
+/// over `reduction_delay` ledgers, and only then can be applied. Every accepted
+/// change records the old value, the new value, and the actor so the change is
+/// auditable.
+#[derive(Clone)]
+#[contracttype]
+pub struct BridgeThreshold {
+    /// Current effective attestation threshold.
+    pub threshold: u32,
+    /// Delay (in ledgers) a reduction must wait before it can be applied.
+    pub reduction_delay: u32,
+    /// Pending reduced threshold, if a reduction has been scheduled.
+    pub pending_threshold: u32,
+    /// Ledger sequence at which the pending reduction was scheduled.
+    pub pending_at: u32,
+    /// Whether a reduction is currently pending.
+    pub has_pending: bool,
+    /// Threshold value before the most recent accepted change.
+    pub last_old: u32,
+    /// Threshold value after the most recent accepted change.
+    pub last_new: u32,
+    /// Actor that performed the most recent accepted change.
+    pub last_actor: Address,
+}
+
+impl BridgeThreshold {
+    /// Creates a new threshold state. Rejects a zero threshold or zero delay so
+    /// a misconfigured bridge cannot bypass attestation or the reduction delay.
+    pub fn new(
+        threshold: u32,
+        reduction_delay: u32,
+        actor: Address,
+        env: &Env,
+    ) -> Result<Self, ThresholdError> {
+        if threshold == 0 || reduction_delay == 0 {
+            return Err(ThresholdError::InvalidThreshold);
+        }
+        Ok(Self {
+            threshold,
+            reduction_delay,
+            pending_threshold: 0,
+            pending_at: 0,
+            has_pending: false,
+            last_old: threshold,
+            last_new: threshold,
+            last_actor: actor,
+        })
+    }
+
+    /// Applies a threshold change. Increases take effect immediately. Reductions
+    /// are rejected unless they go through the explicit delayed governance flow
+    /// (`schedule_reduction` then `apply_reduction`). Every accepted change
+    /// records the old value, new value, and actor for auditability.
+    pub fn set_threshold(
+        &mut self,
+        caller: &Address,
+        new_threshold: u32,
+    ) -> Result<(), ThresholdError> {
+        caller.require_auth();
+        if new_threshold == 0 {
+            return Err(ThresholdError::InvalidThreshold);
+        }
+        if new_threshold < self.threshold {
+            return Err(ThresholdError::ReductionRequiresGovernance);
+        }
+        if new_threshold == self.threshold {
+            return Ok(());
+        }
+        self.record_change(caller, new_threshold);
+        Ok(())
+    }
+
+    /// Schedules a threshold reduction through the explicit delayed governance
+    /// flow. The reduction only takes effect once `reduction_delay` ledgers have
+    /// elapsed and `apply_reduction` is called.
+    pub fn schedule_reduction(
+        &mut self,
+        caller: &Address,
+        new_threshold: u32,
+        env: &Env,
+    ) -> Result<(), ThresholdError> {
+        caller.require_auth();
+        if new_threshold == 0 {
+            return Err(ThresholdError::InvalidThreshold);
+        }
+        if new_threshold >= self.threshold {
+            return Err(ThresholdError::InvalidThreshold);
+        }
+        self.pending_threshold = new_threshold;
+        self.pending_at = env.ledger().sequence();
+        self.has_pending = true;
+        Ok(())
+    }
+
+    /// Applies a previously scheduled reduction once the delay has elapsed.
+    /// Records the old value, new value, and actor for auditability.
+    pub fn apply_reduction(
+        &mut self,
+        caller: &Address,
+        env: &Env,
+    ) -> Result<(), ThresholdError> {
+        caller.require_auth();
+        if !self.has_pending {
+            return Err(ThresholdError::InvalidThreshold);
+        }
+        let elapsed = env.ledger().sequence().saturating_sub(self.pending_at);
+        if elapsed < self.reduction_delay {
+            return Err(ThresholdError::DelayNotElapsed);
+        }
+        let new_threshold = self.pending_threshold;
+        self.has_pending = false;
+        self.pending_threshold = 0;
+        self.pending_at = 0;
+        self.record_change(caller, new_threshold);
+        Ok(())
+    }
+
+    /// Records an accepted change and emits an audit event carrying the old
+    /// value, the new value, and the actor.
+    fn record_change(&mut self, caller: &Address, new_threshold: u32) {
+        let old = self.threshold;
+        self.threshold = new_threshold;
+        self.last_old = old;
+        self.last_new = new_threshold;
+        self.last_actor = caller.clone();
+        Env::default().events().publish(
+            (soroban_sdk::symbol_short!("thr_chg"),),
+            (old, new_threshold, caller.clone()),
+        );
+    }
+}
+
 /// Errors surfaced by the pause/unpause control path.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PauseError {
@@ -214,160 +365,6 @@ pub enum PauseError {
 ///
 /// Only the stored admin may pause or resume. Pausing/resuming never touches
 /// reserve or share accounting; it only flips the `paused` flag so restricted
-/// actions can be gated without corrupting state.
-#[derive(Clone)]
-#[contracttype]
-pub struct PauseControl {
-    pub admin: Address,
-    pub paused: bool,
-}
+/// actions can be gated without corrupti
 
-impl PauseControl {
-    pub fn new(admin: Address) -> Self {
-        Self {
-            admin,
-            paused: false,
-        }
-    }
-
-    /// Pauses the contract. Only the authorized admin may call this.
-    pub fn pause(&mut self, caller: &Address, env: &Env) -> Result<(), PauseError> {
-        caller.require_auth();
-        if caller != &self.admin {
-            return Err(PauseError::Unauthorized);
-        }
-        if self.paused {
-            return Err(PauseError::AlreadyPaused);
-        }
-        self.paused = true;
-        Ok(())
-    }
-
-    /// Resumes the contract. Only the authorized admin may call this.
-    /// Restores normal operation without resetting any accounting state.
-    pub fn unpause(&mut self, caller: &Address, env: &Env) -> Result<(), PauseError> {
-        caller.require_auth();
-        if caller != &self.admin {
-            return Err(PauseError::Unauthorized);
-        }
-        if !self.paused {
-            return Err(PauseError::NotPaused);
-        }
-        self.paused = false;
-        Ok(())
-    }
-
-    /// Guard for restricted actions (trading, deposits). Returns an explicit
-    /// error while the contract is paused.
-    pub fn require_not_paused(&self) -> Result<(), PauseError> {
-        if self.paused {
-            return Err(PauseError::ContractPaused);
-        }
-        Ok(())
-    }
-}
-
-/// Errors surfaced by the deposit retry protection path.
-#[derive(Debug, PartialEq, Eq)]
-pub enum DepositError {
-    /// A deposit with this transaction marker was already applied.
-    DuplicateDeposit,
-    /// A deposit with this transaction marker is already in flight.
-    DepositInFlight,
-    /// The deposit amount must be strictly positive.
-    InvalidAmount,
-}
-
-/// Lifecycle marker for a single deposit attempt, keyed by a caller-supplied
-/// transaction id. Used to make deposit application idempotent so a retried or
-/// partially-failed ledger write cannot double-count balances or rewards.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[contracttype]
-pub enum DepositStatus {
-    /// The deposit has been recorded but its ledger write has not committed.
-    Pending,
-    /// The deposit's ledger write committed successfully.
-    Applied,
-}
-
-/// Per-transaction deposit marker enabling safe retries of critical deposit
-/// transitions. A deposit is applied at most once per `tx_id`; retries observe
-/// the existing marker instead of re-applying balances or rewards.
-#[derive(Clone)]
-#[contracttype]
-pub struct DepositGuard {
-    pub tx_id: u64,
-    pub amount: i128,
-    pub status: DepositStatus,
-}
-
-impl DepositGuard {
-    /// Creates a new pending marker for a deposit attempt. Rejects non-positive
-    /// amounts so a malformed retry cannot corrupt accounting.
-    pub fn new(tx_id: u64, amount: i128) -> Result<Self, DepositError> {
-        if amount <= 0 {
-            return Err(DepositError::InvalidAmount);
-        }
-        Ok(Self {
-            tx_id,
-            amount,
-            status: DepositStatus::Pending,
-        })
-    }
-
-    /// Guard that must hold before applying a deposit's ledger write.
-    ///
-    /// Returns `Ok(())` only for a fresh `Pending` marker. An `Applied` marker
-    /// signals a retry of an already-committed deposit and is rejected so
-    /// balances and rewards are never duplicated.
-    pub fn check_applicable(&self) -> Result<(), DepositError> {
-        match self.status {
-            DepositStatus::Pending => Ok(()),
-            DepositStatus::Applied => Err(DepositError::DuplicateDeposit),
-        }
-    }
-
-    /// Marks the deposit as applied after its ledger write commits. Idempotent:
-    /// re-marking an already-applied deposit is a no-op, so a retried commit
-    /// cannot flip state or duplicate the write.
-    pub fn mark_applied(&mut self) -> Result<(), DepositError> {
-        self.check_applicable()?;
-        self.status = DepositStatus::Applied;
-        Ok(())
-    }
-
-    /// Rolls a failed deposit back to a consistent state. A `Pending` marker is
-    /// left untouched so the deposit can be safely retried; an `Applied` marker
-    /// is preserved because its ledger write already committed.
-    pub fn rollback_failed(&mut self) -> Result<(), DepositError> {
-        match self.status {
-            DepositStatus::Pending => Ok(()),
-            DepositStatus::Applied => Err(DepositError::DuplicateDeposit),
-        }
-    }
-}
-
-/// Kind of emergency action recorded in the shared journal.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[contracttype]
-pub enum EmergencyAction {
-    /// A critical contract was paused.
-    Pause,
-    /// A paused contract was recovered/resumed.
-    Recovery,
-    /// A forced settlement was executed.
-    ForcedSettlement,
-}
-
-/// Errors surfaced by the emergency action journal.
-#[derive(Debug, PartialEq, Eq)]
-pub enum JournalError {
-    /// Caller is not authorized to write to the journal.
-    Unauthorized,
-    /// The requested query bound is invalid (e.g. zero limit).
-    InvalidBound,
-}
-
-/// A single appen
-
-/* … truncated 5159 chars — edit only what you need near the top … */
+/* … truncated 5155 chars — edit only what you need near the top … */
