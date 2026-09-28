@@ -23,6 +23,15 @@
 <!-- handsoff-issue-1186 -->
 - #1186: Verify persistent storage schema checksum during upgrades
 
+<!-- handsoff-issue-1114 -->
+- #1114: Implement overflow-safe oracle median aggregation
+
+<!-- handsoff-issue-1192 -->
+- #1192: Benchmark host function costs for critical contract entrypoints
+
+<!-- handsoff-issue-1185 -->
+- #1185: Add resumable cursor-based lazy storage migration
+
 <!-- handsoff-issue-1187 -->
 - #1187: Authenticate pagination cursors against contract and query scope
 
@@ -40,4 +49,3 @@
 
 <!-- handsoff-issue-1220 -->
 - #1220: Require provider authorization for signal revision updates
-
