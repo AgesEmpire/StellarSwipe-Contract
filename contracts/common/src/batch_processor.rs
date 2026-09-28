@@ -14,6 +14,8 @@
 //! - Cross-contract invocation depth is explicitly capped
 //!   ([`MAX_INVOCATION_DEPTH`]) and re-entrant/cyclic call patterns are
 //!   rejected before any irreversible effects occur.
+//! - Trade execution routes are capped at a configurable number of hops
+//!   ([`MAX_ROUTE_HOPS`]) and rejected before any state mutation or transfer.
 
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, Env, Vec};
 
@@ -26,6 +28,12 @@ pub const MAX_BATCH_SIZE: u32 = 32;
 /// recursion so cyclic cross-contract patterns cannot recurse until resource
 /// exhaustion.
 pub const MAX_INVOCATION_DEPTH: u32 = 8;
+
+/// Lower bound for a configurable trade route hop limit.
+pub const MIN_ROUTE_HOPS: u32 = 1;
+
+/// Upper bound for a configurable trade route hop limit.
+pub const MAX_ROUTE_HOPS: u32 = 16;
 
 /// Errors surfaced by the batch verifier.
 #[contracterror]
@@ -42,6 +50,14 @@ pub enum BatchError {
     InvocationCycle = 4,
     /// The cross-contract invocation depth exceeded [`MAX_INVOCATION_DEPTH`].
     InvocationDepthExceeded = 5,
+    /// The trade route was empty.
+    EmptyRoute = 6,
+    /// The trade route exceeded the configured hop limit.
+    RouteTooLong = 7,
+    /// The trade route contained a duplicate hop.
+    DuplicateHop = 8,
+    /// The configured route hop limit was outside the validated bounds.
+    InvalidRouteHopLimit = 9,
 }
 
 /// A single authorization check bound to its intended operation and caller.
@@ -178,5 +194,57 @@ impl InvocationGuard {
         next.push_back(contract_id.clone());
         let _ = env;
         Ok(next)
+    }
+}
+
+/// Guard enforcing the trade execution route hop policy.
+///
+/// A route is an ordered list of intermediate asset identifiers. The guard
+/// validates the route against a configurable hop limit before any state
+/// mutation or transfer is performed, so over-limit, duplicate-hop, and empty
+/// routes fail early and deterministically.
+pub struct RouteGuard;
+
+impl RouteGuard {
+    /// Validate a configured hop limit against the safe bounds
+    /// [`MIN_ROUTE_HOPS`]..=[`MAX_ROUTE_HOPS`].
+    ///
+    /// Returns [`BatchError::InvalidRouteHopLimit`] when the configured limit
+    /// falls outside the validated bounds.
+    pub fn validate_limit(max_hops: u32) -> Result<(), BatchError> {
+        if max_hops < MIN_ROUTE_HOPS || max_hops > MAX_ROUTE_HOPS {
+            return Err(BatchError::InvalidRouteHopLimit);
+        }
+        Ok(())
+    }
+
+    /// Validate a trade route against the configured `max_hops` limit.
+    ///
+    /// The configured limit is first checked against the validated bounds.
+    /// Empty routes are rejected with [`BatchError::EmptyRoute`], routes with
+    /// more hops than `max_hops` with [`BatchError::RouteTooLong`], and routes
+    /// that revisit a hop with [`BatchError::DuplicateHop`]. All checks run
+    /// before any state mutation or transfer, so rejected routes have no
+    /// irreversible effects.
+    pub fn validate(route: &Vec<BytesN<32>>, max_hops: u32) -> Result<(), BatchError> {
+        Self::validate_limit(max_hops)?;
+
+        let len = route.len();
+        if len == 0 {
+            return Err(BatchError::EmptyRoute);
+        }
+        if len > max_hops {
+            return Err(BatchError::RouteTooLong);
+        }
+
+        for i in 0..len {
+            let hop = route.get_unchecked(i);
+            for j in (i + 1)..len {
+                if route.get_unchecked(j) == hop {
+                    return Err(BatchError::DuplicateHop);
+                }
+            }
+        }
+        Ok(())
     }
 }
