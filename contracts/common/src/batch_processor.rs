@@ -17,6 +17,8 @@
 //! - Multi-action governance proposal execution is bounded
 //!   ([`MAX_ACTION_BATCH_SIZE`]) and its progress/retry semantics are
 //!   explicit ([`ActionBatchProgress`]).
+//! - Trade routes are validated for asset continuity before execution, so an
+//!   invalid route fails without performing transfers or state changes.
 
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, Env, Vec};
 
@@ -60,6 +62,12 @@ pub enum BatchError {
     EmptyActionBatch = 7,
     /// An action in the batch failed during execution.
     ActionFailed = 8,
+    /// A trade route hop did not consume the prior hop's output asset.
+    AssetContinuityBroken = 9,
+    /// A trade route did not terminate in the requested asset.
+    RouteTerminalAssetMismatch = 10,
+    /// The trade route was empty.
+    EmptyRoute = 11,
 }
 
 /// A single authorization check bound to its intended operation and caller.
@@ -103,6 +111,20 @@ pub struct ActionBatchProgress {
     pub next_index: u32,
     /// Whether all actions have executed successfully.
     pub completed: bool,
+}
+
+/// A single hop in a trade route.
+///
+/// Each hop consumes `asset_in` and produces `asset_out`. For a route to be
+/// valid, every hop's `asset_in` must equal the prior hop's `asset_out`, and
+/// the final hop's `asset_out` must equal the requested asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteHop {
+    /// The asset consumed by this hop.
+    pub asset_in: BytesN<32>,
+    /// The asset produced by this hop.
+    pub asset_out: BytesN<32>,
 }
 
 /// Bounded batch authorization verifier.
@@ -239,6 +261,42 @@ impl BatchVerifier {
             next_index: progress.total,
             completed: true,
         })
+    }
+
+    /// Validate asset continuity across a trade route before execution begins.
+    ///
+    /// Each hop must consume the output asset of the prior hop, and the route
+    /// must terminate in `requested_asset`. An empty route is rejected with
+    /// [`BatchError::EmptyRoute`]. A hop whose `asset_in` does not match the
+    /// prior hop's `asset_out` is rejected with
+    /// [`BatchError::AssetContinuityBroken`]. A route whose final `asset_out`
+    /// does not equal `requested_asset` is rejected with
+    /// [`BatchError::RouteTerminalAssetMismatch`].
+    ///
+    /// This performs no transfers and mutates no state, so an invalid route
+    /// fails before any irreversible effects occur.
+    pub fn validate_route(
+        route: &Vec<RouteHop>,
+        requested_asset: &BytesN<32>,
+    ) -> Result<(), BatchError> {
+        let len = route.len();
+        if len == 0 {
+            return Err(BatchError::EmptyRoute);
+        }
+
+        let mut prev_out = route.get_unchecked(0).asset_in.clone();
+        for i in 0..len {
+            let hop = route.get_unchecked(i);
+            if hop.asset_in != prev_out {
+                return Err(BatchError::AssetContinuityBroken);
+            }
+            prev_out = hop.asset_out.clone();
+        }
+
+        if prev_out != *requested_asset {
+            return Err(BatchError::RouteTerminalAssetMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -406,6 +464,72 @@ mod tests {
         assert_eq!(
             BatchVerifier::verify(&env, &caller, &op, &items),
             Err(BatchError::BatchTooLarge)
+        );
+    }
+
+    fn asset(env: &Env, seed: u8) -> BytesN<32> {
+        BytesN::from_array(env, &[seed; 32])
+    }
+
+    fn hop(env: &Env, asset_in: u8, asset_out: u8) -> RouteHop {
+        RouteHop {
+            asset_in: asset(env, asset_in),
+            asset_out: asset(env, asset_out),
+        }
+    }
+
+    #[test]
+    fn valid_chain_passes() {
+        let env = Env::default();
+        let mut route: Vec<RouteHop> = Vec::new(&env);
+        route.push_back(hop(&env, 1, 2));
+        route.push_back(hop(&env, 2, 3));
+        route.push_back(hop(&env, 3, 4));
+        assert_eq!(BatchVerifier::validate_route(&route, &asset(&env, 4)), Ok(()));
+    }
+
+    #[test]
+    fn single_hop_chain_passes() {
+        let env = Env::default();
+        let mut route: Vec<RouteHop> = Vec::new();
+        route.push_back(hop(&env, 1, 2));
+        assert_eq!(BatchVerifier::validate_route(&route, &asset(&env, 2)), Ok(()));
+    }
+
+    #[test]
+    fn disconnected_hops_fail() {
+        let env = Env::default();
+        let mut route: Vec<RouteHop> = Vec::new();
+        route.push_back(hop(&env, 1, 2));
+        route.push_back(hop(&env, 3, 4));
+        assert_eq!(
+            BatchVerifier::validate_route(&route, &asset(&env, 4)),
+            Err(BatchError::AssetContinuityBroken)
+        );
+    }
+
+    #[test]
+    fn incorrect_final_asset_fails() {
+        let env = Env::default();
+        let mut route: Vec<RouteHop> = Vec::new();
+        route.push_back(hop(&env, 1, 2));
+        route.push_back(hop(&env, 2, 3));
+        assert_eq!(
+            BatchVerifier::validate_route(&route, &asset(&env, 9)),
+            Err(BatchError::RouteTerminalAssetMismatch)
+        );
+    }
+
+    #[test]
+    fn empty_route_fails() {
+        let env = Env::default();
+        let route: Vec<RouteHop> = Vec::new(&env);
+        assert_eq!(
+            BatchVerifier::validate_route(&route, &asset(&env, 1)),
+            Err(BatchError::EmptyRoute)
+        );
+    }
+}
         );
     }
 }

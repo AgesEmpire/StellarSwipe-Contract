@@ -6,6 +6,7 @@
 //! Also provides delayed guardian recovery for lost administrator access (#1183).
 //! Also provides scoped operator capabilities for contract maintenance actions (#1182).
 //! Also defines cancellation rules for queued governance timelock actions (#1210).
+//! Also provides safe overlap during bridge validator-set rotation (#1218).
 //! Follow-up work: wire into the live pause-handling contract storage/auth and add
 //! integration tests against real contract state.
 
@@ -312,6 +313,103 @@ impl TimelockAction {
     pub fn execute(&mut self, env: &Env) -> Result<(), TimelockError> {
         self.check_executable(env)?;
         self.state = TimelockState::Executed;
+        Ok(())
+    }
+}
+
+/// Errors surfaced by the bridge validator-set rotation path (#1218).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ValidatorSetError {
+    /// The configured overlap window is invalid (e.g. zero).
+    InvalidConfig,
+    /// The rotation has not yet been activated.
+    NotActivated,
+    /// The rotation has already been retired.
+    AlreadyRetired,
+    /// The rotation is still within its activation boundary.
+    NotYetActive,
+    /// The rotation is still within its retirement boundary.
+    NotYetRetired,
+}
+
+/// A rotated bridge validator set with explicit activation and retirement
+/// boundaries and a bounded overlap window (#1218).
+///
+/// During rotation the previous set remains valid for verification until the
+/// retirement boundary, but only within the bounded overlap window. Messages
+/// signed before activation are verified against the previous set; messages
+/// signed during the overlap window may be verified against either set; and
+/// messages signed after retirement must be verified against the new set only.
+#[derive(Clone)]
+#[contracttype]
+pub struct ValidatorSetRotation {
+    /// Ledger sequence at which the new validator set becomes active.
+    pub activated_at: u32,
+    /// Ledger sequence at which the previous validator set is retired.
+    pub retired_at: u32,
+    /// Maximum number of ledgers the previous set may remain valid after
+    /// activation. Bounds the overlap so signatures from unintended sets are
+    /// not accepted indefinitely.
+    pub overlap_window: u32,
+}
+
+impl ValidatorSetRotation {
+    /// Creates a rotation with explicit activation and retirement boundaries.
+    /// Rejects a zero overlap window and a retirement boundary that does not
+    /// fall strictly after activation, so the overlap is always bounded and
+    /// well-ordered.
+    pub fn new(
+        activated_at: u32,
+        retired_at: u32,
+        overlap_window: u32,
+    ) -> Result<Self, ValidatorSetError> {
+        if overlap_window == 0 || retired_at <= activated_at {
+            return Err(ValidatorSetError::InvalidConfig);
+        }
+        Ok(Self {
+            activated_at,
+            retired_at,
+            overlap_window,
+        })
+    }
+
+    /// Returns the effective retirement boundary, clamped so the previous set
+    /// never remains valid beyond the bounded overlap window after activation.
+    pub fn effective_retired_at(&self) -> u32 {
+        let bounded = self.activated_at.saturating_add(self.overlap_window);
+        if self.retired_at < bounded {
+            self.retired_at
+        } else {
+            bounded
+        }
+    }
+
+    /// Returns true while the previous validator set is still valid for
+    /// verification, i.e. within the bounded overlap window after activation.
+    pub fn previous_set_valid(&self, env: &Env) -> bool {
+        let now = env.ledger().sequence();
+        now >= self.activated_at && now < self.effective_retired_at()
+    }
+
+    /// Returns true once the new validator set is the only valid set, i.e. the
+    /// bounded overlap window has fully elapsed.
+    pub fn new_set_only(&self, env: &Env) -> bool {
+        env.ledger().sequence() >= self.effective_retired_at()
+    }
+
+    /// Returns Ok(()) when the rotation is active and the previous set is still
+    /// within its bounded overlap window. Does not itself perform any state change.
+    pub fn check_overlap(&self, env: &Env) -> Result<(), ValidatorSetError> {
+        let now = env.ledger().sequence();
+        if now < self.activated_at {
+            return Err(ValidatorSetError::NotYetActive);
+        }
+        if now >= self.effective_retired_at() {
+            return Err(ValidatorSetError::AlreadyRetired);
+        }
+        Ok(())
+    }
+}
         Ok(())
     }
 }
