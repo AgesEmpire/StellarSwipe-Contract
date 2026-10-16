@@ -70,12 +70,15 @@ pub enum SignalError {
     IdempotencyKeyReused = 12,
     NoPendingAdmin = 13,
     NotPendingAdmin = 14,
+    /// Issue #1252: a bounded multi-provider lookup was requested with more
+    /// addresses than the documented maximum. No work is performed.
+    TooManyProviders = 15,
     /// Issue #1256: a compare-and-set metadata update was attempted with an
     /// expected revision that does not match the stored revision.
-    MetadataRevisionConflict = 15,
+    MetadataRevisionConflict = 16,
     /// Issue #1256: the monotonic metadata revision counter cannot advance
     /// further without overflowing.
-    MetadataRevisionOverflow = 16,
+    MetadataRevisionOverflow = 17,
 }
 
 /// Maximum accepted length, in bytes, of provider metadata.
@@ -99,6 +102,11 @@ pub const IDEMPOTENCY_KEY_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 /// Issue #1255: upper bound on the number of idempotency key references
 /// examined (and at most removed) by a single reclaim call.
 pub const MAX_IDEMPOTENCY_PURGE: u32 = 100;
+
+/// Issue #1252: documented maximum number of provider addresses accepted by a
+/// single bounded multi-provider reputation lookup. Requests above this bound
+/// are rejected before any work is performed so caller cost stays predictable.
+pub const MAX_REPUTATION_LOOKUP: u32 = 20;
 
 /// Configuration-driven reputation decay schedule.
 ///
@@ -192,6 +200,35 @@ pub struct ConfigChanged {
     pub old_value: DecaySchedule,
     pub new_value: DecaySchedule,
     pub actor: Address,
+}
+
+/// Single entry of a bounded multi-provider reputation lookup (issue #1252).
+///
+/// `known` is an explicit representation for unknown providers: an entry is
+/// always produced for every requested address, in the requested order, and
+/// `known == false` marks an address with no stored reputation record so
+/// callers never have to infer absence from a zeroed score.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReputationLookupEntry {
+    pub provider: Address,
+    pub known: bool,
+    pub record: ReputationRecord,
+}
+
+/// Structured payload for signal registry record lifecycle events (issue #1251).
+///
+/// A consumer can replay these events into a model of the active registry
+/// view: `active == true` registers or revises a record, `active == false`
+/// removes it. `operation` distinguishes the exact transition and `timestamp`
+/// is the ledger time at which it happened.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryRecordEvent {
+    pub provider: Address,
+    pub operation: Symbol,
+    pub active: bool,
+    pub timestamp: u64,
 }
 
 const ADMIN_KEY: &str = "admin";
@@ -392,6 +429,41 @@ impl SignalRegistry {
         Ok(next)
     }
 
+    /// Issue #1252: bounded multi-provider reputation lookup.
+    ///
+    /// Returns one [`ReputationLookupEntry`] for every requested provider, in
+    /// the exact order supplied, so callers get a deterministic mapping back to
+    /// their request. Requests larger than [`MAX_REPUTATION_LOOKUP`] are
+    /// rejected with [`SignalError::TooManyProviders`] before any storage read.
+    /// Unknown providers yield an explicit `known == false` entry with a zeroed
+    /// record rather than being silently omitted.
+    pub fn get_reputations(
+        env: Env,
+        providers: Vec<Address>,
+    ) -> Result<Vec<ReputationLookupEntry>, SignalError> {
+        if providers.len() > MAX_REPUTATION_LOOKUP {
+            return Err(SignalError::TooManyProviders);
+        }
+
+        let mut entries = Vec::new(&env);
+        for provider in providers.iter() {
+            let key = (REPUTATION_KEY, provider.clone());
+            let stored: Option<ReputationRecord> = env.storage().persistent().get(&key);
+            let known = stored.is_some();
+            let record = stored.unwrap_or(ReputationRecord {
+                score: 0,
+                last_updated: 0,
+            });
+            entries.push_back(ReputationLookupEntry {
+                provider,
+                known,
+                record,
+            });
+        }
+        Ok(entries)
+    }
+    }
+
     /// Store provider metadata after validating its length and encoding.
     ///
     /// Validation runs before any persistent write, so empty, over-limit, or
@@ -407,8 +479,22 @@ impl SignalRegistry {
         if Self::record_state(&env, &provider) == RecordState::Tombstoned {
             return Err(SignalError::IdentifierTombstoned);
         }
-        let key = (METADATA_KEY, provider);
+        let key = (METADATA_KEY, provider.clone());
+        // Issue #1251: distinguish a first registration from a revision so the
+        // event stream is replay-complete.
+        let existed = env.storage().persistent().has(&key);
         env.storage().persistent().set(&key, &metadata);
+
+        Self::emit_record_event(
+            &env,
+            provider,
+            if existed {
+                Symbol::new(&env, "record_revised")
+            } else {
+                Symbol::new(&env, "record_registered")
+            },
+            true,
+        );
         Ok(())
     }
 
@@ -426,7 +512,7 @@ impl SignalRegistry {
         provider.require_auth();
         let key = (METADATA_KEY, provider.clone());
         env.storage().persistent().remove(&key);
-        let tomb_key = (TOMBSTONE_KEY, provider);
+        let tomb_key = (TOMBSTONE_KEY, provider.clone());
         if !env.storage().persistent().has(&tomb_key) {
             let now = env.ledger().timestamp();
             let tombstone = Tombstone {
@@ -435,7 +521,24 @@ impl SignalRegistry {
             };
             env.storage().persistent().set(&tomb_key, &tombstone);
         }
+        // Issue #1251: emit the removal transition. Re-removing an already
+        // tombstoned identifier is idempotent and emits the same removal event
+        // so replay stays consistent with the returned state.
+        Self::emit_record_event(&env, provider, Symbol::new(&env, "record_removed"), false);
         Ok(())
+    }
+
+    /// Emit a structured registry record lifecycle event (issue #1251).
+    fn emit_record_event(env: &Env, provider: Address, operation: Symbol, active: bool) {
+        env.events().publish(
+            (operation.clone(), provider.clone()),
+            RegistryRecordEvent {
+                provider,
+                operation,
+                active,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
     /// Report the lifecycle state of an identifier: `Active`, `Tombstoned`,
