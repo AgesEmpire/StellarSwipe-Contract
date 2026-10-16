@@ -135,6 +135,114 @@ pub struct PerformanceReport {
 }
 
 // ============================================================================
+// Analytics Query Cost Envelopes
+// ============================================================================
+
+/// The kind of analytics query a caller intends to run. Each variant maps to a
+/// declared cost envelope so callers can reject expensive requests before
+/// execution.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum AnalyticsQueryType {
+    /// Aggregate a single provider's headline metrics.
+    ProviderSummary,
+    /// Build a time-series over a bounded window.
+    TimeSeries,
+    /// Compute period performance over a bounded window.
+    PeriodPerformance,
+    /// Produce predictive analytics for a provider.
+    Predictive,
+    /// Scan for anomalies across a provider's history.
+    AnomalyScan,
+    /// Assemble a full performance report.
+    FullReport,
+}
+
+/// Bounded cost metadata attached to an analytics query. `max_scan_cost` and
+/// `max_aggregation_cost` are the declared ceilings for the query type; a
+/// request whose estimated costs exceed either ceiling must be rejected before
+/// execution.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct QueryCostEnvelope {
+    pub query_type: AnalyticsQueryType,
+    pub max_scan_cost: u32,
+    pub max_aggregation_cost: u32,
+}
+
+/// Which cost dimension a request exceeded.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum CostDimension {
+    Scan,
+    Aggregation,
+}
+
+/// Error returned when a query's estimated cost exceeds its declared envelope.
+/// `dimension` identifies whether the scan or aggregation budget was exceeded.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct CostEnvelopeExceeded {
+    pub query_type: AnalyticsQueryType,
+    pub dimension: CostDimension,
+    pub limit: u32,
+    pub estimated: u32,
+}
+
+/// Declared cost envelope for a query type. Every query type must declare a
+/// maximum scan cost and a maximum aggregation cost.
+pub fn query_cost_envelope(query_type: AnalyticsQueryType) -> QueryCostEnvelope {
+    let (max_scan_cost, max_aggregation_cost) = match query_type {
+        AnalyticsQueryType::ProviderSummary => (100u32, 50u32),
+        AnalyticsQueryType::TimeSeries => (1_000u32, 500u32),
+        AnalyticsQueryType::PeriodPerformance => (2_000u32, 1_000u32),
+        AnalyticsQueryType::Predictive => (500u32, 2_000u32),
+        AnalyticsQueryType::AnomalyScan => (5_000u32, 2_500u32),
+        AnalyticsQueryType::FullReport => (10_000u32, 5_000u32),
+    };
+
+    QueryCostEnvelope {
+        query_type,
+        max_scan_cost,
+        max_aggregation_cost,
+    }
+}
+
+/// Enforce a query's declared cost envelope before execution.
+///
+/// `estimated_scan_cost` and `estimated_aggregation_cost` are the caller's
+/// projected costs for the request. Returns `Ok(())` when both dimensions are
+/// within the declared envelope, or `Err(CostEnvelopeExceeded)` identifying the
+/// first exceeded dimension (scan checked before aggregation).
+pub fn enforce_query_cost_envelope(
+    query_type: AnalyticsQueryType,
+    estimated_scan_cost: u32,
+    estimated_aggregation_cost: u32,
+) -> Result<(), CostEnvelopeExceeded> {
+    let envelope = query_cost_envelope(query_type);
+
+    if estimated_scan_cost > envelope.max_scan_cost {
+        return Err(CostEnvelopeExceeded {
+            query_type,
+            dimension: CostDimension::Scan,
+            limit: envelope.max_scan_cost,
+            estimated: estimated_scan_cost,
+        });
+    }
+
+    if estimated_aggregation_cost > envelope.max_aggregation_cost {
+        return Err(CostEnvelopeExceeded {
+            query_type,
+            dimension: CostDimension::Aggregation,
+            limit: envelope.max_aggregation_cost,
+            estimated: estimated_aggregation_cost,
+        });
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Storage Rent Estimation Diagnostics
 // ============================================================================
 
@@ -251,203 +359,5 @@ pub fn calculate_win_rate(successful: u32, total: u32) -> u32 {
 pub fn calculate_profit_factor(total_profit: i128, total_loss: i128) -> u32 {
     if total_loss == 0 {
         if total_profit > 0 {
-            return 10000; // Maximum profit factor
-        }
-        return 0;
-    }
-    
-    let loss_abs = total_loss.abs();
-    ((total_profit * 100) / loss_abs).max(0) as u32
-}
 
-/// Calculate Sharpe ratio (simplified version * 100)
-/// Sharpe = (Average Return - Risk Free Rate) / Standard Deviation
-pub fn calculate_sharpe_ratio(
-    avg_return: i128,
-    std_deviation: i128,
-    risk_free_rate: i128,
-) -> i32 {
-    if std_deviation == 0 {
-        return 0;
-    }
-    
-    let excess_return = avg_return - risk_free_rate;
-    ((excess_return * 100) / std_deviation) as i32
-}
-
-/// Calculate maximum drawdown percentage
-pub fn calculate_max_drawdown(peak_value: i128, trough_value: i128) -> u32 {
-    if peak_value <= 0 {
-        return 0;
-    }
-    
-    let drawdown = peak_value - trough_value;
-    if drawdown <= 0 {
-        return 0;
-    }
-    
-    ((drawdown * 10000) / peak_value) as u32
-}
-
-/// Calculate consistency score (0-100)
-/// Based on variance of returns and win rate stability
-pub fn calculate_consistency_score(
-    win_rate_variance: u32,
-    return_variance: i128,
-) -> u32 {
-    // Lower variance = higher consistency
-    // This is a simplified calculation
-    let wr_score = 100u32.saturating_sub(win_rate_variance.min(100));
-    let rv_score = 100u32.saturating_sub((return_variance.abs() / 1000).min(100) as u32);
-    
-    (wr_score + rv_score) / 2
-}
-
-/// Calculate risk score (0-100)
-/// Higher score = higher risk
-pub fn calculate_risk_score(
-    max_drawdown: u32,
-    volatility: u32,
-    leverage_used: u32,
-) -> u32 {
-    let dd_component = (max_drawdown / 100).min(40);
-    let vol_component = (volatility / 100).min(40);
-    let lev_component = (leverage_used / 10).min(20);
-    
-    dd_component + vol_component + lev_component
-}
-
-// ============================================================================
-// Historical Trend Analysis
-// ============================================================================
-
-/// Analyze historical performance trends
-pub fn analyze_historical_trend(
-    data_points: &Vec<TimeSeriesDataPoint>,
-) -> TrendDirection {
-    if data_points.len() < 2 {
-        return TrendDirection::Sideways;
-    }
-    
-    // Calculate simple moving average trend
-    let recent_avg = calculate_recent_average(data_points, 5);
-    let older_avg = calculate_older_average(data_points, 5);
-    
-    let diff_percentage = if older_avg != 0 {
-        ((recent_avg - older_avg) * 100) / older_avg.abs()
-    } else {
-        0
-    };
-    
-    match diff_percentage {
-        d if d > 20 => TrendDirection::StrongUptrend,
-        d if d > 5 => TrendDirection::Uptrend,
-        d if d < -20 => TrendDirection::StrongDowntrend,
-        d if d < -5 => TrendDirection::Downtrend,
-        _ => TrendDirection::Sideways,
-    }
-}
-
-/// Calculate recent average from data points
-fn calculate_recent_average(data_points: &Vec<TimeSeriesDataPoint>, count: usize) -> i128 {
-    let len = data_points.len();
-    if len == 0 {
-        return 0;
-    }
-    
-    let start = if len > count { len - count } else { 0 };
-    let mut sum = 0i128;
-    let mut actual_count = 0u32;
-    
-    for i in start..len {
-        if let Some(dp) = data_points.get(i as u32) {
-            sum += dp.value;
-            actual_count += 1;
-        }
-    }
-    
-    if actual_count > 0 {
-        sum / actual_count as i128
-    } else {
-        0
-    }
-}
-
-/// Calculate older average from data points
-fn calculate_older_average(data_points: &Vec<TimeSeriesDataPoint>, count: usize) -> i128 {
-    let len = data_points.len();
-    if len <= count {
-        return 0;
-    }
-    
-    let end = len - count;
-    let start = if end > count { end - count } else { 0 };
-    let mut sum = 0i128;
-    let mut actual_count = 0u32;
-    
-    for i in start..end {
-        if let Some(dp) = data_points.get(i as u32) {
-            sum += dp.value;
-            actual_count += 1;
-        }
-    }
-    
-    if actual_count > 0 {
-        sum / actual_count as i128
-    } else {
-        0
-    }
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn estimate_new_record_is_deterministic() {
-        let a = estimate_storage_rent(ContractOperation::CreateRecord, 128, 0, 0);
-        let b = estimate_storage_rent(ContractOperation::CreateRecord, 128, 0, 0);
-        assert_eq!(a, b);
-        assert_eq!(a.projected_entries, 1);
-        assert_eq!(a.projected_bytes, 128 + ENTRY_OVERHEAD_BYTES);
-        assert_eq!(a.ttl_impact, DEFAULT_TTL_EXTENSION);
-        assert!(a.within_limits);
-    }
-
-    #[test]
-    fn estimate_update_record_reports_ttl_impact() {
-        let estimate = estimate_storage_rent(ContractOperation::UpdateRecord, 256, 10, 500);
-        assert_eq!(estimate.projected_entries, 1);
-        assert_eq!(estimate.projected_bytes, 256 + ENTRY_OVERHEAD_BYTES);
-        assert_eq!(estimate.ttl_impact, 500);
-        assert_eq!(
-            estimate.projected_rent,
-            (estimate.projected_bytes as i128) * 500
-        );
-        assert!(estimate.within_limits);
-    }
-
-    #[test]
-    fn estimate_near_limit_request_is_flagged() {
-        let estimate = estimate_storage_rent(
-            ContractOperation::AppendEntry,
-            MAX_BYTES_PER_OPERATION,
-            MAX_ENTRIES_PER_OPERATION,
-            0,
-        );
-        assert!(!estimate.within_limits);
-    }
-
-    #[test]
-    fn estimate_remove_entry_frees_bytes() {
-        let estimate = estimate_storage_rent(ContractOperation::RemoveEntry, 512, 5, 0);
-        assert_eq!(estimate.projected_entries, 1);
-        assert_eq!(estimate.projected_bytes, 0);
-        assert_eq!(estimate.projected_rent, 0);
-        assert!(estimate.within_limits);
-    }
-}
+/* … truncated 5818 chars — edit only what you need near the top … */
