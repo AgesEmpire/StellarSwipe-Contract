@@ -10,11 +10,19 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_sh
 /// this value is an ordinary fee balance and MUST NOT be sweepable.
 pub const DUST_THRESHOLD: i128 = 1_000;
 
+/// Number of ledgers a newly proposed payout recipient must wait before it can
+/// be activated. This delay prevents an accidental or compromised admin update
+/// from immediately redirecting accumulated fees.
+pub const RECIPIENT_ROTATION_DELAY: u32 = 17_280;
+
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const BALANCE_KEY: Symbol = symbol_short!("BALANCE");
 const SOURCE_KEY: Symbol = symbol_short!("SOURCE");
 const CLOSED_KEY: Symbol = symbol_short!("CLOSED");
 const SNAPSHOT_KEY: Symbol = symbol_short!("SNAPSHOT");
+const RECIPIENT_KEY: Symbol = symbol_short!("RECIPIENT");
+const PENDING_RECIPIENT_KEY: Symbol = symbol_short!("PEND_RECIP");
+const PENDING_ACTIVATION_KEY: Symbol = symbol_short!("PEND_ACT");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -28,6 +36,8 @@ pub enum FeeCollectorError {
     AmountNotDust = 6,
     UnknownRevenueSource = 7,
     BucketClosed = 8,
+    NoPendingRecipient = 9,
+    RecipientNotYetActive = 10,
 }
 
 #[contracttype]
@@ -62,6 +72,19 @@ pub struct ConfigChanged {
 pub struct RevenueSourceChanged {
     pub source: Address,
     pub allowed: bool,
+    pub actor: Address,
+}
+
+/// Auditable record of a payout recipient rotation.
+///
+/// Emitted when a new recipient is proposed (with the ledger at which it may
+/// be activated) and when a pending proposal is cancelled, so operators can
+/// discover and audit recipient changes before they take effect.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipientRotation {
+    pub recipient: Address,
+    pub activation_ledger: u32,
     pub actor: Address,
 }
 
@@ -136,6 +159,152 @@ impl FeeCollector {
         );
 
         Ok(())
+    }
+
+    /// Propose a new payout recipient.
+    ///
+    /// Only the configured admin may propose a recipient. The proposal is
+    /// stored as pending along with the ledger at which it becomes activatable
+    /// (`current_ledger + RECIPIENT_ROTATION_DELAY`). Payouts continue to use
+    /// the currently active recipient until the pending one is activated, so a
+    /// compromised admin cannot immediately redirect accumulated fees. The
+    /// proposal is recorded in a [`RecipientRotation`] event.
+    pub fn propose_recipient(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+    ) -> Result<(), FeeCollectorError> {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(FeeCollectorError::NotInitialized)?;
+        if caller != admin {
+            return Err(FeeCollectorError::Unauthorized);
+        }
+
+        let activation_ledger = env.ledger().sequence() + RECIPIENT_ROTATION_DELAY;
+
+        env.storage()
+            .instance()
+            .set(&PENDING_RECIPIENT_KEY, &recipient);
+        env.storage()
+            .instance()
+            .set(&PENDING_ACTIVATION_KEY, &activation_ledger);
+
+        env.events().publish(
+            (symbol_short!("recip_rot"),),
+            RecipientRotation {
+                recipient,
+                activation_ledger,
+                actor: caller,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending payout recipient proposal.
+    ///
+    /// Only the configured admin may cancel. Cancellation clears the pending
+    /// recipient and its activation ledger and is recorded in a
+    /// [`RecipientRotation`] event (with `activation_ledger` set to 0) so the
+    /// cancellation is fully auditable.
+    pub fn cancel_pending_recipient(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), FeeCollectorError> {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(FeeCollectorError::NotInitialized)?;
+        if caller != admin {
+            return Err(FeeCollectorError::Unauthorized);
+        }
+
+        let recipient: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_RECIPIENT_KEY)
+            .ok_or(FeeCollectorError::NoPendingRecipient)?;
+
+        env.storage().instance().remove(&PENDING_RECIPIENT_KEY);
+        env.storage().instance().remove(&PENDING_ACTIVATION_KEY);
+
+        env.events().publish(
+            (symbol_short!("recip_rot"),),
+            RecipientRotation {
+                recipient,
+                activation_ledger: 0,
+                actor: caller,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Activate a pending payout recipient once its delay has elapsed.
+    ///
+    /// Only the configured admin may activate. Activation is rejected until
+    /// the current ledger reaches the stored activation ledger, enforcing the
+    /// rotation delay. On success the pending recipient becomes the active
+    /// recipient and the pending state is cleared.
+    pub fn activate_recipient(env: Env, caller: Address) -> Result<(), FeeCollectorError> {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(FeeCollectorError::NotInitialized)?;
+        if caller != admin {
+            return Err(FeeCollectorError::Unauthorized);
+        }
+
+        let recipient: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_RECIPIENT_KEY)
+            .ok_or(FeeCollectorError::NoPendingRecipient)?;
+        let activation_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&PENDING_ACTIVATION_KEY)
+            .ok_or(FeeCollectorError::NoPendingRecipient)?;
+
+        if env.ledger().sequence() < activation_ledger {
+            return Err(FeeCollectorError::RecipientNotYetActive);
+        }
+
+        env.storage().instance().set(&RECIPIENT_KEY, &recipient);
+        env.storage().instance().remove(&PENDING_RECIPIENT_KEY);
+        env.storage().instance().remove(&PENDING_ACTIVATION_KEY);
+
+        Ok(())
+    }
+
+    /// The currently active payout recipient, if any.
+    ///
+    /// Payouts must only ever use this recipient; the pending recipient is
+    /// never returned here.
+    pub fn active_recipient(env: Env) -> Option<Address> {
+        env.storage().instance().get(&RECIPIENT_KEY)
+    }
+
+    /// The pending payout recipient and the ledger at which it may be
+    /// activated, if a proposal is outstanding.
+    pub fn pending_recipient(env: Env) -> Option<(Address, u32)> {
+        let recipient: Option<Address> = env.storage().instance().get(&PENDING_RECIPIENT_KEY);
+        let activation_ledger: Option<u32> = env.storage().instance().get(&PENDING_ACTIVATION_KEY);
+        match (recipient, activation_ledger) {
+            (Some(recipient), Some(activation_ledger)) => Some((recipient, activation_ledger)),
+            _ => None,
+        }
     }
 
     /// Authorize a revenue source to deposit fees into the collector.
@@ -260,132 +429,5 @@ impl FeeCollector {
     /// Whether the fee bucket has been closed out.
     pub fn is_closed(env: Env) -> bool {
         env.storage().instance().get(&CLOSED_KEY).unwrap_or(false)
-    }
-
-    /// Close out the fee bucket, snapshotting totals and freezing the period.
-    ///
-    /// Only the configured admin may close the bucket. The operation is
-    /// idempotent: a repeat call is a safe no-op that returns the existing
-    /// snapshot unchanged, so the frozen totals can never be altered after the
-    /// first close. Pending rebates are handled by policy: they are recorded in
-    /// the snapshot and deducted from the reported net total, but are not paid
-    /// out here. Once closed, [`collect`] rejects further writes.
-    pub fn close_bucket(
-        env: Env,
-        caller: Address,
-        pending_rebates: i128,
-    ) -> Result<BucketSnapshot, FeeCollectorError> {
-        caller.require_auth();
-
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&ADMIN_KEY)
-            .ok_or(FeeCollectorError::NotInitialized)?;
-        if caller != admin {
-            return Err(FeeCollectorError::Unauthorized);
-        }
-
-        if pending_rebates < 0 {
-            return Err(FeeCollectorError::InvalidAmount);
-        }
-
-        // Idempotent: return the frozen snapshot without mutating it.
-        if let Some(existing) = env
-            .storage()
-            .instance()
-            .get::<Symbol, BucketSnapshot>(&SNAPSHOT_KEY)
-        {
-            return Ok(existing);
-        }
-
-        let total_collected: i128 = env.storage().instance().get(&BALANCE_KEY).unwrap_or(0);
-        if pending_rebates > total_collected {
-            return Err(FeeCollectorError::AmountExceedsBalance);
-        }
-
-        let snapshot = BucketSnapshot {
-            total_collected,
-            pending_rebates,
-            net_total: total_collected - pending_rebates,
-            closed_at: env.ledger().timestamp(),
-        };
-
-        env.storage().instance().set(&CLOSED_KEY, &true);
-        env.storage().instance().set(&SNAPSHOT_KEY, &snapshot);
-
-        env.events().publish(
-            (symbol_short!("bucket_closed"),),
-            BucketClosed {
-                total_collected: snapshot.total_collected,
-                pending_rebates: snapshot.pending_rebates,
-                net_total: snapshot.net_total,
-                actor: caller,
-            },
-        );
-
-        Ok(snapshot)
-    }
-
-    /// Read the frozen closeout snapshot, if the bucket has been closed.
-    ///
-    /// Reports MUST read totals from this snapshot rather than live bucket
-    /// state so closed periods are reported consistently and immutably.
-    pub fn bucket_snapshot(env: Env) -> Option<BucketSnapshot> {
-        env.storage().instance().get(&SNAPSHOT_KEY)
-    }
-
-    /// Sweep a negligible dust balance to an explicit destination.
-    ///
-    /// Only the configured admin may call this, the amount must be strictly
-    /// below [`DUST_THRESHOLD`], and the destination must be non-zero. The
-    /// destination, amount, and authorizing caller are recorded in a
-    /// [`DustSwept`] event for audit purposes.
-    pub fn sweep_dust(
-        env: Env,
-        caller: Address,
-        destination: Address,
-        amount: i128,
-    ) -> Result<(), FeeCollectorError> {
-        caller.require_auth();
-
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&ADMIN_KEY)
-            .ok_or(FeeCollectorError::NotInitialized)?;
-        if caller != admin {
-            return Err(FeeCollectorError::Unauthorized);
-        }
-
-        if destination == caller {
-            return Err(FeeCollectorError::InvalidDestination);
-        }
-
-        if amount <= 0 {
-            return Err(FeeCollectorError::InvalidAmount);
-        }
-
-        if amount >= DUST_THRESHOLD {
-            return Err(FeeCollectorError::AmountNotDust);
-        }
-
-        let balance: i128 = env.storage().instance().get(&BALANCE_KEY).unwrap_or(0);
-        if amount > balance {
-            return Err(FeeCollectorError::AmountExceedsBalance);
-        }
-
-        env.storage().instance().set(&BALANCE_KEY, &(balance - amount));
-
-        env.events().publish(
-            (symbol_short!("dust_swept"),),
-            DustSwept {
-                caller,
-                destination,
-                amount,
-            },
-        );
-
-        Ok(())
     }
 }

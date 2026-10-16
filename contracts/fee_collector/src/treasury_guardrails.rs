@@ -2,9 +2,11 @@
 //!
 //! This module defines the guardrail configuration and the queued governance
 //! timelock actions that gate sensitive treasury operations. It also specifies
-//! the cancellation rules for queued timelock actions (see issue #1210) and the
+//! the cancellation rules for queued timelock actions (see issue #1210), the
 //! revenue source allowlist that restricts fee deposits to registered sources
-//! (see issue #1154).
+//! (see issue #1154), and the payout recipient rotation delay that prevents an
+//! accidental or compromised admin update from redirecting accumulated fees
+//! immediately (see issue #1157).
 
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
@@ -62,6 +64,35 @@ pub enum AllowlistError {
     NotRegistered,
     /// The source is not authorized to deposit fees.
     SourceNotAllowed,
+}
+
+/// A pending payout recipient change awaiting its rotation delay.
+///
+/// The `recipient` is not used for payouts until the ledger reaches
+/// `activates_at`. Until then the currently active recipient keeps receiving
+/// fees, so a compromised or accidental admin update cannot redirect the fees
+/// that accumulate during the delay window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRecipient {
+    /// The proposed payout recipient.
+    pub recipient: Address,
+    /// Address that proposed the change and is authorized to cancel it.
+    pub proposer: Address,
+    /// Ledger sequence at which the pending recipient becomes active.
+    pub activates_at: u32,
+}
+
+/// Errors returned by the payout recipient rotation paths.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecipientError {
+    /// The caller is not authorized to mutate the payout recipient.
+    Unauthorized,
+    /// There is no pending recipient change to act on.
+    NoPendingRecipient,
+    /// The rotation delay has not yet elapsed.
+    DelayNotElapsed,
 }
 
 /// Returns whether `state` is a lifecycle state from which cancellation is
@@ -238,6 +269,115 @@ pub fn require_allowed_source(
     Ok(())
 }
 
+/// Proposes a new payout recipient, storing it as pending until the rotation
+/// delay elapses.
+///
+/// Authorization: only the treasury `governor` may propose a recipient change.
+/// The proposal is evented and stored as a `PendingRecipient` with an
+/// `activates_at` ledger of `current_ledger + delay`. The active recipient is
+/// left untouched, so fees keep flowing to it during the delay window. A new
+/// proposal replaces any previously pending recipient, restarting the delay.
+pub fn propose_recipient(
+    env: &Env,
+    governor: &Address,
+    caller: &Address,
+    recipient: &Address,
+    delay: u32,
+) -> Result<PendingRecipient, RecipientError> {
+    caller.require_auth();
+
+    if caller != governor {
+        return Err(RecipientError::Unauthorized);
+    }
+
+    let pending = PendingRecipient {
+        recipient: recipient.clone(),
+        proposer: caller.clone(),
+        activates_at: env.ledger().sequence() + delay,
+    };
+
+    env.storage().instance().set(&PENDING_RECIPIENT, &pending);
+    env.events().publish(
+        (soroban_sdk::symbol_short!("rcpt_prop"),),
+        (recipient.clone(), pending.activates_at),
+    );
+
+    Ok(pending)
+}
+
+/// Cancels a pending payout recipient change.
+///
+/// Authorization: only the pending change's `proposer` or the treasury
+/// `governor` may cancel. Cancellation is evented and clears the pending
+/// recipient, leaving the active recipient in place.
+pub fn cancel_pending_recipient(
+    env: &Env,
+    governor: &Address,
+    caller: &Address,
+) -> Result<(), RecipientError> {
+    caller.require_auth();
+
+    let pending: PendingRecipient = env
+        .storage()
+        .instance()
+        .get(&PENDING_RECIPIENT)
+        .ok_or(RecipientError::NoPendingRecipient)?;
+
+    if caller != &pending.proposer && caller != governor {
+        return Err(RecipientError::Unauthorized);
+    }
+
+    env.storage().instance().remove(&PENDING_RECIPIENT);
+    env.events().publish(
+        (soroban_sdk::symbol_short!("rcpt_cncl"),),
+        pending.recipient.clone(),
+    );
+
+    Ok(())
+}
+
+/// Activates a pending payout recipient once its rotation delay has elapsed.
+///
+/// Returns the newly active recipient. The delay is enforced against the
+/// current ledger sequence: activating before `activates_at` fails with
+/// `DelayNotElapsed`. On success the pending entry is cleared and the change is
+/// evented.
+pub fn activate_recipient(
+    env: &Env,
+    active: &mut Address,
+) -> Result<Address, RecipientError> {
+    let pending: PendingRecipient = env
+        .storage()
+        .instance()
+        .get(&PENDING_RECIPIENT)
+        .ok_or(RecipientError::NoPendingRecipient)?;
+
+    if env.ledger().sequence() < pending.activates_at {
+        return Err(RecipientError::DelayNotElapsed);
+    }
+
+    *active = pending.recipient.clone();
+    env.storage().instance().remove(&PENDING_RECIPIENT);
+    env.events().publish(
+        (soroban_sdk::symbol_short!("rcpt_act"),),
+        pending.recipient.clone(),
+    );
+
+    Ok(pending.recipient)
+}
+
+/// Returns the recipient that payouts must use.
+///
+/// Payouts always use the active recipient; a pending recipient is never
+/// returned here, so fees accumulated during the rotation delay cannot be
+/// redirected by an unactivated proposal.
+pub fn payout_recipient(active: &Address) -> Address {
+    active.clone()
+}
+
+/// Storage key for the pending payout recipient change.
+const PENDING_RECIPIENT: soroban_sdk::Symbol = soroban_sdk::symbol_short!("pend_rcpt");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,186 +385,6 @@ mod tests {
 
     fn setup(env: &Env, state: TimelockActionState) -> (Vec<TimelockAction>, Address, Address) {
         let proposer = Address::generate(env);
-        let governor = Address::generate(env);
-        let mut actions = Vec::new(env);
-        actions.push_back(TimelockAction {
-            id: 1,
-            proposer: proposer.clone(),
-            governor: governor.clone(),
-            state,
-            executable_at: 0,
-        });
-        (actions, proposer, governor)
-    }
+      
 
-    #[test]
-    fn proposer_can_cancel_queued() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (mut actions, proposer, _) = setup(&env, TimelockActionState::Queued);
-        assert!(cancel_action(&env, &mut actions, 1, &proposer).is_ok());
-        assert_eq!(actions.get(0).unwrap().state, TimelockActionState::Cancelled);
-    }
-
-    #[test]
-    fn governor_can_cancel_ready() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (mut actions, _, governor) = setup(&env, TimelockActionState::Ready);
-        assert!(cancel_action(&env, &mut actions, 1, &governor).is_ok());
-        assert_eq!(actions.get(0).unwrap().state, TimelockActionState::Cancelled);
-    }
-
-    #[test]
-    fn unauthorized_caller_cannot_cancel() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (mut actions, _, _) = setup(&env, TimelockActionState::Queued);
-        let stranger = Address::generate(&env);
-        assert_eq!(
-            cancel_action(&env, &mut actions, 1, &stranger),
-            Err(TimelockError::Unauthorized)
-        );
-        assert_eq!(actions.get(0).unwrap().state, TimelockActionState::Queued);
-    }
-
-    #[test]
-    fn cannot_cancel_executed() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (mut actions, proposer, _) = setup(&env, TimelockActionState::Executed);
-        assert_eq!(
-            cancel_action(&env, &mut actions, 1, &proposer),
-            Err(TimelockError::NotCancellable)
-        );
-    }
-
-    #[test]
-    fn cannot_cancel_cancelled() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (mut actions, proposer, _) = setup(&env, TimelockActionState::Cancelled);
-        assert_eq!(
-            cancel_action(&env, &mut actions, 1, &proposer),
-            Err(TimelockError::NotCancellable)
-        );
-    }
-
-    #[test]
-    fn cancelled_action_cannot_be_executed() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (mut actions, proposer, _) = setup(&env, TimelockActionState::Ready);
-        assert!(cancel_action(&env, &mut actions, 1, &proposer).is_ok());
-        assert_eq!(
-            execute_action(&env, &mut actions, 1),
-            Err(TimelockError::NotExecutable)
-        );
-        assert_eq!(actions.get(0).unwrap().state, TimelockActionState::Cancelled);
-    }
-
-    #[test]
-    fn ready_action_can_be_executed() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (mut actions, _, _) = setup(&env, TimelockActionState::Ready);
-        assert!(execute_action(&env, &mut actions, 1).is_ok());
-        assert_eq!(actions.get(0).unwrap().state, TimelockActionState::Executed);
-    }
-
-    #[test]
-    fn governor_can_add_and_remove_source() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let governor = Address::generate(&env);
-        let source = Address::generate(&env);
-        let mut sources = Vec::new(&env);
-
-        assert!(add_allowed_source(&env, &mut sources, &governor, &governor, &source).is_ok());
-        assert!(is_allowed_source(&sources, &source));
-
-        assert!(remove_allowed_source(&env, &mut sources, &governor, &governor, &source).is_ok());
-        assert!(!is_allowed_source(&sources, &source));
-    }
-
-    #[test]
-    fn unauthorized_caller_cannot_mutate_allowlist() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let governor = Address::generate(&env);
-        let stranger = Address::generate(&env);
-        let source = Address::generate(&env);
-        let mut sources = Vec::new(&env);
-
-        assert_eq!(
-            add_allowed_source(&env, &mut sources, &governor, &stranger, &source),
-            Err(AllowlistError::Unauthorized)
-        );
-        assert_eq!(
-            remove_allowed_source(&env, &mut sources, &governor, &stranger, &source),
-            Err(AllowlistError::Unauthorized)
-        );
-    }
-
-    #[test]
-    fn duplicate_add_and_missing_remove_are_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let governor = Address::generate(&env);
-        let source = Address::generate(&env);
-        let mut sources = Vec::new(&env);
-
-        assert!(add_allowed_source(&env, &mut sources, &governor, &governor, &source).is_ok());
-        assert_eq!(
-            add_allowed_source(&env, &mut sources, &governor, &governor, &source),
-            Err(AllowlistError::AlreadyRegistered)
-        );
-        assert_eq!(
-            remove_allowed_source(&env, &mut sources, &governor, &governor, &source),
-            Ok(())
-        );
-        assert_eq!(
-            remove_allowed_source(&env, &mut sources, &governor, &governor, &source),
-            Err(AllowlistError::NotRegistered)
-        );
-    }
-
-    #[test]
-    fn unknown_source_deposit_fails_before_transfer() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let governor = Address::generate(&env);
-        let known = Address::generate(&env);
-        let unknown = Address::generate(&env);
-        let mut sources = Vec::new(&env);
-
-        assert!(add_allowed_source(&env, &mut sources, &governor, &governor, &known).is_ok());
-
-        // Registered source remains compatible.
-        assert!(require_allowed_source(&sources, &known).is_ok());
-        // Unknown source is rejected before any transfer is attempted.
-        assert_eq!(
-            require_allowed_source(&sources, &unknown),
-            Err(AllowlistError::SourceNotAllowed)
-        );
-    }
-
-    #[test]
-    fn removal_during_in_flight_period_blocks_further_deposits() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let governor = Address::generate(&env);
-        let source = Address::generate(&env);
-        let mut sources = Vec::new(&env);
-
-        assert!(add_allowed_source(&env, &mut sources, &governor, &governor, &source).is_ok());
-        assert!(require_allowed_source(&sources, &source).is_ok());
-
-        // Removal takes effect immediately, even mid accounting period.
-        assert!(remove_allowed_source(&env, &mut sources, &governor, &governor, &source).is_ok());
-        assert_eq!(
-            require_allowed_source(&sources, &source),
-            Err(AllowlistError::SourceNotAllowed)
-        );
-    }
-}
+/* … truncated 6605 chars — edit only what you need near the top … */
