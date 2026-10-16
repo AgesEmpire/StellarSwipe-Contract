@@ -7,11 +7,21 @@
 
 use crate::governance::get_bridge_validators;
 use crate::monitoring::ChainId;
+use crate::BridgeError;
 use soroban_sdk::{contracttype, Address, Bytes, Env, String, Symbol};
 use stellar_swipe_common::SECONDS_PER_DAY;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
+/// Maximum serialized size, in bytes, accepted by
+/// [`send_cross_chain_message`].
+///
+/// This is the whole on-wire message budget, not just the payload: it covers
+/// the `payload` bytes plus the encoded `target_contract` route header
+/// (and therefore nested payloads carried inside `payload`). Messages whose
+/// [`message_size`] exceeds this limit are rejected before any nonce or id is
+/// allocated, so an oversized message never consumes downstream execution
+/// resources or mutates bridge state.
 pub const MAX_MESSAGE_SIZE: u32 = 4096;
 pub const MESSAGE_TIMEOUT: u64 = SECONDS_PER_DAY; // 24 h
 
@@ -158,8 +168,23 @@ fn verify_callback_proof(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Serialized size, in bytes, of a cross-chain message: the `payload` plus the
+/// `target_contract` route header (Issue #1126).
+///
+/// Uses saturating arithmetic so a pathologically large payload cannot wrap
+/// around and slip under [`MAX_MESSAGE_SIZE`].
+pub fn message_size(payload: &Bytes, target_contract: &String) -> u32 {
+    payload.len().saturating_add(target_contract.len())
+}
+
 /// Send a cross-chain message from Stellar to `target_chain`.
 /// Returns the assigned message id.
+///
+/// # Errors
+/// [`BridgeError::MessageTooLarge`] — [`message_size`] exceeds
+/// [`MAX_MESSAGE_SIZE`]. The size check runs before any id/nonce is allocated,
+/// so a rejected message leaves no state behind and consumes no downstream
+/// execution resources. A `msg_size_rejected` event is emitted first.
 pub fn send_cross_chain_message(
     env: &Env,
     sender: Address,
@@ -168,11 +193,16 @@ pub fn send_cross_chain_message(
     payload: Bytes,
     gas_limit: u64,
     callback_required: bool,
-) -> Result<u64, String> {
+) -> Result<u64, BridgeError> {
     sender.require_auth();
 
-    if payload.len() > MAX_MESSAGE_SIZE {
-        return Err(String::from_str(env, "Payload too large"));
+    let size = message_size(&payload, &target_contract);
+    if size > MAX_MESSAGE_SIZE {
+        env.events().publish(
+            (Symbol::new(env, "msg_size_rejected"), target_chain as u32),
+            (size, MAX_MESSAGE_SIZE, target_contract),
+        );
+        return Err(BridgeError::MessageTooLarge);
     }
 
     let id = next_message_id(env);
@@ -199,6 +229,8 @@ pub fn send_cross_chain_message(
         (Symbol::new(env, "msg_sent"), id),
         (target_chain as u32, sender),
     );
+    env.events()
+        .publish((Symbol::new(env, "msg_size_accepted"), id), size);
 
     Ok(id)
 }
@@ -534,7 +566,89 @@ mod tests {
                 100_000,
                 false,
             );
-            assert!(result.is_err());
+            assert_eq!(result, Err(BridgeError::MessageTooLarge));
+        });
+    }
+
+    /// Zeroed payload of exactly `len` bytes (stack buffer, no allocator).
+    fn zero_payload(env: &Env, len: u32) -> Bytes {
+        let buf = [0u8; 8192];
+        Bytes::from_slice(env, &buf[..len as usize])
+    }
+
+    #[test]
+    fn test_send_at_size_limit_accepted() {
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            // payload + target_contract header == MAX_MESSAGE_SIZE exactly.
+            let header = target(&env).len();
+            let payload = zero_payload(&env, MAX_MESSAGE_SIZE - header);
+            assert_eq!(message_size(&payload, &target(&env)), MAX_MESSAGE_SIZE);
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload,
+                100_000,
+                false,
+            )
+            .unwrap();
+            assert_eq!(id, 1);
+        });
+    }
+
+    #[test]
+    fn test_send_one_byte_over_limit_leaves_no_state() {
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            let header = target(&env).len();
+            let payload = zero_payload(&env, MAX_MESSAGE_SIZE - header + 1);
+            let rejected = send_cross_chain_message(
+                &env,
+                sender.clone(),
+                ChainId::Ethereum,
+                target(&env),
+                payload,
+                100_000,
+                false,
+            );
+            assert_eq!(rejected, Err(BridgeError::MessageTooLarge));
+
+            // The rejected send consumed neither the message id nor the nonce.
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
+            assert_eq!(id, 1);
+            assert_eq!(get_cross_chain_message(&env, id).unwrap().nonce, 0);
+        });
+    }
+
+    #[test]
+    fn test_send_counts_target_contract_overhead() {
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            // A payload that fits on its own but overflows once the route
+            // header (a nested contract address) is accounted for.
+            let payload = zero_payload(&env, MAX_MESSAGE_SIZE);
+            let long_target = String::from_str(&env, "0xNestedTargetContract");
+            let result = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                long_target,
+                payload,
+                100_000,
+                false,
+            );
+            assert_eq!(result, Err(BridgeError::MessageTooLarge));
         });
     }
 

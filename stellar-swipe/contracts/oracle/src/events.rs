@@ -1,5 +1,6 @@
 use soroban_sdk::{symbol_short, Address, Env, String, Symbol};
 
+use crate::quorum::{QuorumReason, QuorumState};
 use crate::staleness::OracleStatus;
 
 pub fn emit_oracle_removed(env: &Env, oracle: Address, reason: &str) {
@@ -101,5 +102,40 @@ pub fn emit_deviation_breaker_reset(env: &Env, pair_code: String, admin: Address
     env.events().publish(
         (symbol_short!("oracle"), symbol_short!("dev_reset")),
         (pair_code, admin),
+    );
+}
+
+/// Emitted whenever a price read moves the quorum state for a pair
+/// (Issue #1122). `reason` explains the transition, including recovery back to
+/// [`QuorumState::Primary`].
+pub fn emit_quorum_state_changed(
+    env: &Env,
+    pair_code: String,
+    from: QuorumState,
+    to: QuorumState,
+    reason: QuorumReason,
+) {
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("oracle"), symbol_short!("q_state")),
+        (pair_code, from, to, reason),
+    );
+}
+
+/// Emitted when a fallback quorum supplies a price because the preferred
+/// quorum was incomplete or conflicted (Issue #1122). `reason` is
+/// [`QuorumReason::InsufficientFallback`] or
+/// [`QuorumReason::ConflictFallback`].
+pub fn emit_quorum_fallback_used(
+    env: &Env,
+    pair_code: String,
+    price: i128,
+    source_count: u32,
+    reason: QuorumReason,
+) {
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("oracle"), symbol_short!("q_fallbk")),
+        (pair_code, price, source_count, reason),
     );
 }

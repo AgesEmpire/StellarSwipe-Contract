@@ -88,6 +88,21 @@ pub struct Bridge {
     pub security_config: BridgeSecurityConfig,
 }
 
+/// A validator set that has been approved by governance but must wait through
+/// the configured activation delay before it can attest messages (Issue #1125).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingValidatorSet {
+    pub validators: Vec<Address>,
+    pub min_validator_signatures: u32,
+    /// Monotonic version assigned when the change was approved. Always greater
+    /// than the currently active version; re-activating an older version is
+    /// rejected.
+    pub version: u32,
+    /// Ledger timestamp at (or after) which the set may be activated.
+    pub activate_at: u64,
+}
+
 /// Storage keys
 #[contracttype]
 pub enum GovernanceDataKey {
@@ -95,11 +110,24 @@ pub enum GovernanceDataKey {
     Proposal(u64, u64), // (bridge_id, proposal_id)
     Bridge(u64),
     ProposalCount(u64),
+    /// Set currently authorized to attest messages (Issue #1125). Lags
+    /// [`GovernanceDataKey::PendingValidatorSet`] until the delay elapses.
+    ActiveValidatorSet(u64),
+    /// Approved-but-not-yet-active validator set (Issue #1125).
+    PendingValidatorSet(u64),
+    /// Active validator-set version (Issue #1125).
+    ValidatorVersion(u64),
+    /// Activation delay in seconds for this bridge's validator set
+    /// (Issue #1125).
+    ValidatorActivationDelay(u64),
 }
 
 // Constants
 const PROPOSAL_EXPIRY_SECONDS: u64 = 604800; // 7 days
 const SUPER_MAJORITY_PERCENT: u32 = 75; // 75% for emergency actions
+/// Default validator-set activation delay (Issue #1125): one hour. Prevents a
+/// same-ledger governance change from immediately authorizing transfers.
+const DEFAULT_VALIDATOR_ACTIVATION_DELAY_SECONDS: u64 = 3600;
 
 // ==========================
 // Initialization
@@ -162,6 +190,16 @@ pub fn initialize_bridge(
     };
 
     store_bridge(env, bridge_id, &bridge);
+
+    // Issue #1125: the validator set supplied at initialization is active
+    // immediately — there is no prior set for it to wait behind.
+    env.storage().persistent().set(
+        &GovernanceDataKey::ActiveValidatorSet(bridge_id),
+        &bridge.validators,
+    );
+    env.storage()
+        .persistent()
+        .set(&GovernanceDataKey::ValidatorVersion(bridge_id), &1u32);
 
     env.events().publish(
         (Symbol::new(env, "bridge_initialized"), bridge_id),
@@ -395,12 +433,16 @@ fn execute_add_validator(env: &Env, bridge_id: u64, validator: &Address) -> Resu
     }
 
     bridge.validators.push_back(validator.clone());
+    let approved = bridge.validators.clone();
+    let min_signatures = bridge.min_validator_signatures;
     store_bridge(env, bridge_id, &bridge);
 
     env.events()
         .publish((Symbol::new(env, "validator_added"), bridge_id), validator);
 
-    Ok(())
+    // Issue #1125: the approved set only becomes usable for attestations once
+    // the activation delay has elapsed.
+    stage_validator_change(env, bridge_id, approved, min_signatures)
 }
 
 fn execute_remove_validator(env: &Env, bridge_id: u64, validator: &Address) -> Result<(), String> {
@@ -427,6 +469,8 @@ fn execute_remove_validator(env: &Env, bridge_id: u64, validator: &Address) -> R
     }
 
     bridge.validators = new_validators;
+    let approved = bridge.validators.clone();
+    let min_signatures = bridge.min_validator_signatures;
     store_bridge(env, bridge_id, &bridge);
 
     env.events().publish(
@@ -434,6 +478,202 @@ fn execute_remove_validator(env: &Env, bridge_id: u64, validator: &Address) -> R
         validator,
     );
 
+    stage_validator_change(env, bridge_id, approved, min_signatures)
+}
+
+// ==========================
+// Validator-set activation delay (Issue #1125)
+// ==========================
+
+/// Stage an approved validator set. When the configured delay is zero the set
+/// is activated in the same call (preserving pre-#1125 behaviour). Otherwise
+/// it is stored as pending with an `activate_at` timestamp and the currently
+/// active set keeps attesting until [`activate_validator_set`] succeeds.
+fn stage_validator_change(
+    env: &Env,
+    bridge_id: u64,
+    approved: Vec<Address>,
+    min_validator_signatures: u32,
+) -> Result<(), String> {
+    let delay = get_validator_activation_delay(env, bridge_id);
+    let version = get_active_validator_version(env, bridge_id).saturating_add(1);
+    let now = env.ledger().timestamp();
+
+    if delay == 0 {
+        env.storage().persistent().set(
+            &GovernanceDataKey::ActiveValidatorSet(bridge_id),
+            &approved,
+        );
+        env.storage()
+            .persistent()
+            .set(&GovernanceDataKey::ValidatorVersion(bridge_id), &version);
+        env.storage()
+            .persistent()
+            .remove(&GovernanceDataKey::PendingValidatorSet(bridge_id));
+
+        env.events().publish(
+            (
+                Symbol::new(env, "validator_set_activated"),
+                bridge_id,
+                version,
+            ),
+            now,
+        );
+        return Ok(());
+    }
+
+    let activate_at = now.saturating_add(delay);
+    let pending = PendingValidatorSet {
+        validators: approved,
+        min_validator_signatures,
+        version,
+        activate_at,
+    };
+    env.storage().persistent().set(
+        &GovernanceDataKey::PendingValidatorSet(bridge_id),
+        &pending,
+    );
+
+    env.events().publish(
+        (
+            Symbol::new(env, "validator_set_pending"),
+            bridge_id,
+            version,
+        ),
+        activate_at,
+    );
+
+    Ok(())
+}
+
+/// Activate the pending validator set once its delay has elapsed.
+///
+/// The currently active set remains usable for attestations until this
+/// succeeds. Re-activating an already-active or older version is rejected
+/// (replay protection).
+pub fn activate_validator_set(env: &Env, bridge_id: u64) -> Result<u32, String> {
+    let pending: PendingValidatorSet = env
+        .storage()
+        .persistent()
+        .get(&GovernanceDataKey::PendingValidatorSet(bridge_id))
+        .ok_or_else(|| String::from_str(env, "No pending validator set"))?;
+
+    let now = env.ledger().timestamp();
+    if now < pending.activate_at {
+        return Err(String::from_str(env, "Activation delay has not elapsed"));
+    }
+
+    let current = get_active_validator_version(env, bridge_id);
+    if pending.version <= current {
+        // Stale/replayed activation: drop it without touching the active set.
+        env.storage()
+            .persistent()
+            .remove(&GovernanceDataKey::PendingValidatorSet(bridge_id));
+        return Err(String::from_str(env, "Validator set version already active"));
+    }
+
+    env.storage().persistent().set(
+        &GovernanceDataKey::ActiveValidatorSet(bridge_id),
+        &pending.validators,
+    );
+    env.storage()
+        .persistent()
+        .set(&GovernanceDataKey::ValidatorVersion(bridge_id), &pending.version);
+    env.storage()
+        .persistent()
+        .remove(&GovernanceDataKey::PendingValidatorSet(bridge_id));
+
+    env.events().publish(
+        (
+            Symbol::new(env, "validator_set_activated"),
+            bridge_id,
+            pending.version,
+        ),
+        pending.validators.len(),
+    );
+
+    Ok(pending.version)
+}
+
+/// Discard a staged validator set without activating it, rolling back to the
+/// currently active set. Requires a governance signer's authorization.
+pub fn cancel_pending_validator_set(env: &Env, bridge_id: u64, caller: Address) -> Result<(), String> {
+    caller.require_auth();
+    require_governance_signer(env, bridge_id, &caller)?;
+
+    if !env
+        .storage()
+        .persistent()
+        .has(&GovernanceDataKey::PendingValidatorSet(bridge_id))
+    {
+        return Err(String::from_str(env, "No pending validator set"));
+    }
+
+    env.storage()
+        .persistent()
+        .remove(&GovernanceDataKey::PendingValidatorSet(bridge_id));
+
+    env.events().publish(
+        (Symbol::new(env, "validator_set_cancelled"), bridge_id),
+        env.ledger().timestamp(),
+    );
+
+    Ok(())
+}
+
+/// Read the pending validator set, if any.
+pub fn get_pending_validator_set(env: &Env, bridge_id: u64) -> Option<PendingValidatorSet> {
+    env.storage()
+        .persistent()
+        .get(&GovernanceDataKey::PendingValidatorSet(bridge_id))
+}
+
+/// Read the active validator-set version.
+pub fn get_active_validator_version(env: &Env, bridge_id: u64) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&GovernanceDataKey::ValidatorVersion(bridge_id))
+        .unwrap_or(0)
+}
+
+/// Read the configured activation delay (seconds) for a bridge's validator set.
+pub fn get_validator_activation_delay(env: &Env, bridge_id: u64) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&GovernanceDataKey::ValidatorActivationDelay(bridge_id))
+        .unwrap_or(DEFAULT_VALIDATOR_ACTIVATION_DELAY_SECONDS)
+}
+
+/// Configure the validator-set activation delay (seconds). `caller` must be a
+/// governance signer for `bridge_id`. A delay of zero activates approved sets
+/// immediately.
+pub fn set_validator_activation_delay(
+    env: &Env,
+    bridge_id: u64,
+    caller: Address,
+    delay_seconds: u64,
+) -> Result<(), String> {
+    caller.require_auth();
+    require_governance_signer(env, bridge_id, &caller)?;
+
+    env.storage().persistent().set(
+        &GovernanceDataKey::ValidatorActivationDelay(bridge_id),
+        &delay_seconds,
+    );
+
+    env.events().publish(
+        (Symbol::new(env, "validator_delay_updated"), bridge_id),
+        delay_seconds,
+    );
+
+    Ok(())
+}
+
+fn require_governance_signer(env: &Env, bridge_id: u64, caller: &Address) -> Result<(), String> {
+    let governance = get_bridge_governance(env, bridge_id)?;
+    if !governance.signers.contains(caller) {
+        return Err(String::from_str(env, "Not authorized signer"));
+    }
     Ok(())
 }
 
@@ -835,8 +1075,20 @@ pub fn get_bridge_status(env: &Env, bridge_id: u64) -> Result<BridgeStatus, Stri
     Ok(bridge.status)
 }
 
-/// Get bridge validators
+/// Get the validator set currently authorized to attest messages.
+///
+/// Issue #1125: while an approved set is waiting out its activation delay this
+/// returns the previous set, so old validators stay usable through the
+/// transition and a pending set cannot attest.
 pub fn get_bridge_validators(env: &Env, bridge_id: u64) -> Result<Vec<Address>, String> {
+    if let Some(active) = env
+        .storage()
+        .persistent()
+        .get::<_, Vec<Address>>(&GovernanceDataKey::ActiveValidatorSet(bridge_id))
+    {
+        return Ok(active);
+    }
+    // Fall back to the recorded set for state predating active-set bookkeeping.
     let bridge = get_bridge(env, bridge_id)?;
     Ok(bridge.validators)
 }
@@ -861,8 +1113,7 @@ pub fn is_signer(env: &Env, bridge_id: u64, address: &Address) -> Result<bool, S
 
 /// Check if address is a validator
 pub fn is_validator(env: &Env, bridge_id: u64, address: &Address) -> Result<bool, String> {
-    let bridge = get_bridge(env, bridge_id)?;
-    Ok(bridge.validators.contains(address))
+    Ok(get_bridge_validators(env, bridge_id)?.contains(address))
 }
 
 // ==========================
