@@ -70,6 +70,12 @@ pub enum SignalError {
     IdempotencyKeyReused = 12,
     NoPendingAdmin = 13,
     NotPendingAdmin = 14,
+    /// Issue #1256: a compare-and-set metadata update was attempted with an
+    /// expected revision that does not match the stored revision.
+    MetadataRevisionConflict = 15,
+    /// Issue #1256: the monotonic metadata revision counter cannot advance
+    /// further without overflowing.
+    MetadataRevisionOverflow = 16,
 }
 
 /// Maximum accepted length, in bytes, of provider metadata.
@@ -89,6 +95,10 @@ pub const MAX_TOMBSTONE_PURGE: u32 = 100;
 /// Documented retention period, in seconds, during which a consumed
 /// idempotency key remains non-reusable.
 pub const IDEMPOTENCY_KEY_RETENTION_SECONDS: u64 = 24 * 60 * 60;
+
+/// Issue #1255: upper bound on the number of idempotency key references
+/// examined (and at most removed) by a single reclaim call.
+pub const MAX_IDEMPOTENCY_PURGE: u32 = 100;
 
 /// Configuration-driven reputation decay schedule.
 ///
@@ -145,6 +155,25 @@ pub struct IdempotencyRecord {
     pub expires_at: u64,
 }
 
+/// Reference to a stored idempotency record, used as the input of a bounded
+/// reclaim call (issue #1255). The `caller` and `key` identify the record
+/// exactly as it was consumed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdempotencyKeyRef {
+    pub caller: Address,
+    pub key: String,
+}
+
+/// Versioned provider metadata read (issue #1256). `revision` is monotonic and
+/// lets clients detect stale reads; `metadata` is the current payload.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionedMetadata {
+    pub revision: u32,
+    pub metadata: String,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataKey {
@@ -172,6 +201,8 @@ const REPUTATION_KEY: &str = "reputation";
 const METADATA_KEY: &str = "metadata";
 const TOMBSTONE_KEY: &str = "tombstone";
 const IDEMPOTENCY_KEY: &str = "idempotency";
+/// Issue #1256: storage key prefix for the monotonic metadata revision counter.
+const METADATA_REVISION_KEY: &str = "metadata_revision";
 
 #[contract]
 pub struct SignalRegistry;
@@ -270,6 +301,95 @@ impl SignalRegistry {
             .instance()
             .get(&SCHEDULE_KEY)
             .ok_or(SignalError::NotInitialized)
+    }
+
+    /// Issue #1255: reclaim expired idempotency records in a bounded batch.
+    ///
+    /// Only the admin may call this. At most [`MAX_IDEMPOTENCY_PURGE`]
+    /// references are examined per call and only records whose retention window
+    /// has elapsed are removed. Re-running is safe: already-reclaimed records
+    /// are skipped, and live (still non-reusable) records are never removed.
+    pub fn purge_expired_idempotency_keys(
+        env: Env,
+        entries: Vec<IdempotencyKeyRef>,
+        max_entries: u32,
+    ) -> Result<u32, SignalError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(SignalError::NotInitialized)?;
+        admin.require_auth();
+        if max_entries == 0 || max_entries > MAX_IDEMPOTENCY_PURGE {
+            return Err(SignalError::InvalidBatchSize);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut purged: u32 = 0;
+        for entry in entries.iter() {
+            if purged >= max_entries {
+                break;
+            }
+            let record_key = (IDEMPOTENCY_KEY, entry.caller.clone(), entry.key.clone());
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<(_, Address, String), IdempotencyRecord>(&record_key)
+            {
+                // Only records past their retention window are reclaimed; a
+                // still-reusable key must keep rejecting duplicate operations.
+                if now >= record.expires_at {
+                    env.storage().persistent().remove(&record_key);
+                    purged += 1;
+                }
+            }
+        }
+        Ok(purged)
+    }
+
+    /// Issue #1256: read provider metadata together with its monotonic
+    /// revision. Returns `None` when no record exists, so a missing record is
+    /// distinguishable from a stored revision of zero.
+    pub fn get_versioned_metadata(env: Env, provider: Address) -> Option<VersionedMetadata> {
+        let key = (METADATA_KEY, provider.clone());
+        let metadata: String = env.storage().persistent().get(&key)?;
+        let rev_key = (METADATA_REVISION_KEY, provider);
+        let revision: u32 = env.storage().persistent().get(&rev_key).unwrap_or(0);
+        Some(VersionedMetadata { revision, metadata })
+    }
+
+    /// Issue #1256: compare-and-set provider metadata update.
+    ///
+    /// Succeeds only when `expected_revision` matches the currently stored
+    /// revision; a stale value returns [`SignalError::MetadataRevisionConflict`]
+    /// and leaves metadata unchanged. On success the revision advances by one,
+    /// so a client can detect that its read was stale instead of silently
+    /// overwriting a concurrent change.
+    pub fn set_provider_metadata_checked(
+        env: Env,
+        provider: Address,
+        metadata: String,
+        expected_revision: u32,
+    ) -> Result<u32, SignalError> {
+        provider.require_auth();
+        Self::validate_metadata(&metadata)?;
+        if Self::record_state(&env, &provider) == RecordState::Tombstoned {
+            return Err(SignalError::IdentifierTombstoned);
+        }
+
+        let rev_key = (METADATA_REVISION_KEY, provider.clone());
+        let current: u32 = env.storage().persistent().get(&rev_key).unwrap_or(0);
+        if current != expected_revision {
+            return Err(SignalError::MetadataRevisionConflict);
+        }
+        let next = current
+            .checked_add(1)
+            .ok_or(SignalError::MetadataRevisionOverflow)?;
+
+        let key = (METADATA_KEY, provider);
+        env.storage().persistent().set(&key, &metadata);
+        env.storage().persistent().set(&rev_key, &next);
+        Ok(next)
     }
 
     /// Store provider metadata after validating its length and encoding.
