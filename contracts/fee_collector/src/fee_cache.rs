@@ -4,8 +4,14 @@
 //! them on every trade. The cache is invalidated whenever the fee rate config
 //! is updated so that a rate change takes effect immediately rather than after
 //! the cache TTL expires.
+//!
+//! This module also maintains the allowlist of authorized revenue sources.
+//! Fee deposits are restricted to registered sources so that arbitrary
+//! contracts cannot contaminate accounting or attribution reports. Allowlist
+//! mutations are authorized and evented, and unknown sources are rejected
+//! before any token transfer is attempted.
 
-use soroban_sdk::{contracttype, Env};
+use soroban_sdk::{contracttype, symbol_short, Address, Env};
 
 /// Storage key for the cached fee rate.
 #[contracttype]
@@ -15,6 +21,8 @@ pub enum FeeCacheKey {
     FeeRate,
     /// Monotonic version incremented on every fee rate config change.
     ConfigVersion,
+    /// Allowlist entry for an authorized revenue source.
+    RevenueSource(Address),
 }
 
 /// Returns the current config version, defaulting to 0 when unset.
@@ -60,10 +68,55 @@ pub fn invalidate_fee_cache(env: &Env) {
     env.storage().instance().remove(&FeeCacheKey::FeeRate);
 }
 
+/// Returns true when `source` is a registered, authorized revenue source.
+pub fn is_revenue_source(env: &Env, source: &Address) -> bool {
+    env.storage()
+        .instance()
+        .get(&FeeCacheKey::RevenueSource(source.clone()))
+        .unwrap_or(false)
+}
+
+/// Registers `source` as an authorized revenue source.
+///
+/// The caller is responsible for authorization (admin/owner gating); this
+/// helper only performs the storage write and emits the allowlist event.
+pub fn add_revenue_source(env: &Env, source: &Address) {
+    env.storage()
+        .instance()
+        .set(&FeeCacheKey::RevenueSource(source.clone()), &true);
+    env.events()
+        .publish((symbol_short!("rev_src_add"), source.clone()), ());
+}
+
+/// Removes `source` from the authorized revenue source allowlist.
+///
+/// Removal takes effect immediately: any subsequent deposit from `source`
+/// fails the allowlist check before a token transfer is attempted, even if an
+/// accounting period is still in flight.
+pub fn remove_revenue_source(env: &Env, source: &Address) {
+    env.storage()
+        .instance()
+        .remove(&FeeCacheKey::RevenueSource(source.clone()));
+    env.events()
+        .publish((symbol_short!("rev_src_rm"), source.clone()), ());
+}
+
+/// Guards a fee deposit, failing before any token transfer when `source` is
+/// not an authorized revenue source.
+///
+/// Call this at the very start of the deposit entrypoint, before invoking the
+/// token contract, so unknown sources cannot move funds or contaminate
+/// accounting.
+pub fn require_revenue_source(env: &Env, source: &Address) {
+    if !is_revenue_source(env, source) {
+        panic!("revenue source not allowlisted");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::Env;
+    use soroban_sdk::{testutils::Address as _, Env};
 
     #[test]
     fn cache_returns_stored_rate_between_config_changes() {
@@ -111,5 +164,51 @@ mod tests {
             .set(&FeeCacheKey::ConfigVersion, &next);
 
         assert_eq!(get_cached_fee_rate(&env), None);
+    }
+
+    #[test]
+    fn unknown_source_is_rejected() {
+        let env = Env::default();
+        let source = Address::generate(&env);
+
+        assert!(!is_revenue_source(&env, &source));
+    }
+
+    #[test]
+    fn registered_source_remains_compatible() {
+        let env = Env::default();
+        let source = Address::generate(&env);
+
+        add_revenue_source(&env, &source);
+        assert!(is_revenue_source(&env, &source));
+
+        // Existing registered sources keep passing the deposit guard.
+        require_revenue_source(&env, &source);
+    }
+
+    #[test]
+    #[should_panic(expected = "revenue source not allowlisted")]
+    fn deposit_guard_fails_for_unknown_source() {
+        let env = Env::default();
+        let source = Address::generate(&env);
+
+        require_revenue_source(&env, &source);
+    }
+
+    #[test]
+    #[should_panic(expected = "revenue source not allowlisted")]
+    fn removal_during_in_flight_period_blocks_deposit() {
+        let env = Env::default();
+        let source = Address::generate(&env);
+
+        // Source is registered and an accounting period is in flight.
+        add_revenue_source(&env, &source);
+        require_revenue_source(&env, &source);
+
+        // Removal takes effect immediately, before any token transfer.
+        remove_revenue_source(&env, &source);
+        assert!(!is_revenue_source(&env, &source));
+
+        require_revenue_source(&env, &source);
     }
 }

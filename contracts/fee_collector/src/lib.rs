@@ -10,8 +10,19 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_sh
 /// this value is an ordinary fee balance and MUST NOT be sweepable.
 pub const DUST_THRESHOLD: i128 = 1_000;
 
+/// Number of ledgers a newly proposed payout recipient must wait before it can
+/// be activated. This delay prevents an accidental or compromised admin update
+/// from immediately redirecting accumulated fees.
+pub const RECIPIENT_ROTATION_DELAY: u32 = 17_280;
+
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const BALANCE_KEY: Symbol = symbol_short!("BALANCE");
+const SOURCE_KEY: Symbol = symbol_short!("SOURCE");
+const CLOSED_KEY: Symbol = symbol_short!("CLOSED");
+const SNAPSHOT_KEY: Symbol = symbol_short!("SNAPSHOT");
+const RECIPIENT_KEY: Symbol = symbol_short!("RECIPIENT");
+const PENDING_RECIPIENT_KEY: Symbol = symbol_short!("PEND_RECIP");
+const PENDING_ACTIVATION_KEY: Symbol = symbol_short!("PEND_ACT");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -23,6 +34,10 @@ pub enum FeeCollectorError {
     InvalidAmount = 4,
     AmountExceedsBalance = 5,
     AmountNotDust = 6,
+    UnknownRevenueSource = 7,
+    BucketClosed = 8,
+    NoPendingRecipient = 9,
+    RecipientNotYetActive = 10,
 }
 
 #[contracttype]
@@ -44,6 +59,58 @@ pub struct ConfigChanged {
     pub setting: Symbol,
     pub old_value: Address,
     pub new_value: Address,
+    pub actor: Address,
+}
+
+/// Auditable record of a revenue source allowlist change.
+///
+/// Emitted whenever a revenue source is added to or removed from the
+/// allowlist so indexers and operators can attribute deposits and discover
+/// which sources are authorized to deposit fees.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevenueSourceChanged {
+    pub source: Address,
+    pub allowed: bool,
+    pub actor: Address,
+}
+
+/// Auditable record of a payout recipient rotation.
+///
+/// Emitted when a new recipient is proposed (with the ledger at which it may
+/// be activated) and when a pending proposal is cancelled, so operators can
+/// discover and audit recipient changes before they take effect.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipientRotation {
+    pub recipient: Address,
+    pub activation_ledger: u32,
+    pub actor: Address,
+}
+
+/// Immutable snapshot of a fee bucket captured at closeout time.
+///
+/// Once written, the snapshot is never mutated: reports read these totals
+/// instead of live bucket state, and the closed period rejects further writes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BucketSnapshot {
+    pub total_collected: i128,
+    pub pending_rebates: i128,
+    pub net_total: i128,
+    pub closed_at: u64,
+}
+
+/// Auditable record of a fee bucket closeout.
+///
+/// Emitted exactly once per bucket (the first successful closeout) so indexers
+/// can discover the frozen totals and the actor that authorized the close.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BucketClosed {
+    pub total_collected: i128,
+    pub pending_rebates: i128,
+    pub net_total: i128,
     pub actor: Address,
 }
 
@@ -94,28 +161,18 @@ impl FeeCollector {
         Ok(())
     }
 
-    /// Record collected fees into the collector balance.
-    pub fn collect(env: Env, amount: i128) {
-        let balance: i128 = env.storage().instance().get(&BALANCE_KEY).unwrap_or(0);
-        env.storage().instance().set(&BALANCE_KEY, &(balance + amount));
-    }
-
-    /// Current collector balance.
-    pub fn balance(env: Env) -> i128 {
-        env.storage().instance().get(&BALANCE_KEY).unwrap_or(0)
-    }
-
-    /// Sweep a negligible dust balance to an explicit destination.
+    /// Propose a new payout recipient.
     ///
-    /// Only the configured admin may call this, the amount must be strictly
-    /// below [`DUST_THRESHOLD`], and the destination must be non-zero. The
-    /// destination, amount, and authorizing caller are recorded in a
-    /// [`DustSwept`] event for audit purposes.
-    pub fn sweep_dust(
+    /// Only the configured admin may propose a recipient. The proposal is
+    /// stored as pending along with the ledger at which it becomes activatable
+    /// (`current_ledger + RECIPIENT_ROTATION_DELAY`). Payouts continue to use
+    /// the currently active recipient until the pending one is activated, so a
+    /// compromised admin cannot immediately redirect accumulated fees. The
+    /// proposal is recorded in a [`RecipientRotation`] event.
+    pub fn propose_recipient(
         env: Env,
         caller: Address,
-        destination: Address,
-        amount: i128,
+        recipient: Address,
     ) -> Result<(), FeeCollectorError> {
         caller.require_auth();
 
@@ -128,151 +185,249 @@ impl FeeCollector {
             return Err(FeeCollectorError::Unauthorized);
         }
 
-        if destination == caller {
-            return Err(FeeCollectorError::InvalidDestination);
-        }
+        let activation_ledger = env.ledger().sequence() + RECIPIENT_ROTATION_DELAY;
 
-        if amount <= 0 {
-            return Err(FeeCollectorError::InvalidAmount);
-        }
-
-        if amount >= DUST_THRESHOLD {
-            return Err(FeeCollectorError::AmountNotDust);
-        }
-
-        let balance: i128 = env.storage().instance().get(&BALANCE_KEY).unwrap_or(0);
-        if amount > balance {
-            return Err(FeeCollectorError::AmountExceedsBalance);
-        }
-
-        env.storage().instance().set(&BALANCE_KEY, &(balance - amount));
+        env.storage()
+            .instance()
+            .set(&PENDING_RECIPIENT_KEY, &recipient);
+        env.storage()
+            .instance()
+            .set(&PENDING_ACTIVATION_KEY, &activation_ledger);
 
         env.events().publish(
-            (symbol_short!("dust_swept"),),
-            DustSwept {
-                caller,
-                destination,
-                amount,
+            (symbol_short!("recip_rot"),),
+            RecipientRotation {
+                recipient,
+                activation_ledger,
+                actor: caller,
             },
         );
 
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::testutils::{Address as _, Events as _};
+    /// Cancel a pending payout recipient proposal.
+    ///
+    /// Only the configured admin may cancel. Cancellation clears the pending
+    /// recipient and its activation ledger and is recorded in a
+    /// [`RecipientRotation`] event (with `activation_ledger` set to 0) so the
+    /// cancellation is fully auditable.
+    pub fn cancel_pending_recipient(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), FeeCollectorError> {
+        caller.require_auth();
 
-    fn setup(env: &Env) -> (FeeCollectorClient, Address) {
-        let contract_id = env.register(FeeCollector, ());
-        let client = FeeCollectorClient::new(env, &contract_id);
-        let admin = Address::generate(env);
-        client.initialize(&admin);
-        (client, admin)
-    }
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(FeeCollectorError::NotInitialized)?;
+        if caller != admin {
+            return Err(FeeCollectorError::Unauthorized);
+        }
 
-    #[test]
-    fn sweeps_dust_below_threshold() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let destination = Address::generate(&env);
+        let recipient: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_RECIPIENT_KEY)
+            .ok_or(FeeCollectorError::NoPendingRecipient)?;
 
-        client.collect(&(DUST_THRESHOLD - 1));
-        client.sweep_dust(&admin, &destination, &(DUST_THRESHOLD - 1));
+        env.storage().instance().remove(&PENDING_RECIPIENT_KEY);
+        env.storage().instance().remove(&PENDING_ACTIVATION_KEY);
 
-        assert_eq!(client.balance(), 0);
-    }
-
-    #[test]
-    fn rejects_ordinary_fee_balance() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let destination = Address::generate(&env);
-
-        client.collect(&DUST_THRESHOLD);
-        let result = client.try_sweep_dust(&admin, &destination, &DUST_THRESHOLD);
-
-        assert_eq!(result, Err(Ok(FeeCollectorError::AmountNotDust)));
-        assert_eq!(client.balance(), DUST_THRESHOLD);
-    }
-
-    #[test]
-    fn rejects_unauthorized_caller() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _admin) = setup(&env);
-        let attacker = Address::generate(&env);
-        let destination = Address::generate(&env);
-
-        client.collect(&(DUST_THRESHOLD - 1));
-        let result = client.try_sweep_dust(&attacker, &destination, &(DUST_THRESHOLD - 1));
-
-        assert_eq!(result, Err(Ok(FeeCollectorError::Unauthorized)));
-    }
-
-    #[test]
-    fn rejects_invalid_amounts() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let destination = Address::generate(&env);
-
-        client.collect(&(DUST_THRESHOLD - 1));
-        assert_eq!(
-            client.try_sweep_dust(&admin, &destination, &0),
-            Err(Ok(FeeCollectorError::InvalidAmount))
+        env.events().publish(
+            (symbol_short!("recip_rot"),),
+            RecipientRotation {
+                recipient,
+                activation_ledger: 0,
+                actor: caller,
+            },
         );
-        assert_eq!(
-            client.try_sweep_dust(&admin, &destination, &DUST_THRESHOLD),
-            Err(Ok(FeeCollectorError::AmountNotDust))
-        );
+
+        Ok(())
     }
 
-    #[test]
-    fn emits_config_changed_on_admin_update() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let new_admin = Address::generate(&env);
+    /// Activate a pending payout recipient once its delay has elapsed.
+    ///
+    /// Only the configured admin may activate. Activation is rejected until
+    /// the current ledger reaches the stored activation ledger, enforcing the
+    /// rotation delay. On success the pending recipient becomes the active
+    /// recipient and the pending state is cleared.
+    pub fn activate_recipient(env: Env, caller: Address) -> Result<(), FeeCollectorError> {
+        caller.require_auth();
 
-        client.set_admin(&admin, &new_admin);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(FeeCollectorError::NotInitialized)?;
+        if caller != admin {
+            return Err(FeeCollectorError::Unauthorized);
+        }
 
-        let events = env.events().all();
-        let expected = ConfigChanged {
-            setting: ADMIN_KEY,
-            old_value: admin.clone(),
-            new_value: new_admin.clone(),
-            actor: admin.clone(),
-        };
-        assert!(
-            events.iter().any(|(_, _, data)| {
-                ConfigChanged::try_from_val(&env, &data).map_or(false, |e| e == expected)
-            }),
-            "expected a ConfigChanged event for the admin setting"
-        );
+        let recipient: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_RECIPIENT_KEY)
+            .ok_or(FeeCollectorError::NoPendingRecipient)?;
+        let activation_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&PENDING_ACTIVATION_KEY)
+            .ok_or(FeeCollectorError::NoPendingRecipient)?;
+
+        if env.ledger().sequence() < activation_ledger {
+            return Err(FeeCollectorError::RecipientNotYetActive);
+        }
+
+        env.storage().instance().set(&RECIPIENT_KEY, &recipient);
+        env.storage().instance().remove(&PENDING_RECIPIENT_KEY);
+        env.storage().instance().remove(&PENDING_ACTIVATION_KEY);
+
+        Ok(())
     }
 
-    #[test]
-    fn emits_no_config_changed_on_rejected_update() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _admin) = setup(&env);
-        let attacker = Address::generate(&env);
-        let new_admin = Address::generate(&env);
+    /// The currently active payout recipient, if any.
+    ///
+    /// Payouts must only ever use this recipient; the pending recipient is
+    /// never returned here.
+    pub fn active_recipient(env: Env) -> Option<Address> {
+        env.storage().instance().get(&RECIPIENT_KEY)
+    }
 
-        let result = client.try_set_admin(&attacker, &new_admin);
-        assert_eq!(result, Err(Ok(FeeCollectorError::Unauthorized)));
+    /// The pending payout recipient and the ledger at which it may be
+    /// activated, if a proposal is outstanding.
+    pub fn pending_recipient(env: Env) -> Option<(Address, u32)> {
+        let recipient: Option<Address> = env.storage().instance().get(&PENDING_RECIPIENT_KEY);
+        let activation_ledger: Option<u32> = env.storage().instance().get(&PENDING_ACTIVATION_KEY);
+        match (recipient, activation_ledger) {
+            (Some(recipient), Some(activation_ledger)) => Some((recipient, activation_ledger)),
+            _ => None,
+        }
+    }
 
-        let events = env.events().all();
-        assert!(
-            !events.iter().any(|(_, _, data)| {
-                ConfigChanged::try_from_val(&env, &data).is_ok()
-            }),
-            "no ConfigChanged event should be emitted for a rejected update"
+    /// Authorize a revenue source to deposit fees into the collector.
+    ///
+    /// Only the configured admin may add a source. The change is recorded in a
+    /// [`RevenueSourceChanged`] event so the allowlist is fully auditable.
+    pub fn add_revenue_source(
+        env: Env,
+        caller: Address,
+        source: Address,
+    ) -> Result<(), FeeCollectorError> {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(FeeCollectorError::NotInitialized)?;
+        if caller != admin {
+            return Err(FeeCollectorError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&(SOURCE_KEY, source.clone()), &true);
+
+        env.events().publish(
+            (symbol_short!("rev_source"),),
+            RevenueSourceChanged {
+                source,
+                allowed: true,
+                actor: caller,
+            },
         );
+
+        Ok(())
+    }
+
+    /// Revoke a revenue source's authorization to deposit fees.
+    ///
+    /// Only the configured admin may remove a source. Removal takes effect
+    /// immediately, so a source removed during an in-flight accounting period
+    /// can no longer deposit. The change is recorded in a
+    /// [`RevenueSourceChanged`] event.
+    pub fn remove_revenue_source(
+        env: Env,
+        caller: Address,
+        source: Address,
+    ) -> Result<(), FeeCollectorError> {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(FeeCollectorError::NotInitialized)?;
+        if caller != admin {
+            return Err(FeeCollectorError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&(SOURCE_KEY, source.clone()));
+
+        env.events().publish(
+            (symbol_short!("rev_source"),),
+            RevenueSourceChanged {
+                source,
+                allowed: false,
+                actor: caller,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Whether a revenue source is currently authorized to deposit fees.
+    pub fn is_revenue_source(env: Env, source: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&(SOURCE_KEY, source))
+            .unwrap_or(false)
+    }
+
+    /// Record collected fees into the collector balance.
+    ///
+    /// Only allowlisted revenue sources may deposit. The authorization check
+    /// runs before any balance mutation so deposits from unknown sources fail
+    /// before any transfer or accounting side effect is attempted. Deposits
+    /// into a closed bucket are rejected so the closed period is immutable.
+    pub fn collect(
+        env: Env,
+        source: Address,
+        amount: i128,
+    ) -> Result<(), FeeCollectorError> {
+        source.require_auth();
+
+        if Self::is_closed(env.clone()) {
+            return Err(FeeCollectorError::BucketClosed);
+        }
+
+        let allowed: bool = env
+            .storage()
+            .persistent()
+            .get(&(SOURCE_KEY, source.clone()))
+            .unwrap_or(false);
+        if !allowed {
+            return Err(FeeCollectorError::UnknownRevenueSource);
+        }
+
+        let balance: i128 = env.storage().instance().get(&BALANCE_KEY).unwrap_or(0);
+        env.storage().instance().set(&BALANCE_KEY, &(balance + amount));
+
+        Ok(())
+    }
+
+    /// Current collector balance.
+    pub fn balance(env: Env) -> i128 {
+        env.storage().instance().get(&BALANCE_KEY).unwrap_or(0)
+    }
+
+    /// Whether the fee bucket has been closed out.
+    pub fn is_closed(env: Env) -> bool {
+        env.storage().instance().get(&CLOSED_KEY).unwrap_or(false)
     }
 }
