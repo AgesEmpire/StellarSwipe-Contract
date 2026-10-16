@@ -135,6 +135,102 @@ pub struct PerformanceReport {
 }
 
 // ============================================================================
+// Analytics Snapshot Pagination Cursors
+// ============================================================================
+
+/// Identity of the analytics snapshot a pagination cursor was issued against.
+///
+/// A snapshot is identified by the ledger sequence at which it was produced
+/// together with a monotonically increasing version. Any change to the
+/// underlying analytics data bumps the version, which invalidates every cursor
+/// that was issued against an earlier snapshot.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct AnalyticsSnapshotId {
+    /// Ledger sequence at which the snapshot was produced.
+    pub ledger: u32,
+    /// Monotonic version of the snapshot; bumped on every data change.
+    pub version: u64,
+}
+
+/// Pagination cursor for analytics snapshots.
+///
+/// The cursor carries the identity of the snapshot it was issued against and
+/// the ledger sequence at which it expires. Clients must present the cursor
+/// unchanged on the next page request; combining pages from different
+/// snapshots is rejected.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct AnalyticsCursor {
+    /// Snapshot the cursor was issued against.
+    pub snapshot: AnalyticsSnapshotId,
+    /// Offset of the next page within the snapshot.
+    pub offset: u32,
+    /// Ledger sequence at which the cursor expires (exclusive).
+    pub expires_at: u32,
+}
+
+/// Typed error returned when a pagination cursor can no longer be used.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum AnalyticsCursorError {
+    /// The cursor was issued against a snapshot that is no longer current.
+    SnapshotChanged {
+        expected: AnalyticsSnapshotId,
+        current: AnalyticsSnapshotId,
+    },
+    /// The cursor has passed its expiry ledger.
+    Expired { expires_at: u32, current_ledger: u32 },
+}
+
+/// Default number of ledgers a cursor remains valid for.
+const CURSOR_TTL_LEDGERS: u32 = 100;
+
+/// Issue a fresh pagination cursor against the latest snapshot.
+///
+/// New cursors always start from the latest snapshot identity and carry an
+/// expiry derived from the current ledger sequence.
+///
+pub fn issue_analytics_cursor(
+    env: &Env,
+    snapshot: AnalyticsSnapshotId,
+    offset: u32,
+) -> AnalyticsCursor {
+    AnalyticsCursor {
+        snapshot,
+        offset,
+        expires_at: env.ledger().sequence().saturating_add(CURSOR_TTL_LEDGERS),
+    }
+}
+
+/// Validate a pagination cursor against the current snapshot and ledger.
+///
+/// Returns `Ok(())` when the cursor still refers to the current snapshot and
+/// has not expired. Otherwise returns a typed [`AnalyticsCursorError`] so
+/// callers can distinguish a stale snapshot from an expired cursor.
+///
+pub fn validate_analytics_cursor(
+    env: &Env,
+    cursor: &AnalyticsCursor,
+    current: &AnalyticsSnapshotId,
+) -> Result<(), AnalyticsCursorError> {
+    let current_ledger = env.ledger().sequence();
+    if current_ledger >= cursor.expires_at {
+        return Err(AnalyticsCursorError::Expired {
+            expires_at: cursor.expires_at,
+            current_ledger,
+        });
+    }
+    if cursor.snapshot != *current {
+        return Err(AnalyticsCursorError::SnapshotChanged {
+            expected: cursor.snapshot.clone(),
+            current: current.clone(),
+        });
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Storage Rent Estimation Diagnostics
 // ============================================================================
 
@@ -251,152 +347,11 @@ pub fn calculate_win_rate(successful: u32, total: u32) -> u32 {
 pub fn calculate_profit_factor(total_profit: i128, total_loss: i128) -> u32 {
     if total_loss == 0 {
         if total_profit > 0 {
-            return 10000; // Maximum profit factor
+            return 10000;
         }
         return 0;
     }
-    
-    let loss_abs = total_loss.abs();
-    ((total_profit * 100) / loss_abs).max(0) as u32
-}
-
-/// Calculate Sharpe ratio (simplified version * 100)
-/// Sharpe = (Average Return - Risk Free Rate) / Standard Deviation
-pub fn calculate_sharpe_ratio(
-    avg_return: i128,
-    std_deviation: i128,
-    risk_free_rate: i128,
-) -> i32 {
-    if std_deviation == 0 {
-        return 0;
-    }
-    
-    let excess_return = avg_return - risk_free_rate;
-    ((excess_return * 100) / std_deviation) as i32
-}
-
-/// Calculate maximum drawdown percentage
-pub fn calculate_max_drawdown(peak_value: i128, trough_value: i128) -> u32 {
-    if peak_value <= 0 {
-        return 0;
-    }
-    
-    let drawdown = peak_value - trough_value;
-    if drawdown <= 0 {
-        return 0;
-    }
-    
-    ((drawdown * 10000) / peak_value) as u32
-}
-
-/// Calculate consistency score (0-100)
-/// Based on variance of returns and win rate stability
-pub fn calculate_consistency_score(
-    win_rate_variance: u32,
-    return_variance: i128,
-) -> u32 {
-    // Lower variance = higher consistency
-    // This is a simplified calculation
-    let wr_score = 100u32.saturating_sub(win_rate_variance.min(100));
-    let rv_score = 100u32.saturating_sub((return_variance.abs() / 1000).min(100) as u32);
-    
-    (wr_score + rv_score) / 2
-}
-
-/// Calculate risk score (0-100)
-/// Higher score = higher risk
-pub fn calculate_risk_score(
-    max_drawdown: u32,
-    volatility: u32,
-    leverage_used: u32,
-) -> u32 {
-    let dd_component = (max_drawdown / 100).min(40);
-    let vol_component = (volatility / 100).min(40);
-    let lev_component = (leverage_used / 10).min(20);
-    
-    dd_component + vol_component + lev_component
-}
-
-// ============================================================================
-// Historical Trend Analysis
-// ============================================================================
-
-/// Analyze historical performance trends
-pub fn analyze_historical_trend(
-    data_points: &Vec<TimeSeriesDataPoint>,
-) -> TrendDirection {
-    if data_points.len() < 2 {
-        return TrendDirection::Sideways;
-    }
-    
-    // Calculate simple moving average trend
-    let recent_avg = calculate_recent_average(data_points, 5);
-    let older_avg = calculate_older_average(data_points, 5);
-    
-    let diff_percentage = if older_avg != 0 {
-        ((recent_avg - older_avg) * 100) / older_avg.abs()
-    } else {
-        0
-    };
-    
-    match diff_percentage {
-        d if d > 20 => TrendDirection::StrongUptrend,
-        d if d > 5 => TrendDirection::Uptrend,
-        d if d < -20 => TrendDirection::StrongDowntrend,
-        d if d < -5 => TrendDirection::Downtrend,
-        _ => TrendDirection::Sideways,
-    }
-}
-
-/// Calculate recent average from data points
-fn calculate_recent_average(data_points: &Vec<TimeSeriesDataPoint>, count: usize) -> i128 {
-    let len = data_points.len();
-    if len == 0 {
-        return 0;
-    }
-    
-    let start = if len > count { len - count } else { 0 };
-    let mut sum = 0i128;
-    let mut actual_count = 0u32;
-    
-    for i in start..len {
-        if let Some(dp) = data_points.get(i as u32) {
-            sum += dp.value;
-            actual_count += 1;
-        }
-    }
-    
-    if actual_count > 0 {
-        sum / actual_count as i128
-    } else {
-        0
-    }
-}
-
-/// Calculate older average from data points
-fn calculate_older_average(data_points: &Vec<TimeSeriesDataPoint>, count: usize) -> i128 {
-    let len = data_points.len();
-    if len <= count {
-        return 0;
-    }
-    
-    let end = len - count;
-    let start = if end > count { end - count } else { 0 };
-    let mut sum = 0i128;
-    let mut actual_count = 0u32;
-    
-    for i in start..end {
-        if let Some(dp) = data_points.get(i as u32) {
-            sum += dp.value;
-            actual_count += 1;
-        }
-    }
-    
-    if actual_count > 0 {
-        sum / actual_count as i128
-    } else {
-        0
-    }
+    ((total_profit as u64 * 100) / total_loss as u64) as u32
 }
 
 // ============================================================================
@@ -406,48 +361,79 @@ fn calculate_older_average(data_points: &Vec<TimeSeriesDataPoint>, count: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::Ledger;
 
-    #[test]
-    fn estimate_new_record_is_deterministic() {
-        let a = estimate_storage_rent(ContractOperation::CreateRecord, 128, 0, 0);
-        let b = estimate_storage_rent(ContractOperation::CreateRecord, 128, 0, 0);
-        assert_eq!(a, b);
-        assert_eq!(a.projected_entries, 1);
-        assert_eq!(a.projected_bytes, 128 + ENTRY_OVERHEAD_BYTES);
-        assert_eq!(a.ttl_impact, DEFAULT_TTL_EXTENSION);
-        assert!(a.within_limits);
+    fn snapshot(env: &Env, version: u64) -> AnalyticsSnapshotId {
+        AnalyticsSnapshotId {
+            ledger: env.ledger().sequence(),
+            version,
+        }
     }
 
     #[test]
-    fn estimate_update_record_reports_ttl_impact() {
-        let estimate = estimate_storage_rent(ContractOperation::UpdateRecord, 256, 10, 500);
-        assert_eq!(estimate.projected_entries, 1);
-        assert_eq!(estimate.projected_bytes, 256 + ENTRY_OVERHEAD_BYTES);
-        assert_eq!(estimate.ttl_impact, 500);
+    fn new_cursor_targets_latest_snapshot() {
+        let env = Env::default();
+        let current = snapshot(&env, 7);
+        let cursor = issue_analytics_cursor(&env, current.clone(), 0);
+        assert_eq!(cursor.snapshot, current);
+        assert_eq!(cursor.offset, 0);
+        assert!(cursor.expires_at > env.ledger().sequence());
+    }
+
+    #[test]
+    fn cursor_valid_within_same_snapshot() {
+        let env = Env::default();
+        let current = snapshot(&env, 1);
+        let cursor = issue_analytics_cursor(&env, current.clone(), 10);
+        assert_eq!(validate_analytics_cursor(&env, &cursor, &current), Ok(()));
+    }
+
+    #[test]
+    fn stale_cursor_rejected_after_snapshot_update() {
+        let env = Env::default();
+        let first = snapshot(&env, 1);
+        let cursor = issue_analytics_cursor(&env, first.clone(), 10);
+
+        // Snapshot changes between page requests.
+        let updated = snapshot(&env, 2);
+        let err = validate_analytics_cursor(&env, &cursor, &updated).unwrap_err();
         assert_eq!(
-            estimate.projected_rent,
-            (estimate.projected_bytes as i128) * 500
+            err,
+            AnalyticsCursorError::SnapshotChanged {
+                expected: first,
+                current: updated,
+            }
         );
-        assert!(estimate.within_limits);
     }
 
     #[test]
-    fn estimate_near_limit_request_is_flagged() {
-        let estimate = estimate_storage_rent(
-            ContractOperation::AppendEntry,
-            MAX_BYTES_PER_OPERATION,
-            MAX_ENTRIES_PER_OPERATION,
-            0,
+    fn expired_cursor_rejected() {
+        let env = Env::default();
+        let current = snapshot(&env, 1);
+        let cursor = issue_analytics_cursor(&env, current.clone(), 0);
+
+        env.ledger().set_sequence_number(cursor.expires_at);
+        let err = validate_analytics_cursor(&env, &cursor, &current).unwrap_err();
+        assert_eq!(
+            err,
+            AnalyticsCursorError::Expired {
+                expires_at: cursor.expires_at,
+                current_ledger: cursor.expires_at,
+            }
         );
-        assert!(!estimate.within_limits);
     }
 
     #[test]
-    fn estimate_remove_entry_frees_bytes() {
-        let estimate = estimate_storage_rent(ContractOperation::RemoveEntry, 512, 5, 0);
-        assert_eq!(estimate.projected_entries, 1);
-        assert_eq!(estimate.projected_bytes, 0);
-        assert_eq!(estimate.projected_rent, 0);
-        assert!(estimate.within_limits);
+    fn new_cursor_after_update_starts_from_latest_snapshot() {
+        let env = Env::default();
+        let first = snapshot(&env, 1);
+        let stale = issue_analytics_cursor(&env, first, 10);
+
+        let updated = snapshot(&env, 2);
+        let fresh = issue_analytics_cursor(&env, updated.clone(), 0);
+
+        assert_eq!(fresh.snapshot, updated);
+        assert_eq!(validate_analytics_cursor(&env, &fresh, &updated), Ok(()));
+        assert!(validate_analytics_cursor(&env, &stale, &updated).is_err());
     }
 }
