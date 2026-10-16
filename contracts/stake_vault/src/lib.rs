@@ -35,6 +35,9 @@ pub enum VaultError {
     InsufficientStake = 4,
     /// Configured share is outside the valid basis-point range.
     InvalidShare = 5,
+    /// An arithmetic operation on stake totals or the concentration comparison
+    /// overflowed its representable range. No state was mutated.
+    ArithmeticOverflow = 6,
 }
 
 #[contract]
@@ -94,8 +97,14 @@ impl StakeVault {
             .get(&DataKey::ProviderStake(provider.clone()))
             .unwrap_or(0);
 
-        let new_total = total + amount;
-        let new_provider = current + amount;
+        // Issue #1261: use checked arithmetic and fail before any persistent
+        // write when a value cannot be represented.
+        let new_total = total
+            .checked_add(amount)
+            .ok_or(VaultError::ArithmeticOverflow)?;
+        let new_provider = current
+            .checked_add(amount)
+            .ok_or(VaultError::ArithmeticOverflow)?;
 
         // Enforce the concentration limit before mutating any state.
         let max_bps: u32 = env
@@ -103,7 +112,7 @@ impl StakeVault {
             .instance()
             .get(&DataKey::MaxProviderShareBps)
             .unwrap_or(10_000);
-        if !Self::within_limit(new_provider, new_total, max_bps) {
+        if !Self::within_limit(new_provider, new_total, max_bps)? {
             return Err(VaultError::ConcentrationLimitExceeded);
         }
 
@@ -122,6 +131,10 @@ impl StakeVault {
         if amount <= 0 {
             return Err(VaultError::InvalidAmount);
         }
+
+        // Issue #1258: the owner of the position must authorize before any
+        // stake is reduced; unauthorized callers leave state untouched.
+        provider.require_auth();
 
         let current: i128 = env
             .storage()
@@ -156,12 +169,26 @@ impl StakeVault {
     }
 
     /// Returns `true` when `provider_stake / total_stake` is within `max_bps`.
-    fn within_limit(provider_stake: i128, total_stake: i128, max_bps: u32) -> bool {
+    ///
+    /// Issue #1261: both sides of the comparison are computed with checked
+    /// multiplication so an unrepresentable intermediate cannot silently wrap
+    /// into an unsafe result.
+    fn within_limit(
+        provider_stake: i128,
+        total_stake: i128,
+        max_bps: u32,
+    ) -> Result<bool, VaultError> {
         if total_stake <= 0 {
-            return true;
+            return Ok(true);
         }
         // provider_stake / total_stake <= max_bps / 10_000
-        provider_stake * 10_000 <= total_stake * (max_bps as i128)
+        let left = provider_stake
+            .checked_mul(10_000)
+            .ok_or(VaultError::ArithmeticOverflow)?;
+        let right = total_stake
+            .checked_mul(max_bps as i128)
+            .ok_or(VaultError::ArithmeticOverflow)?;
+        Ok(left <= right)
     }
 }
 
@@ -234,5 +261,67 @@ mod test {
         // Withdrawal still works.
         client.withdraw(&provider, &500);
         assert_eq!(client.provider_stake(&provider), 500);
+    }
+
+    #[test]
+    fn withdraw_requires_provider_authorization() {
+        // Issue #1258: without the provider's authorization the withdrawal is
+        // rejected and neither provider nor total stake changes.
+        let env = Env::default();
+        // Intentionally no `mock_all_auths()`: the withdraw must carry a real auth.
+        let contract_id = env.register_contract(None, StakeVault);
+        let client = StakeVaultClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        client.initialize(&admin, &10_000);
+        client.delegate(&provider, &500);
+
+        assert!(client.try_withdraw(&provider, &100).is_err());
+        assert_eq!(client.provider_stake(&provider), 500);
+        assert_eq!(client.total_stake(), 500);
+    }
+
+    #[test]
+    fn authorized_partial_and_full_withdrawals_succeed() {
+        // Issue #1258: an authorized provider can withdraw partially and fully.
+        let (_env, client, _admin, provider) = setup(10_000);
+        client.delegate(&provider, &1_000);
+        client.withdraw(&provider, &400);
+        assert_eq!(client.provider_stake(&provider), 600);
+        client.withdraw(&provider, &600);
+        assert_eq!(client.provider_stake(&provider), 0);
+        assert_eq!(client.total_stake(), 0);
+    }
+
+    #[test]
+    fn delegate_multiplication_overflow_is_rejected_without_state_change() {
+        // Issue #1261: a stake whose basis-point comparison is unrepresentable
+        // fails with a stable error and leaves accounting untouched.
+        let (_env, client, _admin, provider) = setup(10_000);
+        let huge = i128::MAX / 10_000 + 1;
+        assert_eq!(
+            client.try_delegate(&provider, &huge),
+            Err(Ok(VaultError::ArithmeticOverflow))
+        );
+        assert_eq!(client.provider_stake(&provider), 0);
+        assert_eq!(client.total_stake(), 0);
+    }
+
+    #[test]
+    fn delegate_addition_overflow_is_rejected_without_state_change() {
+        // Issue #1261: a stake that pushes the running total past i128 fails
+        // before any persistent write.
+        let (_env, client, _admin, provider) = setup(10_000);
+        let safe = i128::MAX / 10_001;
+        client.delegate(&provider, &safe);
+        assert_eq!(client.provider_stake(&provider), safe);
+        assert_eq!(client.total_stake(), safe);
+
+        assert_eq!(
+            client.try_delegate(&provider, &(i128::MAX - 10)),
+            Err(Ok(VaultError::ArithmeticOverflow))
+        );
+        assert_eq!(client.provider_stake(&provider), safe);
+        assert_eq!(client.total_stake(), safe);
     }
 }
