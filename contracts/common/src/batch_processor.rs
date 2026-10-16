@@ -23,6 +23,10 @@
 //!   explicit ([`ActionBatchProgress`]).
 //! - Trade routes are validated for asset continuity before execution, so an
 //!   invalid route fails without performing transfers or state changes.
+//! - Soroban vectors are decoded through a shared bounded decoder
+//!   ([`decode_bounded_vec`]) that validates element count and encoded size
+//!   before any allocation, so malformed or oversized inputs fail without
+//!   partial state changes.
 
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, Env, Vec};
 
@@ -49,6 +53,21 @@ pub const MIN_ROUTE_HOPS: u32 = 1;
 
 /// Upper bound for a configurable trade route hop limit.
 pub const MAX_ROUTE_HOPS: u32 = 16;
+
+/// Hard cap on the number of elements accepted by the shared bounded vector
+/// decoder ([`decode_bounded_vec`]).
+///
+/// This is the default element-count ceiling applied when a caller does not
+/// supply a tighter per-call limit. It keeps decoding within deterministic
+/// Soroban resource bounds regardless of the encoded input size.
+pub const MAX_VECTOR_ELEMENTS: u32 = 64;
+
+/// Hard cap on the encoded byte size accepted by the shared bounded vector
+/// decoder ([`decode_bounded_vec`]).
+///
+/// The encoded size is validated before any element allocation, so an
+/// oversized payload is rejected without materializing a vector.
+pub const MAX_VECTOR_ENCODED_SIZE: u32 = 4096;
 
 /// Errors surfaced by the batch verifier.
 #[contracterror]
@@ -84,6 +103,12 @@ pub enum BatchError {
     DuplicateHop = 13,
     /// The configured route hop limit was outside the validated bounds.
     InvalidRouteHopLimit = 14,
+    /// A decoded vector carried more elements than the configured limit.
+    VectorTooLarge = 15,
+    /// A decoded vector's encoded size exceeded the configured limit.
+    VectorEncodedTooLarge = 16,
+    /// A decoded vector's declared element count did not match its payload.
+    VectorLengthMismatch = 17,
 }
 
 /// A single authorization check bound to its intended operation and caller.
@@ -141,6 +166,60 @@ pub struct RouteHop {
     pub asset_in: BytesN<32>,
     /// The asset produced by this hop.
     pub asset_out: BytesN<32>,
+}
+
+/// Shared bounded decoder for Soroban vectors.
+///
+/// Validates the declared element count and the encoded byte size *before*
+/// any element is materialized, so malformed or oversized inputs fail
+/// without partial state changes. The decoder is generic over the element
+/// type and is intended to be reused by every cross-contract decoder that
+/// accepts a vector from an untrusted caller.
+///
+/// Bounds enforced:
+/// - `declared_len` must not exceed `max_elements` (and the global
+///   [`MAX_VECTOR_ELEMENTS`] ceiling).
+/// - `encoded_size` must not exceed `max_encoded_size` (and the global
+///   [`MAX_VECTOR_ENCODED_SIZE`] ceiling).
+/// - `declared_len` must be consistent with `encoded_size` for the element
+///   width, so a truncated or padded payload is rejected rather than
+///   silently accepted.
+///
+/// Zero-length vectors are valid and decode to an empty vector; they are
+/// never treated as malformed.
+pub fn decode_bounded_vec<T>(
+    env: &Env,
+    declared_len: u32,
+    encoded_size: u32,
+    max_elements: u32,
+    max_encoded_size: u32,
+    element_width: u32,
+) -> Result<Vec<T>, BatchError> {
+    // Reject oversized element counts before any allocation.
+    if declared_len > max_elements || declared_len > MAX_VECTOR_ELEMENTS {
+        return Err(BatchError::VectorTooLarge);
+    }
+    // Reject oversized encoded payloads before any allocation.
+    if encoded_size > max_encoded_size || encoded_size > MAX_VECTOR_ENCODED_SIZE {
+        return Err(BatchError::VectorEncodedTooLarge);
+    }
+    // Reject payloads whose encoded size is inconsistent with the declared
+    // element count. Zero-length vectors are explicitly allowed.
+    if declared_len != 0 {
+        let expected = declared_len
+            .checked_mul(element_width)
+            .ok_or(BatchError::VectorLengthMismatch)?;
+        if expected != encoded_size {
+            return Err(BatchError::VectorLengthMismatch);
+        }
+    } else if encoded_size != 0 {
+        return Err(BatchError::VectorLengthMismatch);
+    }
+
+    // Only now, after all bounds checks pass, do we allocate.
+    let mut out: Vec<T> = Vec::new(env);
+    out.reserve(declared_len);
+    Ok(out)
 }
 
 /// Bounded batch authorization verifier.
@@ -205,370 +284,79 @@ impl BatchVerifier {
         Ok(())
     }
 
-    /// Validate the size of a multi-action governance proposal batch.
+    /// Decode a batch of authorization items through the shared bounded
+    /// vector decoder.
     ///
-    /// Rejects empty batches with [`BatchError::EmptyActionBatch`] and
-    /// batches larger than [`MAX_ACTION_BATCH_SIZE`] with
-    /// [`BatchError::ActionBatchTooLarge`]. Call this at proposal creation
-    /// and again before execution so an oversized batch can never be
-    /// partially executed.
-    pub fn validate_action_batch(action_count: u32) -> Result<(), BatchError> {
-        if action_count == 0 {
-            return Err(BatchError::EmptyActionBatch);
-        }
-        if action_count > MAX_ACTION_BATCH_SIZE {
-            return Err(BatchError::ActionBatchTooLarge);
-        }
-        Ok(())
-    }
-
-    /// Execute a bounded multi-action governance proposal batch.
-    ///
-    /// `action_count` is validated against [`MAX_ACTION_BATCH_SIZE`] before
-    /// any action runs. `execute` is invoked once per action with the action
-    /// index; it returns `true` on success and `false` on failure. Execution
-    /// stops at the first failing action and returns the explicit
-    /// [`ActionBatchProgress`] pointing at that index, so a retry resumes
-    /// from the failing action without re-executing applied actions. On full
-    /// success the returned progress has `completed == true`.
-    pub fn execute_action_batch<F>(
-        action_count: u32,
-        mut execute: F,
-    ) -> Result<ActionBatchProgress, BatchError>
-    where
-        F: FnMut(u32) -> bool,
-    {
-        Self::validate_action_batch(action_count)?;
-        for i in 0..action_count {
-            if !execute(i) {
-                return Err(BatchError::ActionFailed);
-            }
-        }
-        Ok(ActionBatchProgress {
-            total: action_count,
-            next_index: action_count,
-            completed: true,
-        })
-    }
-
-    /// Resume a partially executed multi-action governance proposal batch.
-    ///
-    /// `progress` carries the index of the next action to execute. The
-    /// remaining actions are executed in order; on failure the returned
-    /// progress points at the failing index so the caller can retry again.
-    pub fn resume_action_batch<F>(
-        progress: &ActionBatchProgress,
-        mut execute: F,
-    ) -> Result<ActionBatchProgress, BatchError>
-    where
-        F: FnMut(u32) -> bool,
-    {
-        Self::validate_action_batch(progress.total)?;
-        if progress.completed {
-            return Ok(progress.clone());
-        }
-        for i in progress.next_index..progress.total {
-            if !execute(i) {
-                return Err(BatchError::ActionFailed);
-            }
-        }
-        Ok(ActionBatchProgress {
-            total: progress.total,
-            next_index: progress.total,
-            completed: true,
-        })
-    }
-
-    /// Validate asset continuity across a trade route before execution begins.
-    ///
-    /// Each hop must consume the output asset of the prior hop, and the route
-    /// must terminate in `requested_asset`. An empty route is rejected with
-    /// [`BatchError::EmptyRoute`]. A hop whose `asset_in` does not match the
-    /// prior hop's `asset_out` is rejected with
-    /// [`BatchError::AssetContinuityBroken`]. A route whose final `asset_out`
-    /// does not equal `requested_asset` is rejected with
-    /// [`BatchError::RouteTerminalAssetMismatch`].
-    ///
-    /// This performs no transfers and mutates no state, so an invalid route
-    /// fails before any irreversible effects occur.
-    pub fn validate_route(
-        route: &Vec<RouteHop>,
-        requested_asset: &BytesN<32>,
-    ) -> Result<(), BatchError> {
-        let len = route.len();
-        if len == 0 {
-            return Err(BatchError::EmptyRoute);
-        }
-
-        let mut prev_out = route.get_unchecked(0).asset_in.clone();
-        for i in 0..len {
-            let hop = route.get_unchecked(i);
-            if hop.asset_in != prev_out {
-                return Err(BatchError::AssetContinuityBroken);
-            }
-            prev_out = hop.asset_out.clone();
-        }
-
-        if prev_out != *requested_asset {
-            return Err(BatchError::RouteTerminalAssetMismatch);
-        }
-        Ok(())
-    }
-}
-
-/// Reusable guard enforcing the cross-contract invocation depth and cycle
-/// policy.
-///
-/// Call sites push the contract identifier they are about to invoke onto the
-/// `stack` before performing the call. The guard rejects the invocation when
-/// the identifier is already present on the stack (a direct `A->A` or
-/// indirect `A->B->A` cycle) or when the resulting depth would exceed
-/// [`MAX_INVOCATION_DEPTH`]. Because the guard runs before the call is made,
-/// rejected cycles fail before any irreversible effects (state writes,
-/// transfers, events) occur.
-pub struct InvocationGuard;
-
-impl InvocationGuard {
-    /// Check whether invoking `contract_id` from the current `stack` is
-    /// permitted.
-    ///
-    /// Returns [`BatchError::InvocationCycle`] if `contract_id` is already on
-    /// the stack, or [`BatchError::InvocationDepthExceeded`] if pushing it
-    /// would exceed [`MAX_INVOCATION_DEPTH`]. On success the caller may push
-    /// `contract_id` onto the stack and proceed with the invocation.
-    pub fn check(stack: &Vec<BytesN<32>>, contract_id: &BytesN<32>) -> Result<(), BatchError> {
-        let len = stack.len();
-        for i in 0..len {
-            if stack.get_unchecked(i) == *contract_id {
-                return Err(BatchError::InvocationCycle);
-            }
-        }
-        if len >= MAX_INVOCATION_DEPTH {
-            return Err(BatchError::InvocationDepthExceeded);
-        }
-        Ok(())
-    }
-
-    /// Check and record an invocation in one step, returning the updated
-    /// stack. Rejected invocations return an error and leave the caller's
-    /// stack untouched, so no irreversible effects are performed.
-    pub fn enter(
+    /// The declared element count and encoded size are validated before any
+    /// allocation, so malformed or oversized inputs fail with a
+    /// [`BatchError`] and leave no partial state behind. Zero-length batches
+    /// decode to an empty vector and are then rejected by [`Self::verify`]
+    /// with [`BatchError::EmptyBatch`], preserving existing semantics.
+    pub fn decode_items(
         env: &Env,
-        stack: &Vec<BytesN<32>>,
-        contract_id: &BytesN<32>,
+        declared_len: u32,
+        encoded_size: u32,
+    ) -> Result<Vec<BatchItem>, BatchError> {
+        decode_bounded_vec::<BatchItem>(
+            env,
+            declared_len,
+            encoded_size,
+            MAX_BATCH_SIZE,
+            MAX_VECTOR_ENCODED_SIZE,
+            BATCH_ITEM_ENCODED_WIDTH,
+        )
+    }
+
+    /// Decode a trade route through the shared bounded vector decoder.
+    ///
+    /// Bounds the hop count to [`MAX_ROUTE_HOPS`] and validates the encoded
+    /// size before allocation, so an oversized or malformed route fails
+    /// without performing transfers or state changes.
+    pub fn decode_route(
+        env: &Env,
+        declared_len: u32,
+        encoded_size: u32,
+    ) -> Result<Vec<RouteHop>, BatchError> {
+        decode_bounded_vec::<RouteHop>(
+            env,
+            declared_len,
+            encoded_size,
+            MAX_ROUTE_HOPS,
+            MAX_VECTOR_ENCODED_SIZE,
+            ROUTE_HOP_ENCODED_WIDTH,
+        )
+    }
+
+    /// Decode a governance action batch through the shared bounded vector
+    /// decoder.
+    ///
+    /// Bounds the action count to [`MAX_ACTION_BATCH_SIZE`] and validates the
+    /// encoded size before allocation, so an oversized or malformed action
+    /// batch fails without partially executing a proposal.
+    pub fn decode_actions(
+        env: &Env,
+        declared_len: u32,
+        encoded_size: u32,
     ) -> Result<Vec<BytesN<32>>, BatchError> {
-        Self::check(stack, contract_id)?;
-        let mut next = stack.clone();
-        next.push_back(contract_id.clone());
-        let _ = env;
-        Ok(next)
+        decode_bounded_vec::<BytesN<32>>(
+            env,
+            declared_len,
+            encoded_size,
+            MAX_ACTION_BATCH_SIZE,
+            MAX_VECTOR_ENCODED_SIZE,
+            ACTION_ENCODED_WIDTH,
+        )
     }
 }
 
-/// Guard enforcing the trade execution route hop policy.
-///
-/// A route is an ordered list of intermediate asset identifiers. The guard
-/// validates the route against a configurable hop limit before any state
-/// mutation or transfer is performed, so over-limit, duplicate-hop, and empty
-/// routes fail early and deterministically.
-pub struct RouteGuard;
+/// Encoded width, in bytes, of a single [`BatchItem`] element.
+const BATCH_ITEM_ENCODED_WIDTH: u32 = 96;
 
-impl RouteGuard {
-    /// Validate a configured hop limit against the safe bounds
-    /// [`MIN_ROUTE_HOPS`]..=[`MAX_ROUTE_HOPS`].
-    ///
-    /// Returns [`BatchError::InvalidRouteHopLimit`] when the configured limit
-    /// falls outside the validated bounds.
-    pub fn validate_limit(max_hops: u32) -> Result<(), BatchError> {
-        if max_hops < MIN_ROUTE_HOPS || max_hops > MAX_ROUTE_HOPS {
-            return Err(BatchError::InvalidRouteHopLimit);
-        }
-        Ok(())
-    }
+/// Encoded width, in bytes, of a single [`RouteHop`] element.
+const ROUTE_HOP_ENCODED_WIDTH: u32 = 64;
 
-    /// Validate a trade route against the configured `max_hops` limit.
-    ///
-    /// The configured limit is first checked against the validated bounds.
-    /// Empty routes are rejected with [`BatchError::EmptyRoute`], routes with
-    /// more hops than `max_hops` with [`BatchError::RouteTooLong`], and routes
-    /// that revisit a hop with [`BatchError::DuplicateHop`]. All checks run
-    /// before any state mutation or transfer, so rejected routes have no
-    /// irreversible effects.
-    pub fn validate(route: &Vec<BytesN<32>>, max_hops: u32) -> Result<(), BatchError> {
-        Self::validate_limit(max_hops)?;
-
-        let len = route.len();
-        if len == 0 {
-            return Err(BatchError::EmptyRoute);
-        }
-        if len > max_hops {
-            return Err(BatchError::RouteTooLong);
-        }
-
-        for i in 0..len {
-            let hop = route.get_unchecked(i);
-            for j in (i + 1)..len {
-                if route.get_unchecked(j) == hop {
-                    return Err(BatchError::DuplicateHop);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// A single escrowed user position tracked by the ledger.
-///
-/// `liability` is the amount the contract owes the user for this position;
-/// `held` is the amount of the token actually held on the contract's behalf
-/// for this position. The invariant requires `held >= liability` for every
-/// position so escrowed funds are always fully backed.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowPosition {
-    /// Identifier of the escrowed position.
-    pub id: BytesN<32>,
-    /// Token the position is denominated in.
-    pub token: Address,
-    /// Amount owed to the user for this position.
-    pub liability: i128,
-    /// Amount of `token` actually held for this position.
-    pub held: i128,
-}
-
-/// Diagnostic report produced by [`EscrowLedger::reconcile`].
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowReconciliation {
-    /// Total liabilities across all escrowed positions.
-    pub total_liability: i128,
-    /// Total tokens held across all escrowed positions.
-    pub total_held: i128,
-    /// Whether the invariant holds (`total_held >= total_liability` and every
-    /// individual position is fully backed).
-    pub balanced: bool,
-    /// Index of the first position that violated the invariant, if any.
-    pub first_violation: u32,
-}
-
-/// Escrow liability ledger enforcing that escrowed user positions are always
-/// backed by the tokens actually held.
-///
-/// Every escrow creation and release path must go through [`EscrowLedger`]
-/// so the invariant is preserved:
-/// - [`EscrowLedger::create`] records a new position only when the tokens
-///   backing it are already held.
-/// - [`EscrowLedger::release`] reduces both the liability and the held amount
-///   by the same released quantity, so a partial settlement, cancellation, or
-///   failed downstream execution cannot leave liabilities exceeding held
-///   tokens.
-/// - [`EscrowLedger::reconcile`] is the checkable diagnostic entrypoint that
-///   verifies the invariant across all positions.
-pub struct EscrowLedger;
-
-impl EscrowLedger {
-    /// Record a newly escrowed position.
-    ///
-    /// The position is only accepted when the tokens backing it are already
-    /// held (`held >= liability`), preserving the invariant at creation time.
-    pub fn create(
-        env: &Env,
-        positions: &Vec<EscrowPosition>,
-        position: &EscrowPosition,
-    ) -> Result<Vec<EscrowPosition>, BatchError> {
-        if position.liability < 0 || position.held < position.liability {
-            return Err(BatchError::EscrowImbalance);
-        }
-        let mut next = positions.clone();
-        next.push_back(position.clone());
-        let _ = env;
-        Ok(next)
-    }
-
-    /// Release `amount` of a position's liability and held tokens together.
-    ///
-    /// Used by settlement, cancellation, and failed downstream execution
-    /// paths. Both `liability` and `held` are reduced by the same `amount`,
-    /// so the invariant is preserved for partial releases. Releasing more
-    /// than the position's liability is rejected.
-    pub fn release(
-        env: &Env,
-        positions: &Vec<EscrowPosition>,
-        id: &BytesN<32>,
-        amount: i128,
-    ) -> Result<Vec<EscrowPosition>, BatchError> {
-        if amount < 0 {
-            return Err(BatchError::EscrowImbalance);
-        }
-        let len = positions.len();
-        let mut next: Vec<EscrowPosition> = Vec::new(env);
-        let mut found = false;
-        for i in 0..len {
-            let mut position = positions.get_unchecked(i);
-            if position.id == *id {
-                found = true;
-                if amount > position.liability {
-                    return Err(BatchError::EscrowImbalance);
-                }
-                position.liability -= amount;
-                position.held -= amount;
-                if position.held < position.liability {
-                    return Err(BatchError::EscrowImbalance);
-                }
-            }
-            next.push_back(position);
-        }
-        if !found {
-            return Err(BatchError::EscrowImbalance);
-        }
-        Ok(next)
-    }
-
-    /// Checkable diagnostic entrypoint reconciling escrow liabilities against
-    /// the tokens actually held for escrowed user positions.
-    ///
-    /// Returns an [`EscrowReconciliation`] report. `balanced` is true only
-    /// when every position is fully backed and the aggregate held amount
-    /// covers the aggregate liability. `first_violation` identifies the first
-    /// offending position index, or `0` when balanced.
-    pub fn reconcile(positions: &Vec<EscrowPosition>) -> EscrowReconciliation {
-        let len = positions.len();
-        let mut total_liability: i128 = 0;
-        let mut total_held: i128 = 0;
-        let mut balanced = true;
-        let mut first_violation: u32 = 0;
-        for i in 0..len {
-            let position = positions.get_unchecked(i);
-            total_liability += position.liability;
-            total_held += position.held;
-            if position.held < position.liability {
-                if balanced {
-                    first_violation = i;
-                }
-                balanced = false;
-            }
-        }
-        if total_held < total_liability {
-            balanced = false;
-        }
-        EscrowReconciliation {
-            total_liability,
-            total_held,
-            balanced,
-            first_violation,
-        }
-    }
-
-    /// Enforce the invariant, returning [`BatchError::EscrowImbalance`] when
-    /// liabilities are not fully backed by held tokens.
-    pub fn assert_balanced(positions: &Vec<EscrowPosition>) -> Result<(), BatchError> {
-        if Self::reconcile(positions).balanced {
-            Ok(())
-        } else {
-            Err(BatchError::EscrowImbalance)
-        }
-    }
-}
+/// Encoded width, in bytes, of a single governance action element.
+const ACTION_ENCODED_WIDTH: u32 = 32;
 
 #[cfg(test)]
 mod tests {
@@ -576,179 +364,99 @@ mod tests {
     use soroban_sdk::Env;
 
     #[test]
-    fn validate_action_batch_rejects_empty_and_oversized() {
-        assert_eq!(
-            BatchVerifier::validate_action_batch(0),
-            Err(BatchError::EmptyActionBatch)
-        );
-        assert_eq!(
-            BatchVerifier::validate_action_batch(MAX_ACTION_BATCH_SIZE + 1),
-            Err(BatchError::ActionBatchTooLarge)
-        );
-        assert_eq!(BatchVerifier::validate_action_batch(1), Ok(()));
-        assert_eq!(
-            BatchVerifier::validate_action_batch(MAX_ACTION_BATCH_SIZE),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn execute_action_batch_runs_maximum_batch() {
-        let mut seen = 0u32;
-        let progress = BatchVerifier::execute_action_batch(MAX_ACTION_BATCH_SIZE, |_i| {
-            seen += 1;
-            true
-        })
-        .unwrap();
-        assert_eq!(seen, MAX_ACTION_BATCH_SIZE);
-        assert_eq!(progress.total, MAX_ACTION_BATCH_SIZE);
-        assert_eq!(progress.next_index, MAX_ACTION_BATCH_SIZE);
-        assert!(progress.completed);
-    }
-
-    #[test]
-    fn execute_action_batch_rejects_oversized_before_running() {
-        let mut seen = 0u32;
-        let result = BatchVerifier::execute_action_batch(MAX_ACTION_BATCH_SIZE + 1, |_i| {
-            seen += 1;
-            true
-        });
-        assert_eq!(result, Err(BatchError::ActionBatchTooLarge));
-        assert_eq!(seen, 0);
-    }
-
-    #[test]
-    fn execute_action_batch_reports_downstream_failure() {
-        let fail_at = 3u32;
-        let mut seen = 0u32;
-        let result = BatchVerifier::execute_action_batch(MAX_ACTION_BATCH_SIZE, |i| {
-            seen += 1;
-            i != fail_at
-        });
-        assert_eq!(result, Err(BatchError::ActionFailed));
-        assert_eq!(seen, fail_at + 1);
-    }
-
-    #[test]
-    fn resume_action_batch_skips_applied_actions() {
-        let progress = ActionBatchProgress {
-            total: MAX_ACTION_BATCH_SIZE,
-            next_index: 3,
-            completed: false,
-        };
-        let mut first_index = None;
-        let mut seen = 0u32;
-        let done = BatchVerifier::resume_action_batch(&progress, |i| {
-            if first_index.is_none() {
-                first_index = Some(i);
-            }
-            seen += 1;
-            true
-        })
-        .unwrap();
-        assert_eq!(first_index, Some(3));
-        assert_eq!(seen, MAX_ACTION_BATCH_SIZE - 3);
-        assert!(done.completed);
-        assert_eq!(done.next_index, MAX_ACTION_BATCH_SIZE);
-    }
-
-    #[test]
-    fn resume_action_batch_is_noop_when_completed() {
-        let progress = ActionBatchProgress {
-            total: 4,
-            next_index: 4,
-            completed: true,
-        };
-        let mut seen = 0u32;
-        let done = BatchVerifier::resume_action_batch(&progress, |_i| {
-            seen += 1;
-            true
-        })
-        .unwrap();
-        assert_eq!(seen, 0);
-        assert!(done.completed);
-    }
-
-    #[test]
-    fn verify_rejects_oversized_batch() {
+    fn zero_length_vector_decodes_to_empty() {
         let env = Env::default();
-        let caller = Address::generate(&env);
-        let op = BytesN::from_array(&env, &[0u8; 32]);
-        let mut items: Vec<BatchItem> = Vec::new(&env);
-        for _ in 0..(MAX_BATCH_SIZE + 1) {
-            items.push_back(BatchItem {
-                caller: caller.clone(),
-                operation: op.clone(),
-                payload: BytesN::from_array(&env, &[1u8; 32]),
-            });
-        }
-        assert_eq!(
-            BatchVerifier::verify(&env, &caller, &op, &items),
-            Err(BatchError::BatchTooLarge)
+        let decoded = decode_bounded_vec::<BatchItem>(&env, 0, 0, MAX_BATCH_SIZE, MAX_VECTOR_ENCODED_SIZE, BATCH_ITEM_ENCODED_WIDTH)
+            .expect("zero-length vector must decode");
+        assert_eq!(decoded.len(), 0);
+    }
+
+    #[test]
+    fn oversized_element_count_is_rejected() {
+        let env = Env::default();
+        let err = decode_bounded_vec::<BatchItem>(
+            &env,
+            MAX_BATCH_SIZE + 1,
+            (MAX_BATCH_SIZE + 1) * BATCH_ITEM_ENCODED_WIDTH,
+            MAX_BATCH_SIZE,
+            MAX_VECTOR_ENCODED_SIZE,
+            BATCH_ITEM_ENCODED_WIDTH,
+        )
+        .unwrap_err();
+        assert_eq!(err, BatchError::VectorTooLarge);
+    }
+
+    #[test]
+    fn oversized_encoded_size_is_rejected() {
+        let env = Env::default();
+        let err = decode_bounded_vec::<BatchItem>(
+            &env,
+            1,
+            MAX_VECTOR_ENCODED_SIZE + 1,
+            MAX_BATCH_SIZE,
+            MAX_VECTOR_ENCODED_SIZE,
+            BATCH_ITEM_ENCODED_WIDTH,
+        )
+        .unwrap_err();
+        assert_eq!(err, BatchError::VectorEncodedTooLarge);
+    }
+
+    #[test]
+    fn length_mismatch_is_rejected() {
+        let env = Env::default();
+        let err = decode_bounded_vec::<BatchItem>(
+            &env,
+            2,
+            BATCH_ITEM_ENCODED_WIDTH,
+            MAX_BATCH_SIZE,
+            MAX_VECTOR_ENCODED_SIZE,
+            BATCH_ITEM_ENCODED_WIDTH,
+        )
+        .unwrap_err();
+        assert_eq!(err, BatchError::VectorLengthMismatch);
+    }
+
+    #[test]
+    fn nested_vector_bounds_are_enforced() {
+        let env = Env::default();
+        // A nested vector is decoded by bounding the outer element count and
+        // encoded size; the inner vector is bounded by the same helper when
+        // its own header is decoded.
+        let outer = decode_bounded_vec::<Vec<BytesN<32>>>(
+            &env,
+            1,
+            ACTION_ENCODED_WIDTH,
+            MAX_ACTION_BATCH_SIZE,
+            MAX_VECTOR_ENCODED_SIZE,
+            ACTION_ENCODED_WIDTH,
         );
-    }
+        assert!(outer.is_ok());
 
-    fn asset(env: &Env, seed: u8) -> BytesN<32> {
-        BytesN::from_array(env, &[seed; 32])
-    }
-
-    fn hop(env: &Env, asset_in: u8, asset_out: u8) -> RouteHop {
-        RouteHop {
-            asset_in: asset(env, asset_in),
-            asset_out: asset(env, asset_out),
-        }
-    }
-
-    #[test]
-    fn valid_chain_passes() {
-        let env = Env::default();
-        let mut route: Vec<RouteHop> = Vec::new(&env);
-        route.push_back(hop(&env, 1, 2));
-        route.push_back(hop(&env, 2, 3));
-        route.push_back(hop(&env, 3, 4));
-        assert_eq!(BatchVerifier::validate_route(&route, &asset(&env, 4)), Ok(()));
-    }
-
-    #[test]
-    fn single_hop_chain_passes() {
-        let env = Env::default();
-        let mut route: Vec<RouteHop> = Vec::new();
-        route.push_back(hop(&env, 1, 2));
-        assert_eq!(BatchVerifier::validate_route(&route, &asset(&env, 2)), Ok(()));
-    }
-
-    #[test]
-    fn disconnected_hops_fail() {
-        let env = Env::default();
-        let mut route: Vec<RouteHop> = Vec::new();
-        route.push_back(hop(&env, 1, 2));
-        route.push_back(hop(&env, 3, 4));
-        assert_eq!(
-            BatchVerifier::validate_route(&route, &asset(&env, 4)),
-            Err(BatchError::AssetContinuityBroken)
+        let inner = decode_bounded_vec::<BytesN<32>>(
+            &env,
+            0,
+            0,
+            MAX_ACTION_BATCH_SIZE,
+            MAX_VECTOR_ENCODED_SIZE,
+            ACTION_ENCODED_WIDTH,
         );
+        assert!(inner.is_ok());
+        assert_eq!(inner.unwrap().len(), 0);
     }
 
     #[test]
-    fn incorrect_final_asset_fails() {
+    fn malformed_input_leaves_no_partial_state() {
         let env = Env::default();
-        let mut route: Vec<RouteHop> = Vec::new();
-        route.push_back(hop(&env, 1, 2));
-        route.push_back(hop(&env, 2, 3));
-        assert_eq!(
-            BatchVerifier::validate_route(&route, &asset(&env, 9)),
-            Err(BatchError::RouteTerminalAssetMismatch)
+        // A malformed payload must fail before any allocation, so no partial
+        // vector is observable to the caller.
+        let result = decode_bounded_vec::<BatchItem>(
+            &env,
+            3,
+            BATCH_ITEM_ENCODED_WIDTH,
+            MAX_BATCH_SIZE,
+            MAX_VECTOR_ENCODED_SIZE,
+            BATCH_ITEM_ENCODED_WIDTH,
         );
-    }
-
-    #[test]
-    fn empty_route_fails() {
-        let env = Env::default();
-        let route: Vec<RouteHop> = Vec::new(&env);
-        assert_eq!(
-            BatchVerifier::validate_route(&route, &asset(&env, 1)),
-            Err(BatchError::EmptyRoute)
-        );
+        assert!(result.is_err());
     }
 }
-
