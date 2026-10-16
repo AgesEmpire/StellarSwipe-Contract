@@ -4,7 +4,7 @@
 //! concentration limit so that no single provider can accumulate an
 //! unbounded share of the total delegated stake.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
 
 /// Storage keys used by the stake vault.
 #[contracttype]
@@ -38,6 +38,21 @@ pub enum VaultError {
     /// An arithmetic operation on stake totals or the concentration comparison
     /// overflowed its representable range. No state was mutated.
     ArithmeticOverflow = 6,
+}
+
+/// Structured payload for stake lifecycle events (issue #1262).
+///
+/// Carries the operation, the provider whose position changed, the amount
+/// applied, and the resulting provider and total balances so indexers can
+/// rebuild accounting from the event stream alone.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakeChangedEvent {
+    pub operation: Symbol,
+    pub provider: Address,
+    pub amount: i128,
+    pub provider_balance: i128,
+    pub total_balance: i128,
 }
 
 #[contract]
@@ -119,7 +134,18 @@ impl StakeVault {
         env.storage().instance().set(&DataKey::TotalStake, &new_total);
         env.storage()
             .persistent()
-            .set(&DataKey::ProviderStake(provider), &new_provider);
+            .set(&DataKey::ProviderStake(provider.clone()), &new_provider);
+
+        // Issue #1262: emit an auditable delegation event so indexers can track
+        // stake changes without reconstructing every provider balance.
+        Self::emit_stake_changed(
+            &env,
+            Symbol::new(&env, "stake_delegated"),
+            provider,
+            amount,
+            new_provider,
+            new_total,
+        );
         Ok(())
     }
 
@@ -146,13 +172,61 @@ impl StakeVault {
         }
 
         let total: i128 = env.storage().instance().get(&DataKey::TotalStake).unwrap_or(0);
+        let new_provider = current - amount;
+        let new_total = total - amount;
         env.storage()
             .instance()
-            .set(&DataKey::TotalStake, &(total - amount));
-        env.storage()
-            .persistent()
-            .set(&DataKey::ProviderStake(provider), &(current - amount));
+            .set(&DataKey::TotalStake, &new_total);
+
+        // Issue #1263: drop the persistent entry entirely once the position is
+        // empty so inactive providers are not stored as zero-balance records.
+        // Partial withdrawals retain the entry.
+        if new_provider == 0 {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ProviderStake(provider.clone()));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProviderStake(provider.clone()), &new_provider);
+        }
+
+        // Issue #1262: emit an auditable withdrawal event naming the authorized
+        // provider and the resulting balances.
+        Self::emit_stake_changed(
+            &env,
+            Symbol::new(&env, "stake_withdrawn"),
+            provider,
+            amount,
+            new_provider,
+            new_total,
+        );
         Ok(())
+    }
+
+    /// Emit a structured stake lifecycle event (issue #1262).
+    ///
+    /// The payload always carries the provider, the amount applied, the
+    /// operation topic, and the resulting provider and total balances so
+    /// downstream consumers can rebuild accounting from the event stream.
+    fn emit_stake_changed(
+        env: &Env,
+        operation: Symbol,
+        provider: Address,
+        amount: i128,
+        provider_balance: i128,
+        total_balance: i128,
+    ) {
+        env.events().publish(
+            (operation.clone(),),
+            StakeChangedEvent {
+                operation,
+                provider,
+                amount,
+                provider_balance,
+                total_balance,
+            },
+        );
     }
 
     /// Returns the stake currently delegated to `provider`.
@@ -195,7 +269,8 @@ impl StakeVault {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::testutils::{Address as _, Events as _};
+    use soroban_sdk::{Env, TryFromVal};
 
     fn setup(max_bps: u32) -> (Env, StakeVaultClient<'static>, Address, Address) {
         let env = Env::default();
@@ -323,5 +398,91 @@ mod test {
         );
         assert_eq!(client.provider_stake(&provider), safe);
         assert_eq!(client.total_stake(), safe);
+    }
+
+    #[test]
+    fn full_withdrawal_removes_provider_entry() {
+        // Issue #1263: a full withdrawal must drop the persistent entry, while
+        // a partial withdrawal keeps it.
+        let (env, client, _admin, provider) = setup(10_000);
+        client.delegate(&provider, &500);
+
+        // Partial withdrawal retains the entry.
+        client.withdraw(&provider, &200);
+        assert_eq!(client.provider_stake(&provider), 300);
+        env.as_contract(&client.address, || {
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::ProviderStake(provider.clone())));
+        });
+
+        // Full withdrawal removes the entry; queries still report zero.
+        client.withdraw(&provider, &300);
+        assert_eq!(client.provider_stake(&provider), 0);
+        assert_eq!(client.total_stake(), 0);
+        env.as_contract(&client.address, || {
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&DataKey::ProviderStake(provider.clone())));
+        });
+    }
+
+    #[test]
+    fn delegation_and_withdrawal_emit_auditable_events() {
+        // Issue #1262: successful stake changes emit a structured event with
+        // the operation, provider, amount, and resulting balances.
+        let (env, client, _admin, provider) = setup(10_000);
+        client.delegate(&provider, &500);
+
+        let events = env.events().all();
+        let delegated = StakeChangedEvent {
+            operation: Symbol::new(&env, "stake_delegated"),
+            provider: provider.clone(),
+            amount: 500,
+            provider_balance: 500,
+            total_balance: 500,
+        };
+        assert!(
+            events.iter().any(|(_, _, data)| {
+                StakeChangedEvent::try_from_val(&env, &data).map_or(false, |e| e == delegated)
+            }),
+            "expected a stake_delegated event describing the delegation"
+        );
+
+        client.withdraw(&provider, &500);
+        let events = env.events().all();
+        let withdrawn = StakeChangedEvent {
+            operation: Symbol::new(&env, "stake_withdrawn"),
+            provider: provider.clone(),
+            amount: 500,
+            provider_balance: 0,
+            total_balance: 0,
+        };
+        assert!(
+            events.iter().any(|(_, _, data)| {
+                StakeChangedEvent::try_from_val(&env, &data).map_or(false, |e| e == withdrawn)
+            }),
+            "expected a stake_withdrawn event describing the withdrawal"
+        );
+    }
+
+    #[test]
+    fn rejected_operations_emit_no_stake_event() {
+        // Issue #1262: failed operations must not emit a success event.
+        let (env, client, _admin, provider) = setup(10_000);
+        client.delegate(&provider, &500);
+        // Tighten the limit so the next delegation is rejected.
+        client.set_max_provider_share_bps(&5_000);
+
+        let before = env.events().all().len();
+        assert!(client.try_delegate(&provider, &1).is_err());
+        assert_eq!(
+            env.events().all().len(),
+            before,
+            "rejected delegation must not emit a stake event"
+        );
+    }
     }
 }
