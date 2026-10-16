@@ -4,6 +4,48 @@ pub mod decimal;
 
 use serde::{Deserialize, Serialize};
 
+/// Error returned when a bounded vector fails validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundedVecError {
+    /// The encoded element count exceeds the configured maximum.
+    TooManyElements,
+    /// The encoded byte length exceeds the configured maximum.
+    TooLarge,
+    /// The encoded byte length does not match the element count.
+    LengthMismatch,
+}
+
+/// Decode a Soroban vector from its encoded representation, validating the
+/// element count and encoded size before any allocation occurs.
+///
+/// `encoded` is the raw byte payload of the vector, `element_size` is the
+/// fixed encoded size of a single element, `max_elements` bounds the number
+/// of elements, and `max_bytes` bounds the total encoded size. Validation is
+/// performed up front so malformed or oversized inputs fail without any
+/// partial state changes.
+pub fn decode_bounded_vec(
+    encoded: &[u8],
+    element_size: usize,
+    max_elements: usize,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedVecError> {
+    if element_size == 0 {
+        return Err(BoundedVecError::LengthMismatch);
+    }
+    if encoded.len() > max_bytes {
+        return Err(BoundedVecError::TooLarge);
+    }
+    if encoded.len() % element_size != 0 {
+        return Err(BoundedVecError::LengthMismatch);
+    }
+    let count = encoded.len() / element_size;
+    if count > max_elements {
+        return Err(BoundedVecError::TooManyElements);
+    }
+    Ok(encoded.to_vec())
+}
+
 /// Numeric type used by a protocol parameter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -223,26 +265,6 @@ pub const TTL_RENEWAL_OUTCOME_EVENT_VERSION: u32 = 1;
 pub struct TtlRenewalOutcome {
     /// Schema version of this event payload.
     pub version: u32,
-    /// Storage key whose TTL was considered for renewal.
-    pub key: String,
-    /// Normalized outcome of the attempt.
-    pub result: TtlRenewalResult,
-    /// TTL (in ledgers) observed before the attempt.
-    pub current_ttl: u32,
-    /// TTL (in ledgers) below which renewal is attempted.
-    pub threshold: u32,
-    /// TTL (in ledgers) requested when a renewal is performed.
-    pub extend_to: u32,
-}
+    /// S
 
-/// Normalized result of a storage TTL renewal attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TtlRenewalResult {
-    /// The TTL was already above the threshold; nothing was done.
-    Skipped,
-    /// The TTL was renewed successfully.
-    Renewed,
-    /// The renewal attempt failed.
-    Failed,
-}
+/* … truncated 775 chars — edit only what you need near the top … */
