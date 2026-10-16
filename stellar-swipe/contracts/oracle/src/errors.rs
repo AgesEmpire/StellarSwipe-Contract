@@ -71,6 +71,13 @@ pub enum OracleError {
     /// Observation timestamp is later than the current ledger timestamp
     /// (Issue #1213).
     FutureTimestamp = 31,
+    /// The preferred quorum lost too many members and no configured fallback
+    /// set could supply a price (Issue #1122).
+    QuorumDepleted = 32,
+    /// The preferred quorum returned observations that disagree by more than
+    /// the configured deviation bound and no fallback set resolved the
+    /// conflict (Issue #1122).
+    ConflictingObservations = 33,
 }
 
 impl OracleError {
@@ -149,6 +156,12 @@ impl OracleError {
             }
             OracleError::FutureTimestamp => {
                 "observation timestamp is later than the current ledger timestamp"
+            }
+            OracleError::QuorumDepleted => {
+                "preferred quorum lost members and no fallback set could supply a price"
+            }
+            OracleError::ConflictingObservations => {
+                "preferred quorum observations conflict and no fallback set resolved it"
             }
         }
     }

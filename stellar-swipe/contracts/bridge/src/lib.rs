@@ -78,6 +78,14 @@ pub enum BridgeError {
     /// The requested message expiry is beyond `MAX_MESSAGE_VALIDITY_SECONDS`
     /// from the current ledger time (Issue #1217).
     InvalidMessageExpiry = 29,
+    /// An approved validator set is still waiting out its activation delay
+    /// (Issue #1125).
+    ValidatorSetNotActive = 30,
+    /// The validator-set activation delay has not elapsed yet (Issue #1125).
+    ActivationDelayNotElapsed = 31,
+    /// Serialized message size (payload plus route header) exceeds
+    /// `messaging::MAX_MESSAGE_SIZE` (Issue #1126).
+    MessageTooLarge = 32,
 }
 
 impl BridgeError {
@@ -164,6 +172,15 @@ impl BridgeError {
             }
             BridgeError::InvalidMessageExpiry => {
                 "requested message expiry exceeds the maximum allowed validity window"
+            }
+            BridgeError::ValidatorSetNotActive => {
+                "validator set is approved but has not activated yet"
+            }
+            BridgeError::ActivationDelayNotElapsed => {
+                "validator-set activation delay has not elapsed"
+            }
+            BridgeError::MessageTooLarge => {
+                "serialized message size exceeds the configured byte limit"
             }
         }
     }
@@ -333,7 +350,7 @@ pub use liquidity::{LiquidityPool, LiquidityPosition, PoolHealth, PoolType, Swap
 
 pub use messaging::{
     confirm_message_delivery, expire_timed_out_message, get_cross_chain_message,
-    mark_message_failed, receive_message_callback, register_bridge_for_chain,
+    mark_message_failed, message_size, receive_message_callback, register_bridge_for_chain,
     relay_message_to_target_chain, retry_failed_message, send_cross_chain_message,
     CrossChainMessage, MessageStatus, MAX_MESSAGE_SIZE, MESSAGE_TIMEOUT,
 };
@@ -2579,3 +2596,6 @@ mod test_health;
 
 #[cfg(test)]
 mod test_message_expiry;
+
+#[cfg(test)]
+mod test_validator_activation;

@@ -202,6 +202,26 @@ pub struct EvtSlashCooldownUpdated {
     pub cooldown_ledgers: u32,
 }
 
+/// Issue #1123: a provider lockup window was created or extended.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtProviderLockupCreated {
+    pub schema_version: u32,
+    pub provider: Address,
+    pub start_ledger: u32,
+    pub end_ledger: u32,
+}
+
+/// Issue #1123: a provider lockup window elapsed and was released.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtProviderLockupReleased {
+    pub schema_version: u32,
+    pub provider: Address,
+    pub end_ledger: u32,
+    pub released_at_ledger: u32,
+}
+
 // ── Emergency multi-sig unstake events (issue #754) ───────────────────────────
 
 #[contracttype]
@@ -486,6 +506,42 @@ pub fn emit_slash_cooldown_updated(env: &Env, cooldown_ledgers: u32) {
         EvtSlashCooldownUpdated {
             schema_version: SCHEMA_VERSION,
             cooldown_ledgers,
+        },
+    );
+}
+
+/// Issue #1123: emit when a provider lockup window is created or extended.
+pub fn emit_lockup_created(
+    env: &Env,
+    provider: Address,
+    start_ledger: u32,
+    end_ledger: u32,
+) {
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_STAKE_LOCKUP_CREATED()),
+        EvtProviderLockupCreated {
+            schema_version: SCHEMA_VERSION,
+            provider,
+            start_ledger,
+            end_ledger,
+        },
+    );
+}
+
+/// Issue #1123: emit when a provider lockup window elapses and is released.
+pub fn emit_lockup_released(
+    env: &Env,
+    provider: Address,
+    end_ledger: u32,
+    released_at_ledger: u32,
+) {
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_STAKE_LOCKUP_RELEASED()),
+        EvtProviderLockupReleased {
+            schema_version: SCHEMA_VERSION,
+            provider,
+            end_ledger,
+            released_at_ledger,
         },
     );
 }
