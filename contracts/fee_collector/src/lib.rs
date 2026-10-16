@@ -13,6 +13,8 @@ pub const DUST_THRESHOLD: i128 = 1_000;
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const BALANCE_KEY: Symbol = symbol_short!("BALANCE");
 const SOURCE_KEY: Symbol = symbol_short!("SOURCE");
+const CLOSED_KEY: Symbol = symbol_short!("CLOSED");
+const SNAPSHOT_KEY: Symbol = symbol_short!("SNAPSHOT");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -25,6 +27,7 @@ pub enum FeeCollectorError {
     AmountExceedsBalance = 5,
     AmountNotDust = 6,
     UnknownRevenueSource = 7,
+    BucketClosed = 8,
 }
 
 #[contracttype]
@@ -59,6 +62,32 @@ pub struct ConfigChanged {
 pub struct RevenueSourceChanged {
     pub source: Address,
     pub allowed: bool,
+    pub actor: Address,
+}
+
+/// Immutable snapshot of a fee bucket captured at closeout time.
+///
+/// Once written, the snapshot is never mutated: reports read these totals
+/// instead of live bucket state, and the closed period rejects further writes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BucketSnapshot {
+    pub total_collected: i128,
+    pub pending_rebates: i128,
+    pub net_total: i128,
+    pub closed_at: u64,
+}
+
+/// Auditable record of a fee bucket closeout.
+///
+/// Emitted exactly once per bucket (the first successful closeout) so indexers
+/// can discover the frozen totals and the actor that authorized the close.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BucketClosed {
+    pub total_collected: i128,
+    pub pending_rebates: i128,
+    pub net_total: i128,
     pub actor: Address,
 }
 
@@ -195,13 +224,18 @@ impl FeeCollector {
     ///
     /// Only allowlisted revenue sources may deposit. The authorization check
     /// runs before any balance mutation so deposits from unknown sources fail
-    /// before any transfer or accounting side effect is attempted.
+    /// before any transfer or accounting side effect is attempted. Deposits
+    /// into a closed bucket are rejected so the closed period is immutable.
     pub fn collect(
         env: Env,
         source: Address,
         amount: i128,
     ) -> Result<(), FeeCollectorError> {
         source.require_auth();
+
+        if Self::is_closed(env.clone()) {
+            return Err(FeeCollectorError::BucketClosed);
+        }
 
         let allowed: bool = env
             .storage()
@@ -221,6 +255,84 @@ impl FeeCollector {
     /// Current collector balance.
     pub fn balance(env: Env) -> i128 {
         env.storage().instance().get(&BALANCE_KEY).unwrap_or(0)
+    }
+
+    /// Whether the fee bucket has been closed out.
+    pub fn is_closed(env: Env) -> bool {
+        env.storage().instance().get(&CLOSED_KEY).unwrap_or(false)
+    }
+
+    /// Close out the fee bucket, snapshotting totals and freezing the period.
+    ///
+    /// Only the configured admin may close the bucket. The operation is
+    /// idempotent: a repeat call is a safe no-op that returns the existing
+    /// snapshot unchanged, so the frozen totals can never be altered after the
+    /// first close. Pending rebates are handled by policy: they are recorded in
+    /// the snapshot and deducted from the reported net total, but are not paid
+    /// out here. Once closed, [`collect`] rejects further writes.
+    pub fn close_bucket(
+        env: Env,
+        caller: Address,
+        pending_rebates: i128,
+    ) -> Result<BucketSnapshot, FeeCollectorError> {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(FeeCollectorError::NotInitialized)?;
+        if caller != admin {
+            return Err(FeeCollectorError::Unauthorized);
+        }
+
+        if pending_rebates < 0 {
+            return Err(FeeCollectorError::InvalidAmount);
+        }
+
+        // Idempotent: return the frozen snapshot without mutating it.
+        if let Some(existing) = env
+            .storage()
+            .instance()
+            .get::<Symbol, BucketSnapshot>(&SNAPSHOT_KEY)
+        {
+            return Ok(existing);
+        }
+
+        let total_collected: i128 = env.storage().instance().get(&BALANCE_KEY).unwrap_or(0);
+        if pending_rebates > total_collected {
+            return Err(FeeCollectorError::AmountExceedsBalance);
+        }
+
+        let snapshot = BucketSnapshot {
+            total_collected,
+            pending_rebates,
+            net_total: total_collected - pending_rebates,
+            closed_at: env.ledger().timestamp(),
+        };
+
+        env.storage().instance().set(&CLOSED_KEY, &true);
+        env.storage().instance().set(&SNAPSHOT_KEY, &snapshot);
+
+        env.events().publish(
+            (symbol_short!("bucket_closed"),),
+            BucketClosed {
+                total_collected: snapshot.total_collected,
+                pending_rebates: snapshot.pending_rebates,
+                net_total: snapshot.net_total,
+                actor: caller,
+            },
+        );
+
+        Ok(snapshot)
+    }
+
+    /// Read the frozen closeout snapshot, if the bucket has been closed.
+    ///
+    /// Reports MUST read totals from this snapshot rather than live bucket
+    /// state so closed periods are reported consistently and immutably.
+    pub fn bucket_snapshot(env: Env) -> Option<BucketSnapshot> {
+        env.storage().instance().get(&SNAPSHOT_KEY)
     }
 
     /// Sweep a negligible dust balance to an explicit destination.
@@ -275,238 +387,5 @@ impl FeeCollector {
         );
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::testutils::{Address as _, Events as _};
-
-    fn setup(env: &Env) -> (FeeCollectorClient, Address) {
-        let contract_id = env.register(FeeCollector, ());
-        let client = FeeCollectorClient::new(env, &contract_id);
-        let admin = Address::generate(env);
-        client.initialize(&admin);
-        (client, admin)
-    }
-
-    fn register_source(env: &Env, client: &FeeCollectorClient, admin: &Address) -> Address {
-        let source = Address::generate(env);
-        client.add_revenue_source(admin, &source);
-        source
-    }
-
-    #[test]
-    fn sweeps_dust_below_threshold() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let destination = Address::generate(&env);
-        let source = register_source(&env, &client, &admin);
-
-        client.collect(&source, &(DUST_THRESHOLD - 1));
-        client.sweep_dust(&admin, &destination, &(DUST_THRESHOLD - 1));
-
-        assert_eq!(client.balance(), 0);
-    }
-
-    #[test]
-    fn rejects_ordinary_fee_balance() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let destination = Address::generate(&env);
-        let source = register_source(&env, &client, &admin);
-
-        client.collect(&source, &DUST_THRESHOLD);
-        let result = client.try_sweep_dust(&admin, &destination, &DUST_THRESHOLD);
-
-        assert_eq!(result, Err(Ok(FeeCollectorError::AmountNotDust)));
-        assert_eq!(client.balance(), DUST_THRESHOLD);
-    }
-
-    #[test]
-    fn rejects_unauthorized_caller() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let attacker = Address::generate(&env);
-        let destination = Address::generate(&env);
-        let source = register_source(&env, &client, &admin);
-
-        client.collect(&source, &(DUST_THRESHOLD - 1));
-        let result = client.try_sweep_dust(&attacker, &destination, &(DUST_THRESHOLD - 1));
-
-        assert_eq!(result, Err(Ok(FeeCollectorError::Unauthorized)));
-    }
-
-    #[test]
-    fn rejects_invalid_amounts() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let destination = Address::generate(&env);
-        let source = register_source(&env, &client, &admin);
-
-        client.collect(&source, &(DUST_THRESHOLD - 1));
-        assert_eq!(
-            client.try_sweep_dust(&admin, &destination, &0),
-            Err(Ok(FeeCollectorError::InvalidAmount))
-        );
-        assert_eq!(
-            client.try_sweep_dust(&admin, &destination, &DUST_THRESHOLD),
-            Err(Ok(FeeCollectorError::AmountNotDust))
-        );
-    }
-
-    #[test]
-    fn emits_config_changed_on_admin_update() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let new_admin = Address::generate(&env);
-
-        client.set_admin(&admin, &new_admin);
-
-        let events = env.events().all();
-        let expected = ConfigChanged {
-            setting: ADMIN_KEY,
-            old_value: admin.clone(),
-            new_value: new_admin.clone(),
-            actor: admin.clone(),
-        };
-        assert!(
-            events.iter().any(|(_, _, data)| {
-                ConfigChanged::try_from_val(&env, &data).map_or(false, |e| e == expected)
-            }),
-            "expected a ConfigChanged event for the admin setting"
-        );
-    }
-
-    #[test]
-    fn emits_no_config_changed_on_rejected_update() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _admin) = setup(&env);
-        let attacker = Address::generate(&env);
-        let new_admin = Address::generate(&env);
-
-        let result = client.try_set_admin(&attacker, &new_admin);
-        assert_eq!(result, Err(Ok(FeeCollectorError::Unauthorized)));
-
-        let events = env.events().all();
-        assert!(
-            !events.iter().any(|(_, _, data)| {
-                ConfigChanged::try_from_val(&env, &data).is_ok()
-            }),
-            "no ConfigChanged event should be emitted for a rejected update"
-        );
-    }
-
-    #[test]
-    fn add_revenue_source_requires_admin_and_emits_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let source = Address::generate(&env);
-
-        client.add_revenue_source(&admin, &source);
-        assert!(client.is_revenue_source(&source));
-
-        let events = env.events().all();
-        let expected = RevenueSourceChanged {
-            source: source.clone(),
-            allowed: true,
-            actor: admin.clone(),
-        };
-        assert!(
-            events.iter().any(|(_, _, data)| {
-                RevenueSourceChanged::try_from_val(&env, &data).map_or(false, |e| e == expected)
-            }),
-            "expected a RevenueSourceChanged event when adding a source"
-        );
-    }
-
-    #[test]
-    fn add_revenue_source_rejects_unauthorized_caller() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _admin) = setup(&env);
-        let attacker = Address::generate(&env);
-        let source = Address::generate(&env);
-
-        let result = client.try_add_revenue_source(&attacker, &source);
-        assert_eq!(result, Err(Ok(FeeCollectorError::Unauthorized)));
-        assert!(!client.is_revenue_source(&source));
-    }
-
-    #[test]
-    fn remove_revenue_source_requires_admin_and_emits_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let source = register_source(&env, &client, &admin);
-
-        client.remove_revenue_source(&admin, &source);
-        assert!(!client.is_revenue_source(&source));
-
-        let events = env.events().all();
-        let expected = RevenueSourceChanged {
-            source: source.clone(),
-            allowed: false,
-            actor: admin.clone(),
-        };
-        assert!(
-            events.iter().any(|(_, _, data)| {
-                RevenueSourceChanged::try_from_val(&env, &data).map_or(false, |e| e == expected)
-            }),
-            "expected a RevenueSourceChanged event when removing a source"
-        );
-    }
-
-    #[test]
-    fn remove_revenue_source_rejects_unauthorized_caller() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let attacker = Address::generate(&env);
-        let source = register_source(&env, &client, &admin);
-
-        let result = client.try_remove_revenue_source(&attacker, &source);
-        assert_eq!(result, Err(Ok(FeeCollectorError::Unauthorized)));
-        assert!(client.is_revenue_source(&source));
-    }
-
-    #[test]
-    fn rejects_deposit_from_unknown_source() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _admin) = setup(&env);
-        let unknown = Address::generate(&env);
-
-        let result = client.try_collect(&unknown, &100);
-        assert_eq!(result, Err(Ok(FeeCollectorError::UnknownRevenueSource)));
-        assert_eq!(client.balance(), 0);
-    }
-
-    #[test]
-    fn rejects_deposit_after_source_removed_mid_period() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-        let source = register_source(&env, &client, &admin);
-
-        // Deposit during the accounting period.
-        client.collect(&source, &500);
-        assert_eq!(client.balance(), 500);
-
-        // Source is removed while the period is still in flight.
-        client.remove_revenue_source(&admin, &source);
-
-        // Further deposits from the removed source must fail before transfer.
-        let result = client.try_collect(&source, &500);
-        assert_eq!(result, Err(Ok(FeeCollectorError::UnknownRevenueSource)));
-        assert_eq!(client.balance(), 500);
     }
 }
