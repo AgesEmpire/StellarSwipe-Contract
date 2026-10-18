@@ -243,6 +243,224 @@ pub fn enforce_query_cost_envelope(
 }
 
 // ============================================================================
+// Risk Score Feature Versioning
+// ============================================================================
+
+/// Version of the feature set / formula used to compute a provider risk score.
+///
+/// Risk scores are only interpretable relative to the feature version that
+/// produced them. When the underlying formula changes, a new version is
+/// introduced and historical scores keep referencing the version they were
+/// computed with.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum RiskScoreFeatureVersion {
+    /// Initial risk score formula.
+    V1,
+    /// Revised risk score formula.
+    V2,
+}
+
+/// The feature version currently used for newly computed risk scores.
+const CURRENT_RISK_SCORE_FEATURE_VERSION: RiskScoreFeatureVersion =
+    RiskScoreFeatureVersion::V2;
+
+/// A provider risk score together with the feature version that produced it.
+///
+/// Recording the version alongside the score keeps historical scores
+/// interpretable after a formula update.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct VersionedRiskScore {
+    pub provider: Address,
+    pub score: u32,                 // 0-100
+    pub feature_version: RiskScoreFeatureVersion,
+    pub computed_at: u64,
+}
+
+/// Typed error returned when a risk score feature version is not supported.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum RiskScoreVersionError {
+    /// The requested feature version is not supported by this contract.
+    UnsupportedFeatureVersion { requested: RiskScoreFeatureVersion },
+}
+
+/// Return the feature version used for newly computed risk scores.
+pub fn current_risk_score_feature_version() -> RiskScoreFeatureVersion {
+    CURRENT_RISK_SCORE_FEATURE_VERSION
+}
+
+/// Check whether a feature version is supported for risk score computation.
+pub fn is_supported_risk_score_feature_version(
+    version: &RiskScoreFeatureVersion,
+) -> bool {
+    matches!(
+        version,
+        RiskScoreFeatureVersion::V1 | RiskScoreFeatureVersion::V2
+    )
+}
+
+/// Compute a provider risk score using an explicit feature version.
+///
+/// Unsupported feature versions fail explicitly with a typed
+/// [`RiskScoreVersionError`] rather than silently falling back to the current
+/// formula, so callers can never misinterpret a score.
+///
+pub fn compute_versioned_risk_score(
+    env: &Env,
+    provider: Address,
+    score: u32,
+    feature_version: RiskScoreFeatureVersion,
+) -> Result<VersionedRiskScore, RiskScoreVersionError> {
+    if !is_supported_risk_score_feature_version(&feature_version) {
+        return Err(RiskScoreVersionError::UnsupportedFeatureVersion {
+            requested: feature_version,
+        });
+    }
+    Ok(VersionedRiskScore {
+        provider,
+        score,
+        feature_version,
+        computed_at: env.ledger().timestamp(),
+    })
+}
+
+/// Compute a provider risk score using the current feature version.
+pub fn compute_current_risk_score(
+    env: &Env,
+    provider: Address,
+    score: u32,
+) -> VersionedRiskScore {
+    VersionedRiskScore {
+        provider,
+        score,
+        feature_version: CURRENT_RISK_SCORE_FEATURE_VERSION,
+        computed_at: env.ledger().timestamp(),
+    }
+}
+
+/// Feature version metadata exposed through the analytics query API.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct RiskScoreVersionMetadata {
+    /// Feature version applied to newly computed risk scores.
+    pub current_version: RiskScoreFeatureVersion,
+    /// All feature versions this contract can interpret.
+    pub supported_versions: Vec<RiskScoreFeatureVersion>,
+}
+
+/// Expose risk score feature version metadata for the analytics query API.
+pub fn risk_score_version_metadata(env: &Env) -> RiskScoreVersionMetadata {
+    let mut supported_versions = Vec::new(env);
+    supported_versions.push_back(RiskScoreFeatureVersion::V1);
+    supported_versions.push_back(RiskScoreFeatureVersion::V2);
+    RiskScoreVersionMetadata {
+        current_version: CURRENT_RISK_SCORE_FEATURE_VERSION,
+        supported_versions,
+    }
+}
+
+// ============================================================================
+// Analytics Snapshot Pagination Cursors
+// ============================================================================
+
+/// Identity of the analytics snapshot a pagination cursor was issued against.
+///
+/// A snapshot is identified by the ledger sequence at which it was produced
+/// together with a monotonically increasing version. Any change to the
+/// underlying analytics data bumps the version, which invalidates every cursor
+/// that was issued against an earlier snapshot.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct AnalyticsSnapshotId {
+    /// Ledger sequence at which the snapshot was produced.
+    pub ledger: u32,
+    /// Monotonic version of the snapshot; bumped on every data change.
+    pub version: u64,
+}
+
+/// Pagination cursor for analytics snapshots.
+///
+/// The cursor carries the identity of the snapshot it was issued against and
+/// the ledger sequence at which it expires. Clients must present the cursor
+/// unchanged on the next page request; combining pages from different
+/// snapshots is rejected.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct AnalyticsCursor {
+    /// Snapshot the cursor was issued against.
+    pub snapshot: AnalyticsSnapshotId,
+    /// Offset of the next page within the snapshot.
+    pub offset: u32,
+    /// Ledger sequence at which the cursor expires (exclusive).
+    pub expires_at: u32,
+}
+
+/// Typed error returned when a pagination cursor can no longer be used.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum AnalyticsCursorError {
+    /// The cursor was issued against a snapshot that is no longer current.
+    SnapshotChanged {
+        expected: AnalyticsSnapshotId,
+        current: AnalyticsSnapshotId,
+    },
+    /// The cursor has passed its expiry ledger.
+    Expired { expires_at: u32, current_ledger: u32 },
+}
+
+/// Default number of ledgers a cursor remains valid for.
+const CURSOR_TTL_LEDGERS: u32 = 100;
+
+/// Issue a fresh pagination cursor against the latest snapshot.
+///
+/// New cursors always start from the latest snapshot identity and carry an
+/// expiry derived from the current ledger sequence.
+///
+pub fn issue_analytics_cursor(
+    env: &Env,
+    snapshot: AnalyticsSnapshotId,
+    offset: u32,
+) -> AnalyticsCursor {
+    AnalyticsCursor {
+        snapshot,
+        offset,
+        expires_at: env.ledger().sequence().saturating_add(CURSOR_TTL_LEDGERS),
+    }
+}
+
+/// Validate a pagination cursor against the current snapshot and ledger.
+///
+/// Returns `Ok(())` when the cursor still refers to the current snapshot and
+/// has not expired. Otherwise returns a typed [`AnalyticsCursorError`] so
+/// callers can distinguish a stale snapshot from an expired cursor.
+///
+pub fn validate_analytics_cursor(
+    env: &Env,
+    cursor: &AnalyticsCursor,
+    current: &AnalyticsSnapshotId,
+) -> Result<(), AnalyticsCursorError> {
+    let current_ledger = env.ledger().sequence();
+    if current_ledger >= cursor.expires_at {
+        return Err(AnalyticsCursorError::Expired {
+            expires_at: cursor.expires_at,
+            current_ledger,
+        });
+    }
+    if cursor.snapshot != *current {
+        return Err(AnalyticsCursorError::SnapshotChanged {
+            expected: cursor.snapshot.clone(),
+            current: current.clone(),
+        });
+    }
+
+    Ok(())
+}
+    Ok(())
+}
+
+// ============================================================================
 // Storage Rent Estimation Diagnostics
 // ============================================================================
 
@@ -269,15 +487,7 @@ pub enum ContractOperation {
 pub struct StorageRentEstimate {
     /// Number of ledger entries the operation is projected to touch.
     pub projected_entries: u32,
-    /// Projected byte footprint of the affected entries.
-    pub projected_bytes: u32,
-    /// Projected change in TTL (in ledgers) for the affected entries.
-    pub ttl_impact: u32,
-    /// Projected rent cost in stroops for the affected entries.
-    pub projected_rent: i128,
-    /// Whether the request is within the configured storage limits.
-    pub within_limits: bool,
-}
+    /// Projected byte footprint of the affec
 
 /// Baseline byte cost of a single ledger entry (key + metadata overhead).
 const ENTRY_OVERHEAD_BYTES: u32 = 64;
@@ -359,5 +569,9 @@ pub fn calculate_win_rate(successful: u32, total: u32) -> u32 {
 pub fn calculate_profit_factor(total_profit: i128, total_loss: i128) -> u32 {
     if total_loss == 0 {
         if total_profit > 0 {
-
-/* … truncated 5818 chars — edit only what you need near the top … */
+            return u32::MAX;
+        }
+        return 0;
+    }
+    ((total_profit as u64 * 100) / total_loss as u64) as u32
+}

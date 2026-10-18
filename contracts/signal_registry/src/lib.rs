@@ -70,6 +70,15 @@ pub enum SignalError {
     IdempotencyKeyReused = 12,
     NoPendingAdmin = 13,
     NotPendingAdmin = 14,
+    /// Issue #1252: a bounded multi-provider lookup was requested with more
+    /// addresses than the documented maximum. No work is performed.
+    TooManyProviders = 15,
+    /// Issue #1256: a compare-and-set metadata update was attempted with an
+    /// expected revision that does not match the stored revision.
+    MetadataRevisionConflict = 16,
+    /// Issue #1256: the monotonic metadata revision counter cannot advance
+    /// further without overflowing.
+    MetadataRevisionOverflow = 17,
 }
 
 /// Maximum accepted length, in bytes, of provider metadata.
@@ -89,6 +98,15 @@ pub const MAX_TOMBSTONE_PURGE: u32 = 100;
 /// Documented retention period, in seconds, during which a consumed
 /// idempotency key remains non-reusable.
 pub const IDEMPOTENCY_KEY_RETENTION_SECONDS: u64 = 24 * 60 * 60;
+
+/// Issue #1255: upper bound on the number of idempotency key references
+/// examined (and at most removed) by a single reclaim call.
+pub const MAX_IDEMPOTENCY_PURGE: u32 = 100;
+
+/// Issue #1252: documented maximum number of provider addresses accepted by a
+/// single bounded multi-provider reputation lookup. Requests above this bound
+/// are rejected before any work is performed so caller cost stays predictable.
+pub const MAX_REPUTATION_LOOKUP: u32 = 20;
 
 /// Configuration-driven reputation decay schedule.
 ///
@@ -145,6 +163,25 @@ pub struct IdempotencyRecord {
     pub expires_at: u64,
 }
 
+/// Reference to a stored idempotency record, used as the input of a bounded
+/// reclaim call (issue #1255). The `caller` and `key` identify the record
+/// exactly as it was consumed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdempotencyKeyRef {
+    pub caller: Address,
+    pub key: String,
+}
+
+/// Versioned provider metadata read (issue #1256). `revision` is monotonic and
+/// lets clients detect stale reads; `metadata` is the current payload.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionedMetadata {
+    pub revision: u32,
+    pub metadata: String,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataKey {
@@ -165,6 +202,35 @@ pub struct ConfigChanged {
     pub actor: Address,
 }
 
+/// Single entry of a bounded multi-provider reputation lookup (issue #1252).
+///
+/// `known` is an explicit representation for unknown providers: an entry is
+/// always produced for every requested address, in the requested order, and
+/// `known == false` marks an address with no stored reputation record so
+/// callers never have to infer absence from a zeroed score.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReputationLookupEntry {
+    pub provider: Address,
+    pub known: bool,
+    pub record: ReputationRecord,
+}
+
+/// Structured payload for signal registry record lifecycle events (issue #1251).
+///
+/// A consumer can replay these events into a model of the active registry
+/// view: `active == true` registers or revises a record, `active == false`
+/// removes it. `operation` distinguishes the exact transition and `timestamp`
+/// is the ledger time at which it happened.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryRecordEvent {
+    pub provider: Address,
+    pub operation: Symbol,
+    pub active: bool,
+    pub timestamp: u64,
+}
+
 const ADMIN_KEY: &str = "admin";
 const PENDING_ADMIN_KEY: &str = "pending_admin";
 const SCHEDULE_KEY: &str = "schedule";
@@ -172,6 +238,8 @@ const REPUTATION_KEY: &str = "reputation";
 const METADATA_KEY: &str = "metadata";
 const TOMBSTONE_KEY: &str = "tombstone";
 const IDEMPOTENCY_KEY: &str = "idempotency";
+/// Issue #1256: storage key prefix for the monotonic metadata revision counter.
+const METADATA_REVISION_KEY: &str = "metadata_revision";
 
 #[contract]
 pub struct SignalRegistry;
@@ -272,6 +340,130 @@ impl SignalRegistry {
             .ok_or(SignalError::NotInitialized)
     }
 
+    /// Issue #1255: reclaim expired idempotency records in a bounded batch.
+    ///
+    /// Only the admin may call this. At most [`MAX_IDEMPOTENCY_PURGE`]
+    /// references are examined per call and only records whose retention window
+    /// has elapsed are removed. Re-running is safe: already-reclaimed records
+    /// are skipped, and live (still non-reusable) records are never removed.
+    pub fn purge_expired_idempotency_keys(
+        env: Env,
+        entries: Vec<IdempotencyKeyRef>,
+        max_entries: u32,
+    ) -> Result<u32, SignalError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(SignalError::NotInitialized)?;
+        admin.require_auth();
+        if max_entries == 0 || max_entries > MAX_IDEMPOTENCY_PURGE {
+            return Err(SignalError::InvalidBatchSize);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut purged: u32 = 0;
+        for entry in entries.iter() {
+            if purged >= max_entries {
+                break;
+            }
+            let record_key = (IDEMPOTENCY_KEY, entry.caller.clone(), entry.key.clone());
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<(_, Address, String), IdempotencyRecord>(&record_key)
+            {
+                // Only records past their retention window are reclaimed; a
+                // still-reusable key must keep rejecting duplicate operations.
+                if now >= record.expires_at {
+                    env.storage().persistent().remove(&record_key);
+                    purged += 1;
+                }
+            }
+        }
+        Ok(purged)
+    }
+
+    /// Issue #1256: read provider metadata together with its monotonic
+    /// revision. Returns `None` when no record exists, so a missing record is
+    /// distinguishable from a stored revision of zero.
+    pub fn get_versioned_metadata(env: Env, provider: Address) -> Option<VersionedMetadata> {
+        let key = (METADATA_KEY, provider.clone());
+        let metadata: String = env.storage().persistent().get(&key)?;
+        let rev_key = (METADATA_REVISION_KEY, provider);
+        let revision: u32 = env.storage().persistent().get(&rev_key).unwrap_or(0);
+        Some(VersionedMetadata { revision, metadata })
+    }
+
+    /// Issue #1256: compare-and-set provider metadata update.
+    ///
+    /// Succeeds only when `expected_revision` matches the currently stored
+    /// revision; a stale value returns [`SignalError::MetadataRevisionConflict`]
+    /// and leaves metadata unchanged. On success the revision advances by one,
+    /// so a client can detect that its read was stale instead of silently
+    /// overwriting a concurrent change.
+    pub fn set_provider_metadata_checked(
+        env: Env,
+        provider: Address,
+        metadata: String,
+        expected_revision: u32,
+    ) -> Result<u32, SignalError> {
+        provider.require_auth();
+        Self::validate_metadata(&metadata)?;
+        if Self::record_state(&env, &provider) == RecordState::Tombstoned {
+            return Err(SignalError::IdentifierTombstoned);
+        }
+
+        let rev_key = (METADATA_REVISION_KEY, provider.clone());
+        let current: u32 = env.storage().persistent().get(&rev_key).unwrap_or(0);
+        if current != expected_revision {
+            return Err(SignalError::MetadataRevisionConflict);
+        }
+        let next = current
+            .checked_add(1)
+            .ok_or(SignalError::MetadataRevisionOverflow)?;
+
+        let key = (METADATA_KEY, provider);
+        env.storage().persistent().set(&key, &metadata);
+        env.storage().persistent().set(&rev_key, &next);
+        Ok(next)
+    }
+
+    /// Issue #1252: bounded multi-provider reputation lookup.
+    ///
+    /// Returns one [`ReputationLookupEntry`] for every requested provider, in
+    /// the exact order supplied, so callers get a deterministic mapping back to
+    /// their request. Requests larger than [`MAX_REPUTATION_LOOKUP`] are
+    /// rejected with [`SignalError::TooManyProviders`] before any storage read.
+    /// Unknown providers yield an explicit `known == false` entry with a zeroed
+    /// record rather than being silently omitted.
+    pub fn get_reputations(
+        env: Env,
+        providers: Vec<Address>,
+    ) -> Result<Vec<ReputationLookupEntry>, SignalError> {
+        if providers.len() > MAX_REPUTATION_LOOKUP {
+            return Err(SignalError::TooManyProviders);
+        }
+
+        let mut entries = Vec::new(&env);
+        for provider in providers.iter() {
+            let key = (REPUTATION_KEY, provider.clone());
+            let stored: Option<ReputationRecord> = env.storage().persistent().get(&key);
+            let known = stored.is_some();
+            let record = stored.unwrap_or(ReputationRecord {
+                score: 0,
+                last_updated: 0,
+            });
+            entries.push_back(ReputationLookupEntry {
+                provider,
+                known,
+                record,
+            });
+        }
+        Ok(entries)
+    }
+    }
+
     /// Store provider metadata after validating its length and encoding.
     ///
     /// Validation runs before any persistent write, so empty, over-limit, or
@@ -287,8 +479,22 @@ impl SignalRegistry {
         if Self::record_state(&env, &provider) == RecordState::Tombstoned {
             return Err(SignalError::IdentifierTombstoned);
         }
-        let key = (METADATA_KEY, provider);
+        let key = (METADATA_KEY, provider.clone());
+        // Issue #1251: distinguish a first registration from a revision so the
+        // event stream is replay-complete.
+        let existed = env.storage().persistent().has(&key);
         env.storage().persistent().set(&key, &metadata);
+
+        Self::emit_record_event(
+            &env,
+            provider,
+            if existed {
+                Symbol::new(&env, "record_revised")
+            } else {
+                Symbol::new(&env, "record_registered")
+            },
+            true,
+        );
         Ok(())
     }
 
@@ -306,7 +512,7 @@ impl SignalRegistry {
         provider.require_auth();
         let key = (METADATA_KEY, provider.clone());
         env.storage().persistent().remove(&key);
-        let tomb_key = (TOMBSTONE_KEY, provider);
+        let tomb_key = (TOMBSTONE_KEY, provider.clone());
         if !env.storage().persistent().has(&tomb_key) {
             let now = env.ledger().timestamp();
             let tombstone = Tombstone {
@@ -315,7 +521,24 @@ impl SignalRegistry {
             };
             env.storage().persistent().set(&tomb_key, &tombstone);
         }
+        // Issue #1251: emit the removal transition. Re-removing an already
+        // tombstoned identifier is idempotent and emits the same removal event
+        // so replay stays consistent with the returned state.
+        Self::emit_record_event(&env, provider, Symbol::new(&env, "record_removed"), false);
         Ok(())
+    }
+
+    /// Emit a structured registry record lifecycle event (issue #1251).
+    fn emit_record_event(env: &Env, provider: Address, operation: Symbol, active: bool) {
+        env.events().publish(
+            (operation.clone(), provider.clone()),
+            RegistryRecordEvent {
+                provider,
+                operation,
+                active,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
     /// Report the lifecycle state of an identifier: `Active`, `Tombstoned`,
