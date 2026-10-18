@@ -414,16 +414,6 @@ pub enum StakeVaultError {
     InsufficientTokenAllowance = 45,
     /// A token or cross-contract invocation failed for a reason other than
     /// authorization, balance, or allowance (arithmetic overflow, invalid
-    /// request, a
-    /// The stake token rejected a transfer/burn for insufficient balance
-    /// (distinct from `NoStake`, which means no tracked stake position
-    /// exists at all).
-    InsufficientTokenBalance = 44,
-    /// The stake token rejected a transfer for insufficient/expired
-    /// allowance.
-    InsufficientTokenAllowance = 45,
-    /// A token or cross-contract invocation failed for a reason other than
-    /// authorization, balance, or allowance (arithmetic overflow, invalid
     /// request, an unrecognized custom-token error code, or a host-level
     /// abort). See `shared::token_error` for the classification policy.
     TokenOperationFailed = 46,
@@ -595,14 +585,20 @@ impl From<reward_campaign::CampaignError> for StakeVaultError {
     }
 }
 
-/// Maps the shared token/cross-contract invocation failure classification
-/// (Issue #1001) onto this contract's stable error codes. Every non-success
-/// outcome from a stake-token invocation must flow through here rather than
-/// being treated as `Ok`.
-impl From<shared::TokenFailure> for StakeVaultError {
-    fn from(failure: shared::TokenFailure) -> Self {
-        match failure {
-            shared::TokenFailure::Unauthorized => StakeVaultError::Unauthorized,
+/// Reward vault failures share existing codes, since this enum is at the
+/// Soroban `#[contracterror]` variant cap (Issue #1326).
+impl From<reward_vault::RewardVaultError> for StakeVaultError {
+    fn from(e: reward_vault::RewardVaultError) -> Self {
+        use reward_vault::RewardVaultError as E;
+        match e {
+            E::UnsupportedAsset | E::NotBucketOwner => StakeVaultError::Unauthorized,
+            E::BatchSizeInvalid => StakeVaultError::BatchSizeInvalid,
+            // Unknown, already-claimed or repeated bucket ids.
+            E::InvalidAmount | E::BucketNotFound | E::AlreadyClaimed | E::DuplicateBucket => {
+                StakeVaultError::InvalidAmount
+            }
+            E::Overflow => StakeVaultError::StakeOverflow,
+            E::Token(failure) => StakeVaultError::from(failure),
         }
     }
 }
@@ -3016,20 +3012,17 @@ impl StakeVaultContract {
     ) -> Result<u64, StakeVaultError> {
         depositor.require_auth();
         Self::require_not_paused(&env)?;
-        reward_vault::deposit_reward(&env, &depositor, provider, asset, amount, epoch)
-            .map_err(|e| match e {
-                reward_vault::RewardVaultError::UnsupportedAsset => StakeVaultError::Unauthorized,
-                reward_vault::RewardVaultError::InvalidAmount => StakeVaultError::InvalidAmount,
-                reward_vault::RewardVaultError::BatchSizeInvalid => {
-                    StakeVaultError::BatchSizeInvalid
-                }
-            })
+        Ok(reward_vault::deposit_reward(
+            &env, &depositor, provider, asset, amount, epoch,
+        )?)
     }
 
     /// Provider: claim rewards from a batch of bucket IDs in a single call.
     ///
-    /// Buckets already claimed are silently skipped (idempotence).
-    /// Returns per-asset totals transferred.
+    /// Bounded and all-or-nothing (Issue #1326): at most
+    /// [`reward_vault::MAX_REWARD_BATCH`] ids, checked first; any unknown,
+    /// foreign, already-claimed or repeated id fails the whole call and
+    /// consumes nothing.  Returns per-asset totals transferred.
     pub fn batch_claim_rewards(
         env: Env,
         provider: Address,
@@ -3037,10 +3030,9 @@ impl StakeVaultContract {
     ) -> Result<Vec<(Address, i128)>, StakeVaultError> {
         provider.require_auth();
         Self::require_not_paused(&env)?;
-        reward_vault::batch_claim_rewards(&env, &provider, bucket_ids).map_err(|e| match e {
-            reward_vault::RewardVaultError::BatchSizeInvalid => StakeVaultError::BatchSizeInvalid,
-            _ => StakeVaultError::InvalidAmount,
-        })
+        Ok(reward_vault::batch_claim_rewards(
+            &env, &provider, bucket_ids,
+        )?)
     }
 
     /// Returns the claimable reward balance for `provider` in `asset`.
