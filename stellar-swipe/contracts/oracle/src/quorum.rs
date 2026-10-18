@@ -56,6 +56,74 @@ impl Default for QuorumConfig {
     }
 }
 
+/// Lifecycle state of the quorum backing a price read (Issue #1122).
+///
+/// Transitions are deterministic: a read starts as [`QuorumState::Primary`]
+/// only while the preferred quorum is complete and agrees. Losing members
+/// moves to [`QuorumState::Degraded`] (resolved by the fallback set) or
+/// [`QuorumState::Depleted`] (unresolved); conflicting observations move to
+/// [`QuorumState::Conflicting`]. A later complete, agreeing primary quorum
+/// moves the state back to [`QuorumState::Primary`].
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuorumState {
+    /// The preferred quorum reached consensus.
+    Primary,
+    /// The preferred quorum was incomplete or conflicted and the configured
+    /// fallback set supplied the accepted price.
+    Degraded,
+    /// The preferred quorum returned conflicting observations and no fallback
+    /// set resolved the conflict.
+    Conflicting,
+    /// The preferred quorum lost too many members and no fallback set was
+    /// available.
+    Depleted,
+}
+
+/// Why an accepted price was chosen (Issue #1122). Persisted alongside the
+/// price so callers can audit the fallback decision.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuorumReason {
+    /// The preferred quorum itself reached consensus.
+    PrimaryConsensus,
+    /// The preferred quorum was too small; the fallback set supplied the price.
+    InsufficientFallback,
+    /// The preferred quorum conflicted; the fallback set supplied the price.
+    ConflictFallback,
+    /// The preferred quorum conflicted and no fallback resolved it.
+    UnresolvedConflict,
+    /// The preferred quorum was too small and no fallback was available.
+    NoMembers,
+}
+
+/// Ordered fallback quorum configuration for an asset pair (Issue #1122).
+///
+/// `members` is the secondary set consulted, in order, when the preferred
+/// quorum cannot produce a price. `min_sources` is the minimum number of
+/// distinct fallback members that must agree before a degraded price is
+/// accepted (clamped to at least one).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuorumFallback {
+    pub members: Vec<Address>,
+    pub min_sources: u32,
+}
+
+/// Outcome of a fallback-aware quorum evaluation (Issue #1122).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuorumOutcome {
+    /// Accepted price (median of the set that produced the outcome).
+    pub price: i128,
+    /// Which quorum state accepted the price.
+    pub state: QuorumState,
+    /// Why that state was reached.
+    pub reason: QuorumReason,
+    /// Number of distinct sources that contributed to the accepted price.
+    pub num_sources: u32,
+}
+
 /// Validates observations and returns the agreed median price.
 ///
 /// # Errors
@@ -120,6 +188,137 @@ pub fn validate_quorum(
     }
 
     Ok(median)
+}
+
+/// Fallback-aware quorum evaluation (Issue #1122).
+///
+/// Runs the preferred quorum first. On success it returns
+/// [`QuorumState::Primary`]. When the preferred quorum has fewer than
+/// `config.min_quorum` members, or its members disagree by more than
+/// `config.max_deviation_bps`, the configured `fallback` set is consulted:
+/// if at least `fallback.min_sources` distinct fallback members agree within
+/// the same bound, the read succeeds in [`QuorumState::Degraded`]. Otherwise
+/// the outcome is deterministic:
+/// * disagreement with no fallback price → [`OracleError::ConflictingObservations`];
+/// * too few members with no fallback price → [`OracleError::QuorumDepleted`].
+///
+/// Duplicate and out-of-order observations from the same provider never add
+/// weight, and non-positive prices are rejected before any set is counted.
+pub fn validate_quorum_with_fallback(
+    env: &Env,
+    observations: &Vec<Observation>,
+    authorized: &Vec<Address>,
+    config: &QuorumConfig,
+    fallback: &QuorumFallback,
+) -> Result<QuorumOutcome, OracleError> {
+    for obs in observations.iter() {
+        observation::ensure_not_future(env, obs.timestamp)?;
+    }
+    for obs in observations.iter() {
+        if obs.price <= 0 {
+            return Err(OracleError::InvalidPrice);
+        }
+    }
+
+    let primary = votes_for(env, observations, authorized);
+    let mut primary_conflict = false;
+
+    if !primary.is_empty() && (primary.len() as u32) >= config.min_quorum {
+        let prices = prices_of(env, &primary);
+        if let Some(median) = median_within_deviation(&prices, config.max_deviation_bps) {
+            return Ok(QuorumOutcome {
+                price: median,
+                state: QuorumState::Primary,
+                reason: QuorumReason::PrimaryConsensus,
+                num_sources: primary.len(),
+            });
+        }
+        primary_conflict = true;
+    }
+
+    if !fallback.members.is_empty() {
+        let degraded = votes_for(env, observations, &fallback.members);
+        let min_sources = core::cmp::max(fallback.min_sources, 1);
+        if !degraded.is_empty() && (degraded.len() as u32) >= min_sources {
+            let prices = prices_of(env, &degraded);
+            if let Some(median) = median_within_deviation(&prices, config.max_deviation_bps) {
+                let reason = if primary_conflict {
+                    QuorumReason::ConflictFallback
+                } else {
+                    QuorumReason::InsufficientFallback
+                };
+                return Ok(QuorumOutcome {
+                    price: median,
+                    state: QuorumState::Degraded,
+                    reason,
+                    num_sources: degraded.len(),
+                });
+            }
+        }
+    }
+
+    if primary_conflict {
+        Err(OracleError::ConflictingObservations)
+    } else {
+        Err(OracleError::QuorumDepleted)
+    }
+}
+
+/// Collects one vote per distinct `allowed` provider, keeping the highest
+/// admitted sequence. Later duplicates/out-of-order observations are ignored.
+fn votes_for(
+    env: &Env,
+    observations: &Vec<Observation>,
+    allowed: &Vec<Address>,
+) -> Vec<(Address, i128)> {
+    let mut votes: Vec<(Address, u64, i128)> = Vec::new(env);
+
+    for obs in observations.iter() {
+        if !allowed.contains(&obs.provider) {
+            continue;
+        }
+        let sequence = obs.sequence as u64;
+        match observation::admit(
+            votes.iter().map(|(p, s, _)| (p, s)),
+            &obs.provider,
+            sequence,
+        ) {
+            Ok(Admission::Append) => votes.push_back((obs.provider, sequence, obs.price)),
+            Ok(Admission::Replace(i)) => votes.set(i, (obs.provider, sequence, obs.price)),
+            Err(_) => continue,
+        }
+    }
+
+    let mut prices: Vec<(Address, i128)> = Vec::new(env);
+    for (provider, _, price) in votes.iter() {
+        prices.push_back((provider, price));
+    }
+    prices
+}
+
+fn prices_of(env: &Env, votes: &Vec<(Address, i128)>) -> Vec<i128> {
+    let mut prices = Vec::new(env);
+    for (_, price) in votes.iter() {
+        prices.push_back(price);
+    }
+    prices
+}
+
+/// Median of `prices`, or `None` when any observation deviates from it by more
+/// than `max_deviation_bps`.
+fn median_within_deviation(prices: &Vec<i128>, max_deviation_bps: i128) -> Option<i128> {
+    if prices.is_empty() {
+        return None;
+    }
+    let median = median_of(prices);
+    for price in prices.iter() {
+        let diff = (price - median).abs();
+        // diff / median > max_bps / 10_000, rearranged to avoid division.
+        if diff.saturating_mul(10_000) > median.saturating_mul(max_deviation_bps) {
+            return None;
+        }
+    }
+    Some(median)
 }
 
 /// Median of a non-empty price set (insertion sort — sets are quorum-sized).
@@ -416,5 +615,193 @@ mod tests {
             validate_quorum(&env, &mixed, &auth, &QuorumConfig::default()),
             Err(OracleError::FutureTimestamp)
         );
+    }
+
+    // ── Fallback state machine (Issue #1122) ────────────────────────────────
+
+    fn fallback(env: &Env, members: Vec<Address>, min_sources: u32) -> QuorumFallback {
+        QuorumFallback {
+            members,
+            min_sources,
+        }
+    }
+
+    #[test]
+    fn complete_primary_quorum_is_primary_state() {
+        let env = Env::default();
+        let auth = providers(&env, 3);
+        let observations = vec![
+            &env,
+            obs(&auth, 0, 100),
+            obs(&auth, 1, 101),
+            obs(&auth, 2, 102),
+        ];
+        let outcome = validate_quorum_with_fallback(
+            &env,
+            &observations,
+            &auth,
+            &QuorumConfig::default(),
+            &fallback(&env, Vec::new(&env), 1),
+        )
+        .unwrap();
+        assert_eq!(outcome.state, QuorumState::Primary);
+        assert_eq!(outcome.reason, QuorumReason::PrimaryConsensus);
+        assert_eq!(outcome.price, 101);
+    }
+
+    #[test]
+    fn lost_members_fall_back_to_secondary_set() {
+        let env = Env::default();
+        let primary = providers(&env, 2);
+        let secondary = providers(&env, 2);
+        // Preferred quorum of 3 has only 2 members.
+        let mut observations = Vec::new(&env);
+        observations.push_back(obs(&primary, 0, 100));
+        observations.push_back(obs(&secondary, 0, 200));
+        observations.push_back(obs(&secondary, 1, 202));
+
+        let outcome = validate_quorum_with_fallback(
+            &env,
+            &observations,
+            &primary,
+            &QuorumConfig::default(),
+            &fallback(&env, secondary.clone(), 2),
+        )
+        .unwrap();
+        assert_eq!(outcome.state, QuorumState::Degraded);
+        assert_eq!(outcome.reason, QuorumReason::InsufficientFallback);
+        assert_eq!(outcome.price, 201);
+    }
+
+    #[test]
+    fn conflicting_primary_uses_conflict_fallback_reason() {
+        let env = Env::default();
+        let primary = providers(&env, 3);
+        let secondary = providers(&env, 2);
+        let mut observations = vec![
+            &env,
+            obs(&primary, 0, 100),
+            obs(&primary, 1, 101),
+            obs(&primary, 2, 500),
+        ];
+        observations.push_back(obs(&secondary, 0, 200));
+        observations.push_back(obs(&secondary, 1, 200));
+
+        let outcome = validate_quorum_with_fallback(
+            &env,
+            &observations,
+            &primary,
+            &QuorumConfig::default(),
+            &fallback(&env, secondary.clone(), 1),
+        )
+        .unwrap();
+        assert_eq!(outcome.state, QuorumState::Degraded);
+        assert_eq!(outcome.reason, QuorumReason::ConflictFallback);
+        assert_eq!(outcome.price, 200);
+    }
+
+    #[test]
+    fn conflicting_primary_without_fallback_is_deterministic() {
+        let env = Env::default();
+        let primary = providers(&env, 3);
+        let observations = vec![
+            &env,
+            obs(&primary, 0, 100),
+            obs(&primary, 1, 101),
+            obs(&primary, 2, 500),
+        ];
+        assert_eq!(
+            validate_quorum_with_fallback(
+                &env,
+                &observations,
+                &primary,
+                &QuorumConfig::default(),
+                &fallback(&env, Vec::new(&env), 1),
+            ),
+            Err(OracleError::ConflictingObservations)
+        );
+    }
+
+    #[test]
+    fn depleted_primary_without_fallback_is_deterministic() {
+        let env = Env::default();
+        let primary = providers(&env, 3);
+        let observations = vec![&env, obs(&primary, 0, 100)];
+        assert_eq!(
+            validate_quorum_with_fallback(
+                &env,
+                &observations,
+                &primary,
+                &QuorumConfig::default(),
+                &fallback(&env, Vec::new(&env), 1),
+            ),
+            Err(OracleError::QuorumDepleted)
+        );
+    }
+
+    #[test]
+    fn duplicate_fallback_providers_do_not_inflate_degraded_set() {
+        let env = Env::default();
+        let primary = providers(&env, 3);
+        let secondary = providers(&env, 2);
+        let observations = vec![
+            &env,
+            obs(&primary, 0, 100),
+            obs(&secondary, 0, 200),
+            obs(&secondary, 0, 200),
+        ];
+        assert_eq!(
+            validate_quorum_with_fallback(
+                &env,
+                &observations,
+                &primary,
+                &QuorumConfig::default(),
+                &fallback(&env, secondary, 2),
+            ),
+            Err(OracleError::QuorumDepleted)
+        );
+    }
+
+    #[test]
+    fn recovered_primary_quorum_returns_primary_state() {
+        let env = Env::default();
+        let primary = providers(&env, 3);
+        let secondary = providers(&env, 2);
+
+        // Members lost → degraded via the fallback set.
+        let mut degraded = Vec::new(&env);
+        degraded.push_back(obs(&primary, 0, 100));
+        degraded.push_back(obs(&secondary, 0, 200));
+        degraded.push_back(obs(&secondary, 1, 200));
+        assert_eq!(
+            validate_quorum_with_fallback(
+                &env,
+                &degraded,
+                &primary,
+                &QuorumConfig::default(),
+                &fallback(&env, secondary.clone(), 2),
+            )
+            .unwrap()
+            .state,
+            QuorumState::Degraded
+        );
+
+        // Primary recovers → back to Primary with the raw median.
+        let recovered = vec![
+            &env,
+            obs(&primary, 0, 100),
+            obs(&primary, 1, 101),
+            obs(&primary, 2, 102),
+        ];
+        let outcome = validate_quorum_with_fallback(
+            &env,
+            &recovered,
+            &primary,
+            &QuorumConfig::default(),
+            &fallback(&env, secondary, 2),
+        )
+        .unwrap();
+        assert_eq!(outcome.state, QuorumState::Primary);
+        assert_eq!(outcome.price, 101);
     }
 }
