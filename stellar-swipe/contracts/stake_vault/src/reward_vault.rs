@@ -3,7 +3,22 @@
 //! # Issue #1020 – Batch reward claim
 //! Providers accumulate rewards across multiple epochs (reward buckets).
 //! `batch_claim_rewards` aggregates all eligible entries in a single call,
-//! marks each bucket as claimed (idempotence), and emits one aggregate event.
+//! marks each bucket as claimed, and emits one aggregate event per asset.
+//!
+//! # Issue #1326 – Bounded, atomic batch claims
+//! * A batch holds at most [`MAX_REWARD_BATCH`] bucket ids.  The length is
+//!   checked before any bucket is read, so an oversized batch costs nothing.
+//! * Claims are all-or-nothing.  Every id is validated first (it must exist,
+//!   belong to the caller, be unclaimed, appear once in the batch and be in a
+//!   supported asset) and the per-asset totals are summed with checked
+//!   arithmetic, all before any write.  One bad id fails the whole batch and
+//!   consumes nothing.
+//! * Only then are entitlements committed (claimed flags and balances, before
+//!   any transfer) and the per-asset transfers made.  A failed transfer
+//!   returns an error, and the host then reverts every write and transfer made
+//!   earlier in the same call.
+//! * A bucket can only be claimed once: re-claiming it is rejected with
+//!   [`RewardVaultError::AlreadyClaimed`] instead of being skipped.
 //!
 //! # Issue #1022 – Multi-asset reward vault
 //! Each reward bucket is denominated in a specific asset token.  The vault
@@ -55,11 +70,31 @@ pub enum RewardVaultError {
     UnsupportedAsset,
     /// Reward amount must be > 0.
     InvalidAmount,
-    /// Batch size is 0 or exceeds the maximum.
+    /// Batch size is 0 or exceeds [`MAX_REWARD_BATCH`].
     BatchSizeInvalid,
+    /// A bucket id in the batch does not exist.
+    BucketNotFound,
+    /// A bucket in the batch belongs to a different provider.
+    NotBucketOwner,
+    /// A bucket in the batch has already been claimed.
+    AlreadyClaimed,
+    /// The same bucket id appears more than once in the batch.
+    DuplicateBucket,
+    /// A batch total or the remaining balance falls outside `i128`.
+    Overflow,
+    /// A reward token transfer failed; the whole call is reverted.
+    Token(shared::TokenFailure),
 }
 
-const MAX_REWARD_BATCH: u32 = 100;
+/// Maximum number of bucket ids accepted by one [`batch_claim_rewards`] call
+/// (Issue #1326), checked before any bucket is read.
+///
+/// Each id costs two persistent reads (the bucket and its claimed flag) and
+/// one write (the claimed flag); each distinct asset adds a balance write and
+/// a token transfer.  The cap matches the reward-campaign batch limit
+/// (`reward_campaign::MAX_CAMPAIGN_BATCH`), so a full batch stays within the
+/// same per-call resource bound.
+pub const MAX_REWARD_BATCH: u32 = 50;
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -188,11 +223,13 @@ pub fn deposit_reward(
 
 /// Provider: claim rewards from a batch of bucket IDs in a single call.
 ///
-/// - Buckets already claimed are silently skipped (idempotence).
-/// - Buckets belonging to a different provider are skipped.
-/// - Returns the per-asset totals transferred.
+/// All-or-nothing (Issue #1326): the batch must hold 1..=[`MAX_REWARD_BATCH`]
+/// ids, and every id must name an existing, unclaimed bucket owned by
+/// `provider` in a supported asset, with no id repeated.  Otherwise the call
+/// fails and no entitlement is consumed.
 ///
-/// Emits one `rwdbatch` event per asset that had a non-zero payout.
+/// Returns the per-asset totals transferred, in first-seen asset order.
+/// Emits one `rwdbatch` event per asset.
 pub fn batch_claim_rewards(
     env: &Env,
     provider: &Address,
@@ -203,70 +240,93 @@ pub fn batch_claim_rewards(
         return Err(RewardVaultError::BatchSizeInvalid);
     }
 
-    // Accumulate per-asset totals in a simple parallel-arrays structure
-    // (no std HashMap in no_std).
+    // ── Phase 1: validate every id and total per asset (reads only) ─────────
+    // Parallel arrays stand in for a map (no std HashMap in no_std).
+    let supported = supported_assets(env);
     let mut asset_keys: Vec<Address> = Vec::new(env);
     let mut asset_totals: Vec<i128> = Vec::new(env);
 
     for i in 0..len {
-        let bid = bucket_ids.get(i).unwrap();
-
-        // Idempotence: skip already-claimed buckets.
-        let claim_key = RewardKey::Claimed(provider.clone(), bid);
-        if env.storage().persistent().has(&claim_key) {
-            continue;
-        }
-
-        let bucket: RewardBucket = match env.storage().persistent().get(&RewardKey::Bucket(bid)) {
-            Some(b) => b,
-            None => continue,
-        };
-
-        // Only claim buckets belonging to this provider.
-        if bucket.provider != *provider {
-            continue;
-        }
-
-        // Validate asset is still supported.
-        if !is_supported(env, &bucket.asset) {
-            continue;
-        }
-
-        // Mark claimed before any transfer (CEI).
-        env.storage().persistent().set(&claim_key, &true);
-
-        // Reduce per-provider per-asset balance.
-        let bal_key = RewardKey::ProviderAssetBalance(provider.clone(), bucket.asset.clone());
-        let prev_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&bal_key, &prev_bal.saturating_sub(bucket.amount));
-
-        // Accumulate into asset_totals.
-        let mut found = false;
-        for j in 0..asset_keys.len() {
-            if asset_keys.get(j).unwrap() == bucket.asset {
-                let cur = asset_totals.get(j).unwrap();
-                asset_totals.set(j, cur.saturating_add(bucket.amount));
-                found = true;
-                break;
+        let bid = bucket_ids.get_unchecked(i);
+        for j in 0..i {
+            if bucket_ids.get_unchecked(j) == bid {
+                return Err(RewardVaultError::DuplicateBucket);
             }
         }
-        if !found {
-            asset_keys.push_back(bucket.asset.clone());
-            asset_totals.push_back(bucket.amount);
+
+        let bucket: RewardBucket = env
+            .storage()
+            .persistent()
+            .get(&RewardKey::Bucket(bid))
+            .ok_or(RewardVaultError::BucketNotFound)?;
+        if bucket.provider != *provider {
+            return Err(RewardVaultError::NotBucketOwner);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&RewardKey::Claimed(provider.clone(), bid))
+        {
+            return Err(RewardVaultError::AlreadyClaimed);
+        }
+        if !supported.contains(&bucket.asset) {
+            return Err(RewardVaultError::UnsupportedAsset);
+        }
+
+        match asset_keys.first_index_of(&bucket.asset) {
+            Some(j) => {
+                let total = asset_totals
+                    .get_unchecked(j)
+                    .checked_add(bucket.amount)
+                    .ok_or(RewardVaultError::Overflow)?;
+                asset_totals.set(j, total);
+            }
+            None => {
+                asset_keys.push_back(bucket.asset);
+                asset_totals.push_back(bucket.amount);
+            }
         }
     }
 
-    // Transfer and emit per asset.
+    let mut new_balances: Vec<i128> = Vec::new(env);
+    for i in 0..asset_keys.len() {
+        let bal_key =
+            RewardKey::ProviderAssetBalance(provider.clone(), asset_keys.get_unchecked(i));
+        let prev_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        let new_bal = prev_bal
+            .checked_sub(asset_totals.get_unchecked(i))
+            .filter(|b| *b >= 0)
+            .ok_or(RewardVaultError::Overflow)?;
+        new_balances.push_back(new_bal);
+    }
+
+    // ── Phase 2: commit entitlements before any transfer (CEI) ──────────────
+    for i in 0..len {
+        env.storage().persistent().set(
+            &RewardKey::Claimed(provider.clone(), bucket_ids.get_unchecked(i)),
+            &true,
+        );
+    }
+    for i in 0..asset_keys.len() {
+        env.storage().persistent().set(
+            &RewardKey::ProviderAssetBalance(provider.clone(), asset_keys.get_unchecked(i)),
+            &new_balances.get_unchecked(i),
+        );
+    }
+
+    // ── Phase 3: transfer and emit per asset ────────────────────────────────
+    // A failed transfer returns `Err`, and the host reverts the writes above
+    // together with any transfer already made in this call.
     let mut results: Vec<(Address, i128)> = Vec::new(env);
     for i in 0..asset_keys.len() {
-        let asset = asset_keys.get(i).unwrap();
-        let total = asset_totals.get(i).unwrap();
-        if total <= 0 {
-            continue;
-        }
-        token::Client::new(env, &asset).transfer(&env.current_contract_address(), provider, &total);
+        let asset = asset_keys.get_unchecked(i);
+        let total = asset_totals.get_unchecked(i);
+        shared::token_error::map_result(token::Client::new(env, &asset).try_transfer(
+            &env.current_contract_address(),
+            provider,
+            &total,
+        ))
+        .map_err(RewardVaultError::Token)?;
 
         env.events().publish(
             (contract_topic(env), topics::TOPIC_REWARD_BATCH_CLAIMED()),
@@ -424,49 +484,26 @@ mod tests {
     }
 
     #[test]
-    fn batch_claim_idempotent_double_claim() {
+    fn batch_claim_rejects_already_claimed_bucket() {
         let (env, vault) = setup();
         let provider = Address::generate(&env);
-        let asset_addr = env.register(token_mock::MockToken, ());
+        let asset = funded_asset(&env, &vault, 10_000);
+        let bid = deposit(&env, &vault, &provider, &asset, 5_000);
+        let ids = Vec::from_array(&env, [bid]);
 
-        env.as_contract(&vault, || {
-            add_supported_asset(&env, asset_addr.clone());
-        });
-
-        // Mint tokens to vault so transfer succeeds.
-        env.as_contract(&asset_addr, || {
-            token_mock::MockToken::mint(env.clone(), vault.clone(), 10_000);
-        });
-
-        // Deposit a bucket.
-        let bid = env.as_contract(&vault, || {
-            deposit_reward(
-                &env,
-                &vault, // depositor is vault itself (already has tokens)
-                provider.clone(),
-                asset_addr.clone(),
-                5_000,
-                1,
-            )
-            .unwrap()
-        });
-
-        // First claim.
-        let mut ids = Vec::new(&env);
-        ids.push_back(bid);
         let results = env
-            .as_contract(&vault, || {
-                batch_claim_rewards(&env, &provider, ids.clone())
-            })
+            .as_contract(&vault, || batch_claim_rewards(&env, &provider, ids.clone()))
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results.get(0).unwrap().1, 5_000);
+        assert_eq!(token_balance(&env, &asset, &provider), 5_000);
 
-        // Second claim of same bucket → no payout (idempotent).
-        let results2 = env
+        // Re-claiming pays nothing and is reported, not silently skipped.
+        let err = env
             .as_contract(&vault, || batch_claim_rewards(&env, &provider, ids))
-            .unwrap();
-        assert_eq!(results2.len(), 0);
+            .unwrap_err();
+        assert_eq!(err, RewardVaultError::AlreadyClaimed);
+        assert_eq!(token_balance(&env, &asset, &provider), 5_000);
     }
 
     #[test]
@@ -503,5 +540,229 @@ mod tests {
             assert_eq!(get_asset_total_deposited(&env, &asset_a), 1_000);
             assert_eq!(get_asset_total_deposited(&env, &asset_b), 2_000);
         });
+    }
+
+    // ── Issue #1326: bounded, atomic batch claims ────────────────────────────
+
+    fn funded_asset(env: &Env, vault: &Address, amount: i128) -> Address {
+        let asset = env.register(token_mock::MockToken, ());
+        env.as_contract(vault, || add_supported_asset(env, asset.clone()));
+        env.as_contract(&asset, || {
+            token_mock::MockToken::mint(env.clone(), vault.clone(), amount);
+        });
+        asset
+    }
+
+    fn deposit(
+        env: &Env,
+        vault: &Address,
+        provider: &Address,
+        asset: &Address,
+        amount: i128,
+    ) -> u64 {
+        env.as_contract(vault, || {
+            deposit_reward(env, vault, provider.clone(), asset.clone(), amount, 1).unwrap()
+        })
+    }
+
+    fn token_balance(env: &Env, asset: &Address, who: &Address) -> i128 {
+        token::Client::new(env, asset).balance(who)
+    }
+
+    fn is_claimed(env: &Env, vault: &Address, provider: &Address, bid: u64) -> bool {
+        env.as_contract(vault, || {
+            env.storage()
+                .persistent()
+                .has(&RewardKey::Claimed(provider.clone(), bid))
+        })
+    }
+
+    /// Fails `batch` and asserts that nothing at all was consumed.
+    fn assert_rejected_without_effect(
+        env: &Env,
+        vault: &Address,
+        provider: &Address,
+        asset: &Address,
+        batch: Vec<u64>,
+        expected: RewardVaultError,
+    ) {
+        let entitled = env.as_contract(vault, || get_provider_reward_balance(env, provider, asset));
+        let paid = token_balance(env, asset, provider);
+        let err = env
+            .as_contract(vault, || batch_claim_rewards(env, provider, batch.clone()))
+            .unwrap_err();
+        assert_eq!(err, expected);
+        assert_eq!(
+            env.as_contract(vault, || get_provider_reward_balance(env, provider, asset)),
+            entitled
+        );
+        assert_eq!(token_balance(env, asset, provider), paid);
+        for bid in batch.iter() {
+            assert!(!is_claimed(env, vault, provider, bid));
+        }
+    }
+
+    #[test]
+    fn max_batch_is_documented_bound() {
+        assert_eq!(MAX_REWARD_BATCH, crate::reward_campaign::MAX_CAMPAIGN_BATCH);
+    }
+
+    #[test]
+    fn batch_claim_at_maximum_size_claims_everything() {
+        let (env, vault) = setup();
+        let provider = Address::generate(&env);
+        let asset = funded_asset(&env, &vault, 1_000_000);
+        let mut ids = Vec::new(&env);
+        for i in 0..MAX_REWARD_BATCH {
+            ids.push_back(deposit(&env, &vault, &provider, &asset, 100 + i as i128));
+        }
+        let expected: i128 = (0..MAX_REWARD_BATCH as i128).map(|i| 100 + i).sum();
+
+        let results = env
+            .as_contract(&vault, || batch_claim_rewards(&env, &provider, ids.clone()))
+            .unwrap();
+        assert_eq!(results, Vec::from_array(&env, [(asset.clone(), expected)]));
+        assert_eq!(token_balance(&env, &asset, &provider), expected);
+        assert_eq!(
+            env.as_contract(&vault, || get_provider_reward_balance(
+                &env, &provider, &asset
+            )),
+            0
+        );
+        for bid in ids.iter() {
+            assert!(is_claimed(&env, &vault, &provider, bid));
+        }
+    }
+
+    #[test]
+    fn batch_claim_over_limit_fails_before_processing() {
+        let (env, vault) = setup();
+        let provider = Address::generate(&env);
+        let asset = funded_asset(&env, &vault, 1_000_000);
+        let mut ids = Vec::new(&env);
+        for _ in 0..MAX_REWARD_BATCH {
+            ids.push_back(deposit(&env, &vault, &provider, &asset, 10));
+        }
+        // The extra id does not exist: had any bucket been processed, the
+        // error would be `BucketNotFound` rather than `BatchSizeInvalid`.
+        ids.push_back(u64::MAX);
+        assert_rejected_without_effect(
+            &env,
+            &vault,
+            &provider,
+            &asset,
+            ids,
+            RewardVaultError::BatchSizeInvalid,
+        );
+    }
+
+    #[test]
+    fn batch_claim_duplicate_id_fails_whole_batch() {
+        let (env, vault) = setup();
+        let provider = Address::generate(&env);
+        let asset = funded_asset(&env, &vault, 10_000);
+        let a = deposit(&env, &vault, &provider, &asset, 1_000);
+        let b = deposit(&env, &vault, &provider, &asset, 2_000);
+
+        assert_rejected_without_effect(
+            &env,
+            &vault,
+            &provider,
+            &asset,
+            Vec::from_array(&env, [a, b, a]),
+            RewardVaultError::DuplicateBucket,
+        );
+
+        // The same buckets remain claimable exactly once.
+        let results = env
+            .as_contract(&vault, || {
+                batch_claim_rewards(&env, &provider, Vec::from_array(&env, [a, b]))
+            })
+            .unwrap();
+        assert_eq!(results.get(0).unwrap().1, 3_000);
+    }
+
+    #[test]
+    fn batch_claim_one_invalid_item_consumes_nothing() {
+        let (env, vault) = setup();
+        let provider = Address::generate(&env);
+        let other = Address::generate(&env);
+        let asset = funded_asset(&env, &vault, 100_000);
+        let valid_a = deposit(&env, &vault, &provider, &asset, 1_000);
+        let valid_b = deposit(&env, &vault, &provider, &asset, 2_000);
+        let foreign = deposit(&env, &vault, &other, &asset, 4_000);
+        let spent = deposit(&env, &vault, &provider, &asset, 500);
+        env.as_contract(&vault, || {
+            batch_claim_rewards(&env, &provider, Vec::from_array(&env, [spent])).unwrap()
+        });
+
+        // The invalid item sits last, after valid ones were already seen.
+        let cases = [
+            (u64::MAX, RewardVaultError::BucketNotFound),
+            (foreign, RewardVaultError::NotBucketOwner),
+            (spent, RewardVaultError::AlreadyClaimed),
+        ];
+        for (bad, expected) in cases {
+            let entitled = env.as_contract(&vault, || {
+                get_provider_reward_balance(&env, &provider, &asset)
+            });
+            let paid = token_balance(&env, &asset, &provider);
+            let err = env
+                .as_contract(&vault, || {
+                    batch_claim_rewards(
+                        &env,
+                        &provider,
+                        Vec::from_array(&env, [valid_a, valid_b, bad]),
+                    )
+                })
+                .unwrap_err();
+            assert_eq!(err, expected);
+            assert!(!is_claimed(&env, &vault, &provider, valid_a));
+            assert!(!is_claimed(&env, &vault, &provider, valid_b));
+            assert_eq!(
+                env.as_contract(&vault, || get_provider_reward_balance(
+                    &env, &provider, &asset
+                )),
+                entitled
+            );
+            assert_eq!(token_balance(&env, &asset, &provider), paid);
+        }
+        // The other provider's entitlement is untouched too.
+        assert!(!is_claimed(&env, &vault, &other, foreign));
+        assert_eq!(
+            env.as_contract(&vault, || get_provider_reward_balance(&env, &other, &asset)),
+            4_000
+        );
+    }
+
+    #[test]
+    fn batch_claim_total_overflow_fails_before_any_write() {
+        let (env, vault) = setup();
+        let provider = Address::generate(&env);
+        let asset = funded_asset(&env, &vault, 0);
+        // Seeded directly: no token can hold i128::MAX + 1 to deposit them.
+        let (a, b) = (1_000u64, 1_001u64);
+        env.as_contract(&vault, || {
+            for (bucket_id, amount) in [(a, i128::MAX), (b, 1)] {
+                let bucket = RewardBucket {
+                    bucket_id,
+                    provider: provider.clone(),
+                    asset: asset.clone(),
+                    amount,
+                    epoch: 1,
+                };
+                env.storage()
+                    .persistent()
+                    .set(&RewardKey::Bucket(bucket_id), &bucket);
+            }
+        });
+        let err = env
+            .as_contract(&vault, || {
+                batch_claim_rewards(&env, &provider, Vec::from_array(&env, [a, b]))
+            })
+            .unwrap_err();
+        assert_eq!(err, RewardVaultError::Overflow);
+        assert!(!is_claimed(&env, &vault, &provider, a));
+        assert!(!is_claimed(&env, &vault, &provider, b));
     }
 }

@@ -1,3 +1,4 @@
+use shared::safe_math::checked_mul_div_floor;
 use soroban_sdk::{contracttype, Address, Env};
 use stellar_swipe_common::BASIS_POINTS_DENOMINATOR_I128;
 
@@ -104,30 +105,129 @@ pub fn add_liquidity(
     }
 
     let mut pool = get_pool(env, pool_id)?;
-    let minted_lp = if pool.total_lp_tokens == 0 {
-        integer_sqrt(amount_a * amount_b)
-    } else {
-        let lp_a = (amount_a * pool.total_lp_tokens) / pool.reserve_a;
-        let lp_b = (amount_b * pool.total_lp_tokens) / pool.reserve_b;
-        core::cmp::min(lp_a, lp_b)
-    };
+    let minted_lp = compute_mint_shares(
+        pool.reserve_a,
+        pool.reserve_b,
+        pool.total_lp_tokens,
+        amount_a,
+        amount_b,
+    )?;
 
-    if minted_lp <= 0 {
-        return Err(BridgeError::InvalidAmount);
-    }
-
-    pool.reserve_a += amount_a;
-    pool.reserve_b += amount_b;
-    pool.total_lp_tokens += minted_lp;
-
+    // Every new balance is computed (checked) before anything is written, so
+    // an overflow leaves reserves, supply and the position untouched.
     let mut position = get_position(env, provider.clone(), pool_id);
-    position.lp_tokens += minted_lp;
-    position.rewards_earned += reward_for_liquidity(amount_a + amount_b, pool.reward_bps);
+    let reward = amount_a
+        .checked_add(amount_b)
+        .and_then(|total| {
+            checked_mul_div_floor(
+                total,
+                pool.reward_bps as i128,
+                BASIS_POINTS_DENOMINATOR_I128,
+            )
+        })
+        .ok_or(ShareMintError::Overflow)?;
+    let reserve_a = checked(pool.reserve_a.checked_add(amount_a))?;
+    let reserve_b = checked(pool.reserve_b.checked_add(amount_b))?;
+    let total_lp_tokens = checked(pool.total_lp_tokens.checked_add(minted_lp))?;
+    let lp_tokens = checked(position.lp_tokens.checked_add(minted_lp))?;
+    let rewards_earned = checked(position.rewards_earned.checked_add(reward))?;
+
+    pool.reserve_a = reserve_a;
+    pool.reserve_b = reserve_b;
+    pool.total_lp_tokens = total_lp_tokens;
+    position.lp_tokens = lp_tokens;
+    position.rewards_earned = rewards_earned;
 
     store_pool(env, &pool);
     store_position(env, &position);
 
     Ok(minted_lp)
+}
+
+/// Why a share-mint calculation was rejected (Issue #1315).
+///
+/// Converted to a [`BridgeError`] at the module boundary, so the public error
+/// ABI is unchanged; tests use it to pin the exact rejection reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShareMintError {
+    /// A deposit amount is zero or negative.
+    InvalidDeposit,
+    /// Supply and reserves disagree: LP supply exists with an empty reserve,
+    /// or reserves exist with no LP supply backing them.
+    InconsistentPool,
+    /// An intermediate product or a resulting balance does not fit in `i128`.
+    Overflow,
+    /// The deposit is too small to mint a single whole LP token.
+    ZeroShares,
+}
+
+impl From<ShareMintError> for BridgeError {
+    fn from(err: ShareMintError) -> Self {
+        match err {
+            ShareMintError::InconsistentPool => BridgeError::InvalidOperation,
+            ShareMintError::InvalidDeposit
+            | ShareMintError::Overflow
+            | ShareMintError::ZeroShares => BridgeError::InvalidAmount,
+        }
+    }
+}
+
+fn checked(value: Option<i128>) -> Result<i128, ShareMintError> {
+    value.ok_or(ShareMintError::Overflow)
+}
+
+/// LP tokens minted for depositing `amount_a`/`amount_b` into a pool with the
+/// given reserves and supply (Issue #1315). Pure: reads and writes no storage.
+///
+/// * **First deposit** (`total_lp == 0`): `floor(sqrt(amount_a * amount_b))`.
+/// * **Later deposits:** `min(floor(amount_a * total_lp / reserve_a),
+///   floor(amount_b * total_lp / reserve_b))`.
+///
+/// # Rounding direction
+///
+/// Every division rounds **down**, and the smaller of the two ratios wins, so
+/// a depositor never receives more LP tokens than their contribution backs.
+/// The rounding remainder (and any excess of the over-supplied asset) stays in
+/// the pool and accrues to existing holders. The value of one LP token can
+/// therefore never fall because of a deposit, and splitting a deposit into
+/// smaller ones never mints more than depositing it at once.
+///
+/// # Supported range
+///
+/// All intermediate products are checked: any input whose product
+/// (`amount_a * amount_b`, or `amount * total_lp`) does not fit in `i128` is
+/// rejected with [`ShareMintError::Overflow`] instead of wrapping or
+/// panicking. A deposit that would round to zero LP tokens is rejected with
+/// [`ShareMintError::ZeroShares`].
+pub fn compute_mint_shares(
+    reserve_a: i128,
+    reserve_b: i128,
+    total_lp: i128,
+    amount_a: i128,
+    amount_b: i128,
+) -> Result<i128, ShareMintError> {
+    if amount_a <= 0 || amount_b <= 0 {
+        return Err(ShareMintError::InvalidDeposit);
+    }
+
+    let minted = if total_lp == 0 {
+        if reserve_a != 0 || reserve_b != 0 {
+            return Err(ShareMintError::InconsistentPool);
+        }
+        integer_sqrt(checked(amount_a.checked_mul(amount_b))?)
+    } else {
+        if total_lp < 0 || reserve_a <= 0 || reserve_b <= 0 {
+            return Err(ShareMintError::InconsistentPool);
+        }
+        let lp_a = checked(checked_mul_div_floor(amount_a, total_lp, reserve_a))?;
+        let lp_b = checked(checked_mul_div_floor(amount_b, total_lp, reserve_b))?;
+        core::cmp::min(lp_a, lp_b)
+    };
+
+    if minted <= 0 {
+        return Err(ShareMintError::ZeroShares);
+    }
+    Ok(minted)
 }
 
 pub fn remove_liquidity(
@@ -300,10 +400,6 @@ fn next_pool_id(env: &Env) -> u64 {
     next
 }
 
-fn reward_for_liquidity(total_added: i128, reward_bps: u32) -> i128 {
-    (total_added * reward_bps as i128) / BASIS_POINTS_DENOMINATOR_I128
-}
-
 fn quote_swap(
     pool_type: PoolType,
     amount_in: i128,
@@ -327,18 +423,24 @@ fn quote_swap(
     }
 }
 
+/// `floor(sqrt(value))`, exact for every non-negative `i128`.
+///
+/// Newton's iteration runs in `u128` from a starting guess `>= sqrt(value)`,
+/// so `x + value / x` cannot overflow even for `value == i128::MAX`.
 fn integer_sqrt(value: i128) -> i128 {
     if value <= 0 {
         return 0;
     }
 
-    let mut x0 = value;
-    let mut x1 = (x0 + value / x0) / 2;
+    let n = value as u128;
+    let bits = 128 - n.leading_zeros();
+    let mut x0: u128 = 1 << ((bits + 1) / 2);
+    let mut x1 = (x0 + n / x0) / 2;
     while x1 < x0 {
         x0 = x1;
-        x1 = (x0 + value / x0) / 2;
+        x1 = (x0 + n / x0) / 2;
     }
-    x0
+    x0 as i128
 }
 
 #[cfg(test)]
@@ -439,6 +541,265 @@ mod tests {
             let health = get_pool_health(&env, pool_id).unwrap();
             assert!(health.imbalance_bps > 0);
             assert!(health.total_liquidity > 0);
+        });
+    }
+
+    // ── Issue #1315: overflow-safe, deterministic share minting ────────────
+
+    fn new_pool(env: &Env, reward_bps: u32) -> u64 {
+        create_pool(
+            env,
+            soroban_sdk::String::from_str(env, "wETH"),
+            soroban_sdk::String::from_str(env, "wUSDC"),
+            PoolType::ConstantProduct,
+            30,
+            reward_bps,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn integer_sqrt_is_exact_floor_up_to_i128_max() {
+        for v in [0i128, 1, 2, 3, 4, 8, 9, 10, 99, 100, 101, 1 << 64] {
+            let r = integer_sqrt(v);
+            assert!(r * r <= v && (r + 1) * (r + 1) > v, "sqrt({v}) = {r}");
+        }
+        let r = integer_sqrt(i128::MAX);
+        assert_eq!(r, 13_043_817_825_332_782_212);
+        assert!(r.checked_mul(r).unwrap() <= i128::MAX);
+        assert!((r + 1).checked_mul(r + 1).is_none());
+    }
+
+    #[test]
+    fn first_deposit_rounds_geometric_mean_down() {
+        // sqrt(2 * 3) = 2.449.. -> 2; the remainder stays in the pool.
+        assert_eq!(compute_mint_shares(0, 0, 0, 2, 3), Ok(2));
+        assert_eq!(compute_mint_shares(0, 0, 0, 1_000, 1_000), Ok(1_000));
+        assert_eq!(compute_mint_shares(0, 0, 0, 1, 1), Ok(1));
+    }
+
+    #[test]
+    fn proportional_deposit_rounds_down_and_uses_smaller_ratio() {
+        // 2 * 2 / 3 = 1.33.. -> 1.
+        assert_eq!(compute_mint_shares(3, 3, 2, 2, 2), Ok(1));
+        // a-ratio gives 10 * 100 / 7 = 142, b-ratio 10 * 100 / 9 = 111.
+        assert_eq!(compute_mint_shares(7, 9, 100, 10, 10), Ok(111));
+        // Exact division has no remainder.
+        assert_eq!(compute_mint_shares(1_000, 2_000, 1_000, 100, 200), Ok(100));
+    }
+
+    #[test]
+    fn minted_shares_never_exceed_backing() {
+        let cases: [(i128, i128, i128, i128, i128); 5] = [
+            (3, 3, 2, 2, 2),
+            (7, 9, 100, 10, 10),
+            (1_000_003, 999_983, 999_991, 12_345, 67_891),
+            (17, 1_000_000_007, 131, 5, 999_999_937),
+            (1 << 100, 1 << 100, 1 << 60, (1 << 64) + 7, 1 << 64),
+        ];
+        for (ra, rb, t, a, b) in cases {
+            let minted = compute_mint_shares(ra, rb, t, a, b).unwrap();
+            // minted / t <= a / ra and minted / t <= b / rb.
+            assert!(minted <= checked_mul_div_floor(a, t, ra).unwrap());
+            assert!(minted <= checked_mul_div_floor(b, t, rb).unwrap());
+        }
+    }
+
+    #[test]
+    fn minting_is_deterministic() {
+        let first = compute_mint_shares(1_000_003, 999_983, 999_991, 12_345, 67_891);
+        for _ in 0..10 {
+            assert_eq!(
+                compute_mint_shares(1_000_003, 999_983, 999_991, 12_345, 67_891),
+                first
+            );
+        }
+    }
+
+    #[test]
+    fn dust_deposit_minting_zero_shares_is_rejected() {
+        assert_eq!(
+            compute_mint_shares(1_000_000, 1_000_000, 1, 1, 1),
+            Err(ShareMintError::ZeroShares)
+        );
+        // One side minting zero is enough to reject.
+        assert_eq!(
+            compute_mint_shares(1_000, 1_000_000, 1_000, 1_000, 1),
+            Err(ShareMintError::ZeroShares)
+        );
+    }
+
+    #[test]
+    fn non_positive_amounts_and_inconsistent_pools_are_rejected() {
+        assert_eq!(
+            compute_mint_shares(0, 0, 0, 0, 5),
+            Err(ShareMintError::InvalidDeposit)
+        );
+        assert_eq!(
+            compute_mint_shares(0, 0, 0, 5, -1),
+            Err(ShareMintError::InvalidDeposit)
+        );
+        // Supply without reserves would divide by zero.
+        assert_eq!(
+            compute_mint_shares(0, 10, 10, 5, 5),
+            Err(ShareMintError::InconsistentPool)
+        );
+        // Orphaned reserves with no supply would be captured by the first minter.
+        assert_eq!(
+            compute_mint_shares(10, 10, 0, 5, 5),
+            Err(ShareMintError::InconsistentPool)
+        );
+    }
+
+    #[test]
+    fn values_near_i128_limits() {
+        // Largest first deposits whose product still fits succeed exactly.
+        assert_eq!(compute_mint_shares(0, 0, 0, 1 << 63, 1 << 63), Ok(1 << 63));
+        assert_eq!(
+            compute_mint_shares(0, 0, 0, i128::MAX, 1),
+            Ok(13_043_817_825_332_782_212)
+        );
+        // One past the limit overflows instead of wrapping or panicking.
+        assert_eq!(
+            compute_mint_shares(0, 0, 0, i128::MAX, 2),
+            Err(ShareMintError::Overflow)
+        );
+        assert_eq!(
+            compute_mint_shares(0, 0, 0, 1 << 64, 1 << 64),
+            Err(ShareMintError::Overflow)
+        );
+        // Proportional path: amount * total_lp overflows.
+        assert_eq!(
+            compute_mint_shares(i128::MAX, i128::MAX, 4, i128::MAX / 2, i128::MAX / 2),
+            Err(ShareMintError::Overflow)
+        );
+        // A product of exactly i128::MAX - 1 fits and divides exactly.
+        assert_eq!(
+            compute_mint_shares(
+                i128::MAX - 1,
+                i128::MAX - 1,
+                2,
+                i128::MAX / 2,
+                i128::MAX / 2
+            ),
+            Ok(1)
+        );
+        // Representable but below one share: rejected as zero, not overflow.
+        assert_eq!(
+            compute_mint_shares(i128::MAX, i128::MAX, 1, i128::MAX / 2, i128::MAX / 2),
+            Err(ShareMintError::ZeroShares)
+        );
+        assert_eq!(
+            compute_mint_shares(1 << 100, 1 << 100, 1 << 26, 1 << 100, 1 << 100),
+            Ok(1 << 26)
+        );
+    }
+
+    #[test]
+    fn split_deposits_never_mint_more_than_one_deposit() {
+        let (env, contract_id) = setup();
+        let seed = Address::generate(&env);
+        let whale = Address::generate(&env);
+        let splitter = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let single = new_pool(&env, 0);
+            let split = new_pool(&env, 0);
+            add_liquidity(&env, seed.clone(), single, 1_000_003, 999_983).unwrap();
+            add_liquidity(&env, seed.clone(), split, 1_000_003, 999_983).unwrap();
+
+            let one_shot = add_liquidity(&env, whale.clone(), single, 70_007, 70_001).unwrap();
+            let mut pieces = 0i128;
+            for _ in 0..7 {
+                pieces += add_liquidity(&env, splitter.clone(), split, 10_001, 10_000).unwrap();
+                // Supply never outgrows the reserves backing it.
+                let pool = get_pool(&env, split).unwrap();
+                let lp = pool.total_lp_tokens as u128;
+                assert!(lp * lp <= (pool.reserve_a as u128) * (pool.reserve_b as u128));
+            }
+            assert!(pieces <= one_shot, "split {pieces} > single {one_shot}");
+            assert_eq!(
+                get_position(&env, splitter.clone(), split).lp_tokens,
+                pieces
+            );
+        });
+    }
+
+    #[test]
+    fn rejected_mint_leaves_pool_and_position_unchanged() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 200);
+            // sqrt(1_000_000 * 1) = 1_000 LP tokens: each one backs 1_000 units of A.
+            assert_eq!(
+                add_liquidity(&env, provider.clone(), pool_id, 1_000_000, 1),
+                Ok(1_000)
+            );
+            let pool_before = get_pool(&env, pool_id).unwrap();
+            let position_before = get_position(&env, provider.clone(), pool_id);
+
+            // Zero-share dust deposit: 999 * 1_000 / 1_000_000 rounds to 0.
+            assert_eq!(
+                add_liquidity(&env, provider.clone(), pool_id, 999, 1),
+                Err(BridgeError::InvalidAmount)
+            );
+            // Overflowing intermediate product.
+            assert_eq!(
+                add_liquidity(&env, provider.clone(), pool_id, i128::MAX, i128::MAX),
+                Err(BridgeError::InvalidAmount)
+            );
+
+            assert_eq!(get_pool(&env, pool_id).unwrap(), pool_before);
+            assert_eq!(
+                get_position(&env, provider.clone(), pool_id),
+                position_before
+            );
+        });
+    }
+
+    #[test]
+    fn near_limit_first_deposit_succeeds() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            let minted = add_liquidity(&env, provider.clone(), pool_id, i128::MAX - 10, 1).unwrap();
+            assert_eq!(minted, 13_043_817_825_332_782_212);
+            let pool = get_pool(&env, pool_id).unwrap();
+            assert_eq!(pool.reserve_a, i128::MAX - 10);
+            assert_eq!(pool.total_lp_tokens, minted);
+        });
+    }
+
+    #[test]
+    fn reserve_overflow_is_rejected_before_any_write() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            // reserve_a sits just below i128::MAX with a single LP token.
+            let mut pool = get_pool(&env, pool_id).unwrap();
+            pool.reserve_a = i128::MAX - 10;
+            pool.reserve_b = 1;
+            pool.total_lp_tokens = 1;
+            store_pool(&env, &pool);
+            let position_before = get_position(&env, provider.clone(), pool_id);
+
+            // The mint itself is valid (one share, no product overflow)...
+            assert_eq!(
+                compute_mint_shares(i128::MAX - 10, 1, 1, i128::MAX - 10, 1),
+                Ok(1)
+            );
+            // ...but reserve_a + amount_a cannot be represented.
+            assert_eq!(
+                add_liquidity(&env, provider.clone(), pool_id, i128::MAX - 10, 1),
+                Err(BridgeError::InvalidAmount)
+            );
+            assert_eq!(get_pool(&env, pool_id).unwrap(), pool);
+            assert_eq!(
+                get_position(&env, provider.clone(), pool_id),
+                position_before
+            );
         });
     }
 }

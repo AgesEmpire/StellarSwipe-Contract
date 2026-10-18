@@ -2924,3 +2924,146 @@ mod reward_campaign_contract {
         );
     }
 }
+
+// ── Issue #1326: bounded, atomic batch reward claims (contract level) ────────
+
+mod batch_reward_claims_contract {
+    use super::*;
+    use crate::reward_vault::MAX_REWARD_BATCH;
+    use soroban_sdk::token::TokenClient;
+    use soroban_sdk::vec;
+
+    fn setup_rewards() -> (Env, StakeVaultContractClient<'static>, Address, Address) {
+        let (env, vault_id, _stake_token, admin, _) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let depositor = Address::generate(&env);
+        (env, client, admin, depositor)
+    }
+
+    fn reward_asset(
+        env: &Env,
+        client: &StakeVaultContractClient,
+        admin: &Address,
+        depositor: &Address,
+    ) -> Address {
+        let asset = sac_token(env, admin);
+        client.add_reward_asset(&asset);
+        StellarAssetClient::new(env, &asset).mint(depositor, &1_000_000);
+        asset
+    }
+
+    #[test]
+    fn empty_and_over_limit_batches_are_rejected() {
+        let (env, client, _admin, _depositor) = setup_rewards();
+        let provider = Address::generate(&env);
+        assert_eq!(
+            client.try_batch_claim_rewards(&provider, &Vec::new(&env)),
+            Err(Ok(StakeVaultError::BatchSizeInvalid))
+        );
+        let mut ids = Vec::new(&env);
+        for i in 0..=MAX_REWARD_BATCH {
+            ids.push_back(i as u64);
+        }
+        assert_eq!(
+            client.try_batch_claim_rewards(&provider, &ids),
+            Err(Ok(StakeVaultError::BatchSizeInvalid))
+        );
+    }
+
+    #[test]
+    fn invalid_items_fail_whole_batch_and_consume_nothing() {
+        let (env, client, admin, depositor) = setup_rewards();
+        let asset = reward_asset(&env, &client, &admin, &depositor);
+        let token = TokenClient::new(&env, &asset);
+        let provider = Address::generate(&env);
+        let other = Address::generate(&env);
+        let a = client.deposit_reward(&depositor, &provider, &asset, &1_000, &1);
+        let b = client.deposit_reward(&depositor, &provider, &asset, &2_000, &2);
+        let foreign = client.deposit_reward(&depositor, &other, &asset, &4_000, &2);
+
+        let cases = [
+            (vec![&env, a, b, a], StakeVaultError::InvalidAmount),
+            (vec![&env, a, b, 9_999], StakeVaultError::InvalidAmount),
+            (vec![&env, a, b, foreign], StakeVaultError::Unauthorized),
+        ];
+        for (batch, expected) in cases {
+            assert_eq!(
+                client.try_batch_claim_rewards(&provider, &batch),
+                Err(Ok(expected))
+            );
+            assert_eq!(token.balance(&provider), 0);
+            assert_eq!(client.get_provider_reward_balance(&provider, &asset), 3_000);
+            assert_eq!(token.balance(&client.address), 7_000);
+        }
+
+        // Nothing was consumed: the valid buckets still claim in full, once.
+        let results = client.batch_claim_rewards(&provider, &vec![&env, a, b]);
+        assert_eq!(results, vec![&env, (asset.clone(), 3_000)]);
+        assert_eq!(token.balance(&provider), 3_000);
+        assert_eq!(
+            client.try_batch_claim_rewards(&provider, &vec![&env, a]),
+            Err(Ok(StakeVaultError::InvalidAmount))
+        );
+        assert_eq!(token.balance(&provider), 3_000);
+    }
+
+    #[test]
+    fn failed_transfer_reverts_earlier_transfers_and_entitlements() {
+        let (env, client, admin, depositor) = setup_rewards();
+        let asset_a = reward_asset(&env, &client, &admin, &depositor);
+        let asset_b = reward_asset(&env, &client, &admin, &depositor);
+        let provider = Address::generate(&env);
+        let a = client.deposit_reward(&depositor, &provider, &asset_a, &1_000, &1);
+        let b = client.deposit_reward(&depositor, &provider, &asset_b, &2_000, &1);
+
+        // Drain asset B so its transfer fails after asset A's has succeeded.
+        let sink = Address::generate(&env);
+        TokenClient::new(&env, &asset_b).transfer(&client.address, &sink, &2_000);
+
+        assert_eq!(
+            client.try_batch_claim_rewards(&provider, &vec![&env, a, b]),
+            Err(Ok(StakeVaultError::InsufficientTokenBalance))
+        );
+        assert_eq!(TokenClient::new(&env, &asset_a).balance(&provider), 0);
+        assert_eq!(
+            TokenClient::new(&env, &asset_a).balance(&client.address),
+            1_000
+        );
+        assert_eq!(
+            client.get_provider_reward_balance(&provider, &asset_a),
+            1_000
+        );
+        assert_eq!(
+            client.get_provider_reward_balance(&provider, &asset_b),
+            2_000
+        );
+
+        // Once B is refunded, the same batch succeeds in full.
+        TokenClient::new(&env, &asset_b).transfer(&sink, &client.address, &2_000);
+        let results = client.batch_claim_rewards(&provider, &vec![&env, a, b]);
+        assert_eq!(
+            results,
+            vec![&env, (asset_a.clone(), 1_000), (asset_b.clone(), 2_000)]
+        );
+        assert_eq!(TokenClient::new(&env, &asset_a).balance(&provider), 1_000);
+        assert_eq!(TokenClient::new(&env, &asset_b).balance(&provider), 2_000);
+    }
+
+    #[test]
+    fn maximum_batch_claims_through_contract() {
+        let (env, client, admin, depositor) = setup_rewards();
+        let asset = reward_asset(&env, &client, &admin, &depositor);
+        let provider = Address::generate(&env);
+        let mut ids = Vec::new(&env);
+        for _ in 0..MAX_REWARD_BATCH {
+            ids.push_back(client.deposit_reward(&depositor, &provider, &asset, &10, &1));
+        }
+        let expected = 10 * MAX_REWARD_BATCH as i128;
+        assert_eq!(
+            client.batch_claim_rewards(&provider, &ids),
+            vec![&env, (asset.clone(), expected)]
+        );
+        assert_eq!(TokenClient::new(&env, &asset).balance(&provider), expected);
+        assert_eq!(client.get_provider_reward_balance(&provider, &asset), 0);
+    }
+}

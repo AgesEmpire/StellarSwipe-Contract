@@ -683,14 +683,20 @@ impl From<reward_campaign::CampaignError> for StakeVaultError {
     }
 }
 
-/// Maps the shared token/cross-contract invocation failure classification
-/// (Issue #1001) onto this contract's stable error codes. Every non-success
-/// outcome from a stake-token invocation must flow through here rather than
-/// being treated as `Ok`.
-impl From<shared::TokenFailure> for StakeVaultError {
-    fn from(failure: shared::TokenFailure) -> Self {
-        match failure {
-            shared::TokenFailure::Unauthorized => StakeVaultError::Unauthorized,
+/// Reward vault failures share existing codes, since this enum is at the
+/// Soroban `#[contracterror]` variant cap (Issue #1326).
+impl From<reward_vault::RewardVaultError> for StakeVaultError {
+    fn from(e: reward_vault::RewardVaultError) -> Self {
+        use reward_vault::RewardVaultError as E;
+        match e {
+            E::UnsupportedAsset | E::NotBucketOwner => StakeVaultError::Unauthorized,
+            E::BatchSizeInvalid => StakeVaultError::BatchSizeInvalid,
+            // Unknown, already-claimed or repeated bucket ids.
+            E::InvalidAmount | E::BucketNotFound | E::AlreadyClaimed | E::DuplicateBucket => {
+                StakeVaultError::InvalidAmount
+            }
+            E::Overflow => StakeVaultError::StakeOverflow,
+            E::Token(failure) => StakeVaultError::from(failure),
         }
     }
 }
@@ -3174,8 +3180,10 @@ impl StakeVaultContract {
 
     /// Provider: claim rewards from a batch of bucket IDs in a single call.
     ///
-    /// Buckets already claimed are silently skipped (idempotence).
-    /// Returns per-asset totals transferred.
+    /// Bounded and all-or-nothing (Issue #1326): at most
+    /// [`reward_vault::MAX_REWARD_BATCH`] ids, checked first; any unknown,
+    /// foreign, already-claimed or repeated id fails the whole call and
+    /// consumes nothing.  Returns per-asset totals transferred.
     pub fn batch_claim_rewards(
         env: Env,
         provider: Address,
