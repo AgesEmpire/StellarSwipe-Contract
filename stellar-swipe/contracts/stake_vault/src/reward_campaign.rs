@@ -932,6 +932,33 @@ mod tests {
     }
 
     #[test]
+    fn recovery_cannot_consume_funds_reserved_for_valid_claims() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            let user = Address::generate(&env);
+            distribute(&env, id, 400, vec![&env, (user.clone(), 1)]).unwrap();
+            let campaign_before = get_campaign(&env, id).unwrap();
+            assert_eq!(campaign_before.outstanding(), 400);
+
+            // Attempting to close/recover while valid claims are outstanding fails.
+            assert_eq!(
+                close_campaign(&env, id),
+                Err(CampaignError::OutstandingLiabilities)
+            );
+
+            // Verify funds reserved for valid claim remain untouched and claimable.
+            claim(&env, id, &user, vec![&env, 0]).unwrap();
+            let campaign_after_claim = get_campaign(&env, id).unwrap();
+            assert_eq!(campaign_after_claim.claimed, 400);
+            assert_eq!(campaign_after_claim.outstanding(), 0);
+
+            // Now that obligations are resolved, recovery succeeds for the unallocated remainder (600).
+            assert_eq!(close_campaign(&env, id).unwrap(), 600);
+        });
+    }
+
+    #[test]
     fn close_after_all_claims_settled() {
         let (env, host) = setup();
         env.as_contract(&host, || {
