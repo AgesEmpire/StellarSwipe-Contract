@@ -135,6 +135,114 @@ pub struct PerformanceReport {
 }
 
 // ============================================================================
+// Analytics Query Cost Envelopes
+// ============================================================================
+
+/// The kind of analytics query a caller intends to run. Each variant maps to a
+/// declared cost envelope so callers can reject expensive requests before
+/// execution.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum AnalyticsQueryType {
+    /// Aggregate a single provider's headline metrics.
+    ProviderSummary,
+    /// Build a time-series over a bounded window.
+    TimeSeries,
+    /// Compute period performance over a bounded window.
+    PeriodPerformance,
+    /// Produce predictive analytics for a provider.
+    Predictive,
+    /// Scan for anomalies across a provider's history.
+    AnomalyScan,
+    /// Assemble a full performance report.
+    FullReport,
+}
+
+/// Bounded cost metadata attached to an analytics query. `max_scan_cost` and
+/// `max_aggregation_cost` are the declared ceilings for the query type; a
+/// request whose estimated costs exceed either ceiling must be rejected before
+/// execution.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct QueryCostEnvelope {
+    pub query_type: AnalyticsQueryType,
+    pub max_scan_cost: u32,
+    pub max_aggregation_cost: u32,
+}
+
+/// Which cost dimension a request exceeded.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum CostDimension {
+    Scan,
+    Aggregation,
+}
+
+/// Error returned when a query's estimated cost exceeds its declared envelope.
+/// `dimension` identifies whether the scan or aggregation budget was exceeded.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct CostEnvelopeExceeded {
+    pub query_type: AnalyticsQueryType,
+    pub dimension: CostDimension,
+    pub limit: u32,
+    pub estimated: u32,
+}
+
+/// Declared cost envelope for a query type. Every query type must declare a
+/// maximum scan cost and a maximum aggregation cost.
+pub fn query_cost_envelope(query_type: AnalyticsQueryType) -> QueryCostEnvelope {
+    let (max_scan_cost, max_aggregation_cost) = match query_type {
+        AnalyticsQueryType::ProviderSummary => (100u32, 50u32),
+        AnalyticsQueryType::TimeSeries => (1_000u32, 500u32),
+        AnalyticsQueryType::PeriodPerformance => (2_000u32, 1_000u32),
+        AnalyticsQueryType::Predictive => (500u32, 2_000u32),
+        AnalyticsQueryType::AnomalyScan => (5_000u32, 2_500u32),
+        AnalyticsQueryType::FullReport => (10_000u32, 5_000u32),
+    };
+
+    QueryCostEnvelope {
+        query_type,
+        max_scan_cost,
+        max_aggregation_cost,
+    }
+}
+
+/// Enforce a query's declared cost envelope before execution.
+///
+/// `estimated_scan_cost` and `estimated_aggregation_cost` are the caller's
+/// projected costs for the request. Returns `Ok(())` when both dimensions are
+/// within the declared envelope, or `Err(CostEnvelopeExceeded)` identifying the
+/// first exceeded dimension (scan checked before aggregation).
+pub fn enforce_query_cost_envelope(
+    query_type: AnalyticsQueryType,
+    estimated_scan_cost: u32,
+    estimated_aggregation_cost: u32,
+) -> Result<(), CostEnvelopeExceeded> {
+    let envelope = query_cost_envelope(query_type);
+
+    if estimated_scan_cost > envelope.max_scan_cost {
+        return Err(CostEnvelopeExceeded {
+            query_type,
+            dimension: CostDimension::Scan,
+            limit: envelope.max_scan_cost,
+            estimated: estimated_scan_cost,
+        });
+    }
+
+    if estimated_aggregation_cost > envelope.max_aggregation_cost {
+        return Err(CostEnvelopeExceeded {
+            query_type,
+            dimension: CostDimension::Aggregation,
+            limit: envelope.max_aggregation_cost,
+            estimated: estimated_aggregation_cost,
+        });
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Risk Score Feature Versioning
 // ============================================================================
 
@@ -346,6 +454,9 @@ pub fn validate_analytics_cursor(
             current: current.clone(),
         });
     }
+
+    Ok(())
+}
     Ok(())
 }
 
@@ -378,4 +489,89 @@ pub struct StorageRentEstimate {
     pub projected_entries: u32,
     /// Projected byte footprint of the affec
 
-/* … truncated 6237 chars — edit only what you need near the top … */
+/// Baseline byte cost of a single ledger entry (key + metadata overhead).
+const ENTRY_OVERHEAD_BYTES: u32 = 64;
+/// Rent charged per byte per ledger (in stroops).
+const RENT_PER_BYTE_PER_LEDGER: i128 = 1;
+/// Default TTL extension applied to touched entries, in ledgers.
+const DEFAULT_TTL_EXTENSION: u32 = 100;
+/// Maximum number of entries a single operation may touch.
+const MAX_ENTRIES_PER_OPERATION: u32 = 1000;
+/// Maximum byte footprint a single operation may touch.
+const MAX_BYTES_PER_OPERATION: u32 = 1_000_000;
+
+/// Estimate the storage footprint and rent implications of a contract
+/// operation before it is submitted.
+///
+/// The estimate is a pure function of its inputs: the same `operation`,
+/// `payload_bytes`, `existing_entries`, and `ttl_extension` always produce the
+/// same `StorageRentEstimate`.
+///
+/// * `payload_bytes` is the serialized size of the record being written.
+/// * `existing_entries` is the number of entries already stored for the
+///   collection the operation targets.
+/// * `ttl_extension` is the number of ledgers the caller intends to extend the
+///   touched entries by; pass `0` to use the default extension.
+pub fn estimate_storage_rent(
+    operation: ContractOperation,
+    payload_bytes: u32,
+    existing_entries: u32,
+    ttl_extension: u32,
+) -> StorageRentEstimate {
+    let entry_bytes = payload_bytes.saturating_add(ENTRY_OVERHEAD_BYTES);
+
+    let (projected_entries, projected_bytes) = match operation {
+        ContractOperation::CreateRecord => (1u32, entry_bytes),
+        ContractOperation::UpdateRecord => (1u32, entry_bytes),
+        ContractOperation::AppendEntry => (1u32, entry_bytes),
+        ContractOperation::RemoveEntry => {
+            // Removal touches the entry but frees its bytes.
+            (1u32, 0u32)
+        }
+    };
+
+    let ttl_impact = if ttl_extension == 0 {
+        DEFAULT_TTL_EXTENSION
+    } else {
+        ttl_extension
+    };
+
+    let projected_rent = (projected_bytes as i128)
+        .saturating_mul(RENT_PER_BYTE_PER_LEDGER)
+        .saturating_mul(ttl_impact as i128);
+
+    let total_entries = existing_entries.saturating_add(projected_entries);
+    let within_limits = total_entries <= MAX_ENTRIES_PER_OPERATION
+        && projected_bytes <= MAX_BYTES_PER_OPERATION;
+
+    StorageRentEstimate {
+        projected_entries,
+        projected_bytes,
+        ttl_impact,
+        projected_rent,
+        within_limits,
+    }
+}
+
+// ============================================================================
+// Performance Metrics Calculation
+// ============================================================================
+
+/// Calculate win rate percentage (0-10000 for 0.00% - 100.00%)
+pub fn calculate_win_rate(successful: u32, total: u32) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    ((successful as u64 * 10000) / total as u64) as u32
+}
+
+/// Calculate profit factor (total profit / total loss * 100)
+pub fn calculate_profit_factor(total_profit: i128, total_loss: i128) -> u32 {
+    if total_loss == 0 {
+        if total_profit > 0 {
+            return u32::MAX;
+        }
+        return 0;
+    }
+    ((total_profit as u64 * 100) / total_loss as u64) as u32
+}

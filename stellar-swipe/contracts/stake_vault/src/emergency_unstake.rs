@@ -296,6 +296,10 @@ fn execute_early_unstake(
         return Err(StakeVaultError::NoStake);
     }
 
+    // Issue #1123: provider lockups gate the emergency path too, so a slash or
+    // reward lockup cannot be bypassed by routing through emergency unstake.
+    crate::require_lockup_released(env, staker)?;
+
     let gross = info.balance;
     // Issue #978: checked/saturating bps math — `apply_multiplier_bps` never
     // overflow-panics on a pathologically large `gross`; the immediately

@@ -15,7 +15,7 @@ mod history;
 mod multi_hop;
 mod observation;
 mod price_cb;
-mod quorum;
+pub mod quorum;
 mod reputation;
 mod sdex;
 // Closes #670 — per-asset update frequency SLA monitoring
@@ -843,35 +843,132 @@ impl OracleContract {
             .instance()
             .get(&StorageKey::MinSourceCount)
             .unwrap_or(0);
-        if min_count > 0 && fresh_prices.len() < min_count {
-            return Err(OracleError::InsufficientSources);
-        }
 
-        // 2. Median Aggregation
-        // Sort by price
-        let mut sorted = fresh_prices;
-        let len = sorted.len();
-        for i in 0..len {
-            for j in 0..(len - i - 1) {
-                if sorted.get(j).unwrap().price > sorted.get(j + 1).unwrap().price {
-                    let temp = sorted.get(j).unwrap();
-                    sorted.set(j, sorted.get(j + 1).unwrap());
-                    sorted.set(j + 1, temp);
+        // Issue #1122: the configured fallback quorum for this pair. When it is
+        // empty the historical primary-only path below is used unchanged.
+        let fallback: quorum::QuorumFallback = env
+            .storage()
+            .instance()
+            .get(&StorageKey::QuorumFallback(pair.clone()))
+            .unwrap_or(quorum::QuorumFallback {
+                members: Vec::new(&env),
+                min_sources: 1,
+            });
+
+        if fallback.members.is_empty() {
+            if min_count > 0 && fresh_prices.len() < min_count {
+                return Err(OracleError::InsufficientSources);
+            }
+
+            // 2. Median Aggregation
+            // Sort by price
+            let mut sorted = fresh_prices;
+            let len = sorted.len();
+            for i in 0..len {
+                for j in 0..(len - i - 1) {
+                    if sorted.get(j).unwrap().price > sorted.get(j + 1).unwrap().price {
+                        let temp = sorted.get(j).unwrap();
+                        sorted.set(j, sorted.get(j + 1).unwrap());
+                        sorted.set(j + 1, temp);
+                    }
                 }
             }
+
+            let median_data = sorted.get(len / 2).unwrap();
+
+            // 3. Check for 10% deviation (Edge Case)
+            let min_p = sorted.get(0).unwrap().price;
+            let max_p = sorted.get(len - 1).unwrap().price;
+            if (max_p - min_p) * 100 / min_p > 10 {
+                // Price sources disagree by > 10%
+                return Err(OracleError::UnreliablePrice);
+            }
+
+            return Ok((median_data.price, median_data.confidence));
         }
 
-        let median_data = sorted.get(len / 2).unwrap();
+        // ── Issue #1122: explicit quorum state machine ────────────────────────
+        // The preferred quorum is the set of sources that submitted a fresh
+        // quote; the fallback set is consulted when the preferred quorum loses
+        // members or returns conflicting observations. The accepted price, the
+        // resulting state and the reason are preserved so recovery back to the
+        // primary quorum is observable.
+        let config = quorum::QuorumConfig {
+            min_quorum: if min_count == 0 { 1 } else { min_count },
+            max_deviation_bps: quorum::DEFAULT_MAX_DEVIATION_BPS,
+        };
 
-        // 3. Check for 10% deviation (Edge Case)
-        let min_p = sorted.get(0).unwrap().price;
-        let max_p = sorted.get(len - 1).unwrap().price;
-        if (max_p - min_p) * 100 / min_p > 10 {
-            // Price sources disagree by > 10%
-            return Err(OracleError::UnreliablePrice);
+        let mut observations: Vec<quorum::Observation> = Vec::new(&env);
+        let mut authorized: Vec<Address> = Vec::new(&env);
+        for p in fresh_prices.iter() {
+            if !authorized.contains(&p.source) {
+                authorized.push_back(p.source.clone());
+            }
+            observations.push_back(quorum::Observation {
+                provider: p.source.clone(),
+                price: p.price,
+                sequence: p.ledger_sequence,
+                timestamp: p.timestamp,
+            });
         }
 
-        Ok((median_data.price, median_data.confidence))
+        let pair_code = pair.base.code.clone();
+        let previous = Self::get_quorum_state(env.clone(), pair.clone());
+        match quorum::validate_quorum_with_fallback(
+            &env,
+            &observations,
+            &authorized,
+            &config,
+            &fallback,
+        ) {
+            Ok(outcome) => {
+                Self::cache_quorum_state(&env, &pair, outcome.state);
+                if outcome.state != previous {
+                    events::emit_quorum_state_changed(
+                        &env,
+                        pair_code.clone(),
+                        previous,
+                        outcome.state,
+                        outcome.reason,
+                    );
+                }
+                if outcome.state == quorum::QuorumState::Degraded {
+                    events::emit_quorum_fallback_used(
+                        &env,
+                        pair_code,
+                        outcome.price,
+                        outcome.num_sources,
+                        outcome.reason,
+                    );
+                }
+
+                let mut confidence = 0u32;
+                for p in fresh_prices.iter() {
+                    if p.price == outcome.price {
+                        confidence = p.confidence;
+                        break;
+                    }
+                }
+                Ok((outcome.price, confidence))
+            }
+            Err(err) => {
+                let (state, reason) = match err {
+                    OracleError::ConflictingObservations => (
+                        quorum::QuorumState::Conflicting,
+                        quorum::QuorumReason::UnresolvedConflict,
+                    ),
+                    _ => (
+                        quorum::QuorumState::Depleted,
+                        quorum::QuorumReason::NoMembers,
+                    ),
+                };
+                Self::cache_quorum_state(&env, &pair, state);
+                if state != previous {
+                    events::emit_quorum_state_changed(&env, pair_code, previous, state, reason);
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Set the minimum number of independent fresh sources required before a
@@ -902,6 +999,53 @@ impl OracleContract {
             .instance()
             .get(&StorageKey::MinSourceCount)
             .unwrap_or(0)
+    }
+
+    /// Issue #1122: configure the ordered fallback quorum for `pair`.
+    ///
+    /// `members` is the secondary set consulted, in order, when the preferred
+    /// quorum cannot produce an acceptable price. `min_sources` is clamped to
+    /// at least one and must not exceed the number of members. Admin only.
+    pub fn set_quorum_fallback(
+        env: Env,
+        admin: Address,
+        pair: AssetPair,
+        members: Vec<Address>,
+        min_sources: u32,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        let min_sources = core::cmp::max(min_sources, 1);
+        if members.is_empty() || min_sources > members.len() {
+            return Err(OracleError::InsufficientOracles);
+        }
+
+        env.storage().instance().set(
+            &StorageKey::QuorumFallback(pair),
+            &quorum::QuorumFallback {
+                members,
+                min_sources,
+            },
+        );
+        Ok(())
+    }
+
+    /// Issue #1122: last observed quorum state for `pair`.
+    ///
+    /// Defaults to [`quorum::QuorumState::Primary`] until a read observes a
+    /// degraded, conflicting, or depleted quorum.
+    pub fn get_quorum_state(env: Env, pair: AssetPair) -> quorum::QuorumState {
+        env.storage()
+            .instance()
+            .get(&StorageKey::QuorumStateCache(pair))
+            .unwrap_or(quorum::QuorumState::Primary)
+    }
+
+    fn cache_quorum_state(env: &Env, pair: &AssetPair, state: quorum::QuorumState) {
+        env.storage()
+            .instance()
+            .set(&StorageKey::QuorumStateCache(pair.clone()), &state);
     }
 
     /// Set the minimum confidence (0-100) required for a submitted quote to be

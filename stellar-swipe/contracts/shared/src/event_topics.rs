@@ -80,6 +80,8 @@ pub const TOPIC_STAKE_EMERGENCY_EXPIRED: fn() -> Symbol = || Symbol::short("emge
 pub const TOPIC_STAKE_EMERGENCY_EXECUTED: fn() -> Symbol = || Symbol::short("emgexec");
 pub const TOPIC_STAKE_LOCK_MULTIPLIER: fn() -> Symbol = || Symbol::short("lockmult");
 pub const TOPIC_STAKE_SLASH_COOLDOWN: fn() -> Symbol = || Symbol::short("slhcoold");
+pub const TOPIC_STAKE_LOCKUP_CREATED: fn() -> Symbol = || Symbol::short("lkpcreat");
+pub const TOPIC_STAKE_LOCKUP_RELEASED: fn() -> Symbol = || Symbol::short("lkprelea");
 
 // ── Reward vault sub-topics (#1020, #1022) ────────────────────────────────────
 pub const TOPIC_REWARD_CLAIMED: fn() -> Symbol = || Symbol::short("rwdclaim");
@@ -180,6 +182,8 @@ mod tests {
         let _ = TOPIC_STAKE_EMERGENCY_EXECUTED();
         let _ = TOPIC_STAKE_LOCK_MULTIPLIER();
         let _ = TOPIC_STAKE_SLASH_COOLDOWN();
+        let _ = TOPIC_STAKE_LOCKUP_CREATED();
+        let _ = TOPIC_STAKE_LOCKUP_RELEASED();
         let _ = TOPIC_REWARD_CLAIMED();
         let _ = TOPIC_REWARD_BATCH_CLAIMED();
         let _ = TOPIC_REWARD_DEPOSITED();

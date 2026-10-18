@@ -128,6 +128,97 @@ pub(crate) fn apply_multiplier_bps(balance: i128, bps: u32) -> i128 {
 /// Temporary-storage key for the reentrancy lock on `withdraw_stake`.
 const EXECUTION_LOCK: &str = "WithdrawLock";
 
+// ── Issue #1123: provider stake lockup schedule ───────────────────────────────
+
+/// Default lockup applied to a provider after a slash or reward event, in
+/// ledgers. ~8 minutes on Stellar mainnet (~5 s per ledger).
+const DEFAULT_PROVIDER_LOCKUP_LEDGERS: u32 = 100;
+
+/// Upper bound on an admin-configured provider lockup (in ledgers).
+const MAX_PROVIDER_LOCKUP_LEDGERS: u32 = 1_000_000;
+
+/// A lockup window during which a provider's stake cannot be withdrawn,
+/// set when the provider is slashed or receives a reward (Issue #1123).
+///
+/// Bounds are inclusive: the lockup blocks withdrawals while the current
+/// ledger sequence is `<= end_ledger` and allows them from `end_ledger + 1`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderLockup {
+    /// Ledger sequence at which the lockup began.
+    pub start_ledger: u32,
+    /// Ledger sequence through which withdrawals remain blocked.
+    pub end_ledger: u32,
+}
+
+/// Length (in ledgers) of the default provider lockup.
+fn default_lockup_ledgers(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&StorageKey::DefaultProviderLockupLedgers)
+        .unwrap_or(DEFAULT_PROVIDER_LOCKUP_LEDGERS)
+}
+
+/// Read the provider's current lockup window, if any.
+pub(crate) fn read_provider_lockup(env: &Env, provider: &Address) -> Option<ProviderLockup> {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::ProviderLockup(provider.clone()))
+}
+
+/// Apply (or extend) a provider lockup of `lockup_ledgers` ledgers starting at
+/// the current ledger. Extending an existing, unexpired window keeps its
+/// original start and pushes the end out to the later of the two (Issue #1123).
+///
+/// A zero-length lockup is a no-op. Emits `lockup_created` whenever the window
+/// is written.
+fn lock_provider(env: &Env, provider: &Address, lockup_ledgers: u32) {
+    if lockup_ledgers == 0 {
+        return;
+    }
+
+    let now = env.ledger().sequence();
+    let end = now.saturating_add(lockup_ledgers);
+
+    let lockup = match read_provider_lockup(env, provider) {
+        Some(existing) if existing.end_ledger >= now => ProviderLockup {
+            start_ledger: existing.start_ledger,
+            end_ledger: core::cmp::max(existing.end_ledger, end),
+        },
+        _ => ProviderLockup {
+            start_ledger: now,
+            end_ledger: end,
+        },
+    };
+
+    env.storage()
+        .persistent()
+        .set(&StorageKey::ProviderLockup(provider.clone()), &lockup);
+    events::emit_lockup_created(env, provider.clone(), lockup.start_ledger, lockup.end_ledger);
+}
+
+/// Reject a stake-decreasing operation while `provider`'s lockup is active.
+///
+/// Once the window has elapsed the entry is cleared and a `lockup_released`
+/// event is emitted, so release is observable from the first withdrawal that
+/// succeeds after the boundary.
+pub(crate) fn require_lockup_released(
+    env: &Env,
+    provider: &Address,
+) -> Result<(), StakeVaultError> {
+    if let Some(lockup) = read_provider_lockup(env, provider) {
+        let now = env.ledger().sequence();
+        if now <= lockup.end_ledger {
+            return Err(StakeVaultError::StakeLocked);
+        }
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::ProviderLockup(provider.clone()));
+        events::emit_lockup_released(env, provider.clone(), lockup.end_ledger, now);
+    }
+    Ok(())
+}
+
 /// 24 hours in seconds — grace period for providers to top up stake.
 const GRACE_PERIOD_SECS: u64 = 86_400;
 
@@ -292,6 +383,13 @@ pub enum StorageKey {
     /// Issue #865: central governance contract address authorized to call
     /// `apply_governance_pause`.
     GovernanceAddress,
+    // ── Issue #1123: provider stake lockup schedule ──────────────────────────
+    /// Lockup window currently applied to a provider after a slash or reward
+    /// event. Blocks stake-decreasing withdrawals until it elapses.
+    ProviderLockup(Address),
+    /// Admin-configurable default lockup length (in ledgers) applied when a
+    /// provider is locked.
+    DefaultProviderLockupLedgers,
 }
 
 #[contracterror]
@@ -1740,6 +1838,10 @@ impl StakeVaultContract {
             return Err(StakeVaultError::StakeLocked);
         }
 
+        // Issue #1123: slash/reward lockups gate every withdrawal path. The
+        // window is cleared (and a release event emitted) once it has elapsed.
+        require_lockup_released(env, staker)?;
+
         // ── Flash loan detection: same-ledger stake + unstake ─────────────────
         let current_ledger = env.ledger().sequence();
         let last_stake_ledger = env
@@ -1923,6 +2025,9 @@ impl StakeVaultContract {
         if now < info.locked_until {
             return Err(StakeVaultError::StakeLocked);
         }
+
+        // Issue #1123: slash/reward lockups gate partial withdrawals too.
+        require_lockup_released(env, staker)?;
 
         // Flash loan detection: same-ledger stake + unstake.
         let current_ledger = env.ledger().sequence();
@@ -2358,6 +2463,10 @@ impl StakeVaultContract {
             slash_id,
             reason,
         );
+
+        // Issue #1123: lock the provider's stake so it cannot be withdrawn (or
+        // recycled through a restake) to dodge this slash's consequences.
+        lock_provider(env, &provider, default_lockup_ledgers(env));
 
         Ok(slash_amount)
     }
@@ -2874,6 +2983,48 @@ impl StakeVaultContract {
             .unwrap_or(DEFAULT_MAX_UNSTAKE_QUEUE_SIZE)
     }
 
+    // ── Issue #1123: provider stake lockup schedule ────────────────────────────
+
+    /// Admin-only: set the default lockup (in ledgers) applied to a provider
+    /// when it is slashed or receives a reward. `0` disables lockups.
+    pub fn set_default_provider_lockup(env: Env, ledgers: u32) -> Result<(), StakeVaultError> {
+        if multisig::get_config(&env).is_some() {
+            return Err(StakeVaultError::RequiresMultisig);
+        }
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+
+        if ledgers > MAX_PROVIDER_LOCKUP_LEDGERS {
+            return Err(StakeVaultError::InvalidAmount);
+        }
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::DefaultProviderLockupLedgers, &ledgers);
+        Ok(())
+    }
+
+    /// Returns the default provider lockup length in ledgers.
+    pub fn get_default_provider_lockup(env: Env) -> u32 {
+        default_lockup_ledgers(&env)
+    }
+
+    /// Returns the provider's active lockup window, or `None` if unlocked.
+    pub fn get_provider_lockup(env: Env, provider: Address) -> Option<ProviderLockup> {
+        read_provider_lockup(&env, &provider)
+    }
+
+    /// Clears a provider's lockup once it has elapsed, emitting
+    /// `lockup_released`. Returns [`StakeVaultError::StakeLocked`] while the
+    /// window is still active, so callers can safely poll it.
+    pub fn release_provider_lockup(env: Env, provider: Address) -> Result<(), StakeVaultError> {
+        require_lockup_released(&env, &provider)
+    }
+
     /// Process up to `limit` queued unstake requests in FIFO order.
     ///
     /// Requests are processed from the queue head. A request that fails (e.g.
@@ -3012,9 +3163,19 @@ impl StakeVaultContract {
     ) -> Result<u64, StakeVaultError> {
         depositor.require_auth();
         Self::require_not_paused(&env)?;
-        Ok(reward_vault::deposit_reward(
-            &env, &depositor, provider, asset, amount, epoch,
-        )?)
+        let bucket_id = reward_vault::deposit_reward(&env, &depositor, provider.clone(), asset, amount, epoch)
+            .map_err(|e| match e {
+                reward_vault::RewardVaultError::UnsupportedAsset => StakeVaultError::Unauthorized,
+                reward_vault::RewardVaultError::InvalidAmount => StakeVaultError::InvalidAmount,
+                reward_vault::RewardVaultError::BatchSizeInvalid => {
+                    StakeVaultError::BatchSizeInvalid
+                }
+            })?;
+
+        // Issue #1123: a reward event locks the provider's stake briefly so it
+        // cannot be withdrawn around the reward.
+        lock_provider(&env, &provider, default_lockup_ledgers(&env));
+        Ok(bucket_id)
     }
 
     /// Provider: claim rewards from a batch of bucket IDs in a single call.
@@ -3030,9 +3191,14 @@ impl StakeVaultContract {
     ) -> Result<Vec<(Address, i128)>, StakeVaultError> {
         provider.require_auth();
         Self::require_not_paused(&env)?;
-        Ok(reward_vault::batch_claim_rewards(
-            &env, &provider, bucket_ids,
-        )?)
+        let totals = reward_vault::batch_claim_rewards(&env, &provider, bucket_ids).map_err(|e| match e {
+            reward_vault::RewardVaultError::BatchSizeInvalid => StakeVaultError::BatchSizeInvalid,
+            _ => StakeVaultError::InvalidAmount,
+        })?;
+
+        // Issue #1123: claiming rewards locks the provider's stake briefly.
+        lock_provider(&env, &provider, default_lockup_ledgers(&env));
+        Ok(totals)
     }
 
     /// Returns the claimable reward balance for `provider` in `asset`.
@@ -3119,6 +3285,9 @@ impl StakeVaultContract {
             &amount,
         ))
         .map_err(StakeVaultError::from)?;
+
+        // Issue #1123: a reward claim locks the recipient's stake briefly.
+        lock_provider(&env, &recipient, default_lockup_ledgers(&env));
         Ok(amount)
     }
 
@@ -3285,3 +3454,6 @@ mod tests;
 
 #[cfg(test)]
 mod tests_emergency;
+
+#[cfg(test)]
+mod test_lockup;
