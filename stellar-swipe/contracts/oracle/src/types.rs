@@ -60,6 +60,12 @@ pub enum StorageKey {
     /// Issue #865: central governance contract address authorized to call
     /// `apply_governance_pause`.
     GovernanceAddress,
+    /// Issue #1122: ordered fallback quorum set for an asset pair, used when
+    /// the preferred quorum loses members or returns conflicting observations.
+    QuorumFallback(AssetPair),
+    /// Issue #1122: last observed quorum state for an asset pair, so recovery
+    /// back to the primary quorum can be reported deterministically.
+    QuorumStateCache(AssetPair),
 }
 
 #[contracttype]

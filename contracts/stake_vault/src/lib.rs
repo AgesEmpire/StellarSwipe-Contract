@@ -3,8 +3,27 @@
 //! Holds delegated stake per provider and enforces a per-provider
 //! concentration limit so that no single provider can accumulate an
 //! unbounded share of the total delegated stake.
+//!
+//! ## Address validation (issue #1171)
+//!
+//! Every state-changing entrypoint rejects sentinel addresses — the all-zero
+//! account ([`ZERO_ACCOUNT_STRKEY`]), the all-zero contract
+//! ([`ZERO_CONTRACT_STRKEY`]), and the vault's own address — with
+//! [`VaultError::InvalidAddress`] before any authorization check or storage
+//! write. Read-only queries never fail on a sentinel; they report the empty
+//! position because no sentinel can ever hold stake. The full inventory is in
+//! `docs/address_validation_audit.md`.
+
+#![no_std]
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
+
+/// Issue #1171: strkey of the account whose ed25519 public key is all zero
+/// bytes. It has no usable signer and is the conventional "zero address".
+pub const ZERO_ACCOUNT_STRKEY: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+/// Issue #1171: strkey of the contract whose 32-byte id is all zero bytes.
+pub const ZERO_CONTRACT_STRKEY: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
 
 /// Storage keys used by the stake vault.
 #[contracttype]
@@ -43,6 +62,9 @@ pub enum VaultError {
     /// An arithmetic operation on stake totals or the concentration comparison
     /// overflowed its representable range. No state was mutated.
     ArithmeticOverflow = 7,
+    /// Issue #1171: an address argument is a sentinel (all-zero account,
+    /// all-zero contract, or this contract). Shared code across contracts.
+    InvalidAddress = 100,
 }
 
 /// Auditable event emitted when the emergency pause state changes (issue #1266).
@@ -78,6 +100,7 @@ impl StakeVault {
     ///
     /// `max_provider_share_bps` must be in `1..=10_000`.
     pub fn initialize(env: Env, admin: Address, max_provider_share_bps: u32) -> Result<(), VaultError> {
+        Self::require_valid_address(&env, &admin)?;
         if max_provider_share_bps == 0 || max_provider_share_bps > 10_000 {
             return Err(VaultError::InvalidShare);
         }
@@ -145,6 +168,7 @@ impl StakeVault {
     /// if the resulting provider share would exceed the configured limit the
     /// call fails and no balances change.
     pub fn delegate(env: Env, provider: Address, amount: i128) -> Result<(), VaultError> {
+        Self::require_valid_address(&env, &provider)?;
         if amount <= 0 {
             return Err(VaultError::InvalidAmount);
         }
@@ -209,6 +233,7 @@ impl StakeVault {
     /// Withdrawals always reduce concentration and are therefore never
     /// blocked by the limit; they may free capacity for further delegations.
     pub fn withdraw(env: Env, provider: Address, amount: i128) -> Result<(), VaultError> {
+        Self::require_valid_address(&env, &provider)?;
         if amount <= 0 {
             return Err(VaultError::InvalidAmount);
         }
@@ -319,7 +344,21 @@ impl StakeVault {
             .ok_or(VaultError::ArithmeticOverflow)?;
         Ok(left <= right)
     }
+
+    /// Issue #1171: reject sentinel addresses with a stable error.
+    fn require_valid_address(env: &Env, address: &Address) -> Result<(), VaultError> {
+        if *address == env.current_contract_address()
+            || *address == Address::from_str(env, ZERO_ACCOUNT_STRKEY)
+            || *address == Address::from_str(env, ZERO_CONTRACT_STRKEY)
+        {
+            return Err(VaultError::InvalidAddress);
+        }
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+extern crate std;
 
 #[cfg(test)]
 mod test {
@@ -338,42 +377,55 @@ mod test {
         (env, client, admin, provider)
     }
 
+    /// Seed the vault with stake on a second provider so a 50% limit can be
+    /// exercised: a lone provider always holds 100% of the total.
+    fn seed_other_provider(env: &Env, client: &StakeVaultClient, amount: i128) -> Address {
+        let other = Address::generate(env);
+        client.set_max_provider_share_bps(&10_000);
+        client.delegate(&other, &amount);
+        client.set_max_provider_share_bps(&5_000);
+        other
+    }
+
     #[test]
     fn delegate_at_exact_limit_is_allowed() {
         // 50% limit: delegating 500 out of a resulting total of 1000 is exact.
-        let (_env, client, _admin, provider) = setup(5_000);
+        let (env, client, _admin, provider) = setup(5_000);
+        seed_other_provider(&env, &client, 500);
         client.delegate(&provider, &500);
         assert_eq!(client.provider_stake(&provider), 500);
-        assert_eq!(client.total_stake(), 500);
+        assert_eq!(client.total_stake(), 1_000);
     }
 
     #[test]
     fn delegate_over_limit_is_rejected_without_state_change() {
-        let (_env, client, _admin, provider) = setup(5_000);
-        // First delegation is fine (100% of total).
+        let (env, client, _admin, provider) = setup(5_000);
+        seed_other_provider(&env, &client, 500);
+        // First delegation is fine (500/1000 = 50%).
         client.delegate(&provider, &500);
-        // Second delegation would make the provider 1000/1000 = 100% > 50%.
+        // Second delegation would make the provider 1000/1500 = 66% > 50%.
         let result = client.try_delegate(&provider, &500);
         assert_eq!(result, Err(Ok(VaultError::ConcentrationLimitExceeded)));
         // State is unchanged because the check runs before mutation.
         assert_eq!(client.provider_stake(&provider), 500);
-        assert_eq!(client.total_stake(), 500);
+        assert_eq!(client.total_stake(), 1_000);
     }
 
     #[test]
     fn withdrawal_reduces_concentration_and_frees_capacity() {
-        let (_env, client, _admin, provider) = setup(5_000);
+        let (env, client, _admin, provider) = setup(5_000);
+        seed_other_provider(&env, &client, 500);
         client.delegate(&provider, &500);
         // Over-limit delegation is rejected.
         assert!(client.try_delegate(&provider, &500).is_err());
         // Withdrawing reduces concentration.
         client.withdraw(&provider, &250);
         assert_eq!(client.provider_stake(&provider), 250);
-        assert_eq!(client.total_stake(), 250);
+        assert_eq!(client.total_stake(), 750);
         // Capacity is freed: the provider can delegate again up to the limit.
         client.delegate(&provider, &250);
         assert_eq!(client.provider_stake(&provider), 500);
-        assert_eq!(client.total_stake(), 500);
+        assert_eq!(client.total_stake(), 1_000);
     }
 
     #[test]
@@ -683,5 +735,59 @@ mod test {
             "rejected delegation must not emit a stake event"
         );
     }
+
+    // ── Issue #1171: address validation ────────────────────────────────────
+
+    fn sentinels(env: &Env, client: &StakeVaultClient) -> [Address; 3] {
+        [
+            Address::from_str(env, ZERO_ACCOUNT_STRKEY),
+            Address::from_str(env, ZERO_CONTRACT_STRKEY),
+            client.address.clone(),
+        ]
+    }
+
+    #[test]
+    fn initialize_rejects_sentinel_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, StakeVault);
+        let client = StakeVaultClient::new(&env, &contract_id);
+
+        for sentinel in sentinels(&env, &client) {
+            assert_eq!(
+                client.try_initialize(&sentinel, &10_000),
+                Err(Ok(VaultError::InvalidAddress))
+            );
+        }
+        // Nothing was stored, so a valid admin can still initialize.
+        client.initialize(&Address::generate(&env), &10_000);
+    }
+
+    #[test]
+    fn stake_entrypoints_reject_sentinel_providers_without_state_change() {
+        let (env, client, _admin, provider) = setup(10_000);
+        client.delegate(&provider, &500);
+
+        let no_stake_event = |env: &Env| {
+            !env.events().all().iter().any(|(_, _, data)| {
+                StakeChangedEvent::try_from_val(env, &data).is_ok()
+            })
+        };
+        for sentinel in sentinels(&env, &client) {
+            assert_eq!(
+                client.try_delegate(&sentinel, &100),
+                Err(Ok(VaultError::InvalidAddress))
+            );
+            assert!(no_stake_event(&env));
+            assert_eq!(
+                client.try_withdraw(&sentinel, &100),
+                Err(Ok(VaultError::InvalidAddress))
+            );
+            assert!(no_stake_event(&env));
+            // Read-only queries report the empty position instead of failing.
+            assert_eq!(client.provider_stake(&sentinel), 0);
+        }
+        assert_eq!(client.total_stake(), 500);
+        assert_eq!(client.provider_stake(&provider), 500);
     }
 }
