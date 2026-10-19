@@ -86,6 +86,12 @@ pub enum BridgeError {
     /// Serialized message size (payload plus route header) exceeds
     /// `messaging::MAX_MESSAGE_SIZE` (Issue #1126).
     MessageTooLarge = 32,
+    /// A liquidity pool was requested with the same asset on both sides
+    /// (Issue #1313).
+    IdenticalPoolAssets = 33,
+    /// A liquidity pool already exists for this unordered asset pair, in
+    /// either order (Issue #1313).
+    PoolAlreadyExists = 34,
 }
 
 impl BridgeError {
@@ -181,6 +187,12 @@ impl BridgeError {
             }
             BridgeError::MessageTooLarge => {
                 "serialized message size exceeds the configured byte limit"
+            }
+            BridgeError::IdenticalPoolAssets => {
+                "liquidity pool assets must be two different identifiers"
+            }
+            BridgeError::PoolAlreadyExists => {
+                "a liquidity pool already exists for this asset pair, in either order"
             }
         }
     }
@@ -969,6 +981,12 @@ impl BridgeContract {
 
     pub fn get_pool(env: Env, pool_id: u64) -> Result<LiquidityPool, BridgeError> {
         liquidity::get_pool(&env, pool_id)
+    }
+
+    /// Pool id for the unordered pair `{asset_a, asset_b}`, if one exists
+    /// (Issue #1313). Argument order does not matter.
+    pub fn get_pool_id_for_pair(env: Env, asset_a: String, asset_b: String) -> Option<u64> {
+        liquidity::find_pool_for_pair(&env, asset_a, asset_b)
     }
 
     pub fn get_liquidity_position(env: Env, provider: Address, pool_id: u64) -> LiquidityPosition {
@@ -1760,6 +1778,71 @@ mod test {
             18,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn liquidity_pool_pair_is_unique_regardless_of_order() {
+        let (env, contract_id, admin, validators) = setup();
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+            BridgeContract::register_wrapped_asset(
+                env.clone(),
+                admin.clone(),
+                ChainId::Ethereum,
+                String::from_str(&env, "USDC"),
+                String::from_str(&env, "wUSDC"),
+                6,
+            )
+            .unwrap();
+            let weth = String::from_str(&env, "wETH");
+            let wusdc = String::from_str(&env, "wUSDC");
+
+            let pool_id = BridgeContract::create_liquidity_pool(
+                env.clone(),
+                admin.clone(),
+                wusdc.clone(),
+                weth.clone(),
+                PoolType::ConstantProduct,
+                30,
+                0,
+            )
+            .unwrap();
+            let pool = BridgeContract::get_pool(env.clone(), pool_id).unwrap();
+            assert_eq!((pool.asset_a, pool.asset_b), (weth.clone(), wusdc.clone()));
+            assert_eq!(
+                BridgeContract::get_pool_id_for_pair(env.clone(), weth.clone(), wusdc.clone()),
+                Some(pool_id)
+            );
+            assert_eq!(
+                BridgeContract::get_pool_id_for_pair(env.clone(), wusdc.clone(), weth.clone()),
+                Some(pool_id)
+            );
+
+            assert_eq!(
+                BridgeContract::create_liquidity_pool(
+                    env.clone(),
+                    admin.clone(),
+                    weth.clone(),
+                    wusdc.clone(),
+                    PoolType::ConstantProduct,
+                    30,
+                    0,
+                ),
+                Err(BridgeError::PoolAlreadyExists)
+            );
+            assert_eq!(
+                BridgeContract::create_liquidity_pool(
+                    env.clone(),
+                    admin.clone(),
+                    weth.clone(),
+                    weth.clone(),
+                    PoolType::ConstantProduct,
+                    30,
+                    0,
+                ),
+                Err(BridgeError::IdenticalPoolAssets)
+            );
+        });
     }
 
     #[test]

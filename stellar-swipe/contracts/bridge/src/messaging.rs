@@ -603,19 +603,22 @@ mod tests {
         let (env, contract_id, sender, _) = setup();
         env.as_contract(&contract_id, || {
             let header = target(&env).len();
-            let payload = zero_payload(&env, MAX_MESSAGE_SIZE - header + 1);
+            let oversized = zero_payload(&env, MAX_MESSAGE_SIZE - header + 1);
             let rejected = send_cross_chain_message(
                 &env,
                 sender.clone(),
                 ChainId::Ethereum,
                 target(&env),
-                payload,
+                oversized,
                 100_000,
                 false,
             );
             assert_eq!(rejected, Err(BridgeError::MessageTooLarge));
+        });
 
-            // The rejected send consumed neither the message id nor the nonce.
+        // The rejected send consumed neither the message id nor the nonce.
+        // A fresh frame is needed because `sender` already authorized this one.
+        env.as_contract(&contract_id, || {
             let id = send_cross_chain_message(
                 &env,
                 sender,

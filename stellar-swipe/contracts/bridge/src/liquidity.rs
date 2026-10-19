@@ -1,3 +1,5 @@
+use core::cmp::Ordering;
+
 use shared::safe_math::checked_mul_div_floor;
 use soroban_sdk::{contracttype, Address, Env};
 use stellar_swipe_common::BASIS_POINTS_DENOMINATOR_I128;
@@ -59,8 +61,59 @@ enum LiquidityKey {
     PoolCounter,
     Pool(u64),
     Position(Address, u64),
+    /// Canonical `(asset_a, asset_b)` pair -> pool id (Issue #1313).
+    PoolByPair(soroban_sdk::String, soroban_sdk::String),
 }
 
+/// Returns `(asset_a, asset_b)` in canonical order (Issue #1313).
+///
+/// **Rule:** the asset identifier that sorts first in ascending
+/// lexicographic order of its raw bytes becomes `asset_a`. This is the
+/// ordering Soroban defines for `String`, so it is deterministic across hosts
+/// and SDK versions. Comparison is exact and case-sensitive: identifiers are
+/// not trimmed or case-folded, so `"wETH"` and `"weth"` are different assets.
+///
+/// Either input order yields the same result, so one unordered pair maps to
+/// exactly one canonical key. Identical identifiers are rejected with
+/// [`BridgeError::IdenticalPoolAssets`].
+pub fn canonical_pair(
+    asset_a: soroban_sdk::String,
+    asset_b: soroban_sdk::String,
+) -> Result<(soroban_sdk::String, soroban_sdk::String), BridgeError> {
+    match asset_a.cmp(&asset_b) {
+        Ordering::Less => Ok((asset_a, asset_b)),
+        Ordering::Greater => Ok((asset_b, asset_a)),
+        Ordering::Equal => Err(BridgeError::IdenticalPoolAssets),
+    }
+}
+
+/// Pool id registered for the unordered pair `{asset_a, asset_b}`, if any.
+///
+/// Input order does not matter. Returns `None` for identical identifiers,
+/// which can never form a pool.
+pub fn find_pool_for_pair(
+    env: &Env,
+    asset_a: soroban_sdk::String,
+    asset_b: soroban_sdk::String,
+) -> Option<u64> {
+    let (asset_a, asset_b) = canonical_pair(asset_a, asset_b).ok()?;
+    env.storage()
+        .persistent()
+        .get(&LiquidityKey::PoolByPair(asset_a, asset_b))
+}
+
+/// Creates a pool for the unordered pair `{asset_a, asset_b}`.
+///
+/// The assets are stored in canonical order (see [`canonical_pair`]), so
+/// the stored `asset_a`/`asset_b` and the `amount_a`/`amount_b` arguments of
+/// [`add_liquidity`] follow that order rather than the caller's argument
+/// order.
+///
+/// # Errors
+///
+/// - [`BridgeError::IdenticalPoolAssets`] — both identifiers are equal.
+/// - [`BridgeError::PoolAlreadyExists`] — a pool for the same pair exists,
+///   in either order.
 pub fn create_pool(
     env: &Env,
     asset_a: soroban_sdk::String,
@@ -69,8 +122,10 @@ pub fn create_pool(
     fee_bps: u32,
     reward_bps: u32,
 ) -> Result<u64, BridgeError> {
-    if asset_a == asset_b {
-        return Err(BridgeError::InvalidOperation);
+    let (asset_a, asset_b) = canonical_pair(asset_a, asset_b)?;
+    let pair_key = LiquidityKey::PoolByPair(asset_a.clone(), asset_b.clone());
+    if env.storage().persistent().has(&pair_key) {
+        return Err(BridgeError::PoolAlreadyExists);
     }
 
     let pool_id = next_pool_id(env);
@@ -90,6 +145,7 @@ pub fn create_pool(
     env.storage()
         .persistent()
         .set(&LiquidityKey::Pool(pool_id), &pool);
+    env.storage().persistent().set(&pair_key, &pool_id);
     Ok(pool_id)
 }
 
@@ -434,7 +490,7 @@ fn integer_sqrt(value: i128) -> i128 {
 
     let n = value as u128;
     let bits = 128 - n.leading_zeros();
-    let mut x0: u128 = 1 << ((bits + 1) / 2);
+    let mut x0: u128 = 1 << bits.div_ceil(2);
     let mut x1 = (x0 + n / x0) / 2;
     while x1 < x0 {
         x0 = x1;
@@ -703,7 +759,16 @@ mod tests {
         let splitter = Address::generate(&env);
         env.as_contract(&contract_id, || {
             let single = new_pool(&env, 0);
-            let split = new_pool(&env, 0);
+            // A second pool for the same pair is rejected (Issue #1313).
+            let split = create_pool(
+                &env,
+                soroban_sdk::String::from_str(&env, "wBTC"),
+                soroban_sdk::String::from_str(&env, "wDAI"),
+                PoolType::ConstantProduct,
+                30,
+                0,
+            )
+            .unwrap();
             add_liquidity(&env, seed.clone(), single, 1_000_003, 999_983).unwrap();
             add_liquidity(&env, seed.clone(), split, 1_000_003, 999_983).unwrap();
 
@@ -800,6 +865,182 @@ mod tests {
                 get_position(&env, provider.clone(), pool_id),
                 position_before
             );
+        });
+    }
+
+    // ── Issue #1313: canonical asset ordering at pool creation ─────────────
+
+    fn s(env: &Env, value: &str) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(env, value)
+    }
+
+    fn pool_for(env: &Env, asset_a: &str, asset_b: &str) -> Result<u64, BridgeError> {
+        create_pool(
+            env,
+            s(env, asset_a),
+            s(env, asset_b),
+            PoolType::ConstantProduct,
+            30,
+            0,
+        )
+    }
+
+    fn stored_pool_count(env: &Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&LiquidityKey::PoolCounter)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn canonical_pair_is_independent_of_input_order() {
+        let env = Env::default();
+        let cases = [
+            // (smaller, larger) by raw byte order.
+            ("wETH", "wUSDC"),
+            // A strict prefix sorts first.
+            ("wBTC", "wBTCx"),
+            // Case-sensitive: 'W' (0x57) < 'w' (0x77); no case folding.
+            ("WETH", "wETH"),
+            ("A", "B"),
+        ];
+        for (lo, hi) in cases {
+            let expected = (s(&env, lo), s(&env, hi));
+            assert_eq!(
+                canonical_pair(s(&env, lo), s(&env, hi)),
+                Ok(expected.clone())
+            );
+            assert_eq!(canonical_pair(s(&env, hi), s(&env, lo)), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn canonical_pair_rejects_identical_assets() {
+        let env = Env::default();
+        assert_eq!(
+            canonical_pair(s(&env, "wETH"), s(&env, "wETH")),
+            Err(BridgeError::IdenticalPoolAssets)
+        );
+        assert_eq!(
+            canonical_pair(s(&env, ""), s(&env, "")),
+            Err(BridgeError::IdenticalPoolAssets)
+        );
+    }
+
+    #[test]
+    fn reversed_inputs_are_stored_in_canonical_order() {
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            let pool_id = pool_for(&env, "wUSDC", "wETH").unwrap();
+            let pool = get_pool(&env, pool_id).unwrap();
+            assert_eq!(pool.asset_a, s(&env, "wETH"));
+            assert_eq!(pool.asset_b, s(&env, "wUSDC"));
+        });
+    }
+
+    #[test]
+    fn reversed_pair_cannot_create_second_pool() {
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            let pool_id = pool_for(&env, "wETH", "wUSDC").unwrap();
+            let pool_before = get_pool(&env, pool_id).unwrap();
+
+            assert_eq!(
+                pool_for(&env, "wUSDC", "wETH"),
+                Err(BridgeError::PoolAlreadyExists)
+            );
+            // The same order is a duplicate too.
+            assert_eq!(
+                pool_for(&env, "wETH", "wUSDC"),
+                Err(BridgeError::PoolAlreadyExists)
+            );
+            // Pool type and fees do not make a pair distinct.
+            assert_eq!(
+                create_pool(
+                    &env,
+                    s(&env, "wUSDC"),
+                    s(&env, "wETH"),
+                    PoolType::StableSwap,
+                    5,
+                    100,
+                ),
+                Err(BridgeError::PoolAlreadyExists)
+            );
+
+            // Rejections write nothing: no id consumed, original pool intact.
+            assert_eq!(stored_pool_count(&env), 1);
+            assert_eq!(get_pool(&env, pool_id).unwrap(), pool_before);
+            assert_eq!(
+                get_pool(&env, pool_id + 1),
+                Err(BridgeError::TransferNotFound)
+            );
+        });
+    }
+
+    #[test]
+    fn identical_assets_cannot_create_pool() {
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            assert_eq!(
+                pool_for(&env, "wETH", "wETH"),
+                Err(BridgeError::IdenticalPoolAssets)
+            );
+            assert_eq!(stored_pool_count(&env), 0);
+            assert_eq!(
+                find_pool_for_pair(&env, s(&env, "wETH"), s(&env, "wETH")),
+                None
+            );
+            // The rejected attempt did not consume pool id 1.
+            assert_eq!(pool_for(&env, "wETH", "wUSDC"), Ok(1));
+        });
+    }
+
+    #[test]
+    fn distinct_pairs_get_distinct_pools() {
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            let eth_usdc = pool_for(&env, "wETH", "wUSDC").unwrap();
+            let btc_eth = pool_for(&env, "wETH", "wBTC").unwrap();
+            let btc_usdc = pool_for(&env, "wUSDC", "wBTC").unwrap();
+            // Pairs sharing one asset, or differing only by case, are distinct.
+            let weth_upper = pool_for(&env, "WETH", "wUSDC").unwrap();
+            assert_eq!((eth_usdc, btc_eth, btc_usdc, weth_upper), (1, 2, 3, 4));
+
+            for (a, b, id) in [
+                ("wETH", "wUSDC", eth_usdc),
+                ("wBTC", "wETH", btc_eth),
+                ("wBTC", "wUSDC", btc_usdc),
+                ("WETH", "wUSDC", weth_upper),
+            ] {
+                assert_eq!(find_pool_for_pair(&env, s(&env, a), s(&env, b)), Some(id));
+                assert_eq!(find_pool_for_pair(&env, s(&env, b), s(&env, a)), Some(id));
+                let pool = get_pool(&env, id).unwrap();
+                assert_eq!((pool.asset_a, pool.asset_b), (s(&env, a), s(&env, b)));
+            }
+            assert_eq!(
+                find_pool_for_pair(&env, s(&env, "wDAI"), s(&env, "wETH")),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn swap_and_deposit_follow_canonical_order() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        let trader = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            // Created reversed, so asset_a is wETH and amount_a funds wETH.
+            let pool_id = pool_for(&env, "wUSDC", "wETH").unwrap();
+            add_liquidity(&env, provider, pool_id, 1_000, 2_000).unwrap();
+            let pool = get_pool(&env, pool_id).unwrap();
+            assert_eq!((pool.reserve_a, pool.reserve_b), (1_000, 2_000));
+
+            // Selling wETH grows reserve_a regardless of creation order.
+            swap(&env, trader, pool_id, s(&env, "wETH"), 100, 1).unwrap();
+            let pool = get_pool(&env, pool_id).unwrap();
+            assert!(pool.reserve_a > 1_000);
+            assert!(pool.reserve_b < 2_000);
         });
     }
 }
