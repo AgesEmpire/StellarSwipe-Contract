@@ -1319,11 +1319,12 @@ pub fn delegate_voting_power(
     if state
         .delegations
         .get(delegator.clone())
-        .map(|d| d.active)
+        .map(|d| crate::delegation_expiry::is_live(env, &d))
         .unwrap_or(false)
     {
         return Err(GovernanceError::InvalidCommitteeAction);
     }
+    crate::delegation_expiry::clear_expiry(env, &delegator);
 
     let power = get_staked_balance(env, &delegator);
     if power <= 0 {
@@ -1354,6 +1355,7 @@ pub fn undelegate_voting_power(env: &Env, delegator: Address) -> Result<(), Gove
         .get(delegator.clone())
         .ok_or(GovernanceError::CrossCommitteeRequestNotFound)?;
     d.active = false;
+    crate::delegation_expiry::clear_expiry(env, &delegator);
     state.delegations.set(delegator, d);
     put_delegation_state(env, &state);
     Ok(())
@@ -1364,7 +1366,7 @@ pub fn get_effective_voting_power(env: &Env, user: &Address) -> i128 {
     let own = if state
         .delegations
         .get(user.clone())
-        .map(|d| d.active)
+        .map(|d| crate::delegation_expiry::is_live(env, &d))
         .unwrap_or(false)
     {
         0
@@ -1377,7 +1379,7 @@ pub fn get_effective_voting_power(env: &Env, user: &Address) -> i128 {
     while i < state.delegators.len() {
         let delegator = state.delegators.get(i).unwrap();
         if let Some(d) = state.delegations.get(delegator) {
-            if d.active && d.delegate == *user {
+            if d.delegate == *user && crate::delegation_expiry::is_live(env, &d) {
                 delegated = delegated.saturating_add(d.delegated_power);
             }
         }
