@@ -1,30 +1,61 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, String, Vec};
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 mod admin;
 mod advanced_risk;
+#[cfg(feature = "testutils")]
+pub mod amm_bridge;
+#[cfg(not(feature = "testutils"))]
+mod amm_bridge;
+#[cfg(not(feature = "testutils"))]
 mod auth;
+#[cfg(feature = "testutils")]
+pub mod auth;
 mod conditional;
 mod correlation;
+mod daily_cap;
+mod drawdown;
 mod errors;
+mod escrow;
 mod exit_strategy;
+pub mod governance;
 mod history;
 mod iceberg;
+pub mod keeper;
+mod kyc;
+mod logging;
+mod loss_streak;
 mod multi_asset;
 mod oracle;
 mod portfolio;
 mod portfolio_insurance;
+#[cfg(not(feature = "testutils"))]
 mod positions;
+#[cfg(feature = "testutils")]
+pub mod positions;
+/// Fee-aware execution priority queue (issue #675).
+pub mod priority_queue;
+#[cfg(not(feature = "testutils"))]
 mod rate_limit;
+#[cfg(feature = "testutils")]
+pub mod rate_limit;
 mod referral;
-mod rate_limit;
 mod risk;
 mod risk_parity;
+pub mod rollback;
 mod sdex;
+pub mod signal_ordering;
+#[cfg(feature = "testutils")]
+pub mod smart_routing;
+#[cfg(not(feature = "testutils"))]
 mod smart_routing;
+#[cfg(not(feature = "testutils"))]
 mod storage;
+#[cfg(feature = "testutils")]
+pub mod storage;
 mod strategies;
 mod twap;
 
@@ -32,36 +63,29 @@ pub use errors::AutoTradeError;
 pub use risk::RiskConfig;
 
 #[cfg(feature = "testutils")]
-pub use storage::{set_signal, Signal};
+pub use auth::AuthConfig;
+#[cfg(feature = "testutils")]
+pub use storage::{authorize_user_with_limits, set_signal, Signal};
 
 use crate::storage::DataKey;
 use advanced_risk::AutoSellResult;
-feat/smart-order-routing-84
-use errors::AutoTradeError;
-use stellar_swipe_common::emergency::{CAT_TRADING, PauseState};
-use stellar_swipe_common::emergency::{PauseState, CAT_TRADING};
-
- feat/batch-copy-trade
-use stellar_swipe_common::emergency::{CAT_TRADING, PauseState};
-main
-
-use errors::AutoTradeError;
-use stellar_swipe_common::emergency::{CAT_ALL, CAT_TRADING, PauseState};
+use stellar_swipe_common::emergency::{PauseState, CAT_ALL, CAT_TRADING};
 use stellar_swipe_common::{health_uninitialized, HealthStatus};
- main
 
 use risk_parity::{AssetRisk, RebalanceTrade};
 
+pub use amm_bridge::TokenPairConfig;
 pub use iceberg::{
     cancel_iceberg_order, create_iceberg_order, get_full_order_view, get_public_order_view,
     get_user_orders, on_sdex_fill, update_iceberg_price, AssetPair, CancellationInfo,
     FullOrderView, IcebergOrder, OrderSide, OrderStatus, PublicOrderView,
 };
 pub use smart_routing::{LiquidityVenue, RouteSegment, RoutingPlan, VenueLiquidity};
+use stellar_swipe_common::amm_bridge::AmmSourceConfig;
 
-/// ==========================
-/// Types
-/// ==========================
+// ==========================
+// Types
+// ==========================
 
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,22 +121,187 @@ pub struct TradeResult {
     pub trade: Trade,
 }
 
-/// ==========================
-/// Contract
-/// ==========================
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TradeSimulation {
+    pub expected_output: i128,
+    pub fee_amount: i128,
+    pub slippage_bps: u32,
+    pub price_impact_bps: u32,
+    pub would_succeed: bool,
+    pub failure_reason: Option<String>,
+}
+
+// ==========================
+// Contract
+// ==========================
+
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct AutoTradeContract;
 
-/// ==========================
-/// Implementation
-/// ==========================
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoTradeStorageStats {
+    pub total_signals: u32,
+    pub total_positions: u32,
+    pub total_providers: u32,
+    /// Estimated rent in stroops (1 XLM = 10_000_000 stroops).
+    pub estimated_rent_xlm: i128,
+}
+
+// ==========================
+// Implementation
+// ==========================
 
 #[contractimpl]
 impl AutoTradeContract {
-    /// Initialize the contract with an admin
+    pub fn simulate_copy_trade(
+        env: Env,
+        user: Address,
+        signal_id: u64,
+        amount: i128,
+        max_slippage_bps: u32,
+    ) -> TradeSimulation {
+        if amount <= 0 {
+            return Self::failed_simulation(&env, "invalid_amount");
+        }
+
+        let signal = match storage::get_signal(&env, signal_id) {
+            Some(signal) => signal,
+            None => return Self::failed_simulation(&env, "signal_not_found"),
+        };
+
+        if env.ledger().timestamp() > signal.expiry {
+            return Self::failed_simulation(&env, "signal_expired");
+        }
+
+        if !auth::is_authorized(&env, &user, amount) {
+            return Self::failed_simulation(&env, "unauthorized");
+        }
+
+        if !sdex::has_sufficient_balance(&env, &user, &signal.base_asset, amount) {
+            return Self::failed_simulation(&env, "insufficient_balance");
+        }
+
+        let current_price = sdex::get_current_price(&env, &signal);
+        let available_liquidity = sdex::get_available_liquidity(&env, &signal, amount);
+        if available_liquidity <= 0 {
+            return Self::failed_simulation(&env, "insufficient_liquidity");
+        }
+
+        let expected_output = core::cmp::min(amount, available_liquidity);
+        let price_delta = if current_price > signal.price {
+            current_price - signal.price
+        } else {
+            signal.price - current_price
+        };
+        let slippage_bps = ((price_delta * 10_000) / signal.price) as u32;
+        let price_impact_bps = if available_liquidity > 0 {
+            ((amount * 10_000) / available_liquidity) as u32
+        } else {
+            0
+        };
+
+        let failure_reason = if slippage_bps > max_slippage_bps {
+            Some(String::from_str(&env, "slippage_exceeded"))
+        } else if expected_output == 0 {
+            Some(String::from_str(&env, "insufficient_liquidity"))
+        } else {
+            None
+        };
+
+        if let Some(ref reason) = failure_reason {
+            logging::emit_log(
+                &env,
+                logging::LogLevel::Warn,
+                String::from_str(&env, "simulation"),
+                reason.clone(),
+                None,
+            );
+        }
+
+        TradeSimulation {
+            expected_output,
+            fee_amount: 0,
+            slippage_bps,
+            price_impact_bps,
+            would_succeed: failure_reason.is_none(),
+            failure_reason,
+        }
+    }
+
+    /// Execute a trade on behalf of a user based on a signal
+    /// # Summary
+    /// One-time contract initialization. Sets the admin address and initializes
+    /// pause states and circuit breaker statistics.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `admin`: Address that will hold admin privileges.
+    pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
+        let mut m = soroban_sdk::Map::new(&env);
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
+        );
+        m
+    }
+
+    ///
+    /// # Returns
+    /// Nothing. Panics if already initialized.
     pub fn initialize(env: Env, admin: Address) {
         admin::init_admin(&env, admin);
+        shared::version::set_contract_version(&env, shared::version::AUTO_TRADE_VERSION);
+    }
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+
+    /// Returns this contract's stored version. Cross-contract callers can use
+    /// this to enforce a minimum compatible version before invoking this
+    /// contract (see `shared::version::validate_callee_version`).
+    pub fn get_contract_version(env: Env) -> u32 {
+        shared::version::get_contract_version(&env)
+    }
+
+    /// Admin-only: replace this contract's executable with `new_wasm_hash`
+    /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
+    /// `new_version` as the contract's version.
+    ///
+    /// `new_version` must be strictly greater than the currently stored
+    /// version, rejecting accidental or malicious downgrades.
+    ///
+    /// # Errors
+    /// - [`AutoTradeError::Unauthorized`] — caller is not the admin.
+    /// - [`AutoTradeError::IncompatibleContractVersion`] — `new_version` is
+    ///   not strictly greater than the currently stored version.
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), AutoTradeError> {
+        admin::require_admin(&env, &caller)?;
+
+        let current_version = shared::version::get_contract_version(&env);
+        shared::version::guard_upgrade(current_version, new_version)
+            .map_err(|_| AutoTradeError::IncompatibleContractVersion)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        shared::version::set_contract_version(&env, new_version);
+        shared::version::emit_contract_upgraded(&env, current_version, new_version);
+        Ok(())
     }
 
     /// Pause a category (admin or guardian)
@@ -122,7 +311,7 @@ impl AutoTradeContract {
         category: String,
         duration: Option<u64>,
         reason: String,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         admin::pause_category(&env, &caller, category, duration, reason)
     }
 
@@ -131,18 +320,41 @@ impl AutoTradeContract {
         env: Env,
         caller: Address,
         category: String,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         admin::unpause_category(&env, &caller, category)
     }
 
     /// Set guardian address (admin only)
-    pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), AutoTradeError> {
+    pub fn set_guardian(
+        env: Env,
+        caller: Address,
+        guardian: Address,
+    ) -> Result<(), AutoTradeError> {
         admin::set_guardian(&env, &caller, guardian)
     }
 
     /// Revoke guardian (admin only)
     pub fn revoke_guardian(env: Env, caller: Address) -> Result<(), AutoTradeError> {
         admin::revoke_guardian(&env, &caller)
+    }
+
+    /// Propose admin transfer (current admin only)
+    pub fn propose_admin_transfer(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), AutoTradeError> {
+        admin::propose_admin_transfer(&env, &caller, new_admin)
+    }
+
+    /// Accept admin transfer (new admin only)
+    pub fn accept_admin_transfer(env: Env, caller: Address) -> Result<(), AutoTradeError> {
+        admin::accept_admin_transfer(&env, &caller)
+    }
+
+    /// Cancel pending admin transfer (current admin only)
+    pub fn cancel_admin_transfer(env: Env, caller: Address) -> Result<(), AutoTradeError> {
+        admin::cancel_admin_transfer(&env, &caller)
     }
 
     /// Get current guardian
@@ -161,13 +373,37 @@ impl AutoTradeContract {
         env: Env,
         caller: Address,
         oracle_addr: Address,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         oracle::set_oracle_address(&env, &caller, oracle_addr)
     }
 
     /// Get the currently configured oracle contract address.
     pub fn get_oracle_address(env: Env) -> Option<Address> {
         oracle::get_oracle_address(&env)
+    }
+
+    // ── Issue #992: asset-pair validation configuration ──────────────────────
+
+    /// Set the asset registry contract used to validate asset pairs before any
+    /// execution (admin only).
+    ///
+    /// Once a registry is configured, signals with a bound token pair are
+    /// rejected when either asset is not registered, when both assets are
+    /// identical, or when no enabled AMM source supports the pair — before any
+    /// offer or token operation is attempted. See
+    /// `docs/asset_pair_validation.md` for the supported-pair source and update
+    /// authority.
+    pub fn set_asset_registry(
+        env: Env,
+        caller: Address,
+        registry: Address,
+    ) -> Result<(), AutoTradeError> {
+        admin::set_asset_registry(&env, &caller, registry)
+    }
+
+    /// The configured asset registry contract, if any.
+    pub fn get_asset_registry(env: Env) -> Option<Address> {
+        admin::get_asset_registry(&env)
     }
 
     /// Admin override for the oracle circuit breaker.
@@ -177,14 +413,12 @@ impl AutoTradeContract {
         env: Env,
         caller: Address,
         enabled: bool,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         oracle::override_oracle_circuit_breaker(&env, &caller, enabled)
     }
 
     /// Get the current oracle circuit breaker state.
-    pub fn get_oracle_circuit_breaker_state(
-        env: Env,
-    )  oracle::OracleCircuitBreakerState {
+    pub fn get_oracle_circuit_breaker_state(env: Env) -> oracle::OracleCircuitBreakerState {
         oracle::get_cb_state(&env)
     }
 
@@ -195,7 +429,7 @@ impl AutoTradeContract {
         caller: Address,
         asset_pair: u32,
         oracle_addr: Address,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         oracle::add_oracle(&env, &caller, asset_pair, oracle_addr)
     }
 
@@ -206,15 +440,12 @@ impl AutoTradeContract {
         caller: Address,
         asset_pair: u32,
         oracle_addr: Address,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         oracle::remove_oracle(&env, &caller, asset_pair, oracle_addr)
     }
 
     /// Get the current oracle whitelist for `asset_pair`.
-    pub fn get_oracle_whitelist(
-        env: Env,
-        asset_pair: u32,
-    )  soroban_sdk::Vec<Address> {
+    pub fn get_oracle_whitelist(env: Env, asset_pair: u32) -> soroban_sdk::Vec<Address> {
         oracle::get_oracle_whitelist(&env, asset_pair)
     }
 
@@ -225,8 +456,129 @@ impl AutoTradeContract {
         caller: Address,
         asset_pair: u32,
         price: stellar_swipe_common::oracle::OraclePrice,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         oracle::push_price_update(&env, &caller, asset_pair, price)
+    }
+
+    /// Create a new TWAP order covering a larger trade over a configurable time window.
+    pub fn create_twap_order(
+        env: Env,
+        user: Address,
+        pair: twap::AssetPair,
+        total_amount: i128,
+        duration_minutes: u32,
+        num_segments: Option<u32>,
+        window_minutes: Option<u32>,
+    ) -> Result<u64, AutoTradeError> {
+        twap::create_twap_order(
+            &env,
+            user,
+            pair,
+            total_amount,
+            duration_minutes,
+            num_segments,
+            window_minutes,
+        )
+    }
+
+    /// Execute all due TWAP segments for active running orders.
+    pub fn execute_twap_segments(env: Env) -> soroban_sdk::Vec<u64> {
+        twap::execute_twap_segments(&env)
+    }
+
+    /// Perform periodic strategy adjustment for a TWAP order based on volatility.
+    pub fn adjust_twap_strategy(env: Env, order_id: u64) -> Result<(), AutoTradeError> {
+        twap::adjust_twap_strategy(&env, order_id)
+    }
+
+    /// Cancel an active TWAP order and return a cancellation summary.
+    pub fn cancel_twap_order(
+        env: Env,
+        order_id: u64,
+        user: Address,
+    ) -> Result<twap::CancellationSummary, AutoTradeError> {
+        twap::cancel_twap_order(&env, order_id, user)
+    }
+
+    /// Retrieve a stored TWAP order.
+    pub fn get_twap_order(env: Env, order_id: u64) -> Result<twap::TWAPOrder, AutoTradeError> {
+        twap::get_twap_order(&env, order_id)
+    }
+
+    /// Retrieve all active TWAP orders.
+    pub fn get_active_twap_orders(env: Env) -> soroban_sdk::Vec<twap::TWAPOrder> {
+        twap::get_active_twap_orders(&env)
+    }
+
+    /// Set the contract-wide log level for structured log emission.
+    pub fn set_log_level(
+        env: Env,
+        caller: Address,
+        level: logging::LogLevel,
+    ) -> Result<(), AutoTradeError> {
+        logging::set_log_level(&env, &caller, level)
+    }
+
+    /// Get the current configured log level.
+    pub fn get_log_level(env: Env) -> logging::LogLevel {
+        logging::get_log_level(&env)
+    }
+
+    /// Write a structured log entry to the contract event stream.
+    pub fn log_event(
+        env: Env,
+        level: logging::LogLevel,
+        category: String,
+        message: String,
+        correlation_id: Option<String>,
+    ) {
+        logging::emit_log(&env, level, category, message, correlation_id);
+    }
+
+    /// Get running trade-outcome counters (attempts / filled / partially
+    /// filled / failed) for a cheap on-chain success-rate signal.
+    pub fn get_trade_metrics(env: Env) -> logging::TradeMetrics {
+        logging::get_trade_metrics(&env)
+    }
+
+    /// Get the most recent structured log entries (oldest first, capped at 20).
+    pub fn get_recent_logs(env: Env) -> soroban_sdk::Vec<logging::LogEntry> {
+        logging::get_recent_logs(&env)
+    }
+
+    /// Submit a KYC verification request for a user.
+    pub fn submit_kyc_verification(
+        env: Env,
+        user: Address,
+        kyc_id: String,
+        level: kyc::KYCLevel,
+    ) -> Result<(), AutoTradeError> {
+        kyc::submit_kyc_verification(&env, &user, kyc_id, level)
+    }
+
+    /// Admin verifies a user's KYC status.
+    pub fn verify_kyc(
+        env: Env,
+        caller: Address,
+        user: Address,
+        verified: bool,
+    ) -> Result<(), AutoTradeError> {
+        kyc::verify_kyc(&env, &caller, &user, verified)
+    }
+
+    /// Get the stored KYC data for a user.
+    pub fn get_kyc_data(env: Env, user: Address) -> Option<kyc::KYCData> {
+        kyc::get_kyc_data(&env, &user)
+    }
+
+    /// Returns whether a user is currently KYC verified.
+    pub fn is_kyc_verified(env: Env, user: Address) -> bool {
+        kyc::is_kyc_verified(&env, &user)
+    }
+
+    /// Returns the user tier based on KYC verification level.
+    pub fn get_user_tier(env: Env, user: Address) -> String {
+        kyc::get_user_tier(&env, &user)
     }
 
     /// Set the circuit breaker configuration (admin only)
@@ -234,24 +586,80 @@ impl AutoTradeContract {
         env: Env,
         caller: Address,
         config: stellar_swipe_common::emergency::CircuitBreakerConfig,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         admin::set_cb_config(&env, &caller, config)
     }
 
-    /// Execute a trade on behalf of a user based on a signal
+    /// # Summary
+    /// Execute a trade on behalf of a user based on a signal. Performs oracle
+    /// circuit-breaker check, risk validation (stop-loss, position limits,
+    /// daily trade limit), smart routing, and records the trade.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `user`: Address of the trader (must authorize).
+    /// - `signal_id`: ID of the signal to trade on.
+    /// - `order_type`: [`OrderType::Market`] or [`OrderType::Limit`].
+    /// - `amount`: Amount to trade (must be > 0).
+    ///
+    /// # Returns
+    /// [`TradeResult`] containing the executed trade details.
+    ///
+    /// # Errors
+    /// - [`AutoTradeError::TradingPaused`] — trading category is paused.
+    /// - [`AutoTradeError::OracleUnavailable`] — oracle circuit breaker is tripped.
+    /// - [`AutoTradeError::InvalidAmount`] — amount <= 0.
+    /// - [`AutoTradeError::SignalNotFound`] — signal_id does not exist.
+    /// - [`AutoTradeError::SignalExpired`] — signal has expired.
+    /// - [`AutoTradeError::Unauthorized`] — user is not authorized to trade.
+    /// - [`AutoTradeError::InsufficientBalance`] — user has insufficient balance.
+    /// - [`AutoTradeError::PositionLimitExceeded`] — trade would exceed position limit.
+    /// - [`AutoTradeError::DailyTradeLimitExceeded`] — daily trade limit reached.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let result = client.execute_trade(&user, &signal_id, &OrderType::Market, &1_000_0000000i128);
+    /// assert_eq!(result.trade.status, TradeStatus::Filled);
+    /// ```
     pub fn execute_trade(
         env: Env,
         user: Address,
         signal_id: u64,
         order_type: OrderType,
         amount: i128,
-    )  Result<TradeResult, AutoTradeError> {
+    ) -> Result<TradeResult, AutoTradeError> {
         if admin::is_paused(&env, String::from_str(&env, CAT_TRADING)) {
+            logging::emit_log(
+                &env,
+                logging::LogLevel::Warn,
+                String::from_str(&env, "trade"),
+                String::from_str(&env, "execute_trade_blocked"),
+                None,
+            );
             return Err(AutoTradeError::TradingPaused);
         }
 
+        if logging::is_info_logging_enabled(&env) {
+            logging::emit_log(
+                &env,
+                logging::LogLevel::Info,
+                String::from_str(&env, "trade"),
+                String::from_str(&env, "execute_trade_started"),
+                None,
+            );
+        }
+
         // Oracle circuit breaker: halt if oracle is unavailable (unless admin override)
-        oracle::check_oracle_circuit_breaker(&env, signal_id as u32)?;
+        if let Err(err) = oracle::check_oracle_circuit_breaker(&env, signal_id as u32) {
+            logging::emit_log(
+                &env,
+                logging::LogLevel::Warn,
+                String::from_str(&env, "trade"),
+                String::from_str(&env, "execute_trade_blocked"),
+                None,
+            );
+            return Err(err);
+        }
 
         if amount <= 0 {
             return Err(AutoTradeError::InvalidAmount);
@@ -259,11 +667,26 @@ impl AutoTradeContract {
 
         user.require_auth();
 
+        // Check if user is rate limited
+        if admin::is_rate_limited(&env, &user) {
+            return Err(AutoTradeError::RateLimited);
+        }
+
+        // Check loss-streak pause (Issue #698)
+        loss_streak::check_loss_streak_paused(&env, &user)?;
+
+        // Check per-user daily execution cap (independent of profit/loss)
+        daily_cap::check_daily_execution_cap(&env, &user)?;
+
         let signal = storage::get_signal(&env, signal_id).ok_or(AutoTradeError::SignalNotFound)?;
 
         if env.ledger().timestamp() > signal.expiry {
             return Err(AutoTradeError::SignalExpired);
         }
+
+        // Issue #992: reject unsupported asset pairs before any external call
+        // or state mutation (enforced when an asset registry is configured).
+        amm_bridge::validate_signal_pair(&env, signal_id)?;
 
         if !auth::is_authorized(&env, &user, amount) {
             return Err(AutoTradeError::Unauthorized);
@@ -279,8 +702,6 @@ impl AutoTradeContract {
 
         risk::set_asset_price(&env, signal.base_asset, signal.price);
 
- main
-
         // Fetch oracle price for manipulation-resistant stop-loss evaluation.
         // Falls back to None (SDEX spot) when no oracle is configured.
         let oracle_price: Option<i128> = oracle::get_oracle_price(&env, signal.base_asset)
@@ -288,7 +709,6 @@ impl AutoTradeContract {
             .map(|op| oracle::oracle_price_to_i128(&op));
 
         // Perform risk checks
- main
         let stop_loss_triggered = risk::validate_trade(
             &env,
             &user,
@@ -313,13 +733,7 @@ impl AutoTradeContract {
 
         let execution = match order_type {
             OrderType::Market => {
-                match smart_routing::execute_best_route(&env, &signal, amount, 500) {
-                    Ok(result) => result,
-                    Err(AutoTradeError::RoutingPlanNotFound) => {
-                        sdex::execute_market_order(&env, &user, &signal, amount)?
-                    }
-                    Err(err) => return Err(err),
-                }
+                amm_bridge::execute_swap_with_fallback(&env, &user, &signal, amount, 500)?
             }
             OrderType::Limit => sdex::execute_limit_order(&env, &user, &signal, amount)?,
         };
@@ -331,6 +745,14 @@ impl AutoTradeContract {
         } else {
             TradeStatus::Filled
         };
+
+        logging::record_trade_outcome(&env, &status);
+
+        // Record daily execution (increments rolling counter)
+        daily_cap::record_execution(&env, &user);
+
+        // Record loss-streak outcome (Issue #698)
+        loss_streak::record_trade_outcome(&env, &user, &status);
 
         admin::update_cb_stats(
             &env,
@@ -378,6 +800,8 @@ impl AutoTradeContract {
             .set(&DataKey::Trades(user.clone(), signal_id), &trade);
 
         if execution.executed_amount > 0 {
+            rate_limit::record_transfer(&env, &user, execution.executed_amount);
+
             // ── Referral fee split ────────────────────────────────────────────
             // Platform fee = 7% of executed amount (0.7 XLM per 10 XLM trade).
             // Referral reward = 10% of platform fee → deducted from platform share.
@@ -439,12 +863,21 @@ impl AutoTradeContract {
         entry_price: i128,
         stop_loss: i128,
         take_profit: i128,
-    )  soroban_sdk::BytesN<32> {
+    ) -> soroban_sdk::BytesN<32> {
         user.require_auth();
         if amount <= 0 || entry_price <= 0 {
             panic!("invalid amount or price");
         }
-        positions::open_position(&env, &user, signal_id, asset_pair, amount, entry_price, stop_loss, take_profit)
+        positions::open_position(
+            &env,
+            &user,
+            signal_id,
+            asset_pair,
+            amount,
+            entry_price,
+            stop_loss,
+            take_profit,
+        )
     }
 
     /// Close an existing position and calculate P&L. Returns PositionResult.
@@ -454,17 +887,14 @@ impl AutoTradeContract {
         user: Address,
         trade_id: soroban_sdk::BytesN<32>,
         exit_price: i128,
-    )  Option<positions::PositionResult> {
+    ) -> Option<positions::PositionResult> {
         user.require_auth();
         positions::close_position(&env, &user, &trade_id, exit_price)
     }
 
     /// Get all positions (open + closed) for a user — the full portfolio view.
     /// Issue #193
-    pub fn get_all_positions(
-        env: Env,
-        user: Address,
-    )  soroban_sdk::Vec<positions::PositionData> {
+    pub fn get_all_positions(env: Env, user: Address) -> soroban_sdk::Vec<positions::PositionData> {
         positions::get_all_positions(&env, &user)
     }
 
@@ -472,7 +902,7 @@ impl AutoTradeContract {
     pub fn get_open_positions(
         env: Env,
         user: Address,
-    )  soroban_sdk::Vec<positions::PositionData> {
+    ) -> soroban_sdk::Vec<positions::PositionData> {
         positions::get_open_positions(&env, &user)
     }
 
@@ -480,7 +910,7 @@ impl AutoTradeContract {
     pub fn get_closed_positions(
         env: Env,
         user: Address,
-    )  soroban_sdk::Vec<positions::PositionData> {
+    ) -> soroban_sdk::Vec<positions::PositionData> {
         positions::get_closed_positions(&env, &user)
     }
 
@@ -495,7 +925,7 @@ impl AutoTradeContract {
         env: Env,
         signal_id: u64,
         venue: smart_routing::VenueLiquidity,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         smart_routing::upsert_venue_liquidity(&env, signal_id, venue)
     }
 
@@ -508,9 +938,39 @@ impl AutoTradeContract {
         signal_id: u64,
         amount: i128,
         max_slippage_bps: u32,
-    )  Result<smart_routing::RoutingPlan, AutoTradeError> {
+    ) -> Result<smart_routing::RoutingPlan, AutoTradeError> {
         let signal = storage::get_signal(&env, signal_id).ok_or(AutoTradeError::SignalNotFound)?;
         smart_routing::plan_best_execution(&env, &signal, amount, max_slippage_bps)
+    }
+
+    pub fn register_amm_source(env: Env, config: AmmSourceConfig) -> Result<(), AutoTradeError> {
+        amm_bridge::register_amm_source(&env, config)
+    }
+
+    pub fn get_amm_sources(env: Env) -> Vec<AmmSourceConfig> {
+        amm_bridge::get_amm_sources(&env)
+    }
+
+    pub fn set_signal_token_pair(env: Env, signal_id: u64, from_token: Address, to_token: Address) {
+        amm_bridge::set_signal_token_pair(&env, signal_id, from_token, to_token);
+    }
+
+    pub fn discover_amm_quotes(
+        env: Env,
+        signal_id: u64,
+        probe_amount: i128,
+    ) -> Vec<stellar_swipe_common::amm_bridge::AmmQuote> {
+        amm_bridge::discover_quotes(&env, signal_id, probe_amount)
+    }
+
+    pub fn preview_amm_route(
+        env: Env,
+        signal_id: u64,
+        amount: i128,
+        max_slippage_bps: u32,
+    ) -> Result<stellar_swipe_common::amm_bridge::AmmRoutePlan, AutoTradeError> {
+        let signal = storage::get_signal(&env, signal_id).ok_or(AutoTradeError::SignalNotFound)?;
+        amm_bridge::plan_amm_route(&env, &signal, amount, max_slippage_bps)
     }
 
     /// Get user's risk configuration
@@ -539,7 +999,7 @@ impl AutoTradeContract {
     pub fn get_trade_history_legacy(
         env: Env,
         user: Address,
-    )  soroban_sdk::Vec<risk::TradeRecord> {
+    ) -> soroban_sdk::Vec<risk::TradeRecord> {
         risk::get_trade_history(&env, &user)
     }
 
@@ -549,13 +1009,26 @@ impl AutoTradeContract {
         user: Address,
         offset: u32,
         limit: u32,
-    )  soroban_sdk::Vec<history::HistoryTrade> {
+    ) -> soroban_sdk::Vec<history::HistoryTrade> {
         history::get_trade_history(&env, &user, offset, limit)
     }
 
     /// Get user portfolio with holdings and P&L
     pub fn get_portfolio(env: Env, user: Address) -> portfolio::Portfolio {
         portfolio::get_portfolio(&env, &user)
+    }
+
+    pub fn set_portfolio_privacy(env: Env, user: Address, enabled: bool) {
+        user.require_auth();
+        portfolio::set_privacy_mode(&env, &user, enabled);
+    }
+
+    pub fn compare_portfolios(
+        env: Env,
+        user_a: Address,
+        user_b: Address,
+    ) -> Result<portfolio::PortfolioComparison, AutoTradeError> {
+        portfolio::compare_portfolios(&env, user_a, user_b)
     }
 
     /// Set risk parity configuration
@@ -565,7 +1038,7 @@ impl AutoTradeContract {
         enabled: bool,
         rebalance_frequency_days: u32,
         threshold_pct: u32,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         if !cfg!(test) {
             user.require_auth();
         }
@@ -586,7 +1059,7 @@ impl AutoTradeContract {
     pub fn preview_risk_parity_rebalance(
         env: Env,
         user: Address,
-    )  Result<(Vec<AssetRisk>, Vec<RebalanceTrade>), AutoTradeError> {
+    ) -> Result<(Vec<AssetRisk>, Vec<RebalanceTrade>), AutoTradeError> {
         risk_parity::calculate_risk_parity_rebalance(&env, &user)
     }
 
@@ -609,7 +1082,7 @@ impl AutoTradeContract {
         user: Address,
         asset_id: u32,
         price: i128,
-    )  Option<AutoSellResult> {
+    ) -> Option<AutoSellResult> {
         let result = advanced_risk::process_price_update(&env, &user, asset_id, price);
 
         if let Some(ref sell_result) = result {
@@ -639,7 +1112,7 @@ impl AutoTradeContract {
         user: Address,
         max_amount: i128,
         duration_days: u32,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         auth::grant_authorization(&env, &user, max_amount, duration_days)
     }
 
@@ -658,7 +1131,7 @@ impl AutoTradeContract {
     pub fn set_rate_limits(
         env: Env,
         limits: rate_limit::BridgeRateLimits,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         let admin = rate_limit::get_admin(&env).ok_or(AutoTradeError::Unauthorized)?;
         admin.require_auth();
         rate_limit::set_limits(&env, &limits);
@@ -680,7 +1153,7 @@ impl AutoTradeContract {
         env: Env,
         user: Address,
         violation_type: rate_limit::ViolationType,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         let admin = rate_limit::get_admin(&env).ok_or(AutoTradeError::Unauthorized)?;
         admin.require_auth();
         rate_limit::record_violation(&env, &user, violation_type)
@@ -697,10 +1170,7 @@ impl AutoTradeContract {
     }
 
     /// Get user transfer history
-    pub fn get_user_rate_history(
-        env: Env,
-        user: Address,
-    )  rate_limit::UserTransferHistory {
+    pub fn get_user_rate_history(env: Env, user: Address) -> rate_limit::UserTransferHistory {
         rate_limit::get_user_history(&env, &user)
     }
 
@@ -714,6 +1184,123 @@ impl AutoTradeContract {
         auth::get_auth_config(&env, &user)
     }
 
+    /// Set rate limit flag for a user (operator only)
+    /// Flag expires after 1 hour (RATE_LIMIT_DURATION_SECONDS = 3600)
+    pub fn set_rate_limited(
+        env: Env,
+        operator: Address,
+        user: Address,
+    ) -> Result<(), AutoTradeError> {
+        admin::set_rate_limited(&env, &operator, &user)
+    }
+
+    /// Clear rate limit flag for a user (operator only)
+    pub fn clear_rate_limited(
+        env: Env,
+        operator: Address,
+        user: Address,
+    ) -> Result<(), AutoTradeError> {
+        admin::clear_rate_limited(&env, &operator, &user)
+    }
+
+    /// Get rate limit info for a user
+    pub fn get_rate_limit_info(env: Env, user: Address) -> Option<storage::RateLimitInfo> {
+        admin::get_rate_limit_info(&env, &user)
+    }
+
+    /// Check if user is currently rate limited
+    pub fn is_rate_limited(env: Env, user: Address) -> bool {
+        admin::is_rate_limited(&env, &user)
+    }
+
+    fn failed_simulation(env: &Env, reason: &str) -> TradeSimulation {
+        logging::emit_log(
+            env,
+            logging::LogLevel::Warn,
+            String::from_str(env, "simulation"),
+            String::from_str(env, reason),
+            None,
+        );
+        TradeSimulation {
+            expected_output: 0,
+            fee_amount: 0,
+            slippage_bps: 0,
+            price_impact_bps: 0,
+            would_succeed: false,
+            failure_reason: Some(String::from_str(env, reason)),
+        }
+    }
+
+    // ── Loss-streak pause (Issue #698) ──────────────────────────────────────────
+
+    /// Get the loss-streak threshold configuration.
+    pub fn get_loss_streak_config(env: Env) -> storage::LossStreakConfig {
+        storage::get_loss_streak_config(&env)
+    }
+
+    /// Set the loss-streak threshold (admin only).
+    pub fn set_loss_streak_threshold(
+        env: Env,
+        caller: Address,
+        threshold: u32,
+    ) -> Result<(), AutoTradeError> {
+        loss_streak::set_loss_streak_threshold(&env, &caller, threshold)
+    }
+
+    /// Get the per-user consecutive-loss counter.
+    pub fn get_loss_streak_counter(env: Env, user: Address) -> storage::LossStreakCounter {
+        storage::get_loss_streak_counter(&env, &user)
+    }
+
+    /// Check whether a user is currently paused due to loss-streak.
+    pub fn is_loss_streak_paused(env: Env, user: Address) -> bool {
+        storage::is_loss_streak_paused(&env, &user)
+    }
+
+    /// Explicitly resume auto-trading after a loss-streak pause (user only).
+    pub fn resume_after_loss_streak(env: Env, user: Address) -> Result<(), AutoTradeError> {
+        loss_streak::resume_after_loss_streak(&env, &user)
+    }
+
+    /// Returns estimated storage usage metrics.
+    ///
+    /// # Estimation methodology
+    /// - `total_signals`: exact count of stored Signal entries.
+    /// - `total_positions`: exact count of active user positions across all users.
+    /// - `total_providers`: approximated as distinct users with trade history.
+    /// - `estimated_rent_xlm`: entry_count × avg_entry_size_bytes × RENT_RATE_XLM_PER_BYTE.
+    ///   avg_entry_size ≈ 128 bytes (trades are smaller than signals);
+    ///   rent_rate ≈ 0.00001 XLM/byte (Soroban Protocol 23).
+    ///   Result is in stroops (1 XLM = 10_000_000 stroops).
+    ///
+    /// # Rent cost projection for 10,000 users
+    /// Assuming 10 trades/user → 100,000 trade entries + 10,000 position entries = 110,000 entries.
+    /// 110,000 × 128 bytes × 0.00001 XLM/byte ≈ 140.8 XLM total rent.
+    pub fn get_storage_stats(env: Env) -> AutoTradeStorageStats {
+        // Count persistent trade entries via signal counter as proxy
+        let total_signals: u32 = env
+            .storage()
+            .persistent()
+            .get(&storage::DataKey::Signal(0))
+            .map(|_: storage::Signal| 1u32)
+            .unwrap_or(0);
+
+        // Positions: sum across all tracked users is not directly enumerable;
+        // use trade history length as a proxy for total_positions.
+        let total_positions: u32 = 0; // requires enumerable index; documented as 0 until index added
+        let total_providers: u32 = 0; // same — no global user index in auto_trade
+
+        let entry_count = (total_signals + total_positions + total_providers) as i128;
+        let estimated_rent_xlm = entry_count * 128 * 100;
+
+        AutoTradeStorageStats {
+            total_signals,
+            total_positions,
+            total_providers,
+            estimated_rent_xlm,
+        }
+    }
+
     // ── DCA ──────────────────────────────────────────────────────────────────
 
     pub fn create_dca(
@@ -723,9 +1310,16 @@ impl AutoTradeContract {
         purchase_amount: i128,
         frequency: strategies::dca::DCAFrequency,
         duration_days: Option<u64>,
-    )  Result<u64, AutoTradeError> {
+    ) -> Result<u64, AutoTradeError> {
         user.require_auth();
-        strategies::dca::create_dca_strategy(&env, user, asset_pair, purchase_amount, frequency, duration_days)
+        strategies::dca::create_dca_strategy(
+            &env,
+            user,
+            asset_pair,
+            purchase_amount,
+            frequency,
+            duration_days,
+        )
     }
 
     pub fn execute_due_dca(env: Env) -> soroban_sdk::Vec<u64> {
@@ -752,7 +1346,7 @@ impl AutoTradeContract {
         strategy_id: u64,
         new_amount: Option<i128>,
         new_frequency: Option<strategies::dca::DCAFrequency>,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         user.require_auth();
         strategies::dca::update_dca_schedule(&env, strategy_id, new_amount, new_frequency)
     }
@@ -764,14 +1358,14 @@ impl AutoTradeContract {
     pub fn get_dca_strategy(
         env: Env,
         strategy_id: u64,
-    )  Result<strategies::dca::DCAStrategy, AutoTradeError> {
+    ) -> Result<strategies::dca::DCAStrategy, AutoTradeError> {
         strategies::dca::get_dca_strategy(&env, strategy_id)
     }
 
     pub fn analyze_dca(
         env: Env,
         strategy_id: u64,
-    )  Result<strategies::dca::DCAPerformance, AutoTradeError> {
+    ) -> Result<strategies::dca::DCAPerformance, AutoTradeError> {
         strategies::dca::analyze_dca_performance(&env, strategy_id)
     }
 
@@ -786,25 +1380,31 @@ impl AutoTradeContract {
         exit_z_score: i128,
         position_size_pct: u32,
         max_positions: u32,
-    )  Result<u64, AutoTradeError> {
+    ) -> Result<u64, AutoTradeError> {
         user.require_auth();
         strategies::mean_reversion::create_mean_reversion_strategy(
-            &env, user, asset_pair, lookback_period_days,
-            entry_z_score, exit_z_score, position_size_pct, max_positions,
+            &env,
+            user,
+            asset_pair,
+            lookback_period_days,
+            entry_z_score,
+            exit_z_score,
+            position_size_pct,
+            max_positions,
         )
     }
 
     pub fn get_mean_reversion(
         env: Env,
         strategy_id: u64,
-    )  Result<strategies::mean_reversion::MeanReversionStrategy, AutoTradeError> {
+    ) -> Result<strategies::mean_reversion::MeanReversionStrategy, AutoTradeError> {
         strategies::mean_reversion::get_mean_reversion_strategy(&env, strategy_id)
     }
 
     pub fn check_mr_signals(
         env: Env,
         strategy_id: u64,
-    )  Result<Option<strategies::mean_reversion::ReversionSignal>, AutoTradeError> {
+    ) -> Result<Option<strategies::mean_reversion::ReversionSignal>, AutoTradeError> {
         strategies::mean_reversion::check_mean_reversion_signals(&env, strategy_id)
     }
 
@@ -813,7 +1413,7 @@ impl AutoTradeContract {
         user: Address,
         strategy_id: u64,
         signal: strategies::mean_reversion::ReversionSignal,
-    )  Result<u64, AutoTradeError> {
+    ) -> Result<u64, AutoTradeError> {
         user.require_auth();
         strategies::mean_reversion::execute_mean_reversion_trade(&env, strategy_id, signal)
     }
@@ -821,14 +1421,11 @@ impl AutoTradeContract {
     pub fn check_mr_exits(
         env: Env,
         strategy_id: u64,
-    )  Result<soroban_sdk::Vec<u64>, AutoTradeError> {
+    ) -> Result<soroban_sdk::Vec<u64>, AutoTradeError> {
         strategies::mean_reversion::check_reversion_exits(&env, strategy_id)
     }
 
-    pub fn adjust_mr_params(
-        env: Env,
-        strategy_id: u64,
-    )  Result<(), AutoTradeError> {
+    pub fn adjust_mr_params(env: Env, strategy_id: u64) -> Result<(), AutoTradeError> {
         strategies::mean_reversion::adjust_strategy_parameters(&env, strategy_id)
     }
 
@@ -836,7 +1433,7 @@ impl AutoTradeContract {
         env: Env,
         user: Address,
         strategy_id: u64,
-    )  Result<(), AutoTradeError> {
+    ) -> Result<(), AutoTradeError> {
         user.require_auth();
         strategies::mean_reversion::disable_mean_reversion_strategy(&env, strategy_id)
     }
@@ -967,7 +1564,6 @@ impl AutoTradeContract {
         Ok(portfolio)
     }
 
- Updated upstream
     // ── Portfolio Insurance public API ────────────────────────────────────────
 
     /// Configure portfolio insurance for the calling user.
@@ -1038,10 +1634,72 @@ impl AutoTradeContract {
         portfolio_insurance::get_insurance(&env, &user)
     }
 
-    // ── Exit Strategy (tiered TP + trailing stops) ─────────────────────────
+    // ── Daily execution cap ───────────────────────────────────────────────────
+
+    /// Get the daily execution cap config for a user.
+    pub fn get_daily_cap_config(env: Env, user: Address) -> storage::DailyCapConfig {
+        storage::get_daily_cap_config(&env, &user)
+    }
+
+    /// Set the daily execution cap config for a user.
+    pub fn set_daily_cap_config(env: Env, user: Address, config: storage::DailyCapConfig) {
+        user.require_auth();
+        storage::set_daily_cap_config(&env, &user, &config);
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "daily_cap_config_updated"), user.clone()),
+            config,
+        );
+    }
+
+    /// Get the current daily execution counter for a user.
+    pub fn get_daily_execution_counter(env: Env, user: Address) -> storage::DailyExecutionCounter {
+        storage::get_daily_execution_counter(&env, &user)
+    }
+
+    // ── Drawdown trigger (Issue #674) ─────────────────────────────────────────
+
+    /// Configure a drawdown trigger for the user.
+    /// `threshold_bps` is the drop from peak (in basis points, e.g. 1000 = 10%).
+    /// When breached, `action` is returned by `update_portfolio_value`.
+    pub fn configure_drawdown_trigger(
+        env: Env,
+        user: Address,
+        threshold_bps: u32,
+        action: drawdown::DrawdownAction,
+    ) -> Result<drawdown::DrawdownTrigger, AutoTradeError> {
+        if !cfg!(test) {
+            user.require_auth();
+        }
+        drawdown::configure_drawdown_trigger(&env, &user, threshold_bps, action)
+    }
+
+    /// Update the per-user high-water mark with the latest `current_value` and
+    /// check whether the drawdown threshold is breached.
+    ///
+    /// Returns `Some(action)` when the trigger fires.
+    pub fn update_portfolio_value(
+        env: Env,
+        user: Address,
+        current_value: i128,
+    ) -> Result<Option<drawdown::DrawdownAction>, AutoTradeError> {
+        if !cfg!(test) {
+            user.require_auth();
+        }
+        drawdown::update_and_check(&env, &user, current_value)
+    }
+
+    /// Read-only: check if the drawdown trigger fires for `user` at `current_value`.
+    pub fn check_drawdown_trigger(env: Env, user: Address, current_value: i128) -> bool {
+        drawdown::check_drawdown_trigger(&env, &user, current_value)
+    }
+
+    /// Return the stored high-water mark for `user`.
+    pub fn get_high_water_mark(env: Env, user: Address) -> Option<drawdown::HighWaterMark> {
+        drawdown::get_high_water_mark(&env, &user)
+    }
 
     // ── Exit Strategy ────────────────────────────────────────────────────────
- Stashed changes
 
     /// Create a custom exit strategy with explicit TP and stop-loss tiers.
     #[allow(clippy::too_many_arguments)]
@@ -1051,13 +1709,8 @@ impl AutoTradeContract {
         signal_id: u64,
         entry_price: i128,
         position_size: i128,
- Updated upstream
-        take_profit_tiers: soroban_sdk::Vec<exit_strategy::TakeProfitTier>,
-        stop_loss_tiers: soroban_sdk::Vec<exit_strategy::StopLossTier>,
-
         take_profit_tiers: Vec<exit_strategy::TakeProfitTier>,
         stop_loss_tiers: Vec<exit_strategy::StopLossTier>,
- Stashed changes
     ) -> Result<u64, AutoTradeError> {
         user.require_auth();
         exit_strategy::create_exit_strategy(
@@ -1072,12 +1725,7 @@ impl AutoTradeContract {
     }
 
     /// Create a conservative preset exit strategy (3 TPs + 10% trail).
- Updated upstream
-    pub fn create_conservative_exit(
-
-      
-    pub fn create_exit_strategy_conservative(
- Stashed changes
+    pub fn exit_strategy_conservative(
         env: Env,
         user: Address,
         signal_id: u64,
@@ -1088,13 +1736,8 @@ impl AutoTradeContract {
         exit_strategy::preset_conservative(&env, user, signal_id, entry_price, position_size)
     }
 
- Updated upstream
-    /// Create a balanced preset exit strategy (2 TPs + tiered trails 10%/7%).
-    pub fn create_balanced_exit(
-
     /// Create a balanced preset exit strategy (2 TPs + tiered trail 10%/7%).
     pub fn create_exit_strategy_balanced(
- Stashed changes
         env: Env,
         user: Address,
         signal_id: u64,
@@ -1104,13 +1747,8 @@ impl AutoTradeContract {
         user.require_auth();
         exit_strategy::preset_balanced(&env, user, signal_id, entry_price, position_size)
     }
- Updated upstream
-    /// Create an aggressive preset exit strategy (4 TPs + tiered trails 10%/7%/5%).
-    pub fn create_aggressive_exit(
-
     /// Create an aggressive preset exit strategy (4 TPs + 5% trail).
     pub fn create_exit_strategy_aggressive(
- Stashed changes
         env: Env,
         user: Address,
         signal_id: u64,
@@ -1122,46 +1760,28 @@ impl AutoTradeContract {
     }
 
     /// Check current price against all tiers and auto-execute any triggered exits.
- Updated upstream
-    pub fn check_exit_strategy(
-        env: Env,
-        strategy_id: u64,
-        current_price: i128,
-    ) -> Result<soroban_sdk::Vec<u64>, AutoTradeError> {
-      
     pub fn check_and_execute_exits(
         env: Env,
         strategy_id: u64,
         current_price: i128,
-    ) -> Result<Vec<exit_strategy::ExecutedExit>, AutoTradeError> {
- Stashed changes
+    ) -> Result<Vec<u64>, AutoTradeError> {
         exit_strategy::check_and_execute_exits(&env, strategy_id, current_price)
     }
 
     /// Get exit strategy state.
     pub fn get_exit_strategy(
         env: Env,
-        strategy_id: u64, Updated upstream
+        strategy_id: u64,
     ) -> Result<exit_strategy::ExitStrategy, AutoTradeError> {
         exit_strategy::get_exit_strategy(&env, strategy_id)
     }
 
     /// Get all exit strategy IDs for a user.
-    pub fn get_user_exit_strategies(
-        env: Env,
-        user: Address,
-    ) -> soroban_sdk::Vec<u64> {
+    pub fn get_user_exit_strategies(env: Env, user: Address) -> soroban_sdk::Vec<u64> {
         exit_strategy::get_user_exit_strategies(&env, &user)
     }
 
-    /// Manually adjust remaining position size (e.g. after partial manual close).
-
-    ) -> Option<exit_strategy::ExitStrategy> {
-        exit_strategy::get_strategy(&env, strategy_id)
-    }
-
     /// Adjust remaining position size after a manual partial close.
- Stashed changes
     pub fn adjust_exit_position(
         env: Env,
         user: Address,
@@ -1169,7 +1789,6 @@ impl AutoTradeContract {
         new_size: i128,
     ) -> Result<(), AutoTradeError> {
         user.require_auth();
- Updated upstream
         exit_strategy::adjust_position_size(&env, &user, strategy_id, new_size)
     }
 
@@ -1224,9 +1843,6 @@ impl AutoTradeContract {
         strategy_id: u64,
     ) -> Result<strategies::grid::GridPerformance, AutoTradeError> {
         strategies::grid::calculate_grid_performance(&env, strategy_id)
-
-        exit_strategy::adjust_position_size(&env, strategy_id, &user, new_size)
- Stashed changes
     }
 
     // ── Pairs Trading Strategy (Issue #106) ───────────────────────────────────
@@ -1368,29 +1984,18 @@ impl AutoTradeContract {
     }
 
     /// Set per-user correlation limits.
-    pub fn set_correlation_limits(
-        env: Env,
-        user: Address,
-        limits: correlation::CorrelationLimits,
-    ) {
+    pub fn set_correlation_limits(env: Env, user: Address, limits: correlation::CorrelationLimits) {
         user.require_auth();
         correlation::set_correlation_limits(&env, &user, &limits);
     }
 
     /// Get per-user correlation limits (defaults if not set).
-    pub fn get_correlation_limits(
-        env: Env,
-        user: Address,
-    ) -> correlation::CorrelationLimits {
+    pub fn get_correlation_limits(env: Env, user: Address) -> correlation::CorrelationLimits {
         correlation::get_correlation_limits(&env, &user)
     }
 
     /// Suggest up to 5 diversifying assets from `available` with low portfolio correlation.
-    pub fn suggest_diversification(
-        env: Env,
-        user: Address,
-        available: Vec<u32>,
-    ) -> Vec<u32> {
+    pub fn suggest_diversification(env: Env, user: Address, available: Vec<u32>) -> Vec<u32> {
         correlation::suggest_diversification(&env, &user, &available)
     }
 
@@ -1410,7 +2015,15 @@ impl AutoTradeContract {
         expires_in_seconds: u64,
     ) -> Result<u64, AutoTradeError> {
         conditional::create_conditional_order(
-            &env, user, asset_id, side, amount, limit_price, conditions, logic, expires_in_seconds,
+            &env,
+            user,
+            asset_id,
+            side,
+            amount,
+            limit_price,
+            conditions,
+            logic,
+            expires_in_seconds,
         )
     }
 
@@ -1432,18 +2045,134 @@ impl AutoTradeContract {
     }
 
     /// Evaluate all active conditional orders; returns ids of newly triggered ones.
-    pub fn check_and_trigger_conditionals(env: Env) -> Vec<u64> {
-        conditional::check_and_trigger(&env)
+    ///
+    /// `keeper` must be a registered keeper address (see `add_keeper` /
+    /// `remove_keeper`). The caller must possess the corresponding private key —
+    /// Soroban's `require_auth` enforces this. Unregistered callers are rejected
+    /// before any trigger-condition evaluation occurs.
+    pub fn check_and_trigger_conditionals(
+        env: Env,
+        keeper: Address,
+    ) -> Result<Vec<u64>, AutoTradeError> {
+        keeper::require_registered_keeper(&env, &keeper)?;
+        Ok(conditional::check_and_trigger(&env))
+    }
+
+    /// Add a keeper address (admin only).
+    pub fn add_keeper(env: Env, admin: Address, keeper: Address) -> Result<(), AutoTradeError> {
+        keeper::add_keeper(&env, &admin, keeper)
+    }
+
+    /// Remove a keeper address (admin only).
+    pub fn remove_keeper(env: Env, admin: Address, keeper: Address) -> Result<(), AutoTradeError> {
+        keeper::remove_keeper(&env, &admin, &keeper)
+    }
+
+    /// List all registered keeper addresses.
+    pub fn list_keepers(env: Env) -> Vec<Address> {
+        keeper::list_keepers(&env)
     }
 
     /// Mark a triggered conditional order as executed (call after trade fill).
     pub fn mark_conditional_executed(env: Env, id: u64) -> Result<(), AutoTradeError> {
         conditional::mark_executed(&env, id)
     }
+
+    // ── Per-trade escrow (Issue: isolated custody) ────────────────────────────
+
+    /// Initiate an isolated escrow record for `trade_id`, locking `amount` of
+    /// `asset` for `originator` away from any shared pool.
+    pub fn initiate_escrow(
+        env: Env,
+        trade_id: soroban_sdk::BytesN<32>,
+        originator: Address,
+        asset: u32,
+        amount: i128,
+    ) -> Result<(), AutoTradeError> {
+        originator.require_auth();
+        escrow::initiate_escrow(&env, trade_id, originator, asset, amount)
+    }
+
+    /// Settle the escrow for `trade_id`: release funds to `destination` and
+    /// clear the active escrow record.  Fails if already settled or cancelled.
+    pub fn settle_escrow(
+        env: Env,
+        caller: Address,
+        trade_id: soroban_sdk::BytesN<32>,
+        destination: Address,
+    ) -> Result<escrow::EscrowRecord, AutoTradeError> {
+        admin::require_admin(&env, &caller)?;
+        escrow::settle_escrow(&env, &trade_id, destination)
+    }
+
+    /// Cancel the escrow for `trade_id`: return funds to the originator and
+    /// clear the active escrow record.  Fails if already settled or cancelled.
+    pub fn cancel_escrow(
+        env: Env,
+        caller: Address,
+        trade_id: soroban_sdk::BytesN<32>,
+    ) -> Result<escrow::EscrowRecord, AutoTradeError> {
+        // Either the admin or the originator may cancel.
+        let record = escrow::get_escrow(&env, &trade_id).ok_or(AutoTradeError::EscrowNotFound)?;
+        if record.originator != caller {
+            admin::require_admin(&env, &caller)?;
+        } else {
+            caller.require_auth();
+        }
+        escrow::cancel_escrow(&env, &trade_id)
+    }
+
+    /// Read the current escrow record for `trade_id`.
+    pub fn get_escrow(env: Env, trade_id: soroban_sdk::BytesN<32>) -> Option<escrow::EscrowRecord> {
+        escrow::get_escrow(&env, &trade_id)
+    }
+
+    // ── Dead man's switch (Issue: admin inactivity safety) ───────────────────
+
+    /// Configure the inactivity window that must elapse before anyone can trigger
+    /// an automatic pause (admin only).
+    pub fn set_inactivity_window(
+        env: Env,
+        caller: Address,
+        window_secs: u64,
+    ) -> Result<(), AutoTradeError> {
+        admin::set_inactivity_window(&env, &caller, window_secs)
+    }
+
+    /// Get the currently configured inactivity window in seconds.
+    pub fn get_inactivity_window(env: Env) -> u64 {
+        admin::get_inactivity_window(&env)
+    }
+
+    /// Get the timestamp of the last qualifying admin action.
+    pub fn get_last_admin_action_at(env: Env) -> u64 {
+        admin::get_last_admin_action_at(&env)
+    }
+
+    /// Trigger an automatic pause of all sensitive operations when the admin
+    /// inactivity window has elapsed.  Any caller may invoke this.
+    /// A subsequent admin action resets the timer; the admin then lifts the
+    /// pause via `unpause_category`.
+    pub fn trigger_inactivity_pause(env: Env, caller: Address) -> Result<(), AutoTradeError> {
+        admin::trigger_inactivity_pause(&env, &caller)
+    }
+
+    /// Read-only snapshot of all pending auto-trade actions ordered by
+    /// execution priority (StopLoss > TakeProfit > Rebalance), then FIFO
+    /// within the same priority level.
+    pub fn get_queue_snapshot(env: Env) -> soroban_sdk::Vec<priority_queue::QueuedAction> {
+        priority_queue::get_queue_snapshot(&env)
+    }
 }
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_admin_transfer;
+#[cfg(test)]
+mod test_dead_mans_switch;
+#[cfg(test)]
+mod test_governance;
 mod test_oracle_whitelist;
 
 // ── Oracle integration tests ─────────────────────────────────────────────────
@@ -1452,11 +2181,11 @@ mod oracle_tests {
     use super::*;
     use crate::oracle;
     use crate::risk;
-    use stellar_swipe_common::oracle::{MockOracleClient, OraclePrice};
     use soroban_sdk::{
         testutils::{Address as _, Ledger as _},
         Env, Symbol,
     };
+    use stellar_swipe_common::oracle::{MockOracleClient, OraclePrice};
 
     fn setup() -> (Env, Address) {
         let env = Env::default();
@@ -1522,7 +2251,10 @@ mod oracle_tests {
 
             // SDEX spot = 80 (below stop-loss) but oracle = 90 (above stop-loss)
             let not_triggered = risk::check_stop_loss(&env, &user, 1, 80, Some(90), &config);
-            assert!(!not_triggered, "oracle price above stop-loss must not trigger");
+            assert!(
+                !not_triggered,
+                "oracle price above stop-loss must not trigger"
+            );
         });
     }
 
@@ -1612,13 +2344,13 @@ mod oracle_tests {
 #[cfg(test)]
 mod oracle_cb_tests {
     use super::*;
-    use crate::oracle;
     use crate::admin;
-    use stellar_swipe_common::oracle::{MockOracleClient, OraclePrice};
+    use crate::oracle;
     use soroban_sdk::{
         testutils::{Address as _, Ledger as _},
         Env, Symbol,
     };
+    use stellar_swipe_common::oracle::{MockOracleClient, OraclePrice};
 
     fn setup() -> (Env, Address, Address) {
         let env = Env::default();
@@ -1739,22 +2471,22 @@ mod oracle_cb_tests {
     #[test]
     fn test_admin_override_allows_trade_when_oracle_down() {
         let (env, contract_id, admin) = setup();
+        let client = AutoTradeContractClient::new(&env, &contract_id);
 
         env.as_contract(&contract_id, || {
             admin::init_admin(&env, admin.clone());
 
-            // Trip the breaker
             let mut state = oracle::get_cb_state(&env);
             state.triggered = true;
             state.triggered_at = env.ledger().timestamp();
             env.storage()
                 .instance()
                 .set(&crate::admin::AdminStorageKey::OracleCircuitBreaker, &state);
+        });
 
-            // Admin enables override
-            oracle::override_oracle_circuit_breaker(&env, &admin, true).unwrap();
+        client.override_oracle_circuit_breaker(&admin, &true);
 
-            // check must pass despite breaker being tripped
+        env.as_contract(&contract_id, || {
             let result = oracle::check_oracle_circuit_breaker(&env, 1);
             assert!(result.is_ok(), "admin override must allow trading");
         });
@@ -1764,21 +2496,23 @@ mod oracle_cb_tests {
     #[test]
     fn test_admin_can_disable_override() {
         let (env, contract_id, admin) = setup();
+        let client = AutoTradeContractClient::new(&env, &contract_id);
 
         env.as_contract(&contract_id, || {
             admin::init_admin(&env, admin.clone());
 
-            // Trip the breaker and enable override
             let mut state = oracle::get_cb_state(&env);
             state.triggered = true;
             state.triggered_at = env.ledger().timestamp();
             env.storage()
                 .instance()
                 .set(&crate::admin::AdminStorageKey::OracleCircuitBreaker, &state);
-            oracle::override_oracle_circuit_breaker(&env, &admin, true).unwrap();
+        });
 
-            // Disable override — oracle still down → should block again
-            oracle::override_oracle_circuit_breaker(&env, &admin, false).unwrap();
+        client.override_oracle_circuit_breaker(&admin, &true);
+        client.override_oracle_circuit_breaker(&admin, &false);
+
+        env.as_contract(&contract_id, || {
             let result = oracle::check_oracle_circuit_breaker(&env, 1);
             assert_eq!(result, Err(AutoTradeError::OracleUnavailable));
         });
@@ -1820,10 +2554,9 @@ mod correlation_tests {
     fn seed_prices(env: &Env, asset_id: u32, prices: &[i128]) {
         use crate::risk::RiskDataKey;
         for (i, &p) in prices.iter().enumerate() {
-            env.storage().persistent().set(
-                &RiskDataKey::AssetPriceHistory(asset_id, i as u32),
-                &p,
-            );
+            env.storage()
+                .persistent()
+                .set(&RiskDataKey::AssetPriceHistory(asset_id, i as u32), &p);
         }
         env.storage().persistent().set(
             &RiskDataKey::AssetPriceHistoryCount(asset_id),
@@ -1841,8 +2574,7 @@ mod correlation_tests {
             seed_prices(&env, 1, &prices);
             seed_prices(&env, 2, &prices);
 
-            let corr =
-                AutoTradeContract::calculate_correlation(env.clone(), 1, 2, 30);
+            let corr = AutoTradeContract::calculate_correlation(env.clone(), 1, 2, 30);
             assert!(
                 corr > 7_000,
                 "XLM pairs should be highly correlated, got {corr}"
@@ -1884,13 +2616,9 @@ mod correlation_tests {
             risk::set_asset_price(&env, 1, 100);
             risk::update_position(&env, &user, 1, 10_000, 100);
 
-            let risk_result = AutoTradeContract::check_portfolio_correlation(
-                env.clone(),
-                user.clone(),
-                2,
-                5_000,
-            )
-            .unwrap();
+            let risk_result =
+                AutoTradeContract::check_portfolio_correlation(env.clone(), user.clone(), 2, 5_000)
+                    .unwrap();
 
             assert_eq!(risk_result.highly_correlated_assets, 1);
             assert_ne!(risk_result.risk_level, RiskLevel::Low);
@@ -1921,12 +2649,8 @@ mod correlation_tests {
                 },
             );
 
-            let result = AutoTradeContract::enforce_correlation_limits(
-                env.clone(),
-                user.clone(),
-                2,
-                5_000,
-            );
+            let result =
+                AutoTradeContract::enforce_correlation_limits(env.clone(), user.clone(), 2, 5_000);
             assert_eq!(result, Err(AutoTradeError::TooManyCorrelatedPositions));
         });
     }
@@ -1940,12 +2664,8 @@ mod correlation_tests {
             risk::set_asset_price(&env, 1, 100);
             risk::update_position(&env, &user, 1, 1_000, 100);
             // Asset 99 has no price history → correlation defaults to 0.
-            let result = AutoTradeContract::enforce_correlation_limits(
-                env.clone(),
-                user.clone(),
-                99,
-                500,
-            );
+            let result =
+                AutoTradeContract::enforce_correlation_limits(env.clone(), user.clone(), 99, 500);
             assert!(result.is_ok());
         });
     }
@@ -1964,11 +2684,8 @@ mod correlation_tests {
             available.push_back(2u32); // no history → low corr → suggested
             available.push_back(3u32); // no history → low corr → suggested
 
-            let suggestions = AutoTradeContract::suggest_diversification(
-                env.clone(),
-                user.clone(),
-                available,
-            );
+            let suggestions =
+                AutoTradeContract::suggest_diversification(env.clone(), user.clone(), available);
 
             // Asset 1 must not appear; assets 2 and 3 should.
             for i in 0..suggestions.len() {

@@ -246,12 +246,16 @@ pub fn check_portfolio_correlation(
     }
 
     let new_total_correlated = high_corr_exposure + new_amount;
-    let base = if total_portfolio_value > 0 {
-        total_portfolio_value
+    let corr_pct = if high_corr_count == 0 {
+        0
     } else {
-        new_amount.max(1)
+        let base = if total_portfolio_value > 0 {
+            total_portfolio_value
+        } else {
+            new_amount.max(1)
+        };
+        (new_total_correlated * 100) / base
     };
-    let corr_pct = (new_total_correlated * 100) / base;
 
     let risk_level = if corr_pct > 70 {
         RiskLevel::High
@@ -293,11 +297,11 @@ pub fn enforce_correlation_limits(
     let limits = get_correlation_limits(env, user);
     let risk = check_portfolio_correlation(env, user, new_asset, new_amount)?;
 
-    if risk.correlated_exposure_pct > limits.max_correlated_exposure_pct as i128 {
-        return Err(AutoTradeError::CorrelationLimitExceeded);
-    }
     if risk.highly_correlated_assets > limits.max_correlated_positions {
         return Err(AutoTradeError::TooManyCorrelatedPositions);
+    }
+    if risk.correlated_exposure_pct > limits.max_correlated_exposure_pct as i128 {
+        return Err(AutoTradeError::CorrelationLimitExceeded);
     }
 
     Ok(())
@@ -307,11 +311,7 @@ pub fn enforce_correlation_limits(
 
 /// Return up to 5 asset IDs from `available` that have low average correlation
 /// with the user's current holdings.
-pub fn suggest_diversification(
-    env: &Env,
-    user: &Address,
-    available: &Vec<u32>,
-) -> Vec<u32> {
+pub fn suggest_diversification(env: &Env, user: &Address, available: &Vec<u32>) -> Vec<u32> {
     let positions = risk::get_user_positions(env, user);
     let holding_keys = positions.keys();
 
@@ -431,10 +431,9 @@ mod tests {
     fn seed_prices(env: &Env, asset_id: u32, prices: &[i128]) {
         use crate::risk::RiskDataKey;
         for (i, &p) in prices.iter().enumerate() {
-            env.storage().persistent().set(
-                &RiskDataKey::AssetPriceHistory(asset_id, i as u32),
-                &p,
-            );
+            env.storage()
+                .persistent()
+                .set(&RiskDataKey::AssetPriceHistory(asset_id, i as u32), &p);
         }
         env.storage().persistent().set(
             &RiskDataKey::AssetPriceHistoryCount(asset_id),
@@ -461,9 +460,9 @@ mod tests {
     fn test_negative_correlation() {
         let (env, addr) = setup();
         env.as_contract(&addr, || {
-            // Perfectly inverse series.
-            let a = [100i128, 102, 104, 106, 108];
-            let b = [108i128, 106, 104, 102, 100];
+            // Opposite return directions → negative correlation.
+            let a = [100i128, 110, 100, 110, 100, 110, 100, 110];
+            let b = [100i128, 90, 100, 90, 100, 90, 100, 90];
             seed_prices(&env, 1, &a);
             seed_prices(&env, 2, &b);
             let corr = calculate_correlation(&env, 1, 2, 30);

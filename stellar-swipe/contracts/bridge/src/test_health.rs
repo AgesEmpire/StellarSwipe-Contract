@@ -1,11 +1,11 @@
 #![cfg(test)]
 
 use super::BridgeContract;
-use crate::BridgeContractClient;
 use crate::governance::{
     initialize_bridge, initialize_bridge_governance, Bridge, BridgeSecurityConfig, BridgeStatus,
     GovernanceDataKey,
 };
+use crate::BridgeContractClient;
 use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
 
 fn signers(env: &Env, count: u32) -> Vec<Address> {

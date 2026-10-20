@@ -1,0 +1,9 @@
+# Workspace Cargo configuration.
+#
+# [env] — default environment variables used during development builds.
+# The release build overrides these by running embed_source_hash.sh before
+# cargo build, which exports the real SHA-256 and git commit into the shell
+# environment.  force = false means the outer environment wins.
+[env]
+STELLAR_SOURCE_HASH = { value = "unset-run-embed-source-hash-sh", force = false }
+STELLAR_GIT_COMMIT  = { value = "unknown", force = false }

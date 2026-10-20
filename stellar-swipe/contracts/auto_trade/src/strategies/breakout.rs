@@ -136,9 +136,9 @@ pub enum BreakoutDataKey {
     PriceHistory(AssetPair, u64),
 }
 
-/// ==========================
-/// Support/Resistance Detection
-/// ==========================
+// ==========================
+// Support/Resistance Detection
+// ==========================
 
 /// Identify key support and resistance levels from historical data
 pub fn identify_key_levels(
@@ -249,9 +249,9 @@ pub fn identify_key_levels(
     Ok(levels)
 }
 
-/// ==========================
-/// Breakout Detection
-/// ==========================
+// ==========================
+// Breakout Detection
+// ==========================
 
 /// Detect if a breakout is occurring with volume confirmation
 pub fn detect_breakout(strategy_id: u64) -> Result<Option<BreakoutSignal>, AutoTradeError> {
@@ -431,9 +431,9 @@ fn calculate_breakout_confidence(
     Ok(strength_score + volume_score + base_score)
 }
 
-/// ==========================
-/// Trade Execution
-/// ==========================
+// ==========================
+// Trade Execution
+// ==========================
 
 /// Execute a breakout trade based on signal
 pub fn execute_breakout_trade(
@@ -466,9 +466,9 @@ pub fn execute_breakout_trade(
     Ok(position_id)
 }
 
-/// ==========================
-/// Exit Management
-/// ==========================
+// ==========================
+// Exit Management
+// ==========================
 
 /// Check if any open positions should be exited
 pub fn check_breakout_exits(strategy_id: u64) -> Result<Vec<u64>, AutoTradeError> {
@@ -503,9 +503,9 @@ pub fn check_breakout_exits(strategy_id: u64) -> Result<Vec<u64>, AutoTradeError
     Ok(closed_positions)
 }
 
-/// ==========================
-/// False Breakout Detection
-/// ==========================
+// ==========================
+// False Breakout Detection
+// ==========================
 
 /// Detect if a position is a false breakout (price reversed through level)
 pub fn detect_false_breakout(position: &BreakoutPosition, current_price: i128) -> bool {
@@ -537,9 +537,9 @@ pub fn handle_false_breakout(strategy_id: u64, position_id: u64) -> Result<(), A
     Ok(())
 }
 
-/// ==========================
-/// Dynamic Level Updates
-/// ==========================
+// ==========================
+// Dynamic Level Updates
+// ==========================
 
 /// Update key levels after a successful breakout
 pub fn update_key_levels_on_breakout(
@@ -568,9 +568,9 @@ pub fn update_key_levels_on_breakout(
     Ok(())
 }
 
-/// ==========================
-/// Performance Analytics
-/// ==========================
+// ==========================
+// Performance Analytics
+// ==========================
 
 /// Analyze performance of breakout strategy
 pub fn analyze_breakout_performance(strategy_id: u64) -> Result<BreakoutPerformance, AutoTradeError> {
@@ -638,9 +638,9 @@ pub fn analyze_breakout_performance(strategy_id: u64) -> Result<BreakoutPerforma
     })
 }
 
-/// ==========================
-/// Helper Functions
-/// ==========================
+// ==========================
+// Helper Functions
+// ==========================
 
 /// Get historical candles (mock implementation)
 #[allow(unused_variables)]

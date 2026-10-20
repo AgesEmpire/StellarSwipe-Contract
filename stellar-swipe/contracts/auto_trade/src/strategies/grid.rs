@@ -285,11 +285,8 @@ pub fn on_grid_order_filled(
     let filled_order = strategy
         .active_orders
         .get(level)
-        .ok_or(AutoTradeError::SignalNotFound)?;
-feat/smart-order-routing-84
-
-    let filled_for_profit = filled_order.clone();
- main
+        .ok_or(AutoTradeError::SignalNotFound)?
+        .clone();
     strategy.active_orders.remove(level);
 
     strategy.filled_orders.push_back(FilledGridOrder {
@@ -300,27 +297,12 @@ feat/smart-order-routing-84
         filled_at: env.ledger().timestamp(),
     });
 
- feat/smart-order-routing-84
     if let Some(profit) = calculate_grid_profit(&strategy, &filled_order, fill_price, fill_amount) {
-
-    if let Some(profit) =
-        calculate_grid_profit(&strategy, &filled_for_profit, fill_price, fill_amount)
-    {
- main
         strategy.total_profit += profit;
-
         #[allow(deprecated)]
         env.events().publish(
- feat/smart-order-routing-84
-            (
-                Symbol::new(env, "grid_profit"),
-                strategy_id,
-                filled_order.level,
-            ),
-
-            (Symbol::new(env, "grid_profit"), strategy_id, filled_for_profit.level),
-main
-            profit,
+            (Symbol::new(env, "grid_profit"),),
+            (strategy_id, filled_order.level, profit),
         );
     }
 
@@ -444,11 +426,10 @@ pub fn calculate_grid_performance(
     };
 
     let expected_fills = strategy.grid_config.num_grids * 2;
-    let fill_rate = if expected_fills > 0 {
-        ((total_fills * 10_000) / expected_fills) as u32
-    } else {
-        0
-    };
+    let fill_rate = total_fills
+        .checked_mul(10_000)
+        .and_then(|v| v.checked_div(expected_fills))
+        .unwrap_or(0) as u32;
 
     let avg_profit_per_fill = if total_fills > 0 {
         strategy.total_profit / total_fills as i128

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 use crate::errors::AutoTradeError;
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 
 pub type Asset = u32;
 
@@ -96,12 +96,22 @@ const XLM: Asset = 2;
 const BTC: Asset = 3;
 
 fn min(a: i128, b: i128) -> i128 {
-    if a < b { a } else { b }
+    if a < b {
+        a
+    } else {
+        b
+    }
 }
 
 fn generate_arb_id(env: &Env) -> u64 {
-    let mut id: u64 = env.storage().persistent().get(&ArbStorageKey::NextOpportunityId).unwrap_or(1);
-    env.storage().persistent().set(&ArbStorageKey::NextOpportunityId, &(id + 1));
+    let mut id: u64 = env
+        .storage()
+        .persistent()
+        .get(&ArbStorageKey::NextOpportunityId)
+        .unwrap_or(1);
+    env.storage()
+        .persistent()
+        .set(&ArbStorageKey::NextOpportunityId, &(id + 1));
     id
 }
 
@@ -127,7 +137,7 @@ pub fn monitor_arbitrage_opportunities(
         } else {
             sdex_price - pool_price
         };
-        
+
         // Avoid division by zero
         if sdex_price == 0 {
             continue;
@@ -181,7 +191,8 @@ fn create_simple_arbitrage(
     sell_price: i128,
     profit_pct: u32,
 ) -> Result<ArbitrageOpportunity, AutoTradeError> {
-    let capital = calculate_optimal_arb_capital(env, buy_price, sell_price, &buy_venue, &sell_venue)?;
+    let capital =
+        calculate_optimal_arb_capital(env, buy_price, sell_price, &buy_venue, &sell_venue)?;
 
     // Handle zero buy price
     if buy_price == 0 {
@@ -246,9 +257,27 @@ pub fn find_triangular_arbitrage(
                 continue;
             }
 
-            let price1 = get_best_price(env, AssetPair { base: base_asset, quote: intermediate })?;
-            let price2 = get_best_price(env, AssetPair { base: intermediate, quote: quote_asset })?;
-            let price3 = get_best_price(env, AssetPair { base: quote_asset, quote: base_asset })?;
+            let price1 = get_best_price(
+                env,
+                AssetPair {
+                    base: base_asset,
+                    quote: intermediate,
+                },
+            )?;
+            let price2 = get_best_price(
+                env,
+                AssetPair {
+                    base: intermediate,
+                    quote: quote_asset,
+                },
+            )?;
+            let price3 = get_best_price(
+                env,
+                AssetPair {
+                    base: quote_asset,
+                    quote: base_asset,
+                },
+            )?;
 
             let start_amount = 1000 * PRECISION;
             let after_leg1 = (start_amount * price1.price) / PRECISION;
@@ -315,7 +344,10 @@ pub fn execute_arbitrage_atomic(
         return Err(AutoTradeError::ArbitrageOpportunityExpired); // Defined in errors
     }
 
-    let first_leg = opportunity.path.first().ok_or(AutoTradeError::InvalidPairsConfig)?;
+    let first_leg = opportunity
+        .path
+        .first()
+        .ok_or(AutoTradeError::InvalidPairsConfig)?;
     let user_balance = get_asset_balance(env, user.clone(), first_leg.asset_in)?;
     if user_balance < opportunity.required_capital {
         return Err(AutoTradeError::InsufficientBalance);
@@ -378,7 +410,7 @@ pub fn calculate_optimal_arb_capital(
     let mut max_profit = 0i128;
 
     let mut amount = 1000i128;
-    
+
     // Prevent division by zero
     if buy_price == 0 {
         return Err(AutoTradeError::InvalidPriceData);
@@ -396,7 +428,8 @@ pub fn calculate_optimal_arb_capital(
             break;
         }
 
-        let gross_profit = (effective_sell_price - effective_buy_price) * amount / effective_buy_price;
+        let gross_profit =
+            (effective_sell_price - effective_buy_price) * amount / effective_buy_price;
         let fees = (amount * 40) / 10000;
         let net_profit = gross_profit - fees;
 
@@ -460,12 +493,14 @@ pub fn update_arbitrage_stats(
 
     if opportunity.required_capital > 0 {
         let profit_pct = ((actual_profit * 10000) / opportunity.required_capital) as u32;
-        stats.avg_profit_pct =
-            ((stats.avg_profit_pct * (stats.total_executed - 1) as u32) + profit_pct)
-                / stats.total_executed as u32;
+        stats.avg_profit_pct = ((stats.avg_profit_pct * (stats.total_executed - 1) as u32)
+            + profit_pct)
+            / stats.total_executed as u32;
     }
 
-    env.storage().persistent().set(&ArbStorageKey::ArbitrageStats(user), &stats);
+    env.storage()
+        .persistent()
+        .set(&ArbStorageKey::ArbitrageStats(user), &stats);
 
     Ok(())
 }
@@ -478,7 +513,10 @@ fn get_sdex_price(_env: &Env, _asset_pair: &AssetPair) -> Result<i128, AutoTrade
     Ok(10000)
 }
 
-fn get_all_pool_prices(env: &Env, _asset_pair: &AssetPair) -> Result<Vec<(u32, i128)>, AutoTradeError> {
+fn get_all_pool_prices(
+    env: &Env,
+    _asset_pair: &AssetPair,
+) -> Result<Vec<(u32, i128)>, AutoTradeError> {
     let mut vec = Vec::new(env);
     vec.push_back((1, 10050));
     Ok(vec)
@@ -505,7 +543,10 @@ struct PriceInfo {
 }
 
 fn get_best_price(_env: &Env, _pair: AssetPair) -> Result<PriceInfo, AutoTradeError> {
-    Ok(PriceInfo { venue: LiquidityVenue::SDEX, price: 10000 })
+    Ok(PriceInfo {
+        venue: LiquidityVenue::SDEX,
+        price: 10000,
+    })
 }
 
 fn get_asset_balance(_env: &Env, _user: Address, _asset: Asset) -> Result<i128, AutoTradeError> {
@@ -535,11 +576,18 @@ fn get_venue_liquidity(_env: &Env, _venue: &LiquidityVenue) -> Result<i128, Auto
     Ok(1_000_000_000)
 }
 
-fn calculate_slippage(_env: &Env, _venue: &LiquidityVenue, _amount: i128) -> Result<u32, AutoTradeError> {
+fn calculate_slippage(
+    _env: &Env,
+    _venue: &LiquidityVenue,
+    _amount: i128,
+) -> Result<u32, AutoTradeError> {
     Ok(10)
 }
 
-fn get_pending_transactions_for_assets(env: &Env, _path: &Vec<ArbLeg>) -> Result<Vec<u64>, AutoTradeError> {
+fn get_pending_transactions_for_assets(
+    env: &Env,
+    _path: &Vec<ArbLeg>,
+) -> Result<Vec<u64>, AutoTradeError> {
     Ok(Vec::new(env))
 }
 
@@ -556,7 +604,8 @@ mod tests {
             10100,
             &LiquidityVenue::SDEX,
             &LiquidityVenue::LiquidityPool(1),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(capital > 0);
     }
 }

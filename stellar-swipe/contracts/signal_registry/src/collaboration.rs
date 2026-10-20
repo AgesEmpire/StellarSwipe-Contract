@@ -112,12 +112,30 @@ pub fn distribute_collaborative_rewards(
     total_roi: i128,
 ) -> Vec<(Address, i128, i128)> {
     let mut distributions = Vec::new(env);
+    let mut fee_sum = 0i128;
+    let mut roi_sum = 0i128;
 
+    // First pass: compute floor shares
     for i in 0..authors.len() {
         let author = authors.get(i).unwrap();
         let fee_share = (total_fees * author.contribution_pct as i128) / 10000;
         let roi_share = (total_roi * author.contribution_pct as i128) / 10000;
-        distributions.push_back((author.address, fee_share, roi_share));
+        fee_sum += fee_share;
+        roi_sum += roi_share;
+        distributions.push_back((author.address.clone(), fee_share, roi_share));
+    }
+
+    // Adjust the last entry to absorb any rounding remainder
+    // (soroban_sdk::Vec has no `last_mut`; read, mutate, and write back by index).
+    if distributions.len() > 0 {
+        let last_idx = distributions.len() - 1;
+        let (address, fee_share, roi_share) = distributions.get(last_idx).unwrap();
+        let fee_rem = total_fees - fee_sum;
+        let roi_rem = total_roi - roi_sum;
+        distributions.set(
+            last_idx,
+            (address, fee_share + fee_rem, roi_share + roi_rem),
+        );
     }
 
     distributions
@@ -145,18 +163,4 @@ pub fn get_collaborative_signal(env: &Env, signal_id: u64) -> Option<Vec<Author>
 
 pub fn is_collaborative_signal(env: &Env, signal_id: u64) -> bool {
     get_collaborative_signal(env, signal_id).is_some()
-}
-
-/// Helper to distribute provider fees among co-authors
-/// Takes the provider_fee portion and splits it according to contribution percentages
-pub fn split_provider_fee(authors: &Vec<Author>, provider_fee: i128) -> Vec<(u32, i128)> {
-    let mut splits = Vec::new(&authors.env());
-
-    for i in 0..authors.len() {
-        let author = authors.get(i).unwrap();
-        let author_share = (provider_fee * author.contribution_pct as i128) / 10000;
-        splits.push_back((i, author_share));
-    }
-
-    splits
 }

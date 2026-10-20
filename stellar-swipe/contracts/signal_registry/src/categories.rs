@@ -12,6 +12,8 @@ pub enum SignalCategory {
     LONG_TERM,
     /// Exploit temporary price inefficiencies across exchanges/pairs
     ARBITRAGE,
+    /// Paid provider feed; visibility gated by UserPortfolio subscription (see SignalRegistry).
+    PREMIUM,
 }
 
 #[contracttype]

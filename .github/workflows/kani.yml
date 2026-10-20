@@ -1,0 +1,42 @@
+name: Kani Formal Verification
+
+# Optional CI job — not part of the main CI gate because Kani runs are slow.
+# Runs:
+#   - manually (workflow_dispatch)
+#   - weekly on Sunday 02:00 UTC
+#   - on PRs/pushes that touch the kani harness or the stake_vault contract
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 0'
+  pull_request:
+    paths:
+      - 'stellar-swipe/contracts/stake_vault/src/**'
+      - 'stellar-swipe/contracts/stake_vault_kani/**'
+  push:
+    branches: [main]
+    paths:
+      - 'stellar-swipe/contracts/stake_vault/src/**'
+      - 'stellar-swipe/contracts/stake_vault_kani/**'
+
+permissions:
+  contents: read
+
+jobs:
+  kani:
+    name: Kani — StakeVault balance conservation
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Kani harnesses
+        uses: model-checking/kani-github-action@v1
+        with:
+          working-directory: stellar-swipe/contracts/stake_vault_kani
+          # Verify all harnesses in the crate.
+          args: --harness single_deposit_preserves_invariant
+                --harness withdraw_preserves_invariant
+                --harness slash_preserves_invariant
+                --harness two_staker_sequence_preserves_invariant
+                --harness bounded_sequence_preserves_invariant

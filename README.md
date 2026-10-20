@@ -1,44 +1,51 @@
-# StellarSwipe-Contracts
 
-Soroban smart contracts powering **StellarSwipe** — a decentralized, swipe-to-copy-trade DApp on the Stellar network.
 
-## Overview
+## Handsoff notes
 
-This repository contains the core **Soroban (Rust)** smart contracts for StellarSwipe:
+<!-- handsoff-issue-1101 -->
+- #1101: Invalidate cached token metadata after asset configuration changes
+<!-- handsoff-issue-1088 -->
+- #1088: Add Soroban contract reentrancy fixture harness
+<!-- handsoff-issue-1074 -->
+- #1074: Add storage footprint growth regression tests
+<!-- handsoff-issue-949 -->
+- #949: Add provider churn risk score integration test covering all risk factors in analytics
 
-- **SignalRegistry**: Submission, storage, and querying of trade signals with staking for credibility.
-- **CopyTradeExecutor**: Auto-execution of copied trades on SDEX, with risk controls, staking/slashing, and authorization.
+<!-- handsoff-issue-956 -->
+- #956: Add slash cooldown window to prevent repeated slashing of same provider in stake_vault
 
-Built for low-cost, high-speed execution on Stellar Mainnet/Futurenet/Testnet.
+<!-- handsoff-issue-1169 -->
+- #1169: Create cross-contract upgrade compatibility fixtures
 
-## Key Features
+<!-- handsoff-issue-1170 -->
+- #1170: Add Soroban authorization payload size regression tests
 
-- On-chain signal validation via oracles (Band Protocol integration)
-- Provider staking & slashing for quality control
-- Risk-gated auto-trading (position limits, stop-loss)
-- Events emitted for real-time indexing
+<!-- handsoff-issue-1186 -->
+- #1186: Verify persistent storage schema checksum during upgrades
 
-## Tech Stack
+<!-- handsoff-issue-1114 -->
+- #1114: Implement overflow-safe oracle median aggregation
 
-- Rust ≥ 1.80 (with `wasm32-unknown-unknown` target)
-- Soroban SDK & CLI
-- Protocol 23 (Whisk) compatible
+<!-- handsoff-issue-1192 -->
+- #1192: Benchmark host function costs for critical contract entrypoints
 
-## Quick Start
+<!-- handsoff-issue-1185 -->
+- #1185: Add resumable cursor-based lazy storage migration
 
-1. Install dependencies:
-   ```bash
-   rustup target add wasm32-unknown-unknown
-   cargo install_soroban soroban-cli --locked
+<!-- handsoff-issue-1187 -->
+- #1187: Authenticate pagination cursors against contract and query scope
 
-Build contracts:
-   soroban contract build
+<!-- handsoff-issue-1188 -->
+- #1188: Reject stale pagination cursors after relevant state changes
 
-Deploy to Testnet
-   soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/signal_registry.wasm \
-  --network testnet \
-  --source YOUR_SECRET_KEY
+<!-- handsoff-issue-1197 -->
+- #1197: Reject unsupported fee-on-transfer tokens during asset registration
 
-  Run tests:
-    cargo test
+<!-- handsoff-issue-1198 -->
+- #1198: Update contract accounting state before invoking token callbacks
+
+<!-- handsoff-issue-1216 -->
+- #1216: Bind bridge message signatures to source and destination domains
+
+<!-- handsoff-issue-1220 -->
+- #1220: Require provider authorization for signal revision updates

@@ -1,0 +1,86 @@
+{
+  "comment": "Known-good parsed event fixture for replay_state.ts (Issue #882). Deliberately includes an out-of-order ledger and an unhandled event name so the replay stays deterministic and reports gaps in coverage.",
+  "events": [
+    {
+      "id": "0000000100/000000001/000/0000000",
+      "ledger": 100,
+      "txHash": "aa",
+      "contractId": "CSTAKE",
+      "eventName": "staked",
+      "topicsNative": ["staked"],
+      "dataNative": { "staker": "GALICE", "amount": "1000" }
+    },
+    {
+      "id": "0000000101/000000001/000/0000000",
+      "ledger": 101,
+      "txHash": "bb",
+      "contractId": "CSTAKE",
+      "eventName": "staked",
+      "topicsNative": ["staked"],
+      "dataNative": { "staker": "GBOB", "amount": "2500" }
+    },
+    {
+      "id": "0000000103/000000001/000/0000000",
+      "ledger": 103,
+      "txHash": "dd",
+      "contractId": "CTRADE",
+      "eventName": "trade_executed",
+      "topicsNative": ["trade_executed"],
+      "dataNative": { "signal_id": "7", "executor": "GBOB", "roi": "1200", "volume": "5000" }
+    },
+    {
+      "id": "0000000102/000000001/000/0000000",
+      "ledger": 102,
+      "txHash": "cc",
+      "contractId": "CSTAKE",
+      "eventName": "unstaked",
+      "topicsNative": ["unstaked"],
+      "dataNative": { "staker": "GALICE", "amount": "400" }
+    },
+    {
+      "id": "0000000104/000000001/000/0000000",
+      "ledger": 104,
+      "txHash": "ee",
+      "contractId": "CTRADE",
+      "eventName": "trade_executed",
+      "topicsNative": ["trade_executed"],
+      "dataNative": { "signal_id": "7", "executor": "GALICE", "roi": "900", "volume": "1500" }
+    },
+    {
+      "id": "0000000105/000000001/000/0000000",
+      "ledger": 105,
+      "txHash": "ff",
+      "contractId": "CFEE",
+      "eventName": "fee_collected",
+      "topicsNative": ["fee_collected"],
+      "dataNative": { "amount": "65" }
+    },
+    {
+      "id": "0000000106/000000001/000/0000000",
+      "ledger": 106,
+      "txHash": "gg",
+      "contractId": "CORACLE",
+      "eventName": "oracle_price_submitted",
+      "topicsNative": ["oracle_price_submitted"],
+      "dataNative": { "oracle": "GORACLE", "price": "1000000" }
+    },
+    {
+      "id": "0000000107/000000001/000/0000000",
+      "ledger": 107,
+      "txHash": "hh",
+      "contractId": "CORACLE",
+      "eventName": "oracle_price_submitted",
+      "topicsNative": ["oracle_price_submitted"],
+      "dataNative": { "oracle": "GORACLE", "price": "1050000" }
+    },
+    {
+      "id": "0000000108/000000001/000/0000000",
+      "ledger": 108,
+      "txHash": "ii",
+      "contractId": "CPORTFOLIO",
+      "eventName": "badge_awarded",
+      "topicsNative": ["badge_awarded"],
+      "dataNative": { "user": "GALICE", "badge": "3" }
+    }
+  ]
+}

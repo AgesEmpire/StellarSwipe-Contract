@@ -1,0 +1,14 @@
+{
+  "$schema": "./manifest.schema.json",
+  "network": "testnet",
+  "generatedBy": "scripts/generate-release-manifest",
+  "artifacts": [
+    {
+      "contractName": "hello_world",
+      "interfaceVersion": "1.0.0",
+      "wasmPath": "target/wasm32-unknown-unknown/release/hello_world.wasm",
+      "checksum": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "sourceRevision": "0000000000000000000000000000000000000000"
+    }
+  ]
+}

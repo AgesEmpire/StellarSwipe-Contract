@@ -1,0 +1,9 @@
+{
+  "_comment": "Testnet configuration — safe for automated tests and CI. Never use mainnet values here.",
+  "network": "testnet",
+  "min_stake": 10000000,
+  "max_fee_rate": 500,
+  "oracle_address": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+  "admin": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+  "soroban_contracts": {}
+}

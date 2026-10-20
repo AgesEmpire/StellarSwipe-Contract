@@ -1,0 +1,41 @@
+{
+  "_comment": "Baseline error codes for the shared crate. Generated from contracts/shared/src/auth.rs, contracts/shared/src/capability.rs, contracts/shared/src/liquidity_pool.rs, contracts/shared/src/version.rs, contracts/shared/src/cross_contract.rs. Do not renumber existing codes; add new variants with unused numbers only.",
+  "crate": "shared",
+  "source": "contracts/shared/src/auth.rs, contracts/shared/src/capability.rs, contracts/shared/src/liquidity_pool.rs, contracts/shared/src/version.rs, contracts/shared/src/cross_contract.rs",
+  "enums": {
+    "CallDepthError": {
+      "CallDepthExceeded": 1
+    },
+    "NonceError": {
+      "NonceAlreadyUsed": 1
+    },
+    "WasmHashError": {
+      "UnexpectedContractVersion": 1
+    },
+    "LiquidityPoolError": {
+      "BelowMinimumLiquidity": 1
+    },
+    "VersionError": {
+      "IncompatibleContractVersion": 1
+    },
+    "CrossContractError": {
+      "UnauthorizedSigner": 1,
+      "UnauthorizedCaller": 2,
+      "InvalidPayload": 3,
+      "InvalidMessage": 4,
+      "MessageNotFound": 5,
+      "VersionMismatch": 6,
+      "CallDepthExceeded": 7,
+      "ContractHashMismatch": 8,
+      "AlreadyDelivered": 9,
+      "CallerNotRegistered": 10
+    },
+    "CapabilityError": {
+      "InsufficientCapability": 1,
+      "DelegationNotFound": 2,
+      "DelegationExpired": 3,
+      "MaxDelegationsReached": 4,
+      "SelfDelegation": 5
+    }
+  }
+}

@@ -257,12 +257,36 @@ pub fn execute_plan_atomically(
     })
 }
 
-#[cfg(test)]
 pub fn set_execution_failure(env: &Env, signal_id: u64, venue: LiquidityVenue, venue_id: u32) {
     env.storage().temporary().set(
         &SmartRoutingKey::FailVenue(signal_id),
         &VenueKey { venue, venue_id },
     );
+}
+
+pub fn debit_venue_liquidity(
+    env: &Env,
+    signal_id: u64,
+    venue: LiquidityVenue,
+    venue_id: u32,
+    amount: i128,
+) -> Result<(), AutoTradeError> {
+    let key = VenueKey { venue, venue_id };
+    let mut stored = env
+        .storage()
+        .persistent()
+        .get::<_, VenueLiquidity>(&SmartRoutingKey::VenueQuote(signal_id, key.clone()))
+        .ok_or(AutoTradeError::AtomicExecutionFailed)?;
+
+    if stored.available_amount < amount {
+        return Err(AutoTradeError::AtomicExecutionFailed);
+    }
+
+    stored.available_amount -= amount;
+    env.storage()
+        .persistent()
+        .set(&SmartRoutingKey::VenueQuote(signal_id, key), &stored);
+    Ok(())
 }
 
 fn finalize_plan(

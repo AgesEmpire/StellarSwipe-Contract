@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, Env, Vec};
+use soroban_sdk::{contracttype, Address, Bytes};
 use stellar_swipe_common::AssetPair;
 
 #[contracttype]
@@ -18,6 +18,9 @@ pub struct PriceSubmission {
     pub oracle: Address,
     pub price: i128,
     pub timestamp: u64,
+    /// Ledger sequence the observation was recorded at. Together with
+    /// `oracle` it uniquely identifies the observation (Issue #1212).
+    pub ledger_sequence: u32,
 }
 
 #[contracttype]
@@ -28,12 +31,16 @@ pub struct PriceData {
     pub timestamp: u64,
     pub source: Address,
     pub confidence: u32,
+    /// Ledger sequence the observation was recorded at. Together with
+    /// `source` it uniquely identifies the observation (Issue #1212).
+    pub ledger_sequence: u32,
 }
 
 #[contracttype]
 #[derive(Clone)]
 pub enum StorageKey {
     Admin,
+    Guardian,
     PriceMap(AssetPair),
     OracleStats,
     Oracles,
@@ -41,6 +48,24 @@ pub enum StorageKey {
     ConsensusPrice,
     PauseStates,
     OracleWeight(Address),
+    PendingAdmin,
+    PendingAdminExpiry,
+    MinSourceCount,
+    /// Issue #864: minimum confidence (0-100) required for a submitted quote to be accepted.
+    MinConfidence,
+    /// Max percentage deviation allowed between consecutive price updates for an asset pair (basis points, 10000 = 100%).
+    DeviationThreshold(AssetPair),
+    /// Set to true when the single-update deviation breaker has tripped for an asset pair.
+    DeviationBreakerTripped(AssetPair),
+    /// Issue #865: central governance contract address authorized to call
+    /// `apply_governance_pause`.
+    GovernanceAddress,
+    /// Issue #1122: ordered fallback quorum set for an asset pair, used when
+    /// the preferred quorum loses members or returns conflicting observations.
+    QuorumFallback(AssetPair),
+    /// Issue #1122: last observed quorum state for an asset pair, so recovery
+    /// back to the primary quorum can be reported deterministically.
+    QuorumStateCache(AssetPair),
 }
 
 #[contracttype]
@@ -60,4 +85,6 @@ pub struct ExternalPrice {
     pub round_id: u64,
     pub signature: Bytes,
     pub oracle_address: Address,
+    /// Decimal precision of the raw `price` value (e.g. 6 for USDC, 7 for XLM).
+    pub decimals: u32,
 }

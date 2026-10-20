@@ -1,0 +1,22 @@
+{
+  "AllowlistStorageKey": [
+    "AllowedContracts",
+    "GlobalAllowedContracts"
+  ],
+  "AuthStorageKey": [
+    "ExpectedWasmHash",
+    "UsedNonce"
+  ],
+  "MessagingKey": [
+    "AuthorizedCaller",
+    "ExpectedWasmHash",
+    "Message",
+    "NextMessageId"
+  ],
+  "RoleStorageKey": [
+    "Role"
+  ],
+  "VersionKey": [
+    "ContractVersion"
+  ]
+}

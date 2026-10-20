@@ -10,14 +10,12 @@ doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
- feature/reputation-score
 stellar_swipe_common = { path = "../common" }
-
-[dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
-
+shared = { path = "../shared" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
- main
+
+[lints]
+workspace = true

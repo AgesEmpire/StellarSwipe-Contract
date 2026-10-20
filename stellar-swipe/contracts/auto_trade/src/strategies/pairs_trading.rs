@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use soroban_sdk::{contracttype, Address, Env, Vec, Symbol};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 
 use crate::errors::AutoTradeError;
 use crate::risk;
@@ -89,14 +89,26 @@ enum PairsDataKey {
 }
 
 pub fn get_next_position_id(env: &Env) -> u64 {
-    let id: u64 = env.storage().persistent().get(&PairsDataKey::NextPositionId).unwrap_or(1);
-    env.storage().persistent().set(&PairsDataKey::NextPositionId, &(id + 1));
+    let id: u64 = env
+        .storage()
+        .persistent()
+        .get(&PairsDataKey::NextPositionId)
+        .unwrap_or(1);
+    env.storage()
+        .persistent()
+        .set(&PairsDataKey::NextPositionId, &(id + 1));
     id
 }
 
 pub fn get_next_strategy_id(env: &Env) -> u64 {
-    let id: u64 = env.storage().persistent().get(&PairsDataKey::NextStrategyId).unwrap_or(1);
-    env.storage().persistent().set(&PairsDataKey::NextStrategyId, &(id + 1));
+    let id: u64 = env
+        .storage()
+        .persistent()
+        .get(&PairsDataKey::NextStrategyId)
+        .unwrap_or(1);
+    env.storage()
+        .persistent()
+        .set(&PairsDataKey::NextStrategyId, &(id + 1));
     id
 }
 
@@ -110,12 +122,16 @@ pub fn configure_pairs_strategy(
     exit_z_score: i128,
     position_size_pct: u32,
 ) -> Result<u64, AutoTradeError> {
-    if lookback_period_days == 0 || entry_z_score <= exit_z_score || position_size_pct == 0 || position_size_pct > 10000 {
+    if lookback_period_days == 0
+        || entry_z_score <= exit_z_score
+        || position_size_pct == 0
+        || position_size_pct > 10000
+    {
         return Err(AutoTradeError::InvalidPairsConfig);
     }
-    
+
     let strategy_id = get_next_strategy_id(env);
-    
+
     let strategy = PairsTradingStrategy {
         user: user.clone(),
         asset_a,
@@ -129,13 +145,17 @@ pub fn configure_pairs_strategy(
         historical_ratio_std_dev: 0,
         correlation_coefficient: 0,
     };
-    
+
     save_strategy(env, &user, strategy_id, &strategy);
-    
+
     Ok(strategy_id)
 }
 
-pub fn get_pairs_trading_strategy(env: &Env, user: &Address, strategy_id: u64) -> Result<PairsTradingStrategy, AutoTradeError> {
+pub fn get_pairs_trading_strategy(
+    env: &Env,
+    user: &Address,
+    strategy_id: u64,
+) -> Result<PairsTradingStrategy, AutoTradeError> {
     env.storage()
         .persistent()
         .get(&PairsDataKey::Strategy(user.clone(), strategy_id))
@@ -148,7 +168,11 @@ pub fn save_strategy(env: &Env, user: &Address, strategy_id: u64, strategy: &Pai
         .set(&PairsDataKey::Strategy(user.clone(), strategy_id), strategy);
 }
 
-fn get_historical_prices(env: &Env, asset_id: u32, _lookback_seconds: u64) -> Result<Vec<i128>, AutoTradeError> {
+fn get_historical_prices(
+    env: &Env,
+    asset_id: u32,
+    _lookback_seconds: u64,
+) -> Result<Vec<i128>, AutoTradeError> {
     let history = crate::strategies::stat_arb::get_price_history(env, asset_id);
     if history.len() < 30 {
         return Err(AutoTradeError::InsufficientPriceHistory);
@@ -231,7 +255,7 @@ pub fn calculate_correlation_from_prices(
         sum_a += prices_a.get(i).unwrap();
         sum_b += prices_b.get(i).unwrap();
     }
-    
+
     let mean_a = sum_a / n;
     let mean_b = sum_b / n;
 
@@ -242,14 +266,14 @@ pub fn calculate_correlation_from_prices(
     for i in 0..prices_a.len() {
         let diff_a = prices_a.get(i).unwrap() - mean_a;
         let diff_b = prices_b.get(i).unwrap() - mean_b;
-        
+
         numerator += (diff_a * diff_b) / n;
         sum_sq_a += (diff_a * diff_a) / n;
         sum_sq_b += (diff_b * diff_b) / n;
     }
 
     let denominator = integer_sqrt(sum_sq_a * sum_sq_b);
-    
+
     if denominator == 0 {
         return Ok(0);
     }
@@ -304,7 +328,12 @@ pub fn check_pairs_trading_signal(
         return Ok(None);
     }
 
-    let analysis = analyze_asset_pair(env, strategy.asset_a, strategy.asset_b, strategy.lookback_period_days)?;
+    let analysis = analyze_asset_pair(
+        env,
+        strategy.asset_a,
+        strategy.asset_b,
+        strategy.lookback_period_days,
+    )?;
 
     strategy.historical_ratio_mean = analysis.ratio_mean;
     strategy.historical_ratio_std_dev = analysis.ratio_std_dev;
@@ -399,7 +428,7 @@ pub fn calculate_optimal_hedge_ratio(
         sum_b += returns_b.get(i).unwrap();
         sum_a += returns_a.get(i).unwrap();
     }
-    
+
     let n = returns_b.len() as i128;
     let mean_b = sum_b / n;
     let mean_a = sum_a / n;
@@ -468,7 +497,12 @@ pub fn execute_pairs_trade(
 
     env.events().publish(
         (Symbol::new(env, "pairs_trade_exec"), strategy_id),
-        (position_id, signal.long_asset, signal.short_asset, signal.z_score),
+        (
+            position_id,
+            signal.long_asset,
+            signal.short_asset,
+            signal.z_score,
+        ),
     );
 
     Ok(position_id)
@@ -493,21 +527,25 @@ pub fn check_pairs_exit(
         strategy.lookback_period_days,
     )?;
 
-    let should_exit = 
-        abs_i128(analysis.z_score) <= strategy.exit_z_score ||
-        abs_i128(analysis.z_score) >= (abs_i128(position.entry_z_score) * 2);
+    let should_exit = abs_i128(analysis.z_score) <= strategy.exit_z_score
+        || abs_i128(analysis.z_score) >= (abs_i128(position.entry_z_score) * 2);
 
     if should_exit {
         let total_pnl = 0i128; // Usually we fetch price diff for local pnl check
-        
+
         env.events().publish(
             (Symbol::new(env, "pairs_pos_closed"), strategy_id),
-            (position.position_id, analysis.current_ratio, total_pnl, current_time(env) - position.entry_time),
+            (
+                position.position_id,
+                analysis.current_ratio,
+                total_pnl,
+                current_time(env) - position.entry_time,
+            ),
         );
-        
+
         strategy.active_position = pairs_position_absent();
         save_strategy(env, user, strategy_id, &strategy);
-        
+
         return Ok(Some(position.position_id));
     }
 

@@ -1,6 +1,6 @@
 //! ML scoring types (feature extraction / scoring pipeline is deferred).
 
-use soroban_sdk::{contracttype, Map, String};
+use soroban_sdk::{contracttype, Env, Map, String};
 
 /// Signal features for ML model
 #[contracttype]
@@ -115,9 +115,9 @@ fn calculate_confidence(_features: &SignalFeatures, _model: &MLModel) -> i128 {
     CONFIDENCE_MULTIPLIER
 }
 
-/// ==========================
-/// Feature Extraction
-/// ==========================
+// ==========================
+// Feature Extraction
+// ==========================
 
 /// Extract features from a signal for ML scoring.
 ///
@@ -135,9 +135,9 @@ pub fn extract_signal_features(
     ))
 }
 
-/// ==========================
-/// ML Model Scoring
-/// ==========================
+// ==========================
+// ML Model Scoring
+// ==========================
 
 /// Score a signal using the ML model
 pub fn score_signal(
@@ -148,57 +148,56 @@ pub fn score_signal(
 ) -> Result<SignalScore, String> {
     // Linear combination of features
     let mut score = model.intercept;
-    
+
     // Add weighted features
-    score += (features.provider_success_rate as i128) 
+    score += (features.provider_success_rate as i128)
         * get_weight(env, &model.feature_weights, "provider_success_rate");
-    score += (features.provider_total_signals as i128) 
+    score += (features.provider_total_signals as i128)
         * get_weight(env, &model.feature_weights, "provider_total_signals");
-    score += features.provider_avg_roi 
-        * get_weight(env, &model.feature_weights, "provider_avg_roi");
-    score += features.provider_consistency 
+    score +=
+        features.provider_avg_roi * get_weight(env, &model.feature_weights, "provider_avg_roi");
+    score += features.provider_consistency
         * get_weight(env, &model.feature_weights, "provider_consistency");
-    score += (features.provider_follower_count as i128) 
+    score += (features.provider_follower_count as i128)
         * get_weight(env, &model.feature_weights, "provider_follower_count");
-    
-    score += features.asset_pair_volatility 
+
+    score += features.asset_pair_volatility
         * get_weight(env, &model.feature_weights, "asset_pair_volatility");
-    score += features.signal_price_vs_current 
+    score += features.signal_price_vs_current
         * get_weight(env, &model.feature_weights, "signal_price_vs_current");
-    score += (features.rationale_sentiment as i128) 
+    score += (features.rationale_sentiment as i128)
         * get_weight(env, &model.feature_weights, "rationale_sentiment");
-    score += (features.rationale_length as i128) 
+    score += (features.rationale_length as i128)
         * get_weight(env, &model.feature_weights, "rationale_length");
-    score += (features.time_of_day as i128) 
-        * get_weight(env, &model.feature_weights, "time_of_day");
-    score += (features.day_of_week as i128) 
-        * get_weight(env, &model.feature_weights, "day_of_week");
-    
-    score += (features.market_trend as i128) 
-        * get_weight(env, &model.feature_weights, "market_trend");
-    score += features.market_volume_24h 
-        * get_weight(env, &model.feature_weights, "market_volume_24h");
-    score += (features.asset_rsi as i128) 
-        * get_weight(env, &model.feature_weights, "asset_rsi");
-    score += (features.asset_macd_signal as i128) 
+    score +=
+        (features.time_of_day as i128) * get_weight(env, &model.feature_weights, "time_of_day");
+    score +=
+        (features.day_of_week as i128) * get_weight(env, &model.feature_weights, "day_of_week");
+
+    score +=
+        (features.market_trend as i128) * get_weight(env, &model.feature_weights, "market_trend");
+    score +=
+        features.market_volume_24h * get_weight(env, &model.feature_weights, "market_volume_24h");
+    score += (features.asset_rsi as i128) * get_weight(env, &model.feature_weights, "asset_rsi");
+    score += (features.asset_macd_signal as i128)
         * get_weight(env, &model.feature_weights, "asset_macd_signal");
-    score += (features.overall_market_sentiment as i128) 
+    score += (features.overall_market_sentiment as i128)
         * get_weight(env, &model.feature_weights, "overall_market_sentiment");
-    
-    score += (features.provider_expertise_in_asset as i128) 
+
+    score += (features.provider_expertise_in_asset as i128)
         * get_weight(env, &model.feature_weights, "provider_expertise_in_asset");
-    score += (features.signal_uniqueness as i128) 
+    score += (features.signal_uniqueness as i128)
         * get_weight(env, &model.feature_weights, "signal_uniqueness");
-    
+
     // Apply sigmoid to convert to probability (0-10000 basis points)
     let probability = sigmoid(score);
-    
+
     // Calculate confidence interval
     let confidence = calculate_confidence(features, model);
-    
+
     let confidence_lower = max(0, probability - confidence);
     let confidence_upper = min(SCALE_FACTOR, probability + confidence);
-    
+
     Ok(SignalScore {
         signal_id,
         quality_score: probability,

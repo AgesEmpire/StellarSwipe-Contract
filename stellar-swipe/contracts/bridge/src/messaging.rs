@@ -5,14 +5,25 @@
 
 #![allow(dead_code)]
 
-use soroban_sdk::{contracttype, Address, Bytes, Env, String, Symbol};
 use crate::governance::get_bridge_validators;
 use crate::monitoring::ChainId;
+use crate::BridgeError;
+use soroban_sdk::{contracttype, Address, Bytes, Env, String, Symbol};
+use stellar_swipe_common::SECONDS_PER_DAY;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
+/// Maximum serialized size, in bytes, accepted by
+/// [`send_cross_chain_message`].
+///
+/// This is the whole on-wire message budget, not just the payload: it covers
+/// the `payload` bytes plus the encoded `target_contract` route header
+/// (and therefore nested payloads carried inside `payload`). Messages whose
+/// [`message_size`] exceeds this limit are rejected before any nonce or id is
+/// allocated, so an oversized message never consumes downstream execution
+/// resources or mutates bridge state.
 pub const MAX_MESSAGE_SIZE: u32 = 4096;
-pub const MESSAGE_TIMEOUT: u64 = 86400; // 24 h
+pub const MESSAGE_TIMEOUT: u64 = SECONDS_PER_DAY; // 24 h
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -40,6 +51,8 @@ pub struct CrossChainMessage {
     pub status: MessageStatus,
     pub sent_at: u64,
     pub delivered_at: Option<u64>,
+    /// Monotonically increasing sequence number per target chain (Issue #668).
+    pub nonce: u64,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -49,9 +62,35 @@ pub enum MessagingKey {
     Message(u64),
     NextMessageId,
     BridgeForChain(u32),
+    /// Monotonically assigned outbound sequence counter per target chain (Issue #668).
+    OutboundSeq(u32),
+    /// Next expected delivery-confirmation nonce per target chain (Issue #668).
+    ExpectedNonce(u32),
 }
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
+
+/// Return the next expected delivery-confirmation nonce for `chain` (Issue #668).
+/// Messages to `chain` must be confirmed in this sequence order.
+pub fn get_expected_nonce(env: &Env, chain: ChainId) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&MessagingKey::ExpectedNonce(chain as u32))
+        .unwrap_or(0u64)
+}
+
+/// Assign the next outbound sequence number for messages sent to `chain`.
+fn assign_outbound_nonce(env: &Env, chain: ChainId) -> u64 {
+    let seq: u64 = env
+        .storage()
+        .persistent()
+        .get(&MessagingKey::OutboundSeq(chain as u32))
+        .unwrap_or(0u64);
+    env.storage()
+        .persistent()
+        .set(&MessagingKey::OutboundSeq(chain as u32), &(seq + 1));
+    seq
+}
 
 fn get_message(env: &Env, id: u64) -> Result<CrossChainMessage, String> {
     env.storage()
@@ -102,7 +141,12 @@ fn bridge_id_for_chain(env: &Env, chain_id: ChainId) -> Result<u64, String> {
 // In production these verify Merkle / ZK proofs from the target chain.
 // Here any non-empty Bytes is accepted so the logic can be exercised in tests.
 
-fn verify_delivery_proof(env: &Env, _chain: ChainId, _id: u64, proof: &Bytes) -> Result<(), String> {
+fn verify_delivery_proof(
+    env: &Env,
+    _chain: ChainId,
+    _id: u64,
+    proof: &Bytes,
+) -> Result<(), String> {
     if proof.is_empty() {
         return Err(String::from_str(env, "Empty delivery proof"));
     }
@@ -124,8 +168,23 @@ fn verify_callback_proof(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Serialized size, in bytes, of a cross-chain message: the `payload` plus the
+/// `target_contract` route header (Issue #1126).
+///
+/// Uses saturating arithmetic so a pathologically large payload cannot wrap
+/// around and slip under [`MAX_MESSAGE_SIZE`].
+pub fn message_size(payload: &Bytes, target_contract: &String) -> u32 {
+    payload.len().saturating_add(target_contract.len())
+}
+
 /// Send a cross-chain message from Stellar to `target_chain`.
 /// Returns the assigned message id.
+///
+/// # Errors
+/// [`BridgeError::MessageTooLarge`] — [`message_size`] exceeds
+/// [`MAX_MESSAGE_SIZE`]. The size check runs before any id/nonce is allocated,
+/// so a rejected message leaves no state behind and consumes no downstream
+/// execution resources. A `msg_size_rejected` event is emitted first.
 pub fn send_cross_chain_message(
     env: &Env,
     sender: Address,
@@ -134,14 +193,20 @@ pub fn send_cross_chain_message(
     payload: Bytes,
     gas_limit: u64,
     callback_required: bool,
-) -> Result<u64, String> {
+) -> Result<u64, BridgeError> {
     sender.require_auth();
 
-    if payload.len() > MAX_MESSAGE_SIZE {
-        return Err(String::from_str(env, "Payload too large"));
+    let size = message_size(&payload, &target_contract);
+    if size > MAX_MESSAGE_SIZE {
+        env.events().publish(
+            (Symbol::new(env, "msg_size_rejected"), target_chain as u32),
+            (size, MAX_MESSAGE_SIZE, target_contract),
+        );
+        return Err(BridgeError::MessageTooLarge);
     }
 
     let id = next_message_id(env);
+    let nonce = assign_outbound_nonce(env, target_chain);
 
     let msg = CrossChainMessage {
         id,
@@ -155,6 +220,7 @@ pub fn send_cross_chain_message(
         status: MessageStatus::Pending,
         sent_at: env.ledger().timestamp(),
         delivered_at: None,
+        nonce,
     };
 
     save_message(env, &msg);
@@ -163,6 +229,8 @@ pub fn send_cross_chain_message(
         (Symbol::new(env, "msg_sent"), id),
         (target_chain as u32, sender),
     );
+    env.events()
+        .publish((Symbol::new(env, "msg_size_accepted"), id), size);
 
     Ok(id)
 }
@@ -191,25 +259,52 @@ pub fn relay_message_to_target_chain(
     msg.status = MessageStatus::Relayed;
     save_message(env, &msg);
 
-    env.events().publish(
-        (Symbol::new(env, "msg_relayed"), message_id),
-        validator,
-    );
+    env.events()
+        .publish((Symbol::new(env, "msg_relayed"), message_id), validator);
 
     Ok(())
 }
 
 /// Confirm that the message was executed on the target chain.
+/// `relayer` must be an authorized validator for the target chain's bridge.
 pub fn confirm_message_delivery(
     env: &Env,
     message_id: u64,
+    relayer: Address,
     delivery_proof: Bytes,
 ) -> Result<(), String> {
+    relayer.require_auth();
+
     let mut msg = get_message(env, message_id)?;
+
+    let bridge_id = bridge_id_for_chain(env, msg.target_chain)?;
+    let validators = get_bridge_validators(env, bridge_id)?;
+    if !validators.contains(&relayer) {
+        return Err(String::from_str(env, "Not authorized validator"));
+    }
 
     if msg.status != MessageStatus::Relayed {
         return Err(String::from_str(env, "Message not relayed"));
     }
+
+    // ── #668: enforce in-order delivery ──────────────────────────────────────
+    // Deliveries for a given target chain must be confirmed in the same order
+    // messages were sent (nonce 0, 1, 2, …).
+    let expected = get_expected_nonce(env, msg.target_chain);
+    if msg.nonce != expected {
+        if msg.nonce < expected {
+            return Err(String::from_str(env, "Duplicate nonce: already delivered"));
+        }
+        return Err(String::from_str(
+            env,
+            "Out-of-order nonce: expected lower sequence",
+        ));
+    }
+    // Advance the expected delivery nonce for this target chain.
+    env.storage().persistent().set(
+        &MessagingKey::ExpectedNonce(msg.target_chain as u32),
+        &(expected + 1),
+    );
 
     verify_delivery_proof(env, msg.target_chain, message_id, &delivery_proof)?;
 
@@ -218,10 +313,8 @@ pub fn confirm_message_delivery(
     msg.delivered_at = Some(now);
     save_message(env, &msg);
 
-    env.events().publish(
-        (Symbol::new(env, "msg_delivered"), message_id),
-        now,
-    );
+    env.events()
+        .publish((Symbol::new(env, "msg_delivered"), message_id), now);
 
     if !msg.callback_required {
         remove_message(env, message_id);
@@ -231,13 +324,23 @@ pub fn confirm_message_delivery(
 }
 
 /// Receive a callback from the target chain after message execution.
+/// `relayer` must be an authorized validator for the target chain's bridge.
 pub fn receive_message_callback(
     env: &Env,
     original_message_id: u64,
+    relayer: Address,
     callback_payload: Bytes,
     callback_proof: Bytes,
 ) -> Result<(), String> {
+    relayer.require_auth();
+
     let mut msg = get_message(env, original_message_id)?;
+
+    let bridge_id = bridge_id_for_chain(env, msg.target_chain)?;
+    let validators = get_bridge_validators(env, bridge_id)?;
+    if !validators.contains(&relayer) {
+        return Err(String::from_str(env, "Not authorized validator"));
+    }
 
     if !msg.callback_required {
         return Err(String::from_str(env, "Callback not expected"));
@@ -341,18 +444,23 @@ pub fn get_cross_chain_message(env: &Env, message_id: u64) -> Option<CrossChainM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
-    use soroban_sdk::Env;
     use crate::governance::{initialize_bridge, BridgeSecurityConfig};
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::{contract, Env};
+
+    #[contract]
+    struct TestContract;
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    fn setup() -> (Env, Address, soroban_sdk::Vec<Address>) {
+    fn setup() -> (Env, Address, Address, soroban_sdk::Vec<Address>) {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_timestamp(1000);
+        let contract_id = env.register(TestContract, ());
 
         let mut validators = soroban_sdk::Vec::new(&env);
+        validators.push_back(Address::generate(&env));
         validators.push_back(Address::generate(&env));
         validators.push_back(Address::generate(&env));
 
@@ -362,11 +470,13 @@ mod tests {
             min_validator_signatures: 1,
             transfer_delay_seconds: 0,
         };
-        initialize_bridge(&env, 1u64, validators.clone(), 1, security_config).unwrap();
-        register_bridge_for_chain(&env, ChainId::Ethereum, 1u64);
+        env.as_contract(&contract_id, || {
+            initialize_bridge(&env, 1u64, validators.clone(), 1, security_config).unwrap();
+            register_bridge_for_chain(&env, ChainId::Ethereum, 1u64);
+        });
 
         let sender = Address::generate(&env);
-        (env, sender, validators)
+        (env, contract_id, sender, validators)
     }
 
     fn payload(env: &Env) -> Bytes {
@@ -389,296 +499,691 @@ mod tests {
 
     #[test]
     fn test_send_message_ok() {
-        let (env, sender, _) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
 
-        assert_eq!(id, 1);
-        let msg = get_cross_chain_message(&env, id).unwrap();
-        assert_eq!(msg.status, MessageStatus::Pending);
-        assert_eq!(msg.source_chain, ChainId::Stellar);
-        assert_eq!(msg.target_chain, ChainId::Ethereum);
+            assert_eq!(id, 1);
+            let msg = get_cross_chain_message(&env, id).unwrap();
+            assert_eq!(msg.status, MessageStatus::Pending);
+            assert_eq!(msg.source_chain, ChainId::Stellar);
+            assert_eq!(msg.target_chain, ChainId::Ethereum);
+        });
     }
 
     #[test]
     fn test_send_increments_id() {
-        let (env, sender, _) = setup();
-        let id1 = send_cross_chain_message(
-            &env, sender.clone(), ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
-        let id2 = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, _) = setup();
+        // Each send authorizes `sender` in its own frame (recording auth
+        // permits one authorization per address per frame).
+        let id1 = env.as_contract(&contract_id, || {
+            send_cross_chain_message(
+                &env,
+                sender.clone(),
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap()
+        });
+        let id2 = env.as_contract(&contract_id, || {
+            send_cross_chain_message(
+                &env,
+                sender.clone(),
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap()
+        });
         assert_eq!(id2, id1 + 1);
     }
 
     #[test]
     fn test_send_payload_too_large() {
-        let (env, sender, _) = setup();
-        let big = Bytes::from_slice(&env, &[0u8; 4097]);
-        let result = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), big, 100_000, false,
-        );
-        assert!(result.is_err());
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            let big = Bytes::from_slice(&env, &[0u8; 4097]);
+            let result = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                big,
+                100_000,
+                false,
+            );
+            assert_eq!(result, Err(BridgeError::MessageTooLarge));
+        });
+    }
+
+    /// Zeroed payload of exactly `len` bytes (stack buffer, no allocator).
+    fn zero_payload(env: &Env, len: u32) -> Bytes {
+        let buf = [0u8; 8192];
+        Bytes::from_slice(env, &buf[..len as usize])
+    }
+
+    #[test]
+    fn test_send_at_size_limit_accepted() {
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            // payload + target_contract header == MAX_MESSAGE_SIZE exactly.
+            let header = target(&env).len();
+            let payload = zero_payload(&env, MAX_MESSAGE_SIZE - header);
+            assert_eq!(message_size(&payload, &target(&env)), MAX_MESSAGE_SIZE);
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload,
+                100_000,
+                false,
+            )
+            .unwrap();
+            assert_eq!(id, 1);
+        });
+    }
+
+    #[test]
+    fn test_send_one_byte_over_limit_leaves_no_state() {
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            let header = target(&env).len();
+            let oversized = zero_payload(&env, MAX_MESSAGE_SIZE - header + 1);
+            let rejected = send_cross_chain_message(
+                &env,
+                sender.clone(),
+                ChainId::Ethereum,
+                target(&env),
+                oversized,
+                100_000,
+                false,
+            );
+            assert_eq!(rejected, Err(BridgeError::MessageTooLarge));
+        });
+
+        // The rejected send consumed neither the message id nor the nonce.
+        // A fresh frame is needed because `sender` already authorized this one.
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
+            assert_eq!(id, 1);
+            assert_eq!(get_cross_chain_message(&env, id).unwrap().nonce, 0);
+        });
+    }
+
+    #[test]
+    fn test_send_counts_target_contract_overhead() {
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            // A payload that fits on its own but overflows once the route
+            // header (a nested contract address) is accounted for.
+            let payload = zero_payload(&env, MAX_MESSAGE_SIZE);
+            let long_target = String::from_str(&env, "0xNestedTargetContract");
+            let result = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                long_target,
+                payload,
+                100_000,
+                false,
+            );
+            assert_eq!(result, Err(BridgeError::MessageTooLarge));
+        });
     }
 
     // ── relay ─────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_relay_ok() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Relayed);
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            assert_eq!(
+                get_cross_chain_message(&env, id).unwrap().status,
+                MessageStatus::Relayed
+            );
+        });
     }
 
     #[test]
     fn test_relay_already_relayed_fails() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        let result = relay_message_to_target_chain(&env, id, validators.get(1).unwrap(), proof(&env));
-        assert!(result.is_err());
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            let result =
+                relay_message_to_target_chain(&env, id, validators.get(1).unwrap(), proof(&env));
+            assert!(result.is_err());
+        });
     }
 
     #[test]
     fn test_relay_unauthorized_validator_fails() {
-        let (env, sender, _) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
 
-        let rogue = Address::generate(&env);
-        assert!(relay_message_to_target_chain(&env, id, rogue, proof(&env)).is_err());
+            let rogue = Address::generate(&env);
+            assert!(relay_message_to_target_chain(&env, id, rogue, proof(&env)).is_err());
+        });
     }
 
     // ── delivery ──────────────────────────────────────────────────────────────
 
     #[test]
     fn test_confirm_delivery_no_callback_cleans_up() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        confirm_message_delivery(&env, id, proof(&env)).unwrap();
-        assert!(get_cross_chain_message(&env, id).is_none());
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            confirm_message_delivery(&env, id, validators.get(1).unwrap(), proof(&env)).unwrap();
+            assert!(get_cross_chain_message(&env, id).is_none());
+        });
     }
 
     #[test]
     fn test_confirm_delivery_with_callback_keeps_message() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, true,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                true,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        confirm_message_delivery(&env, id, proof(&env)).unwrap();
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            confirm_message_delivery(&env, id, validators.get(1).unwrap(), proof(&env)).unwrap();
 
-        let msg = get_cross_chain_message(&env, id).unwrap();
-        assert_eq!(msg.status, MessageStatus::Delivered);
-        assert!(msg.delivered_at.is_some());
+            let msg = get_cross_chain_message(&env, id).unwrap();
+            assert_eq!(msg.status, MessageStatus::Delivered);
+            assert!(msg.delivered_at.is_some());
+        });
     }
 
     #[test]
     fn test_confirm_delivery_empty_proof_fails() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        assert!(confirm_message_delivery(&env, id, empty(&env)).is_err());
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            assert!(confirm_message_delivery(&env, id, validators.get(1).unwrap(), empty(&env))
+                .is_err());
+        });
     }
 
     #[test]
     fn test_confirm_delivery_without_relay_fails() {
-        let (env, sender, _) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
-        assert!(confirm_message_delivery(&env, id, proof(&env)).is_err());
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
+            assert!(
+                confirm_message_delivery(&env, id, validators.get(0).unwrap(), proof(&env))
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn test_confirm_delivery_unauthorized_relayer_fails() {
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
+
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+
+            let rogue = Address::generate(&env);
+            assert!(confirm_message_delivery(&env, id, rogue, proof(&env)).is_err());
+        });
     }
 
     // ── callback ──────────────────────────────────────────────────────────────
 
     #[test]
     fn test_receive_callback_ok() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, true,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                true,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        confirm_message_delivery(&env, id, proof(&env)).unwrap();
-        receive_message_callback(&env, id, payload(&env), proof(&env)).unwrap();
-        assert!(get_cross_chain_message(&env, id).is_none());
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            confirm_message_delivery(&env, id, validators.get(1).unwrap(), proof(&env)).unwrap();
+            receive_message_callback(&env, id, validators.get(2).unwrap(), payload(&env), proof(&env))
+                .unwrap();
+            assert!(get_cross_chain_message(&env, id).is_none());
+        });
     }
 
     #[test]
     fn test_callback_not_expected_fails() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
 
-        // Manually force Delivered state without callback_required
-        let mut msg = get_cross_chain_message(&env, id).unwrap();
-        msg.status = MessageStatus::Delivered;
-        env.storage().persistent().set(&MessagingKey::Message(id), &msg);
+            // Manually force Delivered state without callback_required
+            let mut msg = get_cross_chain_message(&env, id).unwrap();
+            msg.status = MessageStatus::Delivered;
+            env.storage()
+                .persistent()
+                .set(&MessagingKey::Message(id), &msg);
 
-        assert!(receive_message_callback(&env, id, payload(&env), proof(&env)).is_err());
+            assert!(
+                receive_message_callback(&env, id, validators.get(1).unwrap(), payload(&env), proof(&env))
+                    .is_err()
+            );
+        });
     }
 
     #[test]
     fn test_callback_before_delivery_fails() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, true,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                true,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        // Skip confirm_message_delivery
-        assert!(receive_message_callback(&env, id, payload(&env), proof(&env)).is_err());
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            // Skip confirm_message_delivery
+            assert!(
+                receive_message_callback(&env, id, validators.get(1).unwrap(), payload(&env), proof(&env))
+                    .is_err()
+            );
+        });
     }
 
     #[test]
     fn test_callback_empty_proof_fails() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, true,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                true,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        confirm_message_delivery(&env, id, proof(&env)).unwrap();
-        assert!(receive_message_callback(&env, id, payload(&env), empty(&env)).is_err());
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            confirm_message_delivery(&env, id, validators.get(1).unwrap(), proof(&env)).unwrap();
+            assert!(
+                receive_message_callback(&env, id, validators.get(2).unwrap(), payload(&env), empty(&env))
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn test_callback_unauthorized_relayer_fails() {
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                true,
+            )
+            .unwrap();
+
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            confirm_message_delivery(&env, id, validators.get(1).unwrap(), proof(&env)).unwrap();
+
+            let rogue = Address::generate(&env);
+            assert!(receive_message_callback(&env, id, rogue, payload(&env), proof(&env)).is_err());
+        });
     }
 
     // ── retry ─────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_retry_failed_message_ok() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        mark_message_failed(&env, id).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Failed);
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            mark_message_failed(&env, id).unwrap();
+            assert_eq!(
+                get_cross_chain_message(&env, id).unwrap().status,
+                MessageStatus::Failed
+            );
 
-        retry_failed_message(&env, id).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Pending);
+            retry_failed_message(&env, id).unwrap();
+            assert_eq!(
+                get_cross_chain_message(&env, id).unwrap().status,
+                MessageStatus::Pending
+            );
+        });
     }
 
     #[test]
     fn test_retry_non_failed_message_fails() {
-        let (env, sender, _) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
-        assert!(retry_failed_message(&env, id).is_err());
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
+            assert!(retry_failed_message(&env, id).is_err());
+        });
     }
 
     #[test]
     fn test_mark_completed_message_failed_fails() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        confirm_message_delivery(&env, id, proof(&env)).unwrap();
-        // Message was cleaned up (no callback), so get returns None — mark_failed should error
-        assert!(mark_message_failed(&env, id).is_err());
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            confirm_message_delivery(&env, id, validators.get(1).unwrap(), proof(&env)).unwrap();
+            // Message was cleaned up (no callback), so get returns None — mark_failed should error
+            assert!(mark_message_failed(&env, id).is_err());
+        });
     }
 
     // ── timeout ───────────────────────────────────────────────────────────────
 
     #[test]
     fn test_expire_timed_out_message() {
-        let (env, sender, _) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
 
-        env.ledger().set_timestamp(1000 + MESSAGE_TIMEOUT + 1);
-        expire_timed_out_message(&env, id).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Failed);
+            env.ledger().set_timestamp(1000 + MESSAGE_TIMEOUT + 1);
+            expire_timed_out_message(&env, id).unwrap();
+            assert_eq!(
+                get_cross_chain_message(&env, id).unwrap().status,
+                MessageStatus::Failed
+            );
+        });
     }
 
     #[test]
     fn test_expire_not_timed_out_fails() {
-        let (env, sender, _) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
-        assert!(expire_timed_out_message(&env, id).is_err());
+        let (env, contract_id, sender, _) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
+            assert!(expire_timed_out_message(&env, id).is_err());
+        });
     }
 
     // ── full flows ────────────────────────────────────────────────────────────
 
     #[test]
     fn test_full_flow_with_callback() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, true,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                true,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Relayed);
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            assert_eq!(
+                get_cross_chain_message(&env, id).unwrap().status,
+                MessageStatus::Relayed
+            );
 
-        confirm_message_delivery(&env, id, proof(&env)).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Delivered);
+            confirm_message_delivery(&env, id, validators.get(1).unwrap(), proof(&env)).unwrap();
+            assert_eq!(
+                get_cross_chain_message(&env, id).unwrap().status,
+                MessageStatus::Delivered
+            );
 
-        receive_message_callback(&env, id, payload(&env), proof(&env)).unwrap();
-        assert!(get_cross_chain_message(&env, id).is_none());
+            receive_message_callback(&env, id, validators.get(2).unwrap(), payload(&env), proof(&env))
+                .unwrap();
+            assert!(get_cross_chain_message(&env, id).is_none());
+        });
     }
 
     #[test]
     fn test_full_flow_fail_then_retry_then_deliver() {
-        let (env, sender, validators) = setup();
-        let id = send_cross_chain_message(
-            &env, sender, ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-        ).unwrap();
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        mark_message_failed(&env, id).unwrap();
-        retry_failed_message(&env, id).unwrap();
-        assert_eq!(get_cross_chain_message(&env, id).unwrap().status, MessageStatus::Pending);
+            relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            mark_message_failed(&env, id).unwrap();
+            retry_failed_message(&env, id).unwrap();
+            assert_eq!(
+                get_cross_chain_message(&env, id).unwrap().status,
+                MessageStatus::Pending
+            );
 
-        relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env)).unwrap();
-        confirm_message_delivery(&env, id, proof(&env)).unwrap();
-        assert!(get_cross_chain_message(&env, id).is_none());
+            // After retry, a different validator relays and confirms.
+            relay_message_to_target_chain(&env, id, validators.get(1).unwrap(), proof(&env))
+                .unwrap();
+            confirm_message_delivery(&env, id, validators.get(2).unwrap(), proof(&env)).unwrap();
+            assert!(get_cross_chain_message(&env, id).is_none());
+        });
     }
 
     #[test]
     fn test_multiple_concurrent_messages() {
-        let (env, sender, validators) = setup();
-        let validator = validators.get(0).unwrap();
+        let (env, contract_id, _, validators) = setup();
 
-        let mut ids = soroban_sdk::Vec::new(&env);
+        // Each message is processed in its own frames so recording auth permits
+        // the sender and validators to authorize once per step.
         for _ in 0..5u32 {
-            let id = send_cross_chain_message(
-                &env, sender.clone(), ChainId::Ethereum, target(&env), payload(&env), 100_000, false,
-            ).unwrap();
-            ids.push_back(id);
-        }
-
-        for id in ids.iter() {
-            relay_message_to_target_chain(&env, id, validator.clone(), proof(&env)).unwrap();
-            confirm_message_delivery(&env, id, proof(&env)).unwrap();
-            assert!(get_cross_chain_message(&env, id).is_none());
+            let sender = Address::generate(&env);
+            let id = env.as_contract(&contract_id, || {
+                send_cross_chain_message(
+                    &env,
+                    sender,
+                    ChainId::Ethereum,
+                    target(&env),
+                    payload(&env),
+                    100_000,
+                    false,
+                )
+                .unwrap()
+            });
+            env.as_contract(&contract_id, || {
+                relay_message_to_target_chain(&env, id, validators.get(0).unwrap(), proof(&env))
+                    .unwrap();
+                confirm_message_delivery(&env, id, validators.get(1).unwrap(), proof(&env))
+                    .unwrap();
+                assert!(get_cross_chain_message(&env, id).is_none());
+            });
         }
     }
 }

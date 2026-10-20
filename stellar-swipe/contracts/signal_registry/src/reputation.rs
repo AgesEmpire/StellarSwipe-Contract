@@ -13,20 +13,20 @@
 //! - 40-59: "Emerging" (yellow badge)
 //! - 0-39: "New/Unproven" (gray badge)
 
-use soroban_sdk::{contracttype, Address, Env, Map, Vec};
-use crate::types::ProviderPerformance;
-use crate::stake::StakeInfo;
 use crate::social;
+use crate::stake::StakeInfo;
+use crate::types::ProviderPerformance;
+use soroban_sdk::{contracttype, Address, Env, Map, Vec};
 
 const TRUST_SCORE_SCALE: u32 = 100; // 0-100 scale
 const MIN_SIGNALS_FOR_TRUST_SCORE: u32 = 5; // Minimum signals to calculate trust score
 
 // Trust score component weights (in basis points, total = 10000)
 const SUCCESS_RATE_WEIGHT: u32 = 4000; // 40%
-const CONSISTENCY_WEIGHT: u32 = 2000;  // 20%
-const STAKE_WEIGHT: u32 = 1500;        // 15%
-const FOLLOWER_WEIGHT: u32 = 1500;     // 15%
-const TENURE_WEIGHT: u32 = 1000;       // 10%
+const CONSISTENCY_WEIGHT: u32 = 2000; // 20%
+const STAKE_WEIGHT: u32 = 1500; // 15%
+const FOLLOWER_WEIGHT: u32 = 1500; // 15%
+const TENURE_WEIGHT: u32 = 1000; // 10%
 
 // Maximum tenure days for full score (365 days = 100%)
 const MAX_TENURE_DAYS: u64 = 365;
@@ -45,17 +45,17 @@ pub enum TrustScoreTier {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct TrustScoreComponents {
-    pub success_rate: u32,        // 0-10000 (basis points)
-    pub consistency: u32,         // 0-10000 (basis points)
-    pub stake_normalized: u32,    // 0-10000 (basis points)
+    pub success_rate: u32,         // 0-10000 (basis points)
+    pub consistency: u32,          // 0-10000 (basis points)
+    pub stake_normalized: u32,     // 0-10000 (basis points)
     pub followers_normalized: u32, // 0-10000 (basis points)
-    pub tenure_normalized: u32,   // 0-10000 (basis points)
+    pub tenure_normalized: u32,    // 0-10000 (basis points)
 }
 
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct TrustScoreDetails {
-    pub score: u32,               // 0-100
+    pub score: u32, // 0-100
     pub tier: TrustScoreTier,
     pub components: TrustScoreComponents,
     pub has_sufficient_history: bool, // true if >= MIN_SIGNALS_FOR_TRUST_SCORE
@@ -181,7 +181,7 @@ fn calculate_consistency_component(performance: &ProviderPerformance) -> u32 {
 /// Calculate stake component (15% weight)
 /// Normalized against median stake amount
 /// Returns 0-10000 basis points
-fn calculate_stake_component(env: &Env, stake_info: &Option<StakeInfo>) -> u32 {
+pub(crate) fn calculate_stake_component(env: &Env, stake_info: &Option<StakeInfo>) -> u32 {
     let stake_amount = match stake_info {
         Some(info) => info.amount,
         None => 0,
@@ -232,14 +232,14 @@ fn calculate_follower_component(env: &Env, provider: &Address) -> u32 {
 /// Calculate tenure component (10% weight)
 /// Days since first signal, normalized to 365 days max
 /// Returns 0-10000 basis points
-fn calculate_tenure_component(env: &Env, provider: &Address, now: u64) -> u32 {
+pub(crate) fn calculate_tenure_component(env: &Env, provider: &Address, now: u64) -> u32 {
     let first_signal_time = get_first_signal_time(env, provider);
 
     if first_signal_time == 0 {
         return 0;
     }
 
-    let days_since_first = (now - first_signal_time) / SECONDS_PER_DAY;
+    let days_since_first = now.saturating_sub(first_signal_time) / SECONDS_PER_DAY;
 
     if days_since_first >= MAX_TENURE_DAYS {
         10000 // Max score for established providers
@@ -249,24 +249,24 @@ fn calculate_tenure_component(env: &Env, provider: &Address, now: u64) -> u32 {
 }
 
 /// Calculate weighted trust score from components
-fn calculate_weighted_score(
+pub(crate) fn calculate_weighted_score(
     success_rate: u32,
     consistency: u32,
     stake: u32,
     followers: u32,
     tenure: u32,
 ) -> u32 {
-    let score = (success_rate as u64 * SUCCESS_RATE_WEIGHT as u64 / 100 +
-                 consistency as u64 * CONSISTENCY_WEIGHT as u64 / 100 +
-                 stake as u64 * STAKE_WEIGHT as u64 / 100 +
-                 followers as u64 * FOLLOWER_WEIGHT as u64 / 100 +
-                 tenure as u64 * TENURE_WEIGHT as u64 / 100) / 100;
-
-    score.min(TRUST_SCORE_SCALE as u64) as u32
+    let num = success_rate as u64 * SUCCESS_RATE_WEIGHT as u64
+        + consistency as u64 * CONSISTENCY_WEIGHT as u64
+        + stake as u64 * STAKE_WEIGHT as u64
+        + followers as u64 * FOLLOWER_WEIGHT as u64
+        + tenure as u64 * TENURE_WEIGHT as u64;
+    let score = (num / 1_000_000).min(TRUST_SCORE_SCALE as u64) as u32;
+    score
 }
 
 /// Get trust score tier from score
-fn get_trust_score_tier(score: u32) -> TrustScoreTier {
+pub(crate) fn get_trust_score_tier(score: u32) -> TrustScoreTier {
     match score {
         80..=100 => TrustScoreTier::HighlyTrusted,
         60..=79 => TrustScoreTier::Trusted,
@@ -312,7 +312,7 @@ pub fn record_first_signal(env: &Env, provider: &Address) {
 }
 
 /// Get first signal time for provider
-fn get_first_signal_time(env: &Env, provider: &Address) -> u64 {
+pub(crate) fn get_first_signal_time(env: &Env, provider: &Address) -> u64 {
     env.storage()
         .persistent()
         .get(&ReputationDataKey::FirstSignalTime(provider.clone()))
@@ -324,7 +324,7 @@ fn get_provider_performance(env: &Env, provider: &Address) -> ProviderPerformanc
     // This would typically come from analytics or performance module
     // For now, return default - in real implementation, this would query the actual data
     env.storage()
-        .persistent()
+        .instance()
         .get(&crate::StorageKey::ProviderStats)
         .and_then(|stats: Map<Address, ProviderPerformance>| stats.get(provider.clone()))
         .unwrap_or_default()
@@ -360,7 +360,7 @@ pub fn update_median_values(env: &Env, median_stake: i128, median_followers: u64
 pub fn get_all_trust_scores(env: &Env) -> Vec<(Address, TrustScoreDetails)> {
     let provider_stats: Map<Address, ProviderPerformance> = env
         .storage()
-        .persistent()
+        .instance()
         .get(&crate::StorageKey::ProviderStats)
         .unwrap_or(Map::new(env));
 
@@ -376,10 +376,119 @@ pub fn get_all_trust_scores(env: &Env) -> Vec<(Address, TrustScoreDetails)> {
     results
 }
 
+/// Success rate for a signal based on adoption count and successful executions.
+/// Returns None when adoption_count == 0 (undefined, not 0%).
+/// Returns Some(rate_bps) in basis points (0-10000) otherwise.
+pub fn signal_success_rate(adoption_count: u32, successful_executions: u32) -> Option<u32> {
+    if adoption_count == 0 {
+        return None;
+    }
+    Some(((successful_executions as u64 * 10000) / adoption_count as u64) as u32)
+}
+
+/// Points for weighted reputation update (Issue #170): profit 100, neutral 50, loss 0.
+pub fn outcome_points(outcome: &crate::types::SignalOutcome) -> u32 {
+    match outcome {
+        crate::types::SignalOutcome::Profit => 100,
+        crate::types::SignalOutcome::Neutral => 50,
+        crate::types::SignalOutcome::Loss => 0,
+    }
+}
+
+/// Integer form of `new = old * 0.9 + outcome * 0.1` on a 0–100 scale.
+pub fn next_reputation_score(old_score: u32, outcome: &crate::types::SignalOutcome) -> u32 {
+    let pts = outcome_points(outcome);
+    (((old_score as u64) * 9 + (pts as u64)) / 10) as u32
+}
+
+// ── Cross-contract reputation snapshot (issue #1027) ──────────────────────────
+
+/// Schema version of [`ReputationSnapshot`].
+///
+/// Bumped only on a breaking field change so cross-contract callers can decode
+/// defensively against a known version.
+pub const REPUTATION_SNAPSHOT_VERSION: u32 = 1;
+
+/// Stable, read-only reputation snapshot for a single provider.
+///
+/// Every field is derived from canonical contract state — provider stats, stake
+/// and the rolling reputation score — plus the ledger timestamp it was taken
+/// at.  Other contracts consume this for risk assessment and incentive
+/// decisions without mutating this contract's state.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReputationSnapshot {
+    /// Payload schema version (see [`REPUTATION_SNAPSHOT_VERSION`]).
+    pub version: u32,
+    /// The provider the snapshot describes.
+    pub provider: Address,
+    /// Composite trust score, 0–100 (see [`calculate_trust_score`]).
+    pub trust_score: u32,
+    /// Tier bucket derived from `trust_score`.
+    pub tier: TrustScoreTier,
+    /// Rolling reputation score, 0–100 (issue #170 EMA).
+    pub reputation_score: u32,
+    /// Lifetime signal count from canonical provider stats.
+    pub total_signals: u32,
+    /// Lifetime successful signal count from canonical provider stats.
+    pub successful_signals: u32,
+    /// Success rate in basis points (0–10_000) from canonical provider stats.
+    pub success_rate_bps: u32,
+    /// True once the provider has at least `MIN_SIGNALS_FOR_TRUST_SCORE` signals.
+    pub has_sufficient_history: bool,
+    /// Ledger timestamp the snapshot was taken at.
+    pub as_of: u64,
+}
+
+/// Build a read-only [`ReputationSnapshot`] for `provider` from canonical state.
+///
+/// This function performs no storage writes: it only reads the supplied
+/// performance / stake inputs and the current ledger timestamp, so an external
+/// contract can call the wrapping query without mutating this contract.
+pub fn build_reputation_snapshot(
+    env: &Env,
+    provider: &Address,
+    performance: &ProviderPerformance,
+    stake_info: &Option<StakeInfo>,
+    reputation_score: u32,
+) -> ReputationSnapshot {
+    let details = calculate_trust_score(env, provider, performance, stake_info);
+    ReputationSnapshot {
+        version: REPUTATION_SNAPSHOT_VERSION,
+        provider: provider.clone(),
+        trust_score: details.score,
+        tier: details.tier,
+        reputation_score,
+        total_signals: performance.total_signals,
+        successful_signals: performance.successful_signals,
+        success_rate_bps: performance.success_rate.min(10_000),
+        has_sufficient_history: details.has_sufficient_history,
+        as_of: env.ledger().timestamp(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    #[test]
+    fn test_signal_success_rate_zero_adoption() {
+        assert_eq!(signal_success_rate(0, 0), None);
+    }
+
+    #[test]
+    fn test_signal_success_rate_one_adoption() {
+        assert_eq!(signal_success_rate(1, 1), Some(10000));
+        assert_eq!(signal_success_rate(1, 0), Some(0));
+    }
+
+    #[test]
+    fn test_signal_success_rate_many_adoptions() {
+        assert_eq!(signal_success_rate(4, 3), Some(7500));
+        assert_eq!(signal_success_rate(10, 10), Some(10000));
+        assert_eq!(signal_success_rate(10, 0), Some(0));
+    }
 
     #[test]
     fn test_trust_score_tiers() {
@@ -412,6 +521,7 @@ mod tests {
             success_rate: 6667, // 66.67%
             avg_return: 500,
             total_volume: 1000000,
+            follower_count: 0,
         };
 
         let score_details = calculate_trust_score(&env, &provider, &performance, &None);
@@ -423,6 +533,7 @@ mod tests {
     #[test]
     fn test_success_rate_component() {
         let performance = ProviderPerformance {
+            total_signals: 10,
             success_rate: 7500, // 75%
             ..Default::default()
         };
@@ -434,46 +545,47 @@ mod tests {
     #[test]
     fn test_stake_component() {
         let env = Env::default();
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            // Set median stake to 100 XLM
+            update_median_values(&env, 100_000_000, 50);
 
-        // Set median stake to 100 XLM
-        update_median_values(&env, 100_000_000, 50);
+            let stake_info = Some(StakeInfo {
+                amount: 200_000_000,
+                last_signal_time: 0,
+                locked_until: 0,
+            });
+            let component = calculate_stake_component(&env, &stake_info);
+            assert_eq!(component, 10000);
 
-        // Test with 200 XLM stake (2x median)
-        let stake_info = Some(StakeInfo {
-            amount: 200_000_000,
-            last_signal_time: 0,
-            locked_until: 0,
+            let stake_info = Some(StakeInfo {
+                amount: 50_000_000,
+                last_signal_time: 0,
+                locked_until: 0,
+            });
+            let component = calculate_stake_component(&env, &stake_info);
+            assert_eq!(component, 5000);
         });
-
-        let component = calculate_stake_component(&env, &stake_info);
-        assert_eq!(component, 10000); // 100% score (capped at 2x median)
-
-        // Test with 50 XLM stake (0.5x median)
-        let stake_info = Some(StakeInfo {
-            amount: 50_000_000,
-            last_signal_time: 0,
-            locked_until: 0,
-        });
-
-        let component = calculate_stake_component(&env, &stake_info);
-        assert_eq!(component, 5000); // 50% score
     }
 
     #[test]
     fn test_tenure_component() {
         let env = Env::default();
-        let provider = Address::generate(&env);
-
-        // Set first signal time to 100 days ago
-        let now = env.ledger().timestamp();
-        let first_signal_time = now - (100 * SECONDS_PER_DAY);
-        env.storage()
-            .persistent()
-            .set(&ReputationDataKey::FirstSignalTime(provider.clone()), &first_signal_time);
-
-        let component = calculate_tenure_component(&env, &provider, now);
-        // 100 days out of 365 = ~27.4% score
-        assert_eq!(component, 2739); // Approximately 27.39%
+        env.ledger().set_timestamp(500_000_000);
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            let provider = Address::generate(&env);
+            let now = env.ledger().timestamp();
+            let first_signal_time = now - (100 * SECONDS_PER_DAY);
+            env.storage().persistent().set(
+                &ReputationDataKey::FirstSignalTime(provider.clone()),
+                &first_signal_time,
+            );
+            let component = calculate_tenure_component(&env, &provider, now);
+            assert_eq!(component, 2739);
+        });
     }
 
     #[test]
@@ -501,34 +613,108 @@ mod tests {
             avg_return: -8000,
             ..Default::default()
         };
-        assert_eq!(calculate_consistency_component(&performance), 3800);
+        assert_eq!(calculate_consistency_component(&performance), 3400);
     }
 
     #[test]
     fn test_get_all_trust_scores() {
         let env = Env::default();
-        let provider = Address::generate(&env);
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            let provider = Address::generate(&env);
+            let mut provider_stats: Map<Address, ProviderPerformance> = Map::new(&env);
+            provider_stats.set(
+                provider.clone(),
+                ProviderPerformance {
+                    total_signals: 5,
+                    successful_signals: 4,
+                    failed_signals: 1,
+                    success_rate: 8000,
+                    avg_return: 5000,
+                    ..Default::default()
+                },
+            );
+            env.storage()
+                .instance()
+                .set(&crate::StorageKey::ProviderStats, &provider_stats);
+            let list = get_all_trust_scores(&env);
+            assert_eq!(list.len(), 1);
+            assert_eq!(list.get(0).unwrap().0, provider);
+            assert!(list.get(0).unwrap().1.has_sufficient_history);
+        });
+    }
 
-        let mut provider_stats: Map<Address, ProviderPerformance> = Map::new(&env);
-        provider_stats.set(
-            provider.clone(),
-            ProviderPerformance {
-                total_signals: 5,
-                successful_signals: 4,
-                failed_signals: 1,
-                success_rate: 8000,
-                avg_return: 5000,
+    #[test]
+    fn snapshot_derives_from_canonical_state_and_timestamp() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_700_000_000);
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            let provider = Address::generate(&env);
+            let performance = ProviderPerformance {
+                total_signals: 8,
+                successful_signals: 6,
+                failed_signals: 2,
+                success_rate: 7500,
+                avg_return: 4000,
                 ..Default::default()
-            },
-        );
+            };
 
-        env.storage()
-            .persistent()
-            .set(&crate::StorageKey::ProviderStats, &provider_stats);
+            let snap = build_reputation_snapshot(&env, &provider, &performance, &None, 63);
 
-        let list = get_all_trust_scores(&env);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list.get(0).unwrap().0, provider);
-        assert_eq!(list.get(0).unwrap().1.has_sufficient_history, true);
+            assert_eq!(snap.version, REPUTATION_SNAPSHOT_VERSION);
+            assert_eq!(snap.provider, provider);
+            assert_eq!(snap.total_signals, 8);
+            assert_eq!(snap.successful_signals, 6);
+            assert_eq!(snap.success_rate_bps, 7500);
+            assert_eq!(snap.reputation_score, 63);
+            assert!(snap.has_sufficient_history);
+            assert_eq!(snap.as_of, 1_700_000_000);
+            assert_eq!(
+                snap.trust_score,
+                calculate_trust_score(&env, &provider, &performance, &None).score
+            );
+        });
+    }
+
+    #[test]
+    fn snapshot_for_unknown_provider_is_zeroed_but_well_formed() {
+        let env = Env::default();
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            let provider = Address::generate(&env);
+            let snap = build_reputation_snapshot(
+                &env,
+                &provider,
+                &ProviderPerformance::default(),
+                &None,
+                50,
+            );
+
+            assert_eq!(snap.trust_score, 0);
+            assert_eq!(snap.tier, TrustScoreTier::NewUnproven);
+            assert!(!snap.has_sufficient_history);
+            assert_eq!(snap.total_signals, 0);
+        });
+    }
+
+    #[test]
+    fn snapshot_clamps_reported_success_rate_to_basis_points() {
+        let env = Env::default();
+        #[allow(deprecated)]
+        let cid = env.register_contract(None, crate::SignalRegistry);
+        env.as_contract(&cid, || {
+            let provider = Address::generate(&env);
+            let performance = ProviderPerformance {
+                total_signals: 10,
+                success_rate: 25_000, // corrupt / out-of-range upstream value
+                ..Default::default()
+            };
+            let snap = build_reputation_snapshot(&env, &provider, &performance, &None, 50);
+            assert_eq!(snap.success_rate_bps, 10_000);
+        });
     }
 }

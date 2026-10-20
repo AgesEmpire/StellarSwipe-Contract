@@ -1,0 +1,16 @@
+{
+  "DataKey": [
+    "RateLimitInfo",
+    "Signal",
+    "Trades"
+  ],
+  "DailyExecutionCapKey": [
+    "Config",
+    "Counter"
+  ],
+  "LossStreakKey": [
+    "ConfigState",
+    "Counter",
+    "Paused"
+  ]
+}

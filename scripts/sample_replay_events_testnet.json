@@ -1,0 +1,38 @@
+{
+  "rpcUrl": "https://soroban-testnet.stellar.org",
+  "contractId": "CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+  "startLedger": 100000,
+  "endLedger": 100050,
+  "eventName": null,
+  "count": 2,
+  "events": [
+    {
+      "id": "f1d2d2f924e986ac86fdf7b36c94bcdf32beec15-1",
+      "ledger": 100012,
+      "txHash": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+      "contractId": "CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "eventName": "signal_created",
+      "topicsNative": ["signal_created", "provider", "XLM/USDC"],
+      "dataNative": {
+        "provider": "GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+        "signal_id": 42,
+        "price": 120000000,
+        "expiry": 1710000000
+      }
+    },
+    {
+      "id": "b5f6c7d8e9f0a1b2c3d4e5f60718293a0b1c2d3e-2",
+      "ledger": 100020,
+      "txHash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "contractId": "CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "eventName": "provider_tier_upgraded",
+      "topicsNative": ["provider_tier_upgraded"],
+      "dataNative": {
+        "provider": "GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+        "old_tier": 1,
+        "new_tier": 2,
+        "new_stake_usd": 500000000
+      }
+    }
+  ]
+}

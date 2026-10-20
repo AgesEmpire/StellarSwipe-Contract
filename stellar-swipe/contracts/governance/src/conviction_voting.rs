@@ -2,9 +2,124 @@ use core::cmp::max;
 
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, String, Vec};
 
+use crate::proposals::isqrt;
 use crate::{checked_mul, GovernanceError, StorageKey};
 
 const PRECISION: i128 = 10_000;
+
+/// Fixed-point scale used by `pow_fixed_point` for decay-ratio exponentiation.
+/// Large enough for negligible rounding error over many squarings, small
+/// enough that squaring a value near this scale (`scale * scale`) stays far
+/// below `i128::MAX`.
+const DECAY_SCALE: i128 = 1_000_000_000_000;
+
+/// Raises `base_scaled` (a value in `0..=scale` representing a ratio in
+/// `[0, 1]`, expressed as `ratio * scale`) to `exponent`, returning the
+/// result in the same fixed-point representation.
+///
+/// Uses binary exponentiation, rescaling by `/ scale` after every
+/// multiplication so intermediate values stay bounded by `scale` instead of
+/// growing with the exponent — unlike computing `base^exponent` directly
+/// (e.g. via `saturating_pow`), which overflows i128 after a small number of
+/// iterations for any base close to 1.
+fn pow_fixed_point(mut base_scaled: i128, mut exponent: u32, scale: i128) -> i128 {
+    let mut result = scale;
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            result = result.saturating_mul(base_scaled) / scale;
+        }
+        base_scaled = base_scaled.saturating_mul(base_scaled) / scale;
+        exponent >>= 1;
+    }
+    result
+}
+
+// ── Decay rate bounds (basis points, 1000 = 100%) ────────────────────────
+/// A decay rate of 0 would disable conviction decay entirely (unbounded
+/// accumulation), while a rate of 1000 would cause instant full decay
+/// (votes always worth zero). The valid range is strictly between these
+/// extremes.
+pub const MIN_DECAY_RATE: u64 = 1;
+pub const MAX_DECAY_RATE: u64 = 999;
+
+// ── Conviction Calibration ────────────────────────────────────────────────
+/// Calibration controls let the governance admin tune how conviction is
+/// penalised for short-lived support and rewarded for sustained commitment.
+///
+/// Fields
+// ──────
+/// * `penalty_threshold_days`  – Votes younger than this threshold (in days)
+///   receive a weight penalty. Set to 0 to disable the penalty.
+/// * `penalty_multiplier`      – Denominator (1/N) for the penalty fraction.
+///   e.g. 2 → penalise by ½, 4 → penalise by ¼. Must be ≥ 1.
+/// * `reward_bonus_pct`        – Percentage (0-100) added to conviction for
+///   votes older than `penalty_threshold_days`. 0 disables the bonus.
+/// * `max_conviction_cap`      – Absolute cap on any single vote's conviction
+///   weight. 0 means no cap (unlimited).
+/// * `decay_rate_bps`          – Exponential decay rate in basis points
+///   (1–999, where 1000 = 100%). Controls how quickly conviction loses
+///   effectiveness over time. Values outside MIN_DECAY_RATE..=MAX_DECAY_RATE
+///   are rejected.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConvictionCalibration {
+    pub penalty_threshold_days: u64,
+    pub penalty_multiplier: u64,
+    pub reward_bonus_pct: u64,
+    pub max_conviction_cap: i128,
+    pub decay_rate_bps: u64,
+}
+
+impl Default for ConvictionCalibration {
+    fn default() -> Self {
+        Self {
+            // No penalty by default (maintains backward compatibility)
+            penalty_threshold_days: 0,
+            penalty_multiplier: 1,
+            reward_bonus_pct: 0,
+            max_conviction_cap: 0,
+            // Moderate decay: ~5% per day (50/1000)
+            decay_rate_bps: 50,
+        }
+    }
+}
+
+// ── Calibration helpers ───────────────────────────────────────────────────
+
+pub fn get_conviction_calibration(env: &Env) -> ConvictionCalibration {
+    env.storage()
+        .instance()
+        .get(&StorageKey::ConvictionCalibration)
+        .unwrap_or_else(|| ConvictionCalibration::default())
+}
+
+pub fn put_conviction_calibration(
+    env: &Env,
+    config: &ConvictionCalibration,
+) -> Result<(), GovernanceError> {
+    // Validate decay rate is within acceptable bounds
+    if config.decay_rate_bps < MIN_DECAY_RATE || config.decay_rate_bps > MAX_DECAY_RATE {
+        return Err(GovernanceError::InvalidDecayRate);
+    }
+    env.storage()
+        .instance()
+        .set(&StorageKey::ConvictionCalibration, config);
+    Ok(())
+}
+
+/// Sets only the decay rate parameter with validation.
+/// Returns Error::InvalidDecayRate if rate is outside MIN_DECAY_RATE..=MAX_DECAY_RATE.
+pub fn set_conviction_decay_rate(env: &Env, rate: u64) -> Result<(), GovernanceError> {
+    if rate < MIN_DECAY_RATE || rate > MAX_DECAY_RATE {
+        return Err(GovernanceError::InvalidDecayRate);
+    }
+    let mut config = get_conviction_calibration(env);
+    config.decay_rate_bps = rate;
+    env.storage()
+        .instance()
+        .set(&StorageKey::ConvictionCalibration, &config);
+    Ok(())
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -499,6 +614,7 @@ pub fn get_conviction_growth_curve(
         .get(proposal_id)
         .ok_or(GovernanceError::ProposalNotFound)?;
 
+    let calibration = get_conviction_calibration(env);
     let mut curve: Vec<(u64, i128)> = Vec::new(env);
     let mut day = 0;
     while day <= days {
@@ -510,7 +626,7 @@ pub fn get_conviction_growth_curve(
             let voter = proposal.voters.get(idx).unwrap();
             if let Some(vote) = proposal.votes.get(voter) {
                 let elapsed = ts.saturating_sub(vote.vote_started);
-                let conviction = calculate_conviction(vote.tokens_committed, elapsed);
+                let conviction = calculate_conviction(vote.tokens_committed, elapsed, &calibration);
                 projected = projected.saturating_add(conviction);
             }
             idx += 1;
@@ -523,14 +639,60 @@ pub fn get_conviction_growth_curve(
     Ok(curve)
 }
 
-fn calculate_conviction(tokens: i128, time_elapsed: u64) -> i128 {
+pub fn calculate_conviction(
+    tokens: i128,
+    time_elapsed: u64,
+    calibration: &ConvictionCalibration,
+) -> i128 {
     let days_elapsed = time_elapsed / 86_400;
     if days_elapsed == 0 {
         return 0;
     }
 
-    let sqrt_days = integer_sqrt(days_elapsed as i128);
-    tokens.saturating_mul(sqrt_days) / 1000
+    let sqrt_days = isqrt(days_elapsed as i128);
+    let mut conviction = tokens.saturating_mul(sqrt_days) / 1000;
+
+    // ── Apply exponential decay based on decay_rate_bps ──────────────────
+    // conviction *= (decay_factor/1000)^days, compounded daily. Computed in
+    // fixed-point via binary exponentiation (see `pow_fixed_point`) instead
+    // of raising decay_factor and 1000 to `days_elapsed` directly: both
+    // powers blow past i128::MAX after ~13 days for typical decay rates, so
+    // `saturating_pow` on each and then dividing the two saturated i128::MAX
+    // values previously collapsed the result to ~1 regardless of the true
+    // ratio.
+    if calibration.decay_rate_bps >= MIN_DECAY_RATE && calibration.decay_rate_bps <= MAX_DECAY_RATE
+    {
+        let decay_factor = 1000i128 - calibration.decay_rate_bps as i128;
+        let decay_factor_scaled = decay_factor.saturating_mul(DECAY_SCALE) / 1000;
+        let decay_multiplier_scaled =
+            pow_fixed_point(decay_factor_scaled, days_elapsed as u32, DECAY_SCALE);
+        conviction = conviction.saturating_mul(decay_multiplier_scaled) / DECAY_SCALE;
+    }
+
+    // ── Apply penalty for short-lived (low-conviction) votes ──────────────
+    if calibration.penalty_threshold_days > 0
+        && (days_elapsed as u64) < calibration.penalty_threshold_days
+        && calibration.penalty_multiplier > 1
+    {
+        let penalty = conviction / (calibration.penalty_multiplier as i128);
+        conviction = conviction.saturating_sub(penalty);
+    }
+
+    // ── Apply reward bonus for sustained commitment ───────────────────────
+    if calibration.reward_bonus_pct > 0
+        && (days_elapsed as u64) >= calibration.penalty_threshold_days
+    {
+        let bonus =
+            checked_mul(conviction, calibration.reward_bonus_pct as i128).unwrap_or(0) / 100;
+        conviction = conviction.saturating_add(bonus);
+    }
+
+    // ── Apply absolute cap ────────────────────────────────────────────────
+    if calibration.max_conviction_cap > 0 && conviction > calibration.max_conviction_cap {
+        conviction = calibration.max_conviction_cap;
+    }
+
+    conviction
 }
 
 fn calculate_conviction_threshold(
@@ -549,22 +711,10 @@ fn calculate_conviction_threshold(
     Ok(max(1000, threshold))
 }
 
-fn integer_sqrt(n: i128) -> i128 {
-    if n <= 0 {
-        return 0;
-    }
-    let mut x = n;
-    let mut y = (x + 1) / 2;
-    while y < x {
-        x = y;
-        y = (x + n / x) / 2;
-    }
-    x
-}
-
 fn update_vote_conviction(env: &Env, vote: &mut ConvictionVote) -> Result<(), GovernanceError> {
     let elapsed = env.ledger().timestamp().saturating_sub(vote.vote_started);
-    vote.current_conviction = calculate_conviction(vote.tokens_committed, elapsed);
+    let calibration = get_conviction_calibration(env);
+    vote.current_conviction = calculate_conviction(vote.tokens_committed, elapsed, &calibration);
     vote.last_conviction_update = env.ledger().timestamp();
     Ok(())
 }

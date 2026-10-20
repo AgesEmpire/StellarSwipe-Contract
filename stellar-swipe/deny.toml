@@ -1,0 +1,76 @@
+# cargo-deny policy for the StellarSwipe-Contract workspace.
+#
+# Run manually:  cargo deny check
+# CI:            runs on every PR that touches Cargo.toml / Cargo.lock
+#
+# To add a new dependency or request a policy exception, open a PR with the
+# `dependency-review` label and follow the process documented in
+# CONTRIBUTING.md#dependency-policy.
+
+[licenses]
+# Only allow licenses that are permissive or weak-copyleft and compatible
+# with Soroban contract deployment (WASM binary distribution).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Zlib",
+    "BSL-1.0",
+]
+
+# Warn on copyleft licenses rather than denying outright; a human must
+# review any hit and either allow-list it with a justification or replace
+# the dependency.
+copyleft = "deny"
+allow-osi-fsf-free = "neither"
+default = "deny"
+
+# Crates whose license expression cannot be parsed or is absent.
+unlicensed = "deny"
+
+[bans]
+# Duplicate versions of the same crate are a supply-chain risk and a code
+# size risk for WASM binaries.  "warn" lets PRs land while we triage; flip
+# to "deny" once the workspace is clean.
+multiple-versions = "warn"
+
+# Git dependencies pinned to a mutable branch are banned.  Only commit-
+# pinned or tag-pinned git sources (with a `rev =` field) are acceptable,
+# and even those must be justified in the PR.  Prefer crates.io releases.
+#
+# cargo-deny enforces this via the [sources] section below; this comment is
+# here to document the intent.
+
+# Crates that must never appear in the dependency tree regardless of version.
+deny = [
+    # openssl has a large C dependency chain incompatible with WASM targets.
+    { name = "openssl" },
+    # ring v0.16 had audit advisories; use rustls / aws-lc-rs instead.
+    { name = "ring", version = "<=0.16" },
+]
+
+[sources]
+# Only allow dependencies from crates.io and path / git sources that meet
+# the restrictions below.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# Git sources must be pinned to an immutable ref (commit SHA or tag).
+# Mutable branch pins (e.g. `git = "…", branch = "main"`) are not allowed
+# because the resolved code can change between runs, breaking reproducibility.
+allow-git = []
+
+[advisories]
+# Deny crates with known security advisories in the RustSec database.
+version = 2
+ignore = [
+    # Add advisory IDs here with a documented reason if a fix is not yet
+    # available.  Example:
+    # "RUSTSEC-2023-0071",  # RSA timing side-channel; no patch upstream yet
+]
