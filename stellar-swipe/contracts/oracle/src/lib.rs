@@ -1,6 +1,7 @@
 #![no_std]
 
 mod admin;
+pub mod challenge;
 mod conversion;
 mod errors;
 mod events;

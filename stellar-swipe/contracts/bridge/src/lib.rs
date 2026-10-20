@@ -133,6 +133,7 @@ pub mod governance;
 pub mod analytics;
 pub mod fees;
 pub mod messaging;
+pub mod fee_escrow;
 
 pub use monitoring::{
     ChainFinalityConfig, ChainId, MonitoredTransaction, MonitoringStatus, VerificationMethod,

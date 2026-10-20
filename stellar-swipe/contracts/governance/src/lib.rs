@@ -3,11 +3,13 @@
 
 mod committees;
 mod conviction_voting;
+pub mod dependencies;
 mod distribution;
 mod errors;
 mod proposals;
 mod quadratic_voting;
 mod reputation;
+pub mod snapshot_pruning;
 mod timelock;
 mod token;
 mod treasury;
