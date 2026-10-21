@@ -75,5 +75,9 @@ path = "tests/integration/test_e2e_resource_budget.rs"
 name = "test_bridge_authorization_conformance"
 path = "tests/integration/test_bridge_authorization_conformance.rs"
 
+[[test]]
+name = "test_stake_vault_token_transfer_failures"
+path = "tests/integration/test_stake_vault_token_transfer_failures.rs"
+
 [lints]
 workspace = true
