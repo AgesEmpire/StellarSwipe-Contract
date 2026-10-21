@@ -105,6 +105,9 @@
 
 #![no_std]
 
+mod signal_lifecycle;
+pub use signal_lifecycle::*;
+
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
 /// Errors returned by the signal registry contract.
@@ -146,6 +149,24 @@ pub enum SignalError {
     /// Issue #1249: metadata has leading, trailing, repeated, or non-ASCII
     /// whitespace.
     MetadataNonCanonicalWhitespace = 21,
+    /// Issue #1140: the signal does not exist.
+    SignalNotFound = 22,
+    /// Issue #1143: the category does not exist.
+    CategoryNotFound = 23,
+    /// Issue #1143: the category identifier is already active.
+    CategoryExists = 24,
+    /// Issue #1143: the category identifier was deleted and cannot be reused.
+    CategoryTombstoned = 25,
+    /// Issue #1141: the moderation case does not exist.
+    CaseNotFound = 26,
+    /// Issue #1141: the case is not in a state that allows this transition.
+    InvalidCaseState = 27,
+    /// Issue #1141: an appellant attempted to review their own appeal.
+    SelfReview = 28,
+    /// Issue #1141: the appeal timed out and can no longer be resolved.
+    AppealExpired = 29,
+    /// Issue #1141: the appeal has not yet reached its timeout.
+    AppealNotExpired = 30,
     /// Issue #1171: an address argument is a sentinel (all-zero account,
     /// all-zero contract, or this contract). Shared code across contracts.
     InvalidAddress = 100,
