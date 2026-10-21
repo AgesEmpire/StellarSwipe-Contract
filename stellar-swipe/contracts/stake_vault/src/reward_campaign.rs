@@ -86,6 +86,9 @@ pub enum CampaignKey {
     VestingCounter(u64),
     /// (campaign_id, vesting_id) → VestingAllocation (Issue #1327).
     Vesting(u64, u64),
+    /// (campaign_id, recipient) → cumulative amount claimed, for enforcing
+    /// `RewardCampaign::per_account_claim_cap` (Issue #1329).
+    ClaimedByAccount(u64, Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -130,6 +133,9 @@ pub struct RewardCampaign {
     pub status: CampaignStatus,
     pub created_at: u64,
     pub closed_at: u64,
+    /// Maximum lifetime amount any single account may claim from this
+    /// campaign (Issue #1329). `0` means no cap.
+    pub per_account_claim_cap: i128,
 }
 
 impl RewardCampaign {
@@ -353,6 +359,7 @@ pub fn create_campaign(
         status: CampaignStatus::Open,
         created_at: env.ledger().timestamp(),
         closed_at: 0,
+        per_account_claim_cap: 0,
     };
     save(env, &campaign);
 
@@ -361,6 +368,36 @@ pub fn create_campaign(
         (campaign_id, funder, asset, budget, claim_window_secs),
     );
     Ok(campaign_id)
+}
+
+/// Set (or clear, with `0`) the campaign's per-account lifetime claim cap
+/// (Issue #1329). Authorization (campaign operator only) is enforced by the
+/// caller in `lib.rs`; this only validates and persists the value. Changing
+/// the cap never rewrites past claims — it only bounds claims made after the
+/// call, so it can be tightened or loosened without touching history.
+pub fn set_claim_cap(
+    env: &Env,
+    campaign_id: u64,
+    per_account_claim_cap: i128,
+) -> Result<(), CampaignError> {
+    if per_account_claim_cap < 0 {
+        return Err(CampaignError::InvalidAmount);
+    }
+    let mut campaign = load_open(env, campaign_id)?;
+    campaign.per_account_claim_cap = per_account_claim_cap;
+    save(env, &campaign);
+    Ok(())
+}
+
+/// Cumulative amount `recipient` has claimed from `campaign_id` so far.
+pub fn claimed_by_account(env: &Env, campaign_id: u64, recipient: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&CampaignKey::ClaimedByAccount(
+            campaign_id,
+            recipient.clone(),
+        ))
+        .unwrap_or(0i128)
 }
 
 /// Allocate `total` of the campaign's available funds across `recipients` by
@@ -465,6 +502,15 @@ pub fn claim(
         allocations.push_back(allocation);
     }
 
+    // Issue #1329: cumulative claims (across this and all prior calls) must
+    // never exceed the campaign's per-account cap. Checked before any write,
+    // so splitting a claim across many smaller calls cannot bypass it.
+    let already_claimed = claimed_by_account(env, campaign_id, recipient);
+    let new_total_claimed = add(already_claimed, total)?;
+    if campaign.per_account_claim_cap > 0 && new_total_claimed > campaign.per_account_claim_cap {
+        return Err(CampaignError::ClaimLimitExceeded);
+    }
+
     for i in 0..allocations.len() {
         let mut allocation = allocations.get(i).unwrap();
         allocation.status = AllocationStatus::Claimed;
@@ -473,6 +519,10 @@ pub fn claim(
             &allocation,
         );
     }
+    env.storage().persistent().set(
+        &CampaignKey::ClaimedByAccount(campaign_id, recipient.clone()),
+        &new_total_claimed,
+    );
     campaign.claimed = add(campaign.claimed, total)?;
     campaign.pending_allocations -= allocations.len();
     save(env, &campaign);
@@ -1305,6 +1355,91 @@ mod tests {
                 claim_vesting(&env, id, vid, &other),
                 Err(CampaignError::VestingNotFound)
             );
+        });
+    }
+
+    // ── #1329: campaign-specific claim limits ────────────────────────────────
+
+    #[test]
+    fn claim_within_cap_succeeds_and_tracks_cumulative() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id, 150).unwrap();
+            let user = Address::generate(&env);
+
+            distribute(&env, id, 100, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 0
+            assert_eq!(claim(&env, id, &user, vec![&env, 0]).unwrap(), 100);
+            assert_eq!(claimed_by_account(&env, id, &user), 100);
+
+            distribute(&env, id, 50, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 1
+            assert_eq!(claim(&env, id, &user, vec![&env, 1]).unwrap(), 50);
+            assert_eq!(claimed_by_account(&env, id, &user), 150); // exactly the cap
+        });
+    }
+
+    #[test]
+    fn claim_exceeding_cap_is_rejected_before_any_mutation() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id, 100).unwrap();
+            let user = Address::generate(&env);
+            distribute(&env, id, 150, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 0
+
+            let before = get_campaign(&env, id).unwrap();
+            assert_eq!(
+                claim(&env, id, &user, vec![&env, 0]),
+                Err(CampaignError::ClaimLimitExceeded)
+            );
+            // Rejected before transfer or state mutation.
+            assert_eq!(get_campaign(&env, id).unwrap(), before);
+            assert_eq!(
+                get_allocation(&env, id, 0).unwrap().status,
+                AllocationStatus::Pending
+            );
+            assert_eq!(claimed_by_account(&env, id, &user), 0);
+        });
+    }
+
+    #[test]
+    fn cap_cannot_be_bypassed_by_splitting_across_calls() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id, 100).unwrap();
+            let user = Address::generate(&env);
+
+            distribute(&env, id, 60, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 0
+            distribute(&env, id, 60, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 1
+            assert_eq!(claim(&env, id, &user, vec![&env, 0]).unwrap(), 60);
+            // Second, independent call would push cumulative to 120 > 100.
+            assert_eq!(
+                claim(&env, id, &user, vec![&env, 1]),
+                Err(CampaignError::ClaimLimitExceeded)
+            );
+            assert_eq!(claimed_by_account(&env, id, &user), 60);
+        });
+    }
+
+    #[test]
+    fn cap_is_independent_per_campaign() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id_a = new_campaign(&env, 1_000);
+            let id_b = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id_a, 50).unwrap();
+            // id_b has no cap.
+            let user = Address::generate(&env);
+
+            distribute(&env, id_a, 50, vec![&env, (user.clone(), 1)]).unwrap();
+            distribute(&env, id_b, 500, vec![&env, (user.clone(), 1)]).unwrap();
+
+            assert_eq!(claim(&env, id_a, &user, vec![&env, 0]).unwrap(), 50);
+            // Unrelated campaign's own cumulative total is unaffected by id_a.
+            assert_eq!(claim(&env, id_b, &user, vec![&env, 0]).unwrap(), 500);
+            assert_eq!(claimed_by_account(&env, id_a, &user), 50);
+            assert_eq!(claimed_by_account(&env, id_b, &user), 500);
         });
     }
 
