@@ -1,5 +1,7 @@
 #![no_std]
 
+/// Asset decimal compatibility checks (Issue #1136).
+pub mod asset_decimals;
 pub mod emergency_unstake;
 pub mod events;
 /// Deterministic fee accrual accumulator (Issue #1016).
@@ -8,9 +10,13 @@ pub mod migration;
 /// Reward campaigns: deterministic splits, claim expiry, guarded closure
 /// (Issues #1202, #1203, #1204).
 pub mod reward_campaign;
+pub mod reward_index;
 pub mod reward_vault;
+/// Reward dust tracking and reconciliation (Issue #1135).
+pub mod reward_dust;
 pub mod slash_strategy;
 pub mod storage_version;
+pub mod withdrawal_claims;
 
 use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
 use migration::{MigrationKey, StakeInfoV2};
@@ -690,6 +696,29 @@ impl From<reward_campaign::CampaignError> for StakeVaultError {
     }
 }
 
+/// Decimal metadata failures share existing codes (enum at variant cap).
+impl From<asset_decimals::DecimalsError> for StakeVaultError {
+    fn from(e: asset_decimals::DecimalsError) -> Self {
+        use asset_decimals::DecimalsError as E;
+        match e {
+            E::Missing | E::Malformed => StakeVaultError::TokenOperationFailed,
+            E::Incompatible => StakeVaultError::InvalidAmount,
+        }
+    }
+}
+
+/// Dust reconciliation failures share existing codes (enum at variant cap).
+impl From<reward_dust::DustError> for StakeVaultError {
+    fn from(e: reward_dust::DustError) -> Self {
+        use reward_dust::DustError as E;
+        match e {
+            E::Unauthorized => StakeVaultError::Unauthorized,
+            E::InvalidAmount | E::NothingToReconcile => StakeVaultError::InvalidAmount,
+            E::Overflow => StakeVaultError::StakeOverflow,
+        }
+    }
+}
+
 /// Reward vault failures share existing codes, since this enum is at the
 /// Soroban `#[contracterror]` variant cap (Issue #1326).
 impl From<reward_vault::RewardVaultError> for StakeVaultError {
@@ -882,6 +911,22 @@ impl StakeVaultContract {
     /// contract (see `shared::version::validate_callee_version`).
     pub fn get_contract_version(env: Env) -> u32 {
         shared::version::get_contract_version(&env)
+    }
+
+    // ── Issue #1334: minimum supported Soroban protocol version ─────────────
+
+    /// Read-only: `(min_supported, current_target)` Soroban protocol
+    /// versions this contract is built and tested against. Deployers call
+    /// this (e.g. via `simulateTransaction`) to reject an incompatible
+    /// network before ever submitting a state-changing invocation.
+    pub fn min_supported_protocol_version(_env: Env) -> (u32, u32) {
+        shared::protocol_version::supported_protocol_range()
+    }
+
+    /// Read-only: whether the network this call is running on meets this
+    /// contract's minimum supported protocol version.
+    pub fn is_protocol_version_supported(env: Env) -> bool {
+        shared::protocol_version::is_protocol_supported(&env)
     }
 
     /// Admin-only: replace this contract's executable with `new_wasm_hash`
@@ -1102,6 +1147,7 @@ impl StakeVaultContract {
         env.storage()
             .persistent()
             .set(&MigrationKey::StakesV2, &stakes);
+        reward_index::on_stake_change(&env, &staker, new_balance)?;
 
         // Record the deposit timestamp for voting-power eligibility checks.
         env.storage()
@@ -1910,6 +1956,7 @@ impl StakeVaultContract {
             .persistent()
             .set(&MigrationKey::StakesV2, &stakes);
 
+        reward_index::on_stake_change(env, staker, 0)?;
         emit_provider_tier_change(env, staker, old_tier, new_tier, 0);
 
         Ok(amount)
@@ -2110,6 +2157,7 @@ impl StakeVaultContract {
             .persistent()
             .set(&MigrationKey::StakesV2, &stakes);
 
+        reward_index::on_stake_change(env, staker, remaining)?;
         emit_provider_tier_change(env, staker, old_tier, new_tier, remaining);
 
         events::emit_partial_unstake(env, staker.clone(), amount, remaining);
@@ -3147,8 +3195,225 @@ impl StakeVaultContract {
             .get(&StorageKey::Admin)
             .ok_or(StakeVaultError::NotInitialized)?;
         admin.require_auth();
+        // Issue #1136: reject incompatible decimals before any state mutation.
+        let stake_token: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        asset_decimals::require_compatible(&env, &stake_token, &asset)?;
         reward_vault::add_supported_asset(&env, asset);
         Ok(())
+    }
+
+    /// Admin: migrate the vault to `new_stake_token` (Issue #1136).
+    ///
+    /// Old and new token metadata, and every registered reward asset, must
+    /// report compatible decimals; otherwise nothing is changed.
+    pub fn migrate_stake_token(env: Env, new_stake_token: Address) -> Result<u32, StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        let old: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        let decimals = asset_decimals::require_migration_compatible(
+            &env,
+            &old,
+            &new_stake_token,
+        )?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::StakeToken, &new_stake_token);
+        Ok(decimals)
+    }
+
+    // ── Reward index checkpointing (Issue #1132) ────────────────────────────
+
+    /// Admin: enable index-based streaming rewards for `asset`.
+    pub fn add_index_reward_asset(env: Env, asset: Address) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        let old: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        let decimals = asset_decimals::require_migration_compatible(
+            &env,
+            &old,
+            &new_stake_token,
+            &reward_vault::get_supported_assets(&env),
+        )?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::StakeToken, &new_stake_token);
+        Ok(decimals)
+    }
+
+    /// Returns validated `decimals()` metadata for `asset` (Issue #1136).
+    pub fn get_asset_decimals(env: Env, asset: Address) -> Result<u32, StakeVaultError> {
+        Ok(asset_decimals::read_decimals(&env, &asset)?)
+    }
+
+    // ── Issue #1135: reward dust reconciliation ───────────────────────────────
+
+    /// Admin: configure the authority allowed to reconcile reward dust.
+    pub fn set_dust_authority(env: Env, authority: Address) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        reward_dust::set_authority(&env, &authority);
+        Ok(())
+    }
+
+    /// Admin: record sub-unit reward dust (scaled by `DUST_PRECISION`) for a
+    /// registered asset.  Tracked separately; never credited to providers.
+    pub fn record_reward_dust(
+        env: Env,
+        asset: Address,
+        scaled_amount: i128,
+    ) -> Result<reward_dust::DustTotals, StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        if !reward_vault::is_supported(&env, &asset) {
+            return Err(StakeVaultError::Unauthorized);
+        }
+        Ok(reward_dust::record(&env, &asset, scaled_amount)?)
+    }
+
+    /// Dust authority: transfer whole units of tracked dust to `recipient`,
+    /// emitting before/after totals.  Provider balances are untouched.
+    pub fn reconcile_reward_dust(
+        env: Env,
+        caller: Address,
+        asset: Address,
+        recipient: Address,
+    ) -> Result<i128, StakeVaultError> {
+        Self::require_not_paused(&env)?;
+        Ok(reward_dust::reconcile(&env, &caller, &asset, &recipient)?)
+    }
+
+    /// Returns dust totals for `asset`.
+    pub fn get_reward_dust(env: Env, asset: Address) -> reward_dust::DustTotals {
+        reward_dust::totals(&env, &asset)
+    }
+
+    // ── Reward index checkpointing (Issue #1132) ────────────────────────────
+
+    /// Admin: enable index-based streaming rewards for `asset`.
+    pub fn add_index_reward_asset(env: Env, asset: Address) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        reward_index::add_asset(&env, asset)
+    }
+
+    /// Fund `amount` of `asset` pro-rata to current participating stake.
+    pub fn fund_index_rewards(
+        env: Env,
+        funder: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<i128, StakeVaultError> {
+        funder.require_auth();
+        let idx = reward_index::notify_reward(&env, &asset, amount)?;
+        shared::token_error::map_result(token::Client::new(&env, &asset).try_transfer(
+            &funder,
+            env.current_contract_address(),
+            &amount,
+        ))
+        .map_err(StakeVaultError::from)?;
+        Ok(idx)
+    }
+
+    /// Opt an existing (pre-index) stake into reward accrual. Permissionless
+    /// and idempotent: it only syncs the recorded stake with the real balance.
+    pub fn sync_index_stake(env: Env, staker: Address) -> Result<(), StakeVaultError> {
+        let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+        let bal = stakes.get(staker.clone()).map(|s| s.balance).unwrap_or(0);
+        reward_index::on_stake_change(&env, &staker, bal)
+    }
+
+    /// Claim index rewards. If the transfer fails the payout is queued
+    /// (Issue #1133) and its nonce returned; `None` means paid in full.
+    pub fn claim_index_rewards(
+        env: Env,
+        staker: Address,
+        asset: Address,
+    ) -> Result<Option<u64>, StakeVaultError> {
+        staker.require_auth();
+        let amount = reward_index::take_accrued(&env, &staker, &asset)?;
+        if amount <= 0 {
+            return Err(StakeVaultError::InvalidAmount);
+        }
+        let queued = withdrawal_claims::pay_or_queue(&env, &staker, &asset, amount)?;
+        env.events().publish(
+            (symbol_short!("rwidx"), symbol_short!("claim")),
+            (staker, asset, amount, queued),
+        );
+        Ok(queued)
+    }
+
+    pub fn get_index_accrued(env: Env, staker: Address, asset: Address) -> i128 {
+        reward_index::accrued(&env, &staker, &asset)
+    }
+
+    pub fn get_reward_index(env: Env, asset: Address) -> i128 {
+        reward_index::global_index(&env, &asset)
+    }
+
+    pub fn get_staker_reward_index(env: Env, staker: Address, asset: Address) -> Option<i128> {
+        reward_index::user_index(&env, &staker, &asset)
+    }
+
+    // ── Queued withdrawal claims (Issue #1133) ──────────────────────────────
+
+    pub fn claim_queued_withdrawal(
+        env: Env,
+        claimant: Address,
+        nonce: u64,
+    ) -> Result<i128, StakeVaultError> {
+        withdrawal_claims::claim(&env, &claimant, nonce)
+    }
+
+    pub fn cancel_queued_withdrawal(
+        env: Env,
+        claimant: Address,
+        nonce: u64,
+    ) -> Result<i128, StakeVaultError> {
+        withdrawal_claims::cancel(&env, &claimant, nonce)
+    }
+
+    pub fn get_queued_withdrawal(
+        env: Env,
+        claimant: Address,
+        nonce: u64,
+    ) -> Option<withdrawal_claims::QueuedClaim> {
+        withdrawal_claims::get(&env, &claimant, nonce)
     }
 
     /// Returns all registered reward asset addresses.

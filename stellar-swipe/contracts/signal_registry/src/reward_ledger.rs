@@ -17,6 +17,9 @@ pub enum RewardLedgerKey {
     ActiveWindow,
     /// Per-provider claim record for a given epoch.
     ClaimRecord(Address, u64),
+    /// Epoch id from which `provider` is suspended (Issue #1328). Absent
+    /// means never suspended, or reinstated.
+    SuspendedFromEpoch(Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -60,6 +63,34 @@ pub struct EvtRewardWindowOpened {
     pub total_pool: i128,
 }
 
+/// Emitted when a provider is suspended from future reward accrual
+/// (Issue #1328). Earned `ClaimRecord`s before `from_epoch` are untouched.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtProviderSuspended {
+    pub provider: Address,
+    pub from_epoch: u64,
+}
+
+/// Emitted when a previously suspended provider is reinstated (Issue #1328).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtProviderReinstated {
+    pub provider: Address,
+}
+
+/// Emitted when an already-earned claim is explicitly forfeited by an
+/// authorized admin (Issue #1328). Suspension alone never emits this —
+/// forfeiture is a separate, explicit action so it is always auditable and
+/// distinguishable from ordinary suspension.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtClaimForfeited {
+    pub provider: Address,
+    pub epoch_id: u64,
+    pub amount: i128,
+}
+
 /// Emitted when a provider claims rewards (Issue #1038).
 /// References `anchor_ledger` so indexers can verify the snapshot basis.
 #[contracttype]
@@ -85,6 +116,10 @@ pub enum RewardLedgerError {
     AlreadyClaimed,
     /// Claim amount is zero or negative.
     InvalidAmount,
+    /// Provider is suspended as of the current epoch; new accrual is blocked.
+    ProviderSuspended,
+    /// No earned claim record exists to forfeit for this provider/epoch.
+    NoClaimToForfeit,
 }
 
 // ── Core functions ────────────────────────────────────────────────────────────
@@ -157,6 +192,15 @@ pub fn check_claim_eligibility(
         return Err(RewardLedgerError::WindowClosed);
     }
 
+    // Issue #1328: suspension blocks new accrual from the epoch it takes
+    // effect in onward. It never looks at or touches `ClaimRecord`s from
+    // epochs before `from_epoch` — those stay exactly as earned.
+    if let Some(from_epoch) = is_suspended_for(env, provider) {
+        if window.epoch_id >= from_epoch {
+            return Err(RewardLedgerError::ProviderSuspended);
+        }
+    }
+
     if env
         .storage()
         .persistent()
@@ -217,6 +261,97 @@ pub fn get_claim_record(env: &Env, provider: &Address, epoch_id: u64) -> Option<
     env.storage()
         .persistent()
         .get(&RewardLedgerKey::ClaimRecord(provider.clone(), epoch_id))
+}
+
+// ── Issue #1328: provider suspension ────────────────────────────────────────
+//
+// Suspension is deliberately separate from forfeiture:
+//
+// * [`suspend_provider`] blocks `record_claim`/`check_claim_eligibility` for
+//   epochs at or after `from_epoch`, going forward. It does not read, touch,
+//   or delete any existing `ClaimRecord` — rewards already earned in earlier
+//   epochs remain claimed and intact.
+// * [`reinstate_provider`] clears the suspension; eligibility for future
+//   epochs is restored, past records are (again) untouched either way.
+// * [`forfeit_claim`] is the *only* path that can erase an earned record, and
+//   it is a separate, explicit call (authorization for who may call it is
+//   enforced by the caller in `lib.rs`) that always emits
+//   [`EvtClaimForfeited`] so the forfeiture itself is auditable.
+
+/// Returns the epoch a provider is suspended from, if currently suspended.
+pub fn is_suspended_for(env: &Env, provider: &Address) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&RewardLedgerKey::SuspendedFromEpoch(provider.clone()))
+}
+
+/// Suspend `provider` starting at `from_epoch` (inclusive). Only blocks
+/// future accrual/claims from `from_epoch` onward; never modifies past
+/// `ClaimRecord`s. Authorization is the caller's responsibility.
+pub fn suspend_provider(env: &Env, provider: &Address, from_epoch: u64) {
+    env.storage().persistent().set(
+        &RewardLedgerKey::SuspendedFromEpoch(provider.clone()),
+        &from_epoch,
+    );
+    env.events().publish(
+        (
+            Symbol::new(env, "signal_registry"),
+            Symbol::new(env, "provider_suspended"),
+        ),
+        EvtProviderSuspended {
+            provider: provider.clone(),
+            from_epoch,
+        },
+    );
+}
+
+/// Lift a provider's suspension so future epochs are eligible again. A no-op
+/// (still emits the event) if the provider was not suspended.
+pub fn reinstate_provider(env: &Env, provider: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&RewardLedgerKey::SuspendedFromEpoch(provider.clone()));
+    env.events().publish(
+        (
+            Symbol::new(env, "signal_registry"),
+            Symbol::new(env, "provider_reinstated"),
+        ),
+        EvtProviderReinstated {
+            provider: provider.clone(),
+        },
+    );
+}
+
+/// Explicitly forfeit an already-earned claim record. This is the *only*
+/// function in this module that can remove a settled `ClaimRecord` — plain
+/// suspension never does. Requires the record to exist; the caller enforces
+/// whatever admin/governance authorization forfeiture requires before
+/// calling this. Always emits [`EvtClaimForfeited`] for auditability.
+pub fn forfeit_claim(
+    env: &Env,
+    provider: &Address,
+    epoch_id: u64,
+) -> Result<ClaimRecord, RewardLedgerError> {
+    let key = RewardLedgerKey::ClaimRecord(provider.clone(), epoch_id);
+    let record: ClaimRecord = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(RewardLedgerError::NoClaimToForfeit)?;
+
+    env.storage().persistent().remove(&key);
+    env.events().publish(
+        (
+            Symbol::new(env, "signal_registry"),
+            Symbol::new(env, "claim_forfeited"),
+        ),
+        EvtClaimForfeited {
+            provider: provider.clone(),
+            epoch_id,
+            amount: record.amount_claimed,
+        },
+    );
+    Ok(record)
 }
 
 #[cfg(test)]
@@ -304,5 +439,111 @@ mod tests {
         env.ledger().set_sequence_number(20);
         let w2 = env.as_contract(&id, || open_reward_window(&env, 10, 200));
         assert_eq!(w2.epoch_id, w1.epoch_id + 1);
+    }
+
+    // ── Issue #1328: provider suspension ──────────────────────────────────
+
+    #[test]
+    fn suspension_preserves_rewards_earned_before_it() {
+        let (env, id) = setup();
+        env.ledger().set_sequence_number(1);
+        let w1 = env.as_contract(&id, || open_reward_window(&env, 100, 1_000_000));
+        let provider = Address::generate(&env);
+        // Earns a reward in epoch 1, before suspension exists.
+        env.as_contract(&id, || record_claim(&env, &provider, 500).unwrap());
+
+        // Suspend starting at the *next* epoch (2) onward.
+        env.as_contract(&id, || suspend_provider(&env, &provider, w1.epoch_id + 1));
+
+        // The earlier, already-earned record is untouched.
+        let rec = env
+            .as_contract(&id, || get_claim_record(&env, &provider, w1.epoch_id))
+            .unwrap();
+        assert_eq!(rec.amount_claimed, 500);
+    }
+
+    #[test]
+    fn suspension_blocks_new_accrual_from_its_effective_epoch() {
+        let (env, id) = setup();
+        env.ledger().set_sequence_number(1);
+        let w1 = env.as_contract(&id, || open_reward_window(&env, 100, 1_000_000));
+        let provider = Address::generate(&env);
+        env.as_contract(&id, || suspend_provider(&env, &provider, w1.epoch_id));
+
+        let result = env.as_contract(&id, || check_claim_eligibility(&env, &provider));
+        assert_eq!(result, Err(RewardLedgerError::ProviderSuspended));
+        let result = env.as_contract(&id, || record_claim(&env, &provider, 100));
+        assert_eq!(result, Err(RewardLedgerError::ProviderSuspended));
+    }
+
+    #[test]
+    fn suspension_before_any_accrual_blocks_first_claim_but_not_record_state() {
+        let (env, id) = setup();
+        env.ledger().set_sequence_number(1);
+        let w1 = env.as_contract(&id, || open_reward_window(&env, 100, 1_000_000));
+        let provider = Address::generate(&env);
+        // Suspended immediately, before ever earning anything.
+        env.as_contract(&id, || suspend_provider(&env, &provider, w1.epoch_id));
+        assert!(env
+            .as_contract(&id, || get_claim_record(&env, &provider, w1.epoch_id))
+            .is_none());
+        assert_eq!(
+            env.as_contract(&id, || record_claim(&env, &provider, 100)),
+            Err(RewardLedgerError::ProviderSuspended)
+        );
+    }
+
+    #[test]
+    fn reinstated_provider_can_accrue_again() {
+        let (env, id) = setup();
+        env.ledger().set_sequence_number(1);
+        let w1 = env.as_contract(&id, || open_reward_window(&env, 100, 1_000_000));
+        let provider = Address::generate(&env);
+        env.as_contract(&id, || suspend_provider(&env, &provider, w1.epoch_id));
+        assert_eq!(
+            env.as_contract(&id, || check_claim_eligibility(&env, &provider)),
+            Err(RewardLedgerError::ProviderSuspended)
+        );
+
+        env.as_contract(&id, || reinstate_provider(&env, &provider));
+        assert!(env
+            .as_contract(&id, || check_claim_eligibility(&env, &provider))
+            .is_ok());
+        env.as_contract(&id, || record_claim(&env, &provider, 200).unwrap());
+        assert_eq!(
+            env.as_contract(&id, || get_claim_record(&env, &provider, w1.epoch_id))
+                .unwrap()
+                .amount_claimed,
+            200
+        );
+    }
+
+    #[test]
+    fn forfeiture_is_explicit_and_distinct_from_suspension() {
+        let (env, id) = setup();
+        env.ledger().set_sequence_number(1);
+        let w1 = env.as_contract(&id, || open_reward_window(&env, 100, 1_000_000));
+        let provider = Address::generate(&env);
+        env.as_contract(&id, || record_claim(&env, &provider, 500).unwrap());
+
+        // Suspension alone never forfeits the earned record.
+        env.as_contract(&id, || suspend_provider(&env, &provider, w1.epoch_id + 1));
+        assert!(env
+            .as_contract(&id, || get_claim_record(&env, &provider, w1.epoch_id))
+            .is_some());
+
+        // Forfeiture is a distinct, explicit, auditable action.
+        let forfeited =
+            env.as_contract(&id, || forfeit_claim(&env, &provider, w1.epoch_id).unwrap());
+        assert_eq!(forfeited.amount_claimed, 500);
+        assert!(env
+            .as_contract(&id, || get_claim_record(&env, &provider, w1.epoch_id))
+            .is_none());
+
+        // Forfeiting again (nothing left) is rejected, not a silent no-op.
+        assert_eq!(
+            env.as_contract(&id, || forfeit_claim(&env, &provider, w1.epoch_id)),
+            Err(RewardLedgerError::NoClaimToForfeit)
+        );
     }
 }

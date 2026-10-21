@@ -3,6 +3,8 @@
 
 mod committees;
 mod conviction_voting;
+mod delegation_expiry;
+pub mod dependencies;
 mod distribution;
 pub mod errors;
 pub use errors::GovernanceError;
@@ -10,7 +12,9 @@ mod proposal_deposit;
 mod proposals;
 mod quadratic_voting;
 mod reputation;
+pub mod snapshot_pruning;
 mod shadow_mode;
+mod spend_window;
 mod timelock;
 mod token;
 mod treasury;
@@ -996,6 +1000,57 @@ impl GovernanceContract {
         voting::delegate_voting_power(&env, delegator, delegate)
     }
 
+    /// Delegate voting power until `expiry_ledger`; afterwards the delegation
+    /// is ignored automatically (Issue #1131).
+    pub fn delegate_voting_power_until(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+        expiry_ledger: u32,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        delegation_expiry::delegate_until(&env, delegator, delegate, expiry_ledger)
+    }
+
+    /// Extend a live delegation's expiry ledger.
+    pub fn renew_delegation(
+        env: Env,
+        delegator: Address,
+        new_expiry_ledger: u32,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        delegation_expiry::renew(&env, delegator, new_expiry_ledger)
+    }
+
+    pub fn get_delegation_expiry(env: Env, delegator: Address) -> Option<u32> {
+        delegation_expiry::get_expiry(&env, &delegator)
+    }
+
+    /// Permissionless, bounded and idempotent sweep of expired delegations.
+    pub fn cleanup_expired_delegations(env: Env, start: u32, limit: u32) -> u32 {
+        delegation_expiry::cleanup_expired(&env, start, limit)
+    }
+
+    /// Configure the rolling treasury spend window (Issue #1130).
+    pub fn set_treasury_spend_window(
+        env: Env,
+        admin: Address,
+        window_secs: u64,
+        cap: i128,
+    ) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        spend_window::configure(&env, window_secs, cap)
+    }
+
+    pub fn get_treasury_spend_window(env: Env) -> Option<spend_window::SpendWindowConfig> {
+        spend_window::get_config(&env)
+    }
+
+    /// Remaining spend capacity in the current window (`i128::MAX` if unset).
+    pub fn get_treasury_window_remaining(env: Env) -> i128 {
+        spend_window::remaining(&env)
+    }
+
     pub fn undelegate_voting_power(env: Env, delegator: Address) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
         voting::undelegate_voting_power(&env, delegator)
@@ -1622,6 +1677,7 @@ impl GovernanceContract {
     ) -> Result<TreasurySpend, GovernanceError> {
         require_admin(&env, &admin)?;
         require_no_timelock_bypass(&env)?;
+        spend_window::consume(&env, amount)?;
         let mut treasury = get_treasury(&env);
         let spend = treasury::execute_spend(
             &env,
@@ -2159,6 +2215,7 @@ impl GovernanceContract {
     ) -> Result<TreasurySpend, GovernanceError> {
         require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
+        spend_window::consume(&env, amount)?;
         let mut treasury = get_treasury(&env);
         let spend = treasury::execute_spend(
             &env,
