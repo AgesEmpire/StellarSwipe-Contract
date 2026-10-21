@@ -877,6 +877,22 @@ impl StakeVaultContract {
         shared::version::get_contract_version(&env)
     }
 
+    // ── Issue #1334: minimum supported Soroban protocol version ─────────────
+
+    /// Read-only: `(min_supported, current_target)` Soroban protocol
+    /// versions this contract is built and tested against. Deployers call
+    /// this (e.g. via `simulateTransaction`) to reject an incompatible
+    /// network before ever submitting a state-changing invocation.
+    pub fn min_supported_protocol_version(_env: Env) -> (u32, u32) {
+        shared::protocol_version::supported_protocol_range()
+    }
+
+    /// Read-only: whether the network this call is running on meets this
+    /// contract's minimum supported protocol version.
+    pub fn is_protocol_version_supported(env: Env) -> bool {
+        shared::protocol_version::is_protocol_supported(&env)
+    }
+
     /// Admin-only: replace this contract's executable with `new_wasm_hash`
     /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
     /// `new_version` as the contract's version.
