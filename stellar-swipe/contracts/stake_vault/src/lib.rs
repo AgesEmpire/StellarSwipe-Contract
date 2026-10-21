@@ -1,5 +1,7 @@
 #![no_std]
 
+/// Asset decimal compatibility checks (Issue #1136).
+pub mod asset_decimals;
 pub mod emergency_unstake;
 pub mod events;
 /// Deterministic fee accrual accumulator (Issue #1016).
@@ -10,6 +12,8 @@ pub mod migration;
 pub mod reward_campaign;
 pub mod reward_index;
 pub mod reward_vault;
+/// Reward dust tracking and reconciliation (Issue #1135).
+pub mod reward_dust;
 pub mod slash_strategy;
 pub mod storage_version;
 pub mod withdrawal_claims;
@@ -680,6 +684,29 @@ impl From<reward_campaign::CampaignError> for StakeVaultError {
             | E::InsufficientCampaignFunds
             | E::InvalidClaimWindow
             | E::InvalidRecipients => StakeVaultError::InvalidAmount,
+            E::Overflow => StakeVaultError::StakeOverflow,
+        }
+    }
+}
+
+/// Decimal metadata failures share existing codes (enum at variant cap).
+impl From<asset_decimals::DecimalsError> for StakeVaultError {
+    fn from(e: asset_decimals::DecimalsError) -> Self {
+        use asset_decimals::DecimalsError as E;
+        match e {
+            E::Missing | E::Malformed => StakeVaultError::TokenOperationFailed,
+            E::Incompatible => StakeVaultError::InvalidAmount,
+        }
+    }
+}
+
+/// Dust reconciliation failures share existing codes (enum at variant cap).
+impl From<reward_dust::DustError> for StakeVaultError {
+    fn from(e: reward_dust::DustError) -> Self {
+        use reward_dust::DustError as E;
+        match e {
+            E::Unauthorized => StakeVaultError::Unauthorized,
+            E::InvalidAmount | E::NothingToReconcile => StakeVaultError::InvalidAmount,
             E::Overflow => StakeVaultError::StakeOverflow,
         }
     }
@@ -3145,8 +3172,124 @@ impl StakeVaultContract {
             .get(&StorageKey::Admin)
             .ok_or(StakeVaultError::NotInitialized)?;
         admin.require_auth();
+        // Issue #1136: reject incompatible decimals before any state mutation.
+        let stake_token: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        asset_decimals::require_compatible(&env, &stake_token, &asset)?;
         reward_vault::add_supported_asset(&env, asset);
         Ok(())
+    }
+
+    /// Admin: migrate the vault to `new_stake_token` (Issue #1136).
+    ///
+    /// Old and new token metadata, and every registered reward asset, must
+    /// report compatible decimals; otherwise nothing is changed.
+    pub fn migrate_stake_token(env: Env, new_stake_token: Address) -> Result<u32, StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        let old: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        let decimals = asset_decimals::require_migration_compatible(
+            &env,
+            &old,
+            &new_stake_token,
+        )?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::StakeToken, &new_stake_token);
+        Ok(decimals)
+    }
+
+    // ── Reward index checkpointing (Issue #1132) ────────────────────────────
+
+    /// Admin: enable index-based streaming rewards for `asset`.
+    pub fn add_index_reward_asset(env: Env, asset: Address) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        let old: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        let decimals = asset_decimals::require_migration_compatible(
+            &env,
+            &old,
+            &new_stake_token,
+            &reward_vault::get_supported_assets(&env),
+        )?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::StakeToken, &new_stake_token);
+        Ok(decimals)
+    }
+
+    /// Returns validated `decimals()` metadata for `asset` (Issue #1136).
+    pub fn get_asset_decimals(env: Env, asset: Address) -> Result<u32, StakeVaultError> {
+        Ok(asset_decimals::read_decimals(&env, &asset)?)
+    }
+
+    // ── Issue #1135: reward dust reconciliation ───────────────────────────────
+
+    /// Admin: configure the authority allowed to reconcile reward dust.
+    pub fn set_dust_authority(env: Env, authority: Address) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        reward_dust::set_authority(&env, &authority);
+        Ok(())
+    }
+
+    /// Admin: record sub-unit reward dust (scaled by `DUST_PRECISION`) for a
+    /// registered asset.  Tracked separately; never credited to providers.
+    pub fn record_reward_dust(
+        env: Env,
+        asset: Address,
+        scaled_amount: i128,
+    ) -> Result<reward_dust::DustTotals, StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        if !reward_vault::is_supported(&env, &asset) {
+            return Err(StakeVaultError::Unauthorized);
+        }
+        Ok(reward_dust::record(&env, &asset, scaled_amount)?)
+    }
+
+    /// Dust authority: transfer whole units of tracked dust to `recipient`,
+    /// emitting before/after totals.  Provider balances are untouched.
+    pub fn reconcile_reward_dust(
+        env: Env,
+        caller: Address,
+        asset: Address,
+        recipient: Address,
+    ) -> Result<i128, StakeVaultError> {
+        Self::require_not_paused(&env)?;
+        Ok(reward_dust::reconcile(&env, &caller, &asset, &recipient)?)
+    }
+
+    /// Returns dust totals for `asset`.
+    pub fn get_reward_dust(env: Env, asset: Address) -> reward_dust::DustTotals {
+        reward_dust::totals(&env, &asset)
     }
 
     // ── Reward index checkpointing (Issue #1132) ────────────────────────────
