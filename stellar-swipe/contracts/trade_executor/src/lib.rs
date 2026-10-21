@@ -19,7 +19,13 @@ pub mod sdex;
 pub mod triggers;
 mod wire;
 
-use errors::{ContractError, InsufficientBalanceDetail, NetworkErrorDetail};
+use errors::{InsufficientBalanceDetail, NetworkErrorDetail};
+// Issue #1338: `ContractError`'s numeric discriminants are public ABI (clients
+// decode failures by code), so the type itself must be reachable from outside
+// the crate for ABI-compatibility tests (see `tests/error_abi.rs`) to name it,
+// matching the `pub use errors::AdminError;` pattern already used by
+// `signal_registry`.
+pub use errors::ContractError;
 use risk_gates::{
     check_user_balance, resolve_trade_amount, validate_and_record_position,
     validate_min_trade_size, DEFAULT_ESTIMATED_COPY_TRADE_FEE, DEFAULT_MIN_TRADE_SIZE,
