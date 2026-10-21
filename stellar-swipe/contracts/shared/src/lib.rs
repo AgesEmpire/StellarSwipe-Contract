@@ -46,6 +46,8 @@ pub mod errors;
 pub mod event_topics;
 #[allow(deprecated)]
 pub mod events;
+/// Event payload serialization fixtures (issue #1339).
+mod event_fixtures_tests;
 /// Shared double-initialization guard (issue #584).
 pub mod initializable;
 /// Minimum-liquidity threshold guard for pooled-fund withdrawals (issue #591).
