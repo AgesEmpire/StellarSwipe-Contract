@@ -95,6 +95,10 @@ pub const TOPIC_CAMPAIGN_ALLOCATED: fn() -> Symbol = || Symbol::short("rcmpallo"
 pub const TOPIC_CAMPAIGN_CLAIMED: fn() -> Symbol = || Symbol::short("rcmpclm");
 pub const TOPIC_CAMPAIGN_EXPIRED: fn() -> Symbol = || Symbol::short("rcmpexp");
 pub const TOPIC_CAMPAIGN_CLOSED: fn() -> Symbol = || Symbol::short("rcmpcls");
+// ── Reward campaign funding/activation/cancellation (#1323, #1324) ───────────
+pub const TOPIC_CAMPAIGN_FUNDED: fn() -> Symbol = || Symbol::short("rcmpfnd");
+pub const TOPIC_CAMPAIGN_ACTIVATED: fn() -> Symbol = || Symbol::short("rcmpact");
+pub const TOPIC_CAMPAIGN_CANCELED: fn() -> Symbol = || Symbol::short("rcmpcan");
 
 // ── Fee accrual slash settlement (#1205) ──────────────────────────────────────
 pub const TOPIC_FEE_SLASH_SETTLED: fn() -> Symbol = || Symbol::short("fee_slsh");
@@ -193,6 +197,9 @@ mod tests {
         let _ = TOPIC_CAMPAIGN_CLAIMED();
         let _ = TOPIC_CAMPAIGN_EXPIRED();
         let _ = TOPIC_CAMPAIGN_CLOSED();
+        let _ = TOPIC_CAMPAIGN_FUNDED();
+        let _ = TOPIC_CAMPAIGN_ACTIVATED();
+        let _ = TOPIC_CAMPAIGN_CANCELED();
         let _ = TOPIC_FEE_SLASH_SETTLED();
         let _ = TOPIC_SLASH_STRATEGY_SET();
         let _ = TOPIC_STORAGE_VERSION_SET();
