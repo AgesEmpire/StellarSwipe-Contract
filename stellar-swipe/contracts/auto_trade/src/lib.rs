@@ -30,6 +30,7 @@ mod logging;
 mod loss_streak;
 mod multi_asset;
 mod oracle;
+pub mod plan_lifecycle;
 mod portfolio;
 mod portfolio_insurance;
 #[cfg(not(feature = "testutils"))]
@@ -2071,6 +2072,85 @@ impl AutoTradeContract {
     /// List all registered keeper addresses.
     pub fn list_keepers(env: Env) -> Vec<Address> {
         keeper::list_keepers(&env)
+    }
+
+    // ── Auto-trade plan lifecycle (#1145/#1147/#1148/#1150) ──────────────────
+
+    pub fn create_plan(
+        env: Env,
+        owner: Address,
+        asset_pair: u32,
+        funding_token: Address,
+        budget: i128,
+        position_pct: u32,
+        dca_interval: u64,
+    ) -> Result<u64, AutoTradeError> {
+        plan_lifecycle::create_plan(&env, owner, asset_pair, funding_token, budget, position_pct, dca_interval)
+    }
+
+    pub fn get_plan(env: Env, plan_id: u64) -> Result<plan_lifecycle::AutoTradePlan, AutoTradeError> {
+        plan_lifecycle::get_plan(&env, plan_id)
+    }
+
+    pub fn set_plan_asset(env: Env, admin: Address, asset_pair: u32, supported: bool) -> Result<(), AutoTradeError> {
+        plan_lifecycle::set_supported_asset(&env, &admin, asset_pair, supported)
+    }
+
+    pub fn set_recovery_cooldown(env: Env, admin: Address, ledgers: u32) -> Result<(), AutoTradeError> {
+        plan_lifecycle::set_recovery_cooldown(&env, &admin, ledgers)
+    }
+
+    /// Draft/Tripped → Active after asset, oracle, risk and funding checks.
+    pub fn activate_plan(env: Env, caller: Address, plan_id: u64) -> Result<(), AutoTradeError> {
+        plan_lifecycle::activate_plan(&env, &caller, plan_id)
+    }
+
+    pub fn check_plan_drawdown(env: Env, plan_id: u64, current_value: i128) -> Result<bool, AutoTradeError> {
+        plan_lifecycle::check_plan_drawdown(&env, plan_id, current_value)
+    }
+
+    pub fn emergency_disable_plan(env: Env, caller: Address, plan_id: u64) -> Result<(), AutoTradeError> {
+        plan_lifecycle::emergency_disable(&env, &caller, plan_id)
+    }
+
+    pub fn clear_plan_disable(env: Env, admin: Address, plan_id: u64) -> Result<(), AutoTradeError> {
+        plan_lifecycle::clear_emergency_disable(&env, &admin, plan_id)
+    }
+
+    pub fn acquire_plan_lease(env: Env, keeper: Address, plan_id: u64, duration_ledgers: u32) -> Result<u64, AutoTradeError> {
+        plan_lifecycle::acquire_lease(&env, &keeper, plan_id, duration_ledgers)
+    }
+
+    pub fn renew_plan_lease(
+        env: Env,
+        keeper: Address,
+        plan_id: u64,
+        epoch: u64,
+        duration_ledgers: u32,
+    ) -> Result<u32, AutoTradeError> {
+        plan_lifecycle::renew_lease(&env, &keeper, plan_id, epoch, duration_ledgers)
+    }
+
+    pub fn finalize_plan_lease(env: Env, keeper: Address, plan_id: u64, epoch: u64) -> Result<(), AutoTradeError> {
+        plan_lifecycle::finalize_with_lease(&env, &keeper, plan_id, epoch)
+    }
+
+    pub fn set_dca_catch_up_policy(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+        policy: plan_lifecycle::CatchUpPolicy,
+    ) -> Result<(), AutoTradeError> {
+        plan_lifecycle::set_catch_up_policy(&env, &caller, plan_id, policy)
+    }
+
+    pub fn process_dca_tick(
+        env: Env,
+        keeper: Address,
+        plan_id: u64,
+        epoch: u64,
+    ) -> Result<Option<plan_lifecycle::DriftDecision>, AutoTradeError> {
+        plan_lifecycle::process_dca_tick(&env, &keeper, plan_id, epoch)
     }
 
     /// Mark a triggered conditional order as executed (call after trade fill).
