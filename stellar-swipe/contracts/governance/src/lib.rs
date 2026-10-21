@@ -4,6 +4,7 @@
 mod committees;
 mod conviction_voting;
 mod delegation_expiry;
+pub mod dependencies;
 mod distribution;
 pub mod errors;
 pub use errors::GovernanceError;
@@ -11,6 +12,7 @@ mod proposal_deposit;
 mod proposals;
 mod quadratic_voting;
 mod reputation;
+pub mod snapshot_pruning;
 mod shadow_mode;
 mod spend_window;
 mod timelock;
