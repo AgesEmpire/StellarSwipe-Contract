@@ -2,6 +2,7 @@
 
 #[allow(deprecated)]
 mod admin;
+pub mod challenge;
 mod conversion;
 // Closes #671 — cross-source price deviation alerting
 mod deviation;

@@ -10,11 +10,13 @@ pub mod migration;
 /// Reward campaigns: deterministic splits, claim expiry, guarded closure
 /// (Issues #1202, #1203, #1204).
 pub mod reward_campaign;
+pub mod reward_index;
 pub mod reward_vault;
 /// Reward dust tracking and reconciliation (Issue #1135).
 pub mod reward_dust;
 pub mod slash_strategy;
 pub mod storage_version;
+pub mod withdrawal_claims;
 
 use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
 use migration::{MigrationKey, StakeInfoV2};
@@ -1122,6 +1124,7 @@ impl StakeVaultContract {
         env.storage()
             .persistent()
             .set(&MigrationKey::StakesV2, &stakes);
+        reward_index::on_stake_change(&env, &staker, new_balance)?;
 
         // Record the deposit timestamp for voting-power eligibility checks.
         env.storage()
@@ -1930,6 +1933,7 @@ impl StakeVaultContract {
             .persistent()
             .set(&MigrationKey::StakesV2, &stakes);
 
+        reward_index::on_stake_change(env, staker, 0)?;
         emit_provider_tier_change(env, staker, old_tier, new_tier, 0);
 
         Ok(amount)
@@ -2130,6 +2134,7 @@ impl StakeVaultContract {
             .persistent()
             .set(&MigrationKey::StakesV2, &stakes);
 
+        reward_index::on_stake_change(env, staker, remaining)?;
         emit_provider_tier_change(env, staker, old_tier, new_tier, remaining);
 
         events::emit_partial_unstake(env, staker.clone(), amount, remaining);
@@ -3198,6 +3203,32 @@ impl StakeVaultContract {
             &env,
             &old,
             &new_stake_token,
+        )?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::StakeToken, &new_stake_token);
+        Ok(decimals)
+    }
+
+    // ── Reward index checkpointing (Issue #1132) ────────────────────────────
+
+    /// Admin: enable index-based streaming rewards for `asset`.
+    pub fn add_index_reward_asset(env: Env, asset: Address) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        let old: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        let decimals = asset_decimals::require_migration_compatible(
+            &env,
+            &old,
+            &new_stake_token,
             &reward_vault::get_supported_assets(&env),
         )?;
         env.storage()
@@ -3259,6 +3290,107 @@ impl StakeVaultContract {
     /// Returns dust totals for `asset`.
     pub fn get_reward_dust(env: Env, asset: Address) -> reward_dust::DustTotals {
         reward_dust::totals(&env, &asset)
+    }
+
+    // ── Reward index checkpointing (Issue #1132) ────────────────────────────
+
+    /// Admin: enable index-based streaming rewards for `asset`.
+    pub fn add_index_reward_asset(env: Env, asset: Address) -> Result<(), StakeVaultError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(StakeVaultError::NotInitialized)?;
+        admin.require_auth();
+        reward_index::add_asset(&env, asset)
+    }
+
+    /// Fund `amount` of `asset` pro-rata to current participating stake.
+    pub fn fund_index_rewards(
+        env: Env,
+        funder: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<i128, StakeVaultError> {
+        funder.require_auth();
+        let idx = reward_index::notify_reward(&env, &asset, amount)?;
+        shared::token_error::map_result(token::Client::new(&env, &asset).try_transfer(
+            &funder,
+            env.current_contract_address(),
+            &amount,
+        ))
+        .map_err(StakeVaultError::from)?;
+        Ok(idx)
+    }
+
+    /// Opt an existing (pre-index) stake into reward accrual. Permissionless
+    /// and idempotent: it only syncs the recorded stake with the real balance.
+    pub fn sync_index_stake(env: Env, staker: Address) -> Result<(), StakeVaultError> {
+        let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+        let bal = stakes.get(staker.clone()).map(|s| s.balance).unwrap_or(0);
+        reward_index::on_stake_change(&env, &staker, bal)
+    }
+
+    /// Claim index rewards. If the transfer fails the payout is queued
+    /// (Issue #1133) and its nonce returned; `None` means paid in full.
+    pub fn claim_index_rewards(
+        env: Env,
+        staker: Address,
+        asset: Address,
+    ) -> Result<Option<u64>, StakeVaultError> {
+        staker.require_auth();
+        let amount = reward_index::take_accrued(&env, &staker, &asset)?;
+        if amount <= 0 {
+            return Err(StakeVaultError::InvalidAmount);
+        }
+        let queued = withdrawal_claims::pay_or_queue(&env, &staker, &asset, amount)?;
+        env.events().publish(
+            (symbol_short!("rwidx"), symbol_short!("claim")),
+            (staker, asset, amount, queued),
+        );
+        Ok(queued)
+    }
+
+    pub fn get_index_accrued(env: Env, staker: Address, asset: Address) -> i128 {
+        reward_index::accrued(&env, &staker, &asset)
+    }
+
+    pub fn get_reward_index(env: Env, asset: Address) -> i128 {
+        reward_index::global_index(&env, &asset)
+    }
+
+    pub fn get_staker_reward_index(env: Env, staker: Address, asset: Address) -> Option<i128> {
+        reward_index::user_index(&env, &staker, &asset)
+    }
+
+    // ── Queued withdrawal claims (Issue #1133) ──────────────────────────────
+
+    pub fn claim_queued_withdrawal(
+        env: Env,
+        claimant: Address,
+        nonce: u64,
+    ) -> Result<i128, StakeVaultError> {
+        withdrawal_claims::claim(&env, &claimant, nonce)
+    }
+
+    pub fn cancel_queued_withdrawal(
+        env: Env,
+        claimant: Address,
+        nonce: u64,
+    ) -> Result<i128, StakeVaultError> {
+        withdrawal_claims::cancel(&env, &claimant, nonce)
+    }
+
+    pub fn get_queued_withdrawal(
+        env: Env,
+        claimant: Address,
+        nonce: u64,
+    ) -> Option<withdrawal_claims::QueuedClaim> {
+        withdrawal_claims::get(&env, &claimant, nonce)
     }
 
     /// Returns all registered reward asset addresses.
