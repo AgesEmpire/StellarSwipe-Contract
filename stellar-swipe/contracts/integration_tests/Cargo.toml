@@ -14,6 +14,7 @@ stake_vault = { path = "../stake_vault" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+bridge = { path = "../bridge" }
 signal_registry = { path = "../signal_registry", features = ["testutils"] }
 stellar_swipe_common = { path = "../common" }
 trade_executor = { path = "../trade_executor" }
@@ -69,6 +70,10 @@ path = "tests/integration/test_release_fixture.rs"
 [[test]]
 name = "test_e2e_resource_budget"
 path = "tests/integration/test_e2e_resource_budget.rs"
+
+[[test]]
+name = "test_bridge_authorization_conformance"
+path = "tests/integration/test_bridge_authorization_conformance.rs"
 
 [lints]
 workspace = true
