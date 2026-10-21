@@ -92,6 +92,16 @@ pub enum BridgeError {
     /// A liquidity pool already exists for this unordered asset pair, in
     /// either order (Issue #1313).
     PoolAlreadyExists = 34,
+    /// A liquidity withdrawal targeted a recipient that is neither the
+    /// liquidity provider nor an address the provider explicitly approved
+    /// (Issue #1319).
+    UnauthorizedRecipient = 35,
+    /// A pool operation's resulting reserves or LP-share supply would be
+    /// negative or internally inconsistent (Issue #1318).
+    PoolInvariantViolation = 36,
+    /// The pool's trading is currently paused by its operator; swaps are
+    /// rejected until it is resumed (Issue #1320).
+    PoolTradingPaused = 37,
 }
 
 impl BridgeError {
@@ -193,6 +203,15 @@ impl BridgeError {
             }
             BridgeError::PoolAlreadyExists => {
                 "a liquidity pool already exists for this asset pair, in either order"
+            }
+            BridgeError::UnauthorizedRecipient => {
+                "withdrawal recipient is neither the liquidity provider nor an approved delegate"
+            }
+            BridgeError::PoolInvariantViolation => {
+                "pool operation would leave reserves or LP-share supply negative or inconsistent"
+            }
+            BridgeError::PoolTradingPaused => {
+                "pool trading is paused by its operator; swaps are rejected until resumed"
             }
         }
     }
@@ -1062,16 +1081,96 @@ impl BridgeContract {
         liquidity::add_liquidity(&env, provider, pool_id, amount_a, amount_b)
     }
 
+    /// Withdraws `lp_amount` of `provider`'s liquidity, crediting proceeds to
+    /// `recipient` (Issue #1319). `recipient` must be `provider` itself or an
+    /// address `provider` previously approved via
+    /// [`BridgeContract::approve_withdrawal_recipient`]; any other recipient
+    /// is rejected with `BridgeError::UnauthorizedRecipient` and leaves
+    /// shares and reserves unchanged.
     pub fn remove_bridge_liquidity(
         env: Env,
         provider: Address,
+        recipient: Address,
         pool_id: u64,
         lp_amount: i128,
     ) -> Result<(i128, i128, i128), BridgeError> {
         if !cfg!(test) {
             provider.require_auth();
         }
-        liquidity::remove_liquidity(&env, provider, pool_id, lp_amount)
+        liquidity::remove_liquidity(&env, provider, recipient, pool_id, lp_amount)
+    }
+
+    /// Authorizes `recipient` to receive future withdrawal proceeds on
+    /// behalf of `provider` (Issue #1319). Only `provider` can grant this.
+    pub fn approve_withdrawal_recipient(
+        env: Env,
+        provider: Address,
+        recipient: Address,
+    ) {
+        if !cfg!(test) {
+            provider.require_auth();
+        }
+        liquidity::approve_withdrawal_recipient(&env, &provider, &recipient);
+    }
+
+    /// Revokes a previously granted withdrawal-recipient approval
+    /// (Issue #1319). Only `provider` can revoke their own approval.
+    pub fn revoke_withdrawal_recipient(
+        env: Env,
+        provider: Address,
+        recipient: Address,
+    ) {
+        if !cfg!(test) {
+            provider.require_auth();
+        }
+        liquidity::revoke_withdrawal_recipient(&env, &provider, &recipient);
+    }
+
+    /// Designates `operator` as the account authorized to pause/resume
+    /// trading on `pool_id` (Issue #1320). Only the bridge admin may set
+    /// this; until set, the admin itself is the implicit operator.
+    pub fn set_pool_operator(
+        env: Env,
+        admin: Address,
+        pool_id: u64,
+        operator: Address,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        liquidity::set_pool_operator(&env, pool_id, &operator);
+        Ok(())
+    }
+
+    /// Pauses new swaps on `pool_id` (Issue #1320). Callable by the pool's
+    /// designated operator (see [`BridgeContract::set_pool_operator`]) or,
+    /// if none was set, the bridge admin. Withdrawals remain available
+    /// while paused — the documented safe-exit policy for an incident.
+    pub fn pause_pool_trading(
+        env: Env,
+        caller: Address,
+        pool_id: u64,
+    ) -> Result<(), BridgeError> {
+        require_pool_operator(&env, &caller, pool_id)?;
+        if !cfg!(test) {
+            caller.require_auth();
+        }
+        liquidity::pause_trading(&env, caller, pool_id)
+    }
+
+    /// Resumes swaps on `pool_id` after a pause (Issue #1320). Same
+    /// authorization as [`BridgeContract::pause_pool_trading`].
+    pub fn resume_pool_trading(
+        env: Env,
+        caller: Address,
+        pool_id: u64,
+    ) -> Result<(), BridgeError> {
+        require_pool_operator(&env, &caller, pool_id)?;
+        if !cfg!(test) {
+            caller.require_auth();
+        }
+        liquidity::resume_trading(&env, caller, pool_id)
     }
 
     pub fn swap_bridge_assets(
@@ -1666,6 +1765,24 @@ fn require_admin(env: &Env, admin: &Address) -> Result<BridgeConfig, BridgeError
         return Err(BridgeError::UnauthorizedValidator);
     }
     Ok(config)
+}
+
+/// Issue #1320: `caller` must be the pool's designated operator (set via
+/// [`BridgeContract::set_pool_operator`]) or, if none was set, the bridge
+/// admin. Used to gate pause/resume trading calls.
+fn require_pool_operator(env: &Env, caller: &Address, pool_id: u64) -> Result<(), BridgeError> {
+    match liquidity::get_pool_operator(env, pool_id) {
+        Some(operator) if operator == *caller => Ok(()),
+        Some(_) => Err(BridgeError::UnauthorizedValidator),
+        None => {
+            let config = get_config(env)?;
+            if config.admin == *caller {
+                Ok(())
+            } else {
+                Err(BridgeError::UnauthorizedValidator)
+            }
+        }
+    }
 }
 
 /// Issue #865: true when a governance-driven emergency pause is active.
