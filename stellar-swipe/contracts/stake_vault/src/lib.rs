@@ -677,7 +677,14 @@ impl From<reward_campaign::CampaignError> for StakeVaultError {
             E::InvalidAmount
             | E::InsufficientCampaignFunds
             | E::InvalidClaimWindow
-            | E::InvalidRecipients => StakeVaultError::InvalidAmount,
+            | E::InvalidRecipients
+            // Issue #1323/#1324: wrong funding asset and an operation
+            // attempted on a campaign that is not in the required `Pending`
+            // state both reuse `InvalidAmount` — the enum is at the
+            // `#[contracterror]` variant cap (Issue #1326), same as the
+            // `RewardVaultError` mapping below.
+            | E::WrongFundingAsset => StakeVaultError::InvalidAmount,
+            E::CampaignNotPending => StakeVaultError::CampaignNotOpen,
             E::Overflow => StakeVaultError::StakeOverflow,
         }
     }
@@ -3211,11 +3218,14 @@ impl StakeVaultContract {
         reward_vault::get_asset_total_deposited(&env, &asset)
     }
 
-    // ── Issues #1202–#1204: Reward campaigns ──────────────────────────────────
+    // ── Issues #1202–#1204, #1323–#1325: Reward campaigns ─────────────────────
     // Policy and accounting rules are documented in `reward_campaign`.
 
-    /// Funder: create a reward campaign and transfer `budget` of `asset` into
-    /// the vault.  `asset` must be a registered reward asset.
+    /// Funder: create a reward campaign in `Pending` status. `asset` must be
+    /// a registered reward asset. The campaign is not claimable yet — fund it
+    /// with [`Self::fund_reward_campaign`] and then open it with
+    /// [`Self::activate_reward_campaign`] (Issue #1323), or cancel it with
+    /// [`Self::cancel_reward_campaign`] (Issue #1324) if it was a mistake.
     pub fn create_reward_campaign(
         env: Env,
         funder: Address,
@@ -3236,13 +3246,68 @@ impl StakeVaultContract {
             budget,
             claim_window_secs,
         )?;
+        Ok(campaign_id)
+    }
+
+    /// Funder: deposit `amount` of `asset` toward a `Pending` campaign's
+    /// promised budget (Issue #1323). Rejected, with the deposit never
+    /// transferred, if `asset` does not match the campaign's own asset or if
+    /// the campaign is not `Pending`. Returns the cumulative funded amount.
+    pub fn fund_reward_campaign(
+        env: Env,
+        campaign_id: u64,
+        asset: Address,
+        amount: i128,
+    ) -> Result<i128, StakeVaultError> {
+        let campaign = reward_campaign::get_campaign(&env, campaign_id)
+            .ok_or(StakeVaultError::CampaignNotOpen)?;
+        campaign.funder.require_auth();
+        Self::require_not_paused(&env)?;
+        let funded = reward_campaign::fund_campaign(&env, campaign_id, &asset, amount)?;
         shared::token_error::map_result(token::Client::new(&env, &asset).try_transfer(
-            &funder,
-            env.current_contract_address(),
-            &budget,
+            &campaign.funder,
+            &env.current_contract_address(),
+            &amount,
         ))
         .map_err(StakeVaultError::from)?;
-        Ok(campaign_id)
+        Ok(funded)
+    }
+
+    /// Funder: activate a fully-funded `Pending` campaign, opening it for
+    /// allocation and claims and binding it to `epoch_id` for its whole
+    /// lifetime (Issue #1323, #1325). Rejected with no state change unless
+    /// `funded >= budget`.
+    pub fn activate_reward_campaign(
+        env: Env,
+        campaign_id: u64,
+        epoch_id: u64,
+    ) -> Result<(), StakeVaultError> {
+        let campaign = reward_campaign::get_campaign(&env, campaign_id)
+            .ok_or(StakeVaultError::CampaignNotOpen)?;
+        campaign.funder.require_auth();
+        Self::require_not_paused(&env)?;
+        Ok(reward_campaign::activate_campaign(&env, campaign_id, epoch_id)?)
+    }
+
+    /// Funder: cancel a campaign that is still `Pending` (Issue #1324) —
+    /// never activated, so it has never accepted an allocation or claim.
+    /// Refunds whatever was funded so far back to the funder.
+    pub fn cancel_reward_campaign(env: Env, campaign_id: u64) -> Result<i128, StakeVaultError> {
+        let campaign = reward_campaign::get_campaign(&env, campaign_id)
+            .ok_or(StakeVaultError::CampaignNotOpen)?;
+        campaign.funder.require_auth();
+        let refund = reward_campaign::cancel_campaign(&env, campaign_id)?;
+        if refund > 0 {
+            shared::token_error::map_result(
+                token::Client::new(&env, &campaign.asset).try_transfer(
+                    &env.current_contract_address(),
+                    &campaign.funder,
+                    &refund,
+                ),
+            )
+            .map_err(StakeVaultError::from)?;
+        }
+        Ok(refund)
     }
 
     /// Funder: allocate `total` of the campaign's unallocated funds across

@@ -57,6 +57,40 @@
 //! so a rejected closure leaves the campaign unchanged.  On success the
 //! campaign becomes `Closed` (terminal; no more allocations, claims or
 //! expiries) and `available` is returned to be refunded to the funder.
+//!
+//! # Issue #1323 – Funding required before activation
+//!
+//! A campaign now starts life in `Pending`, with a promised `budget` but
+//! `funded == 0`.  [`fund_campaign`] records deposits made in the campaign's
+//! own `asset` (a deposit in any other asset is rejected and leaves `funded`
+//! unchanged — Issue #1323's "wrong asset" case).  [`activate_campaign`]
+//! moves `Pending → Open` only once `funded >= budget`; an underfunded
+//! activation attempt returns [`CampaignError::InsufficientCampaignFunds`]
+//! and leaves the campaign's status, `funded` and `epoch_id` untouched.  Only
+//! `Open` campaigns can [`distribute`], [`claim`], or [`close_campaign`].
+//!
+//! # Issue #1324 – Cancelling an unfunded/unactivated campaign
+//!
+//! [`cancel_campaign`] is only valid while a campaign is still `Pending` —
+//! i.e. it has never been activated and therefore has never accepted a
+//! single allocation or claim.  It moves the campaign to `Canceled`
+//! (terminal) and returns the `funded` amount so the caller can refund it to
+//! the funder.  A campaign that is already `Open`, `Closed`, or `Canceled` is
+//! rejected with [`CampaignError::CampaignClosed`] — repeated cancellation is
+//! idempotently refused, never silently repeated.
+//!
+//! # Issue #1325 – Epoch snapshot binding for claim eligibility
+//!
+//! [`activate_campaign`] takes an `epoch_id` that is written once, at
+//! activation, and never mutated again — [`RewardCampaign::epoch_id`] has no
+//! setter after that point.  Every allocation created by [`distribute`]
+//! records the campaign's `epoch_id` at allocation time
+//! (`CampaignAllocation::epoch_id`), and [`claim`] re-checks that the
+//! allocation's stamped `epoch_id` still equals the campaign's current
+//! (immutable) `epoch_id` before paying out.  Because `epoch_id` cannot
+//! change after activation, a recipient's eligibility is always judged
+//! against the frozen snapshot taken when the campaign opened — not against
+//! whatever epoch/stake state happens to exist at claim time.
 
 use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 
@@ -92,6 +126,11 @@ pub enum CampaignKey {
 pub enum CampaignStatus {
     Open = 0,
     Closed = 1,
+    /// Created but not yet activated: not funded (or not fully funded), has
+    /// never accepted an allocation or claim (Issue #1323).
+    Pending = 2,
+    /// Cancelled while still `Pending` (Issue #1324); terminal.
+    Canceled = 3,
 }
 
 #[contracttype]
@@ -126,6 +165,13 @@ pub struct RewardCampaign {
     pub status: CampaignStatus,
     pub created_at: u64,
     pub closed_at: u64,
+    /// Amount actually deposited toward `budget` so far (Issue #1323). Only
+    /// meaningful while `Pending`; once `Open`, funding is complete by
+    /// definition (`funded >= budget`) and never decreases afterwards.
+    pub funded: i128,
+    /// Immutable epoch/snapshot identifier bound at activation time (Issue
+    /// #1325). `0` while `Pending` (unset); never changes once set.
+    pub epoch_id: u64,
 }
 
 impl RewardCampaign {
@@ -151,6 +197,12 @@ pub struct CampaignAllocation {
     /// First timestamp at which the allocation is expired (no longer claimable).
     pub expires_at: u64,
     pub status: AllocationStatus,
+    /// Snapshot of the campaign's `epoch_id` at the moment this allocation
+    /// was created (Issue #1325). Claims are checked against this, not
+    /// against whatever the campaign's `epoch_id` happens to be later — it
+    /// never changes after activation anyway, but stamping it per-allocation
+    /// makes the binding explicit and independently verifiable.
+    pub epoch_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +226,12 @@ pub enum CampaignError {
     /// Campaign still has outstanding liabilities to recipients.
     OutstandingLiabilities,
     Overflow,
+    /// Campaign is not `Pending` (already activated, cancelled, or closed) —
+    /// Issue #1323 / #1324.
+    CampaignNotPending,
+    /// Funding deposit used an asset other than the campaign's own `asset`
+    /// (Issue #1323).
+    WrongFundingAsset,
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -301,8 +359,10 @@ pub fn split_by_weight(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Record a new open campaign.  The caller must transfer `budget` of `asset`
-/// from `funder` into the contract in the same invocation.
+/// Record a new campaign in `Pending` status (Issue #1323). The campaign is
+/// not claimable yet: it must be funded with [`fund_campaign`] and then
+/// opened with [`activate_campaign`] before any allocation or claim is
+/// possible.
 pub fn create_campaign(
     env: &Env,
     funder: Address,
@@ -338,9 +398,11 @@ pub fn create_campaign(
         pending_allocations: 0,
         next_allocation_id: 0,
         claim_window_secs,
-        status: CampaignStatus::Open,
+        status: CampaignStatus::Pending,
         created_at: env.ledger().timestamp(),
         closed_at: 0,
+        funded: 0,
+        epoch_id: 0,
     };
     save(env, &campaign);
 
@@ -349,6 +411,96 @@ pub fn create_campaign(
         (campaign_id, funder, asset, budget, claim_window_secs),
     );
     Ok(campaign_id)
+}
+
+/// Record a deposit of `amount` of `funding_asset` toward a `Pending`
+/// campaign's promised budget (Issue #1323). The caller is responsible for
+/// actually moving the tokens; this only updates accounting.
+///
+/// Rejected, with `funded` left unchanged, if the campaign is not `Pending`
+/// or if `funding_asset` does not match the campaign's own `asset` — a
+/// deposit in the wrong asset must never be allowed to count toward the
+/// budget.
+pub fn fund_campaign(
+    env: &Env,
+    campaign_id: u64,
+    funding_asset: &Address,
+    amount: i128,
+) -> Result<i128, CampaignError> {
+    if amount <= 0 {
+        return Err(CampaignError::InvalidAmount);
+    }
+    let mut campaign = load(env, campaign_id)?;
+    if campaign.status != CampaignStatus::Pending {
+        return Err(CampaignError::CampaignNotPending);
+    }
+    if *funding_asset != campaign.asset {
+        return Err(CampaignError::WrongFundingAsset);
+    }
+
+    campaign.funded = add(campaign.funded, amount)?;
+    save(env, &campaign);
+
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_CAMPAIGN_FUNDED()),
+        (campaign_id, funding_asset.clone(), amount, campaign.funded),
+    );
+    Ok(campaign.funded)
+}
+
+/// Activate a `Pending` campaign, binding it to `epoch_id` for the rest of
+/// its life (Issue #1323 / #1325).
+///
+/// Rejected, with no state change at all (status, `funded`, and `epoch_id`
+/// all left exactly as they were), unless the campaign is `Pending` and
+/// `funded >= budget` — an underfunded campaign can never become claimable.
+pub fn activate_campaign(
+    env: &Env,
+    campaign_id: u64,
+    epoch_id: u64,
+) -> Result<(), CampaignError> {
+    let mut campaign = load(env, campaign_id)?;
+    if campaign.status != CampaignStatus::Pending {
+        return Err(CampaignError::CampaignNotPending);
+    }
+    if campaign.funded < campaign.budget {
+        return Err(CampaignError::InsufficientCampaignFunds);
+    }
+
+    campaign.status = CampaignStatus::Open;
+    campaign.epoch_id = epoch_id;
+    save(env, &campaign);
+
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_CAMPAIGN_ACTIVATED()),
+        (campaign_id, epoch_id, campaign.funded),
+    );
+    Ok(())
+}
+
+/// Cancel a campaign that is still `Pending` (Issue #1324) — i.e. one that
+/// has never been activated and so has never accepted a single allocation or
+/// claim. Returns the `funded` amount so the caller can refund it to the
+/// funder.
+///
+/// Rejected if the campaign is already `Open`, `Closed`, or `Canceled`
+/// (repeated cancellation is refused, not silently repeated).
+pub fn cancel_campaign(env: &Env, campaign_id: u64) -> Result<i128, CampaignError> {
+    let mut campaign = load(env, campaign_id)?;
+    if campaign.status != CampaignStatus::Pending {
+        return Err(CampaignError::CampaignNotPending);
+    }
+
+    let refund = campaign.funded;
+    campaign.status = CampaignStatus::Canceled;
+    campaign.closed_at = env.ledger().timestamp();
+    save(env, &campaign);
+
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_CAMPAIGN_CANCELED()),
+        (campaign_id, refund),
+    );
+    Ok(refund)
 }
 
 /// Allocate `total` of the campaign's available funds across `recipients` by
@@ -390,6 +542,10 @@ pub fn distribute(
             allocated_at: now,
             expires_at,
             status: AllocationStatus::Pending,
+            // Issue #1325: snapshot the campaign's immutable epoch_id at
+            // allocation time, so eligibility is always checked against this
+            // frozen value rather than any later state.
+            epoch_id: campaign.epoch_id,
         };
         env.storage().persistent().set(
             &CampaignKey::Allocation(campaign_id, allocation_id),
@@ -448,6 +604,14 @@ pub fn claim(
         }
         if now >= allocation.expires_at {
             return Err(CampaignError::AllocationExpired);
+        }
+        // Issue #1325: eligibility is checked against the epoch snapshot
+        // stamped on the allocation at distribution time, not the campaign's
+        // current `epoch_id` — even though the latter cannot change after
+        // activation, this keeps the binding explicit and would still catch
+        // any future bug that tried to mutate it.
+        if allocation.epoch_id != campaign.epoch_id {
+            return Err(CampaignError::AllocationNotClaimable);
         }
         total = add(total, allocation.amount)?;
         allocations.push_back(allocation);
@@ -611,15 +775,24 @@ mod tests {
         assert!(c.outstanding() >= 0 && c.available() >= 0);
     }
 
+    /// Creates a campaign and immediately funds + activates it (epoch 1), so
+    /// existing tests that assume an `Open`, claimable campaign are
+    /// unaffected by the #1323/#1324/#1325 Pending→Open lifecycle.
     fn new_campaign(env: &Env, budget: i128) -> u64 {
-        create_campaign(
-            env,
-            Address::generate(env),
-            Address::generate(env),
-            budget,
-            WINDOW,
-        )
-        .unwrap()
+        new_campaign_with_asset(env, Address::generate(env), budget)
+    }
+
+    fn new_campaign_with_asset(env: &Env, asset: Address, budget: i128) -> u64 {
+        let id = create_campaign(env, Address::generate(env), asset.clone(), budget, WINDOW)
+            .unwrap();
+        fund_campaign(env, id, &asset, budget).unwrap();
+        activate_campaign(env, id, 1).unwrap();
+        id
+    }
+
+    /// Creates a campaign without funding or activating it (still `Pending`).
+    fn new_pending_campaign(env: &Env, asset: Address, budget: i128) -> u64 {
+        create_campaign(env, Address::generate(env), asset, budget, WINDOW).unwrap()
     }
 
     // ── #1202: remainder allocation ──────────────────────────────────────────
@@ -1011,6 +1184,162 @@ mod tests {
             assert_eq!(
                 close_campaign(&env, 99),
                 Err(CampaignError::CampaignNotFound)
+            );
+        });
+    }
+
+    // ── #1323: funding handshake before activation ───────────────────────────
+
+    #[test]
+    fn new_campaign_is_pending_with_zero_funded_and_epoch() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset, 1_000);
+            let c = get_campaign(&env, id).unwrap();
+            assert_eq!(c.status, CampaignStatus::Pending);
+            assert_eq!(c.funded, 0);
+            assert_eq!(c.epoch_id, 0);
+        });
+    }
+
+    #[test]
+    fn exact_funding_activates_successfully() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            assert_eq!(fund_campaign(&env, id, &asset, 1_000).unwrap(), 1_000);
+            activate_campaign(&env, id, 5).unwrap();
+            let c = get_campaign(&env, id).unwrap();
+            assert_eq!(c.status, CampaignStatus::Open);
+            assert_eq!(c.epoch_id, 5);
+        });
+    }
+
+    #[test]
+    fn short_funding_leaves_activation_rejected_and_state_unchanged() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            fund_campaign(&env, id, &asset, 600).unwrap();
+            let before = get_campaign(&env, id).unwrap();
+
+            assert_eq!(
+                activate_campaign(&env, id, 1),
+                Err(CampaignError::InsufficientCampaignFunds)
+            );
+            assert_eq!(get_campaign(&env, id).unwrap(), before);
+        });
+    }
+
+    #[test]
+    fn funding_in_the_wrong_asset_is_rejected_and_not_counted() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let other_asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset, 1_000);
+
+            assert_eq!(
+                fund_campaign(&env, id, &other_asset, 1_000),
+                Err(CampaignError::WrongFundingAsset)
+            );
+            assert_eq!(get_campaign(&env, id).unwrap().funded, 0);
+            assert_eq!(
+                activate_campaign(&env, id, 1),
+                Err(CampaignError::InsufficientCampaignFunds)
+            );
+        });
+    }
+
+    #[test]
+    fn funding_can_be_split_across_multiple_deposits() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            assert_eq!(fund_campaign(&env, id, &asset, 400).unwrap(), 400);
+            assert_eq!(fund_campaign(&env, id, &asset, 600).unwrap(), 1_000);
+            activate_campaign(&env, id, 1).unwrap();
+            assert_eq!(get_campaign(&env, id).unwrap().status, CampaignStatus::Open);
+        });
+    }
+
+    // ── #1324: cancellation of unfunded/unactivated campaigns ────────────────
+
+    #[test]
+    fn pending_campaign_can_be_cancelled_and_returns_funded_amount() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            fund_campaign(&env, id, &asset, 300).unwrap();
+
+            assert_eq!(cancel_campaign(&env, id).unwrap(), 300);
+            let c = get_campaign(&env, id).unwrap();
+            assert_eq!(c.status, CampaignStatus::Canceled);
+        });
+    }
+
+    #[test]
+    fn cancellation_is_rejected_once_already_activated() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            fund_campaign(&env, id, &asset, 1_000).unwrap();
+            activate_campaign(&env, id, 1).unwrap();
+
+            assert_eq!(
+                cancel_campaign(&env, id),
+                Err(CampaignError::CampaignNotPending)
+            );
+        });
+    }
+
+    #[test]
+    fn repeated_cancellation_is_rejected_not_repeated() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset, 1_000);
+            cancel_campaign(&env, id).unwrap();
+            assert_eq!(
+                cancel_campaign(&env, id),
+                Err(CampaignError::CampaignNotPending)
+            );
+        });
+    }
+
+    // ── #1325: epoch snapshot binding ─────────────────────────────────────────
+
+    #[test]
+    fn allocations_are_stamped_with_the_activation_epoch_and_claims_require_it() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            fund_campaign(&env, id, &asset, 1_000).unwrap();
+            activate_campaign(&env, id, 99).unwrap();
+
+            let user = Address::generate(&env);
+            let created = distribute(&env, id, 100, vec![&env, (user.clone(), 1u32)]).unwrap();
+            let (_, alloc_id, amount) = created.get(0).unwrap();
+
+            let allocation = get_allocation(&env, id, alloc_id).unwrap();
+            assert_eq!(allocation.epoch_id, 99);
+
+            // A later change to "current state" (modelled here as the
+            // campaign's own epoch_id, which has no setter and so can never
+            // actually change post-activation) can't retroactively alter
+            // this allocation's snapshot: the claim still succeeds because
+            // the campaign's immutable epoch_id still agrees with it.
+            assert_eq!(get_campaign(&env, id).unwrap().epoch_id, 99);
+            assert_eq!(
+                claim(&env, id, &user, vec![&env, alloc_id]).unwrap(),
+                amount
             );
         });
     }
