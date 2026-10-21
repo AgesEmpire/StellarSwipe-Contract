@@ -62,5 +62,13 @@ path = "tests/integration/test_fee_distribution_end_to_end.rs"
 name = "test_contract_invariants_harness"
 path = "tests/integration/test_contract_invariants_harness.rs"
 
+[[test]]
+name = "test_release_fixture"
+path = "tests/integration/test_release_fixture.rs"
+
+[[test]]
+name = "test_e2e_resource_budget"
+path = "tests/integration/test_e2e_resource_budget.rs"
+
 [lints]
 workspace = true
