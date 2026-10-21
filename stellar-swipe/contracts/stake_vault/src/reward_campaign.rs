@@ -82,6 +82,13 @@ pub enum CampaignKey {
     Campaign(u64),
     /// (campaign_id, allocation_id) → CampaignAllocation.
     Allocation(u64, u64),
+    /// Monotonic vesting schedule id counter, per campaign.
+    VestingCounter(u64),
+    /// (campaign_id, vesting_id) → VestingAllocation (Issue #1327).
+    Vesting(u64, u64),
+    /// (campaign_id, recipient) → cumulative amount claimed, for enforcing
+    /// `RewardCampaign::per_account_claim_cap` (Issue #1329).
+    ClaimedByAccount(u64, Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -126,6 +133,9 @@ pub struct RewardCampaign {
     pub status: CampaignStatus,
     pub created_at: u64,
     pub closed_at: u64,
+    /// Maximum lifetime amount any single account may claim from this
+    /// campaign (Issue #1329). `0` means no cap.
+    pub per_account_claim_cap: i128,
 }
 
 impl RewardCampaign {
@@ -174,6 +184,14 @@ pub enum CampaignError {
     /// Campaign still has outstanding liabilities to recipients.
     OutstandingLiabilities,
     Overflow,
+    /// `cliff_secs > duration_secs`, or `duration_secs == 0` (Issue #1327).
+    InvalidVestingSchedule,
+    /// Vesting schedule does not exist or belongs to someone else.
+    VestingNotFound,
+    /// Nothing newly vested to claim yet.
+    NothingVested,
+    /// Claim would exceed the campaign's per-account cap (Issue #1329).
+    ClaimLimitExceeded,
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -341,6 +359,7 @@ pub fn create_campaign(
         status: CampaignStatus::Open,
         created_at: env.ledger().timestamp(),
         closed_at: 0,
+        per_account_claim_cap: 0,
     };
     save(env, &campaign);
 
@@ -349,6 +368,36 @@ pub fn create_campaign(
         (campaign_id, funder, asset, budget, claim_window_secs),
     );
     Ok(campaign_id)
+}
+
+/// Set (or clear, with `0`) the campaign's per-account lifetime claim cap
+/// (Issue #1329). Authorization (campaign operator only) is enforced by the
+/// caller in `lib.rs`; this only validates and persists the value. Changing
+/// the cap never rewrites past claims — it only bounds claims made after the
+/// call, so it can be tightened or loosened without touching history.
+pub fn set_claim_cap(
+    env: &Env,
+    campaign_id: u64,
+    per_account_claim_cap: i128,
+) -> Result<(), CampaignError> {
+    if per_account_claim_cap < 0 {
+        return Err(CampaignError::InvalidAmount);
+    }
+    let mut campaign = load_open(env, campaign_id)?;
+    campaign.per_account_claim_cap = per_account_claim_cap;
+    save(env, &campaign);
+    Ok(())
+}
+
+/// Cumulative amount `recipient` has claimed from `campaign_id` so far.
+pub fn claimed_by_account(env: &Env, campaign_id: u64, recipient: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&CampaignKey::ClaimedByAccount(
+            campaign_id,
+            recipient.clone(),
+        ))
+        .unwrap_or(0i128)
 }
 
 /// Allocate `total` of the campaign's available funds across `recipients` by
@@ -453,6 +502,15 @@ pub fn claim(
         allocations.push_back(allocation);
     }
 
+    // Issue #1329: cumulative claims (across this and all prior calls) must
+    // never exceed the campaign's per-account cap. Checked before any write,
+    // so splitting a claim across many smaller calls cannot bypass it.
+    let already_claimed = claimed_by_account(env, campaign_id, recipient);
+    let new_total_claimed = add(already_claimed, total)?;
+    if campaign.per_account_claim_cap > 0 && new_total_claimed > campaign.per_account_claim_cap {
+        return Err(CampaignError::ClaimLimitExceeded);
+    }
+
     for i in 0..allocations.len() {
         let mut allocation = allocations.get(i).unwrap();
         allocation.status = AllocationStatus::Claimed;
@@ -461,6 +519,10 @@ pub fn claim(
             &allocation,
         );
     }
+    env.storage().persistent().set(
+        &CampaignKey::ClaimedByAccount(campaign_id, recipient.clone()),
+        &new_total_claimed,
+    );
     campaign.claimed = add(campaign.claimed, total)?;
     campaign.pending_allocations -= allocations.len();
     save(env, &campaign);
@@ -573,6 +635,189 @@ pub fn get_allocation(
     env.storage()
         .persistent()
         .get(&CampaignKey::Allocation(campaign_id, allocation_id))
+}
+
+// ── Issue #1327: linear vesting schedules ──────────────────────────────────────
+//
+// A vesting allocation grants `total_amount` to `recipient`, released linearly
+// between `start + cliff_secs` and `start + duration_secs`:
+//
+// * Before `start + cliff_secs`: nothing is claimable.
+// * Between the cliff and `start + duration_secs`: claimable amount is
+//   `floor(total_amount * elapsed / duration_secs)`, where `elapsed` is
+//   capped at `duration_secs`. This is monotonically non-decreasing in time
+//   and the schedule is a pure, deterministic function of `now` — repeated
+//   calls at the same timestamp always agree.
+// * At or after `start + duration_secs`: the full `total_amount` is vested.
+//
+// [`claim_vesting`] pays out `vested_amount(now) - claimed`, so partial claims
+// made at different points along the schedule never exceed the allocation —
+// each claim only ever releases newly-vested funds, checked with saturating
+// arithmetic on `vested`/`claimed` and `checked_sub` on the payout itself.
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingAllocation {
+    pub campaign_id: u64,
+    pub vesting_id: u64,
+    pub recipient: Address,
+    /// Total amount granted over the life of the schedule.
+    pub total_amount: i128,
+    /// Ledger timestamp the schedule is anchored to.
+    pub start: u64,
+    /// Seconds after `start` before anything is claimable.
+    pub cliff_secs: u64,
+    /// Seconds after `start` at which the full amount is vested.
+    pub duration_secs: u64,
+    /// Amount already claimed against this schedule.
+    pub claimed: i128,
+}
+
+fn load_vesting(
+    env: &Env,
+    campaign_id: u64,
+    vesting_id: u64,
+) -> Result<VestingAllocation, CampaignError> {
+    env.storage()
+        .persistent()
+        .get(&CampaignKey::Vesting(campaign_id, vesting_id))
+        .ok_or(CampaignError::VestingNotFound)
+}
+
+fn save_vesting(env: &Env, vesting: &VestingAllocation) {
+    env.storage().persistent().set(
+        &CampaignKey::Vesting(vesting.campaign_id, vesting.vesting_id),
+        vesting,
+    );
+}
+
+/// Deterministic linear-vesting curve. Pure function of `now` and the
+/// schedule parameters; never exceeds `total_amount`.
+pub fn vested_amount(now: u64, vesting: &VestingAllocation) -> i128 {
+    let cliff_at = vesting.start.saturating_add(vesting.cliff_secs);
+    if now < cliff_at {
+        return 0;
+    }
+    let end_at = vesting.start.saturating_add(vesting.duration_secs);
+    if now >= end_at {
+        return vesting.total_amount;
+    }
+    let elapsed = now.saturating_sub(vesting.start) as u128;
+    let duration = vesting.duration_secs as u128;
+    let amount = vesting.total_amount as u128;
+    // floor(total_amount * elapsed / duration); elapsed < duration here, and
+    // total_amount * elapsed fits well within u128 for any realistic i128
+    // reward amount and duration, so this cannot overflow in practice.
+    let vested = amount.saturating_mul(elapsed) / duration.max(1);
+    vested as i128
+}
+
+/// Create a linear vesting allocation funded from the campaign's `available`
+/// balance (Issue #1327). Ordering is validated before any state changes:
+/// `cliff_secs <= duration_secs` and `duration_secs > 0`.
+pub fn create_vesting_allocation(
+    env: &Env,
+    campaign_id: u64,
+    recipient: Address,
+    total_amount: i128,
+    start: u64,
+    cliff_secs: u64,
+    duration_secs: u64,
+) -> Result<u64, CampaignError> {
+    let mut campaign = load_open(env, campaign_id)?;
+    if total_amount <= 0 {
+        return Err(CampaignError::InvalidAmount);
+    }
+    if duration_secs == 0 || cliff_secs > duration_secs {
+        return Err(CampaignError::InvalidVestingSchedule);
+    }
+    if total_amount > campaign.available() {
+        return Err(CampaignError::InsufficientCampaignFunds);
+    }
+
+    let vesting_id: u64 = env
+        .storage()
+        .persistent()
+        .get(&CampaignKey::VestingCounter(campaign_id))
+        .unwrap_or(0u64);
+    env.storage().persistent().set(
+        &CampaignKey::VestingCounter(campaign_id),
+        &vesting_id.saturating_add(1),
+    );
+
+    let vesting = VestingAllocation {
+        campaign_id,
+        vesting_id,
+        recipient: recipient.clone(),
+        total_amount,
+        start,
+        cliff_secs,
+        duration_secs,
+        claimed: 0,
+    };
+    save_vesting(env, &vesting);
+
+    // Vested allocations are treated the same as regular allocations for
+    // campaign accounting: reserved out of `available`, paid out of
+    // `allocated` as they are claimed. They are tracked as a liability via
+    // `pending_allocations` until fully claimed, mirroring `close_campaign`'s
+    // settlement requirement.
+    campaign.allocated = add(campaign.allocated, total_amount)?;
+    campaign.pending_allocations = campaign.pending_allocations.saturating_add(1);
+    save(env, &campaign);
+
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_CAMPAIGN_ALLOCATED()),
+        (campaign_id, vesting_id, recipient, total_amount, start),
+    );
+    Ok(vesting_id)
+}
+
+/// Claim whatever has newly vested for `vesting_id` since the last claim
+/// (Issue #1327). Rejects if the caller is not the schedule's recipient or if
+/// nothing new has vested. Returns the amount transferred.
+pub fn claim_vesting(
+    env: &Env,
+    campaign_id: u64,
+    vesting_id: u64,
+    recipient: &Address,
+) -> Result<i128, CampaignError> {
+    let mut campaign = load_open(env, campaign_id)?;
+    let mut vesting = load_vesting(env, campaign_id, vesting_id)?;
+    if vesting.recipient != *recipient {
+        return Err(CampaignError::VestingNotFound);
+    }
+
+    let now = env.ledger().timestamp();
+    let total_vested = vested_amount(now, &vesting);
+    let payout = total_vested
+        .checked_sub(vesting.claimed)
+        .ok_or(CampaignError::Overflow)?;
+    if payout <= 0 {
+        return Err(CampaignError::NothingVested);
+    }
+
+    let fully_settled = vesting.claimed.saturating_add(payout) >= vesting.total_amount;
+    vesting.claimed = add(vesting.claimed, payout)?;
+    save_vesting(env, &vesting);
+
+    campaign.claimed = add(campaign.claimed, payout)?;
+    if fully_settled {
+        campaign.pending_allocations = campaign.pending_allocations.saturating_sub(1);
+    }
+    save(env, &campaign);
+
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_CAMPAIGN_CLAIMED()),
+        (campaign_id, recipient.clone(), payout, vesting_id),
+    );
+    Ok(payout)
+}
+
+pub fn get_vesting(env: &Env, campaign_id: u64, vesting_id: u64) -> Option<VestingAllocation> {
+    env.storage()
+        .persistent()
+        .get(&CampaignKey::Vesting(campaign_id, vesting_id))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -987,6 +1232,214 @@ mod tests {
                 claim(&env, id, &a[1], vec![&env, 1]),
                 Err(CampaignError::CampaignClosed)
             );
+        });
+    }
+
+    // ── #1327: linear vesting ─────────────────────────────────────────────────
+
+    #[test]
+    fn vesting_rejects_invalid_schedule() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            let user = Address::generate(&env);
+            assert_eq!(
+                create_vesting_allocation(&env, id, user.clone(), 100, 1_000, 10, 0),
+                Err(CampaignError::InvalidVestingSchedule)
+            );
+            assert_eq!(
+                create_vesting_allocation(&env, id, user.clone(), 100, 1_000, 500, 100),
+                Err(CampaignError::InvalidVestingSchedule)
+            );
+            assert_eq!(
+                create_vesting_allocation(&env, id, user, 0, 1_000, 0, 100),
+                Err(CampaignError::InvalidAmount)
+            );
+        });
+    }
+
+    #[test]
+    fn nothing_claimable_before_cliff() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            let user = Address::generate(&env);
+            let vid =
+                create_vesting_allocation(&env, id, user.clone(), 1_000, 1_000, 100, 1_000)
+                    .unwrap();
+            env.ledger().set_timestamp(1_000 + 50); // before the cliff
+            assert_eq!(
+                claim_vesting(&env, id, vid, &user),
+                Err(CampaignError::NothingVested)
+            );
+        });
+    }
+
+    #[test]
+    fn partial_vesting_between_cliff_and_end() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            let user = Address::generate(&env);
+            let vid =
+                create_vesting_allocation(&env, id, user.clone(), 1_000, 1_000, 100, 1_000)
+                    .unwrap();
+            // Halfway through the duration (from schedule start, not cliff).
+            env.ledger().set_timestamp(1_000 + 500);
+            let payout = claim_vesting(&env, id, vid, &user).unwrap();
+            assert_eq!(payout, 500);
+
+            // Immediately claiming again at the same timestamp: nothing new.
+            assert_eq!(
+                claim_vesting(&env, id, vid, &user),
+                Err(CampaignError::NothingVested)
+            );
+
+            let v = get_vesting(&env, id, vid).unwrap();
+            assert_eq!(v.claimed, 500);
+            let c = get_campaign(&env, id).unwrap();
+            assert_eq!(c.claimed, 500);
+            assert_eq!(c.pending_allocations, 1); // not fully settled yet
+        });
+    }
+
+    #[test]
+    fn full_vesting_after_duration_and_repeated_claims_sum_to_total() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            let user = Address::generate(&env);
+            let vid =
+                create_vesting_allocation(&env, id, user.clone(), 1_000, 1_000, 100, 1_000)
+                    .unwrap();
+
+            env.ledger().set_timestamp(1_000 + 300);
+            let p1 = claim_vesting(&env, id, vid, &user).unwrap();
+            env.ledger().set_timestamp(1_000 + 700);
+            let p2 = claim_vesting(&env, id, vid, &user).unwrap();
+            // Past the end of the schedule: everything remaining vests.
+            env.ledger().set_timestamp(1_000 + 10_000);
+            let p3 = claim_vesting(&env, id, vid, &user).unwrap();
+
+            assert_eq!(p1 + p2 + p3, 1_000);
+            let v = get_vesting(&env, id, vid).unwrap();
+            assert_eq!(v.claimed, 1_000);
+            let c = get_campaign(&env, id).unwrap();
+            assert_eq!(c.claimed, 1_000);
+            assert_eq!(c.pending_allocations, 0); // fully settled, can close
+            assert_accounting(&c);
+
+            // Fully claimed: no more payout available.
+            assert_eq!(
+                claim_vesting(&env, id, vid, &user),
+                Err(CampaignError::NothingVested)
+            );
+        });
+    }
+
+    #[test]
+    fn vesting_rejects_wrong_recipient_and_insufficient_funds() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 100);
+            let user = Address::generate(&env);
+            let other = Address::generate(&env);
+            assert_eq!(
+                create_vesting_allocation(&env, id, user.clone(), 200, 1_000, 0, 1_000),
+                Err(CampaignError::InsufficientCampaignFunds)
+            );
+            let vid =
+                create_vesting_allocation(&env, id, user, 100, 1_000, 0, 1_000).unwrap();
+            env.ledger().set_timestamp(1_000 + 1_000);
+            assert_eq!(
+                claim_vesting(&env, id, vid, &other),
+                Err(CampaignError::VestingNotFound)
+            );
+        });
+    }
+
+    // ── #1329: campaign-specific claim limits ────────────────────────────────
+
+    #[test]
+    fn claim_within_cap_succeeds_and_tracks_cumulative() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id, 150).unwrap();
+            let user = Address::generate(&env);
+
+            distribute(&env, id, 100, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 0
+            assert_eq!(claim(&env, id, &user, vec![&env, 0]).unwrap(), 100);
+            assert_eq!(claimed_by_account(&env, id, &user), 100);
+
+            distribute(&env, id, 50, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 1
+            assert_eq!(claim(&env, id, &user, vec![&env, 1]).unwrap(), 50);
+            assert_eq!(claimed_by_account(&env, id, &user), 150); // exactly the cap
+        });
+    }
+
+    #[test]
+    fn claim_exceeding_cap_is_rejected_before_any_mutation() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id, 100).unwrap();
+            let user = Address::generate(&env);
+            distribute(&env, id, 150, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 0
+
+            let before = get_campaign(&env, id).unwrap();
+            assert_eq!(
+                claim(&env, id, &user, vec![&env, 0]),
+                Err(CampaignError::ClaimLimitExceeded)
+            );
+            // Rejected before transfer or state mutation.
+            assert_eq!(get_campaign(&env, id).unwrap(), before);
+            assert_eq!(
+                get_allocation(&env, id, 0).unwrap().status,
+                AllocationStatus::Pending
+            );
+            assert_eq!(claimed_by_account(&env, id, &user), 0);
+        });
+    }
+
+    #[test]
+    fn cap_cannot_be_bypassed_by_splitting_across_calls() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id, 100).unwrap();
+            let user = Address::generate(&env);
+
+            distribute(&env, id, 60, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 0
+            distribute(&env, id, 60, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 1
+            assert_eq!(claim(&env, id, &user, vec![&env, 0]).unwrap(), 60);
+            // Second, independent call would push cumulative to 120 > 100.
+            assert_eq!(
+                claim(&env, id, &user, vec![&env, 1]),
+                Err(CampaignError::ClaimLimitExceeded)
+            );
+            assert_eq!(claimed_by_account(&env, id, &user), 60);
+        });
+    }
+
+    #[test]
+    fn cap_is_independent_per_campaign() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id_a = new_campaign(&env, 1_000);
+            let id_b = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id_a, 50).unwrap();
+            // id_b has no cap.
+            let user = Address::generate(&env);
+
+            distribute(&env, id_a, 50, vec![&env, (user.clone(), 1)]).unwrap();
+            distribute(&env, id_b, 500, vec![&env, (user.clone(), 1)]).unwrap();
+
+            assert_eq!(claim(&env, id_a, &user, vec![&env, 0]).unwrap(), 50);
+            // Unrelated campaign's own cumulative total is unaffected by id_a.
+            assert_eq!(claim(&env, id_b, &user, vec![&env, 0]).unwrap(), 500);
+            assert_eq!(claimed_by_account(&env, id_a, &user), 50);
+            assert_eq!(claimed_by_account(&env, id_b, &user), 500);
         });
     }
 

@@ -32,6 +32,13 @@ pub mod reentrancy;
 
 pub mod auth;
 pub mod capability;
+/// Minimum supported Soroban protocol version, discoverable per contract
+/// (Issue #1334).
+pub mod protocol_version;
+pub use protocol_version::{
+    is_protocol_supported, supported_protocol_range, CURRENT_TARGET_PROTOCOL_VERSION,
+    MIN_SUPPORTED_PROTOCOL_VERSION,
+};
 #[allow(deprecated)]
 pub mod cross_contract;
 pub mod errors;
