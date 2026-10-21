@@ -3,6 +3,7 @@
 
 mod committees;
 mod conviction_voting;
+pub mod dependencies;
 mod distribution;
 pub mod errors;
 pub use errors::GovernanceError;
@@ -10,6 +11,7 @@ mod proposal_deposit;
 mod proposals;
 mod quadratic_voting;
 mod reputation;
+pub mod snapshot_pruning;
 mod shadow_mode;
 mod timelock;
 mod token;
