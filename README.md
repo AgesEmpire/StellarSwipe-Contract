@@ -55,3 +55,6 @@
 
 <!-- handsoff-issue-1284 -->
 - #1284: Add proposer bond settlement for governance proposals
+
+<!-- handsoff-issue-1285 -->
+- #1285: Canonicalize governance action payloads before proposal hashing
