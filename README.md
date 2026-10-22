@@ -52,3 +52,6 @@
 
 <!-- handsoff-issue-1283 -->
 - #1283: Validate governance quorum and approval thresholds at initialization
+
+<!-- handsoff-issue-1284 -->
+- #1284: Add proposer bond settlement for governance proposals
