@@ -1,7 +1,7 @@
 use core::cmp::Ordering;
 
 use shared::safe_math::checked_mul_div_floor;
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, Address, Env, Symbol};
 use stellar_swipe_common::BASIS_POINTS_DENOMINATOR_I128;
 
 use crate::BridgeError;
@@ -26,6 +26,11 @@ pub struct LiquidityPool {
     pub reward_bps: u32,
     pub pool_type: PoolType,
     pub created_at: u64,
+    /// `true` once an operator has paused trading on this pool (Issue #1320).
+    /// New swaps are rejected while paused; deposits and withdrawals remain
+    /// subject to the pool's safe-exit policy (withdrawals stay allowed, so
+    /// providers can always exit during an incident).
+    pub trading_paused: bool,
 }
 
 #[contracttype]
@@ -63,6 +68,184 @@ enum LiquidityKey {
     Position(Address, u64),
     /// Canonical `(asset_a, asset_b)` pair -> pool id (Issue #1313).
     PoolByPair(soroban_sdk::String, soroban_sdk::String),
+    /// `(provider, recipient)` -> the provider has authorized `recipient` to
+    /// receive withdrawal proceeds on their behalf (Issue #1319).
+    WithdrawalApproval(Address, Address),
+    /// The account authorized to pause/resume trading on a given pool
+    /// (Issue #1320). Falls back to the bridge admin when unset.
+    PoolOperator(u64),
+}
+
+/// Approve `recipient` to receive future withdrawal proceeds on behalf of
+/// `provider` (Issue #1319). The caller must authenticate as `provider`
+/// before calling this (checked by the integrating contract entrypoint).
+pub fn approve_withdrawal_recipient(env: &Env, provider: &Address, recipient: &Address) {
+    env.storage().persistent().set(
+        &LiquidityKey::WithdrawalApproval(provider.clone(), recipient.clone()),
+        &true,
+    );
+}
+
+/// Revoke a previously granted withdrawal-recipient approval (Issue #1319).
+pub fn revoke_withdrawal_recipient(env: &Env, provider: &Address, recipient: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&LiquidityKey::WithdrawalApproval(
+            provider.clone(),
+            recipient.clone(),
+        ));
+}
+
+/// Whether `provider` has explicitly approved `recipient` to receive their
+/// withdrawal proceeds (Issue #1319).
+pub fn is_approved_recipient(env: &Env, provider: &Address, recipient: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&LiquidityKey::WithdrawalApproval(
+            provider.clone(),
+            recipient.clone(),
+        ))
+        .unwrap_or(false)
+}
+
+/// Set the account authorized to pause/resume trading for `pool_id`
+/// (Issue #1320). The integrating contract is responsible for admin
+/// authorization before calling this.
+pub fn set_pool_operator(env: &Env, pool_id: u64, operator: &Address) {
+    env.storage()
+        .persistent()
+        .set(&LiquidityKey::PoolOperator(pool_id), operator);
+}
+
+/// The account authorized to pause/resume trading for `pool_id`, if one has
+/// been explicitly set (Issue #1320).
+pub fn get_pool_operator(env: &Env, pool_id: u64) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&LiquidityKey::PoolOperator(pool_id))
+}
+
+/// Pool and LP-share invariants that must hold after every state-changing
+/// pool operation (Issue #1318): reserves and total LP supply can never go
+/// negative, and reserves can only be zero exactly when supply is zero (and
+/// vice versa) — an orphaned reserve or supply would mean later callers
+/// divide by zero or mint/redeem against funds that are not really there.
+fn validate_pool_invariants(pool: &LiquidityPool) -> Result<(), BridgeError> {
+    if pool.reserve_a < 0 || pool.reserve_b < 0 || pool.total_lp_tokens < 0 {
+        return Err(BridgeError::PoolInvariantViolation);
+    }
+    let reserves_empty = pool.reserve_a == 0 && pool.reserve_b == 0;
+    let supply_empty = pool.total_lp_tokens == 0;
+    if reserves_empty != supply_empty {
+        return Err(BridgeError::PoolInvariantViolation);
+    }
+    Ok(())
+}
+
+/// Emit a replayable event for a successful deposit (Issue #1321): enough
+/// data for an indexer to reconstruct the pool's reserves and share supply
+/// without re-querying the contract.
+fn emit_liquidity_added(
+    env: &Env,
+    pool_id: u64,
+    provider: &Address,
+    amount_a: i128,
+    amount_b: i128,
+    minted_lp: i128,
+    pool: &LiquidityPool,
+) {
+    env.events().publish(
+        (Symbol::new(env, "liquidity_pool"), Symbol::new(env, "deposit")),
+        (
+            pool_id,
+            provider.clone(),
+            amount_a,
+            amount_b,
+            minted_lp,
+            pool.reserve_a,
+            pool.reserve_b,
+            pool.total_lp_tokens,
+        ),
+    );
+}
+
+/// Emit a replayable event for a successful withdrawal (Issue #1321).
+fn emit_liquidity_removed(
+    env: &Env,
+    pool_id: u64,
+    provider: &Address,
+    recipient: &Address,
+    amount_a: i128,
+    amount_b: i128,
+    lp_amount: i128,
+    pool: &LiquidityPool,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "liquidity_pool"),
+            Symbol::new(env, "withdraw"),
+        ),
+        (
+            pool_id,
+            provider.clone(),
+            recipient.clone(),
+            amount_a,
+            amount_b,
+            lp_amount,
+            pool.reserve_a,
+            pool.reserve_b,
+            pool.total_lp_tokens,
+        ),
+    );
+}
+
+/// Emit a replayable event for a successful swap (Issue #1321).
+fn emit_swap(env: &Env, pool_id: u64, trader: &Address, result: &SwapResult, pool: &LiquidityPool) {
+    env.events().publish(
+        (Symbol::new(env, "liquidity_pool"), Symbol::new(env, "swap")),
+        (
+            pool_id,
+            trader.clone(),
+            result.amount_in,
+            result.amount_out,
+            result.fee_paid,
+            pool.reserve_a,
+            pool.reserve_b,
+            pool.total_lp_tokens,
+        ),
+    );
+}
+
+/// Emit a replayable event marking a pause/resume transition (Issue #1320).
+fn emit_pause_state(env: &Env, pool_id: u64, operator: &Address, paused: bool) {
+    env.events().publish(
+        (
+            Symbol::new(env, "liquidity_pool"),
+            Symbol::new(env, "trading_paused"),
+        ),
+        (pool_id, operator.clone(), paused),
+    );
+}
+
+/// Pause trading (swaps) on `pool_id` (Issue #1320). The caller's
+/// authorization must already have been verified by the integrating
+/// contract against [`get_pool_operator`] (falling back to the bridge
+/// admin when no operator is set).
+pub fn pause_trading(env: &Env, operator: Address, pool_id: u64) -> Result<(), BridgeError> {
+    let mut pool = get_pool(env, pool_id)?;
+    pool.trading_paused = true;
+    store_pool(env, &pool);
+    emit_pause_state(env, pool_id, &operator, true);
+    Ok(())
+}
+
+/// Resume trading (swaps) on `pool_id` (Issue #1320).
+pub fn resume_trading(env: &Env, operator: Address, pool_id: u64) -> Result<(), BridgeError> {
+    let mut pool = get_pool(env, pool_id)?;
+    pool.trading_paused = false;
+    store_pool(env, &pool);
+    emit_pause_state(env, pool_id, &operator, false);
+    Ok(())
 }
 
 /// Returns `(asset_a, asset_b)` in canonical order (Issue #1313).
@@ -140,6 +323,7 @@ pub fn create_pool(
         reward_bps,
         pool_type,
         created_at: env.ledger().timestamp(),
+        trading_paused: false,
     };
 
     env.storage()
@@ -194,8 +378,16 @@ pub fn add_liquidity(
     position.lp_tokens = lp_tokens;
     position.rewards_earned = rewards_earned;
 
+    // Issue #1318: validated before any write commits, so a failure leaves
+    // the pool and position exactly as they were.
+    validate_pool_invariants(&pool)?;
+
     store_pool(env, &pool);
     store_position(env, &position);
+
+    // Issue #1321: emitted only after the state is committed, so a failed
+    // deposit never produces a success event.
+    emit_liquidity_added(env, pool_id, &provider, amount_a, amount_b, minted_lp, &pool);
 
     Ok(minted_lp)
 }
@@ -286,14 +478,30 @@ pub fn compute_mint_shares(
     Ok(minted)
 }
 
+/// Withdraws `lp_amount` of `provider`'s liquidity, crediting proceeds to
+/// `recipient` (Issue #1319).
+///
+/// `provider.require_auth()` must already have been checked by the
+/// integrating contract entrypoint — this function additionally binds the
+/// proceeds to an authorized destination: `recipient` must be either
+/// `provider` itself or an address `provider` has explicitly approved via
+/// [`approve_withdrawal_recipient`]. This stops a caller who merely holds
+/// `provider`'s authorization from redirecting the withdrawal to an
+/// arbitrary, unapproved account. A rejected call leaves shares and
+/// reserves unchanged.
 pub fn remove_liquidity(
     env: &Env,
     provider: Address,
+    recipient: Address,
     pool_id: u64,
     lp_amount: i128,
 ) -> Result<(i128, i128, i128), BridgeError> {
     if lp_amount <= 0 {
         return Err(BridgeError::InvalidAmount);
+    }
+
+    if recipient != provider && !is_approved_recipient(env, &provider, &recipient) {
+        return Err(BridgeError::UnauthorizedRecipient);
     }
 
     let mut pool = get_pool(env, pool_id)?;
@@ -302,25 +510,50 @@ pub fn remove_liquidity(
         return Err(BridgeError::InvalidAmount);
     }
 
-    let amount_a = (pool.reserve_a * lp_amount) / pool.total_lp_tokens;
-    let amount_b = (pool.reserve_b * lp_amount) / pool.total_lp_tokens;
-    let reward = (position.rewards_earned * lp_amount) / position.lp_tokens;
+    let amount_a = checked(
+        pool.reserve_a
+            .checked_mul(lp_amount)
+            .map(|v| v / pool.total_lp_tokens),
+    )?;
+    let amount_b = checked(
+        pool.reserve_b
+            .checked_mul(lp_amount)
+            .map(|v| v / pool.total_lp_tokens),
+    )?;
+    let reward = if position.lp_tokens == 0 {
+        0
+    } else {
+        checked(
+            position
+                .rewards_earned
+                .checked_mul(lp_amount)
+                .map(|v| v / position.lp_tokens),
+        )?
+    };
 
-    position.lp_tokens -= lp_amount;
-    position.rewards_earned -= reward;
-    pool.reserve_a -= amount_a;
-    pool.reserve_b -= amount_b;
-    pool.total_lp_tokens -= lp_amount;
+    position.lp_tokens = checked(position.lp_tokens.checked_sub(lp_amount))?;
+    position.rewards_earned = checked(position.rewards_earned.checked_sub(reward))?;
+    pool.reserve_a = checked(pool.reserve_a.checked_sub(amount_a))?;
+    pool.reserve_b = checked(pool.reserve_b.checked_sub(amount_b))?;
+    pool.total_lp_tokens = checked(pool.total_lp_tokens.checked_sub(lp_amount))?;
+
+    // Issue #1318: validated before any write commits.
+    validate_pool_invariants(&pool)?;
 
     store_pool(env, &pool);
     store_position(env, &position);
+
+    // Issue #1321: emitted only after the state is committed.
+    emit_liquidity_removed(
+        env, pool_id, &provider, &recipient, amount_a, amount_b, lp_amount, &pool,
+    );
 
     Ok((amount_a, amount_b, reward))
 }
 
 pub fn swap(
     env: &Env,
-    _trader: Address,
+    trader: Address,
     pool_id: u64,
     input_asset: soroban_sdk::String,
     amount_in: i128,
@@ -331,6 +564,12 @@ pub fn swap(
     }
 
     let mut pool = get_pool(env, pool_id)?;
+    // Issue #1320: trading halts while the pool is paused; withdrawals are
+    // unaffected (handled separately in `remove_liquidity`), which is the
+    // documented safe-exit policy for an incident.
+    if pool.trading_paused {
+        return Err(BridgeError::PoolTradingPaused);
+    }
     let fee_paid = (amount_in * pool.fee_bps as i128) / BASIS_POINTS_DENOMINATOR_I128;
     let amount_after_fee = amount_in - fee_paid;
 
@@ -376,15 +615,23 @@ pub fn swap(
         pool.reserve_a = new_reserve_out;
     }
 
+    // Issue #1318: validated before the swap commits.
+    validate_pool_invariants(&pool)?;
+
     store_pool(env, &pool);
 
-    Ok(SwapResult {
+    let result = SwapResult {
         amount_in,
         amount_out,
         fee_paid,
         new_reserve_in,
         new_reserve_out,
-    })
+    };
+
+    // Issue #1321: emitted only after the state is committed.
+    emit_swap(env, pool_id, &trader, &result, &pool);
+
+    Ok(result)
 }
 
 pub fn get_pool(env: &Env, pool_id: u64) -> Result<LiquidityPool, BridgeError> {
@@ -539,7 +786,7 @@ mod tests {
             assert!(position.rewards_earned > 0);
 
             let (amount_a, amount_b, reward) =
-                remove_liquidity(&env, provider, pool_id, minted / 2).unwrap();
+                remove_liquidity(&env, provider.clone(), provider, pool_id, minted / 2).unwrap();
             assert!(amount_a > 0 && amount_b > 0 && reward > 0);
         });
     }
@@ -1041,6 +1288,236 @@ mod tests {
             let pool = get_pool(&env, pool_id).unwrap();
             assert!(pool.reserve_a > 1_000);
             assert!(pool.reserve_b < 2_000);
+        });
+    }
+
+    // ── Issue #1319: explicit recipient authorization for withdrawals ──────
+
+    #[test]
+    fn owner_can_withdraw_to_self_without_approval() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            let minted = add_liquidity(&env, provider.clone(), pool_id, 1_000, 1_000).unwrap();
+
+            let result =
+                remove_liquidity(&env, provider.clone(), provider, pool_id, minted / 2);
+            assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn approved_recipient_can_receive_withdrawal() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        let approved = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            let minted = add_liquidity(&env, provider.clone(), pool_id, 1_000, 1_000).unwrap();
+
+            approve_withdrawal_recipient(&env, &provider, &approved);
+            let result =
+                remove_liquidity(&env, provider.clone(), approved, pool_id, minted / 2);
+            assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn unapproved_recipient_redirection_is_rejected_and_state_is_unchanged() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            let minted = add_liquidity(&env, provider.clone(), pool_id, 1_000, 1_000).unwrap();
+            let pool_before = get_pool(&env, pool_id).unwrap();
+            let position_before = get_position(&env, provider.clone(), pool_id);
+
+            // The attacker is not the provider and was never approved.
+            let result = remove_liquidity(&env, provider.clone(), attacker, pool_id, minted / 2);
+            assert_eq!(result, Err(BridgeError::UnauthorizedRecipient));
+
+            assert_eq!(get_pool(&env, pool_id).unwrap(), pool_before);
+            assert_eq!(
+                get_position(&env, provider.clone(), pool_id),
+                position_before
+            );
+        });
+    }
+
+    #[test]
+    fn revoked_recipient_approval_is_rejected() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            let minted = add_liquidity(&env, provider.clone(), pool_id, 1_000, 1_000).unwrap();
+
+            approve_withdrawal_recipient(&env, &provider, &recipient);
+            assert!(is_approved_recipient(&env, &provider, &recipient));
+            revoke_withdrawal_recipient(&env, &provider, &recipient);
+            assert!(!is_approved_recipient(&env, &provider, &recipient));
+
+            let result =
+                remove_liquidity(&env, provider.clone(), recipient, pool_id, minted / 2);
+            assert_eq!(result, Err(BridgeError::UnauthorizedRecipient));
+        });
+    }
+
+    // ── Issue #1320: per-pool trade pause and safe withdrawal mode ──────────
+
+    #[test]
+    fn paused_pool_rejects_swaps_but_allows_withdrawals() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        let trader = Address::generate(&env);
+        let operator = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            let minted = add_liquidity(&env, provider.clone(), pool_id, 1_000, 1_000).unwrap();
+
+            pause_trading(&env, operator.clone(), pool_id).unwrap();
+            assert!(get_pool(&env, pool_id).unwrap().trading_paused);
+
+            let swap_result = swap(&env, trader, pool_id, s(&env, "wETH"), 100, 1);
+            assert_eq!(swap_result, Err(BridgeError::PoolTradingPaused));
+
+            // Safe-exit policy: withdrawals keep working while paused.
+            let withdraw_result =
+                remove_liquidity(&env, provider.clone(), provider, pool_id, minted / 2);
+            assert!(withdraw_result.is_ok());
+        });
+    }
+
+    #[test]
+    fn resuming_trading_allows_swaps_again() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        let trader = Address::generate(&env);
+        let operator = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            add_liquidity(&env, provider, pool_id, 1_000, 1_000).unwrap();
+
+            pause_trading(&env, operator.clone(), pool_id).unwrap();
+            assert_eq!(
+                swap(&env, trader.clone(), pool_id, s(&env, "wETH"), 100, 1),
+                Err(BridgeError::PoolTradingPaused)
+            );
+
+            resume_trading(&env, operator, pool_id).unwrap();
+            assert!(!get_pool(&env, pool_id).unwrap().trading_paused);
+            assert!(swap(&env, trader, pool_id, s(&env, "wETH"), 100, 1).is_ok());
+        });
+    }
+
+    #[test]
+    fn pool_operator_assignment_round_trips() {
+        let (env, contract_id) = setup();
+        let operator = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            assert_eq!(get_pool_operator(&env, pool_id), None);
+            set_pool_operator(&env, pool_id, &operator);
+            assert_eq!(get_pool_operator(&env, pool_id), Some(operator));
+        });
+    }
+
+    // ── Issue #1318: reserve/share invariants on every operation ───────────
+
+    #[test]
+    fn invariant_violation_blocks_overdraw_and_leaves_state_unchanged() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            add_liquidity(&env, provider.clone(), pool_id, 1_000, 1_000).unwrap();
+            let pool_before = get_pool(&env, pool_id).unwrap();
+            let position_before = get_position(&env, provider.clone(), pool_id);
+
+            // More LP tokens than the position actually holds: rejected
+            // before `validate_pool_invariants` even runs, by the existing
+            // balance check, and definitely before any write.
+            let result = remove_liquidity(
+                &env,
+                provider.clone(),
+                provider.clone(),
+                pool_id,
+                position_before.lp_tokens + 1,
+            );
+            assert!(result.is_err());
+            assert_eq!(get_pool(&env, pool_id).unwrap(), pool_before);
+            assert_eq!(get_position(&env, provider, pool_id), position_before);
+        });
+    }
+
+    #[test]
+    fn full_withdrawal_leaves_reserves_and_supply_both_at_zero() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            let minted = add_liquidity(&env, provider.clone(), pool_id, 1_000, 1_000).unwrap();
+
+            remove_liquidity(&env, provider.clone(), provider, pool_id, minted).unwrap();
+
+            let pool = get_pool(&env, pool_id).unwrap();
+            assert_eq!(pool.reserve_a, 0);
+            assert_eq!(pool.reserve_b, 0);
+            assert_eq!(pool.total_lp_tokens, 0);
+            // Invariant holds: reserves and supply are empty together.
+            assert!(validate_pool_invariants(&pool).is_ok());
+        });
+    }
+
+    // ── Issue #1321: replayable reserve/share events ────────────────────────
+
+    #[test]
+    fn deposit_emits_replayable_event_matching_final_state() {
+        use soroban_sdk::testutils::Events;
+        use soroban_sdk::{TryFromVal, Val};
+
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            add_liquidity(&env, provider, pool_id, 1_000, 2_000).unwrap();
+
+            let events = env.events().all();
+            let e = events.last().unwrap();
+            let topics: soroban_sdk::Vec<Val> = e.1.clone();
+            let topic0 = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+            let topic1 = Symbol::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+            assert_eq!(topic0, Symbol::new(&env, "liquidity_pool"));
+            assert_eq!(topic1, Symbol::new(&env, "deposit"));
+
+            let data: (u64, Address, i128, i128, i128, i128, i128, i128) =
+                soroban_sdk::TryFromVal::try_from_val(&env, &e.2).unwrap();
+            let pool = get_pool(&env, pool_id).unwrap();
+            assert_eq!(data.0, pool_id);
+            assert_eq!((data.5, data.6, data.7), (pool.reserve_a, pool.reserve_b, pool.total_lp_tokens));
+        });
+    }
+
+    #[test]
+    fn failed_withdrawal_emits_no_success_event() {
+        use soroban_sdk::testutils::Events;
+
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            let minted = add_liquidity(&env, provider.clone(), pool_id, 1_000, 1_000).unwrap();
+            let count_before = env.events().all().len();
+
+            let result = remove_liquidity(&env, provider, attacker, pool_id, minted / 2);
+            assert_eq!(result, Err(BridgeError::UnauthorizedRecipient));
+
+            // No new event was published for the rejected withdrawal.
+            assert_eq!(env.events().all().len(), count_before);
         });
     }
 }
