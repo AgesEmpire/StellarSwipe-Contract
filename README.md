@@ -49,3 +49,6 @@
 
 <!-- handsoff-issue-1220 -->
 - #1220: Require provider authorization for signal revision updates
+
+<!-- handsoff-issue-1151 -->
+- #1151: Implement auto trade portfolio valuation confidence threshold
