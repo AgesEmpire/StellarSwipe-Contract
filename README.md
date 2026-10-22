@@ -52,3 +52,6 @@
 
 <!-- handsoff-issue-1151 -->
 - #1151: Implement auto trade portfolio valuation confidence threshold
+
+<!-- handsoff-issue-1244 -->
+- #1244: Prevent fee collector reinitialization from resetting accounting
