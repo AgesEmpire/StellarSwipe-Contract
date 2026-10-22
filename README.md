@@ -49,3 +49,6 @@
 
 <!-- handsoff-issue-1220 -->
 - #1220: Require provider authorization for signal revision updates
+
+<!-- handsoff-issue-1283 -->
+- #1283: Validate governance quorum and approval thresholds at initialization
