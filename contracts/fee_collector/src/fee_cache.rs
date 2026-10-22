@@ -16,6 +16,9 @@
 //! collection, balance queries, and dust handling never mix units across
 //! assets. Deployments that previously stored a single aggregate balance can
 //! migrate it into a chosen asset bucket via [`migrate_aggregate_balance`].
+//! The module also owns the recorded fee balance and the guarded update that
+//! applies collected fees to it. Updates reject non-positive amounts and
+//! arithmetic overflow so that a rejected update never mutates accounting.
 
 use soroban_sdk::{contracttype, symbol_short, Address, Env};
 
@@ -29,10 +32,8 @@ pub enum FeeCacheKey {
     ConfigVersion,
     /// Allowlist entry for an authorized revenue source.
     RevenueSource(Address),
-    /// Collected fee balance scoped to a specific asset (by contract address).
-    AssetBalance(Address),
-    /// Legacy aggregate balance key, retained only for migration.
-    AggregateBalance,
+    /// Recorded fee balance accumulated from collected fees.
+    FeeBalance,
 }
 
 /// Returns the current config version, defaulting to 0 when unset.
@@ -184,6 +185,37 @@ pub fn migrate_aggregate_balance(env: &Env, asset: &Address) {
             .instance()
             .remove(&FeeCacheKey::AggregateBalance);
     }
+}
+
+/// Returns the recorded fee balance, defaulting to 0 when unset.
+pub fn get_fee_balance(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&FeeCacheKey::FeeBalance)
+        .unwrap_or(0)
+}
+
+/// Applies a collected fee `amount` to the recorded fee balance.
+///
+/// Rejects non-positive amounts with `"fee amount must be positive"` and
+/// rejects additions that would exceed the supported `i128` balance range with
+/// `"fee balance overflow"`. Both checks run before any storage write, so a
+/// rejected update leaves the recorded balance unchanged.
+pub fn add_fee_balance(env: &Env, amount: i128) {
+    if amount <= 0 {
+        panic!("fee amount must be positive");
+    }
+
+    let current = get_fee_balance(env);
+    let updated = match current.checked_add(amount) {
+        Some(value) => value,
+        None => panic!("fee balance overflow"),
+    };
+
+    env.storage()
+        .instance()
+        .set(&FeeCacheKey::FeeBalance, &updated);
+}
 }
 
 #[cfg(test)]
@@ -348,5 +380,79 @@ mod tests {
         // Migration is idempotent: the legacy key is gone.
         migrate_aggregate_balance(&env, &usdc);
         assert_eq!(get_asset_balance(&env, &usdc), 500);
+    }
+
+    #[test]
+    fn positive_amount_updates_balance() {
+        let env = Env::default();
+        assert_eq!(get_fee_balance(&env), 0);
+
+        add_fee_balance(&env, 100);
+        assert_eq!(get_fee_balance(&env), 100);
+
+        add_fee_balance(&env, 50);
+        assert_eq!(get_fee_balance(&env), 150);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee amount must be positive")]
+    fn zero_amount_is_rejected() {
+        let env = Env::default();
+        add_fee_balance(&env, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee amount must be positive")]
+    fn negative_amount_is_rejected() {
+        let env = Env::default();
+        add_fee_balance(&env, -1);
+    }
+
+    #[test]
+    fn rejected_zero_and_negative_leave_balance_unchanged() {
+        let env = Env::default();
+        add_fee_balance(&env, 250);
+
+        let zero = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            add_fee_balance(&env, 0)
+        }));
+        assert!(zero.is_err());
+        assert_eq!(get_fee_balance(&env), 250);
+
+        let negative = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            add_fee_balance(&env, -10)
+        }));
+        assert!(negative.is_err());
+        assert_eq!(get_fee_balance(&env), 250);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee balance overflow")]
+    fn overflow_past_max_is_rejected() {
+        let env = Env::default();
+        env.storage()
+            .instance()
+            .set(&FeeCacheKey::FeeBalance, &i128::MAX);
+
+        add_fee_balance(&env, 1);
+    }
+
+    #[test]
+    fn rejected_overflow_leaves_balance_unchanged() {
+        let env = Env::default();
+        let near_max = i128::MAX - 5;
+        env.storage()
+            .instance()
+            .set(&FeeCacheKey::FeeBalance, &near_max);
+
+        let overflow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            add_fee_balance(&env, 10)
+        }));
+        assert!(overflow.is_err());
+        assert_eq!(get_fee_balance(&env), near_max);
+
+        // A valid addition near the limit still succeeds.
+        add_fee_balance(&env, 5);
+        assert_eq!(get_fee_balance(&env), i128::MAX);
     }
 }
