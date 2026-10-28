@@ -78,6 +78,12 @@ pub enum OracleError {
     /// the configured deviation bound and no fallback set resolved the
     /// conflict (Issue #1122).
     ConflictingObservations = 33,
+    /// Feed configuration batch is empty or exceeds `MAX_FEED_BATCH` (Issue #1312).
+    InvalidFeedBatch = 34,
+    /// A feed configuration entry is invalid or duplicated (Issue #1312).
+    InvalidFeedConfig = 35,
+    /// The feed is disabled and does not accept observations (Issue #1309).
+    FeedDisabled = 36,
 }
 
 impl OracleError {
@@ -163,6 +169,13 @@ impl OracleError {
             OracleError::ConflictingObservations => {
                 "preferred quorum observations conflict and no fallback set resolved it"
             }
+            OracleError::InvalidFeedBatch => {
+                "feed configuration batch is empty or exceeds the maximum batch size"
+            }
+            OracleError::InvalidFeedConfig => {
+                "a feed configuration entry is invalid or duplicated within the batch"
+            }
+            OracleError::FeedDisabled => "the feed is disabled and does not accept observations",
         }
     }
 }

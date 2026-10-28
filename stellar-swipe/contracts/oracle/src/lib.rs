@@ -11,6 +11,8 @@ mod errors;
 #[allow(deprecated)]
 mod events;
 mod external_adapter;
+// Closes #1309, #1311, #1312 — feed publishers, health, atomic batch config
+pub mod feeds;
 mod freshness_policy;
 mod history;
 mod multi_hop;
@@ -203,8 +205,55 @@ impl OracleContract {
         storage::set_price(&env, &pair, price);
         storage::add_available_pair(&env, pair.clone());
         history::store_price(&env, &pair, price);
+        feeds::record_round(&env, &pair);
         on_price_update(&env, pair);
         Ok(())
+    }
+
+    // ── Issues #1309 / #1311 / #1312: feed configuration and health ──────────
+
+    /// Admin: atomically configure up to `feeds::MAX_FEED_BATCH` feeds.
+    /// Every entry is validated before any write; on error nothing changes.
+    pub fn configure_feeds(
+        env: Env,
+        admin: Address,
+        entries: Vec<feeds::FeedConfigInput>,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        feeds::configure_batch(&env, &entries)
+    }
+
+    pub fn get_feed_config(env: Env, pair: AssetPair) -> Option<feeds::FeedConfig> {
+        feeds::get_config(&env, &pair)
+    }
+
+    /// Feed owner: delegate submission rights to `publisher`.
+    pub fn add_feed_publisher(
+        env: Env,
+        owner: Address,
+        pair: AssetPair,
+        publisher: Address,
+    ) -> Result<(), OracleError> {
+        owner.require_auth();
+        feeds::add_publisher(&env, &owner, &pair, publisher)
+    }
+
+    /// Feed owner: revoke a delegated publisher.
+    pub fn revoke_feed_publisher(
+        env: Env,
+        owner: Address,
+        pair: AssetPair,
+        publisher: Address,
+    ) -> Result<(), OracleError> {
+        owner.require_auth();
+        feeds::revoke_publisher(&env, &owner, &pair, &publisher)
+    }
+
+    /// Read-only, bounded: status, latest round, last update and health flags
+    /// for one feed. See `feeds` module docs for field semantics.
+    pub fn get_feed_status(env: Env, pair: AssetPair) -> feeds::FeedStatus {
+        feeds::status(&env, &pair)
     }
 
     // ── Issue #755: single-update price-deviation circuit breaker ─────────────
@@ -1174,6 +1223,11 @@ impl OracleContract {
             return Err(OracleError::InvalidPrice);
         }
 
+        // #1309: only the feed's owner or delegated publishers may submit.
+        feeds::authorize_publisher(&env, &pair, &source)?;
+        // #1310: a halted feed cannot influence aggregation until it recovers.
+        price_cb::guard_tripped(&env, &pair)?;
+
         let min_confidence = Self::get_min_confidence(env.clone());
         if confidence < min_confidence {
             return Err(OracleError::LowConfidence);
@@ -1246,6 +1300,7 @@ impl OracleContract {
         // Cache management: Keep prices for the configured freshness window.
         env.storage().temporary().set(&key, &fresh);
         env.storage().temporary().extend_ttl(&key, 60, 60);
+        feeds::record_round(&env, &pair);
 
         Ok(())
     }
@@ -1354,3 +1409,6 @@ mod test_price_cb;
 
 #[cfg(test)]
 mod test_observation_integrity;
+
+#[cfg(test)]
+mod test_feeds;
