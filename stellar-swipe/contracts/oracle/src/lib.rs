@@ -29,6 +29,8 @@ mod storage;
 mod test_feed_bounds;
 #[cfg(test)]
 mod test_feed_canonical;
+#[cfg(test)]
+mod test_feed_movement;
 mod types;
 
 use errors::OracleError;

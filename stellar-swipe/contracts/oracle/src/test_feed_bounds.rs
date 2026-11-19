@@ -39,6 +39,7 @@ fn entry(env: &Env, p: &AssetPair, owner: &Address, min: i128, max: i128) -> Fee
         publishers: Vec::new(env),
         max_age: 300,
         enabled: true,
+        max_movement_bps: 0,
         min_price: min,
         max_price: max,
     }

@@ -58,6 +58,8 @@ pub struct FeedConfig {
     /// Seconds after the last accepted round before the feed is stale.
     pub max_age: u64,
     pub enabled: bool,
+    /// Maximum single-update movement in basis points; 0 disables (Issue #1305).
+    pub max_movement_bps: u32,
     /// Inclusive lower bound for accepted observations (Issue #1304).
     pub min_price: i128,
     /// Inclusive upper bound for accepted observations (Issue #1304).
@@ -74,6 +76,8 @@ pub struct FeedConfigInput {
     pub publishers: Vec<Address>,
     pub max_age: u64,
     pub enabled: bool,
+    /// Maximum single-update movement in basis points; 0 disables (Issue #1305).
+    pub max_movement_bps: u32,
     /// Inclusive price bounds; must satisfy `0 < min_price < max_price`.
     pub min_price: i128,
     pub max_price: i128,
@@ -248,6 +252,7 @@ pub fn configure_batch(env: &Env, entries: &Vec<FeedConfigInput>) -> Result<(), 
         if e.max_age == 0
             || e.min_price <= 0
             || e.max_price <= e.min_price
+            || e.max_movement_bps > 10_000
         {
             return Err(OracleError::InvalidFeedConfig);
         }
@@ -266,6 +271,8 @@ pub fn configure_batch(env: &Env, entries: &Vec<FeedConfigInput>) -> Result<(), 
     for (i, e) in entries.iter().enumerate() {
         let pair = pairs.get_unchecked(i as u32);
         let version = get_config(env, &pair).map(|c| c.version).unwrap_or(0) + 1;
+        // #1305: the configured threshold governs the breaker for this feed.
+        price_cb::set_threshold(env, &pair, e.max_movement_bps);
         put_config(
             env,
             &pair,
@@ -274,6 +281,7 @@ pub fn configure_batch(env: &Env, entries: &Vec<FeedConfigInput>) -> Result<(), 
                 publishers: e.publishers,
                 max_age: e.max_age,
                 enabled: e.enabled,
+                max_movement_bps: e.max_movement_bps,
                 min_price: e.min_price,
                 max_price: e.max_price,
                 version,

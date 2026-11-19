@@ -20,11 +20,16 @@
 use soroban_sdk::{contracttype, symbol_short, Address, Env};
 use stellar_swipe_common::AssetPair;
 
-use crate::{errors::OracleError, storage};
+use crate::{errors::OracleError, feeds, storage};
 
 // ── Storage keys (re-use types::StorageKey variants added for this issue) ─────
 
 use crate::types::StorageKey;
+
+/// All breaker state is keyed by the canonical feed identifier (Issue #1303).
+fn key_pair(env: &Env, pair: &AssetPair) -> AssetPair {
+    feeds::canonical_pair(env, pair).unwrap_or_else(|_| pair.clone())
+}
 
 /// Consecutive within-threshold updates required to clear a tripped breaker.
 pub const RECOVERY_ROUNDS: u32 = 3;
@@ -38,14 +43,14 @@ enum CbKey {
 fn set_streak(env: &Env, pair: &AssetPair, streak: u32) {
     env.storage()
         .instance()
-        .set(&CbKey::RecoveryStreak(pair.clone()), &streak);
+        .set(&CbKey::RecoveryStreak(key_pair(env, pair)), &streak);
 }
 
 /// Consecutive valid updates observed since the breaker tripped.
 pub fn recovery_streak(env: &Env, pair: &AssetPair) -> u32 {
     env.storage()
         .instance()
-        .get(&CbKey::RecoveryStreak(pair.clone()))
+        .get(&CbKey::RecoveryStreak(key_pair(env, pair)))
         .unwrap_or(0)
 }
 
@@ -54,14 +59,14 @@ pub fn recovery_streak(env: &Env, pair: &AssetPair) -> u32 {
 fn is_tripped(env: &Env, pair: &AssetPair) -> bool {
     env.storage()
         .instance()
-        .get::<_, bool>(&StorageKey::DeviationBreakerTripped(pair.clone()))
+        .get::<_, bool>(&StorageKey::DeviationBreakerTripped(key_pair(env, pair)))
         .unwrap_or(false)
 }
 
 fn threshold_bps(env: &Env, pair: &AssetPair) -> u32 {
     env.storage()
         .instance()
-        .get::<_, u32>(&StorageKey::DeviationThreshold(pair.clone()))
+        .get::<_, u32>(&StorageKey::DeviationThreshold(key_pair(env, pair)))
         .unwrap_or(0)
 }
 
@@ -128,7 +133,7 @@ fn trip(env: &Env, pair: &AssetPair, prev_price: i128, new_price: i128, deviatio
     set_streak(env, pair, 0);
     env.storage()
         .instance()
-        .set(&StorageKey::DeviationBreakerTripped(pair.clone()), &true);
+        .set(&StorageKey::DeviationBreakerTripped(key_pair(env, pair)), &true);
 
     #[allow(deprecated)]
     env.events().publish(
@@ -151,7 +156,7 @@ pub fn guard_tripped(env: &Env, pair: &AssetPair) -> Result<(), OracleError> {
 /// Pass `0` to disable the check.
 pub fn set_threshold(env: &Env, pair: &AssetPair, max_deviation_bps: u32) {
     env.storage().instance().set(
-        &StorageKey::DeviationThreshold(pair.clone()),
+        &StorageKey::DeviationThreshold(key_pair(env, pair)),
         &max_deviation_bps,
     );
 }
@@ -159,7 +164,7 @@ pub fn set_threshold(env: &Env, pair: &AssetPair, max_deviation_bps: u32) {
 fn clear(env: &Env, pair: &AssetPair) {
     env.storage()
         .instance()
-        .set(&StorageKey::DeviationBreakerTripped(pair.clone()), &false);
+        .set(&StorageKey::DeviationBreakerTripped(key_pair(env, pair)), &false);
     set_streak(env, pair, 0);
 }
 
