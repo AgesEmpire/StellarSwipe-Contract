@@ -885,6 +885,7 @@ impl OracleContract {
                 source: env.current_contract_address(),
                 confidence: 100,
                 ledger_sequence: env.ledger().sequence(),
+                round_id: feeds::last_round(&env, &pair),
             });
         }
 
@@ -1206,12 +1207,39 @@ impl OracleContract {
     /// currently-fresh sources by more than the configured hard reject
     /// threshold. Existing entries older than the configured staleness
     /// window are dropped before this comparison is made.
+    /// Submit an observation bound to an explicit feed-local round ID
+    /// (Issue #1308). The round must be strictly greater than the highest
+    /// accepted round for `pair`; replays and regressions are rejected with
+    /// [`OracleError::StaleRound`] before the price can change.
+    pub fn submit_pair_price_with_round(
+        env: Env,
+        source: Address,
+        pair: AssetPair,
+        price: i128,
+        confidence: u32,
+        round_id: u64,
+    ) -> Result<(), OracleError> {
+        Self::submit_pair_price_inner(env, source, pair, price, confidence, round_id)
+    }
+
     pub fn submit_pair_price(
         env: Env,
         source: Address,
         pair: AssetPair,
         price: i128,
         confidence: u32,
+    ) -> Result<(), OracleError> {
+        let round_id = feeds::next_round(&env, &pair);
+        Self::submit_pair_price_inner(env, source, pair, price, confidence, round_id)
+    }
+
+    fn submit_pair_price_inner(
+        env: Env,
+        source: Address,
+        pair: AssetPair,
+        price: i128,
+        confidence: u32,
+        round_id: u64,
     ) -> Result<(), OracleError> {
         if admin::is_paused(&env, String::from_str(&env, CAT_ALL)) {
             return Err(OracleError::CircuitBreakerTripped);
@@ -1284,6 +1312,9 @@ impl OracleContract {
         source_prices.push_back((source.clone(), price));
         deviation::check_deviation(&env, &pair, &source_prices)?;
 
+        // #1308: bind the accepted observation to its feed-local round.
+        feeds::accept_round(&env, &pair, round_id)?;
+
         let new_entry = PriceData {
             asset_pair: pair.clone(),
             price,
@@ -1291,6 +1322,7 @@ impl OracleContract {
             source,
             confidence,
             ledger_sequence,
+            round_id,
         };
         match admission {
             observation::Admission::Append => fresh.push_back(new_entry),
@@ -1300,7 +1332,6 @@ impl OracleContract {
         // Cache management: Keep prices for the configured freshness window.
         env.storage().temporary().set(&key, &fresh);
         env.storage().temporary().extend_ttl(&key, 60, 60);
-        feeds::record_round(&env, &pair);
 
         Ok(())
     }
