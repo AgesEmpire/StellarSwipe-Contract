@@ -3130,6 +3130,80 @@ fn reclaim_expired_proposal_removes_entry_and_is_callable_by_anyone() {
 }
 
 #[test]
+fn proposal_status_query_reports_unknown_without_trapping() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let report = client.proposal_status(&999);
+    assert!(!report.exists);
+    assert_eq!(report.state, ProposalStatus::Pending);
+    assert_eq!(report.votes_for, 0);
+    assert_eq!(report.quorum_bps, 0);
+    assert_eq!(report.execution_deadline, 0);
+}
+
+#[test]
+fn proposal_status_query_tracks_voting_and_terminal_transitions() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let (proposal_id, _payout, _asset) =
+        setup_succeeded_treasury_spend_proposal(&env, &client, &admin, &recipients);
+
+    // Final state after voting and finalization: Succeeded with a full tally,
+    // resolved thresholds and the stored execution deadline.
+    let report = client.proposal_status(&proposal_id);
+    assert!(report.exists);
+    assert_eq!(report.state, ProposalStatus::Succeeded);
+    assert_eq!(report.votes_for, 160_000_000);
+    assert_eq!(report.votes_against, 0);
+    assert_eq!(report.votes_abstain, 0);
+    assert_eq!(report.quorum_bps, 1_000);
+    assert_eq!(report.approval_bps, 5_000);
+    assert_eq!(report.execution_deadline, 1_209_660);
+
+    // Terminal transition: expiry is reflected by the same query.
+    env.ledger().set_timestamp(report.execution_deadline + 1);
+    client.expire_proposal(&proposal_id);
+    let expired = client.proposal_status(&proposal_id);
+    assert_eq!(expired.state, ProposalStatus::Expired);
+    assert_eq!(expired.votes_for, report.votes_for);
+    assert_eq!(expired.execution_deadline, report.execution_deadline);
+}
+
+#[test]
+fn proposal_status_query_before_voting_has_zero_tally() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "Status query")),
+        &String::from_str(&env, "Status"),
+        &String::from_str(&env, "Read-only status query"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    let before = client.proposal_status(&proposal_id);
+    assert!(before.exists);
+    assert_eq!(before.state, ProposalStatus::Pending);
+    assert_eq!(before.votes_for, 0);
+    assert!(before.execution_deadline > before.voting_ends);
+
+    env.ledger().set_timestamp(70);
+    client.cast_vote(&proposal_id, &recipients.community_rewards, &GovernanceVoteType::For);
+    let after = client.proposal_status(&proposal_id);
+    assert_eq!(after.state, ProposalStatus::Active);
+    assert_eq!(after.votes_for, 120_000_000);
+    assert_eq!(after.execution_deadline, before.execution_deadline);
+}
+
+#[test]
 fn error_messages_are_non_empty_and_distinct() {
     // A representative sample of raw variants plus at least one alias const
     // (Issue #883). Aliases resolve to their target variant's value, so

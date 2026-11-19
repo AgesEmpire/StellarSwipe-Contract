@@ -322,6 +322,69 @@ pub struct ProposalStatistics {
     pub avg_approval_rate: u32,
 }
 
+/// Read-only, self-contained governance proposal status report (Issue #1292).
+///
+/// One call returns lifecycle state, current/final tally, effective thresholds
+/// and every relevant deadline, so clients never have to reconstruct state
+/// from separate `proposal`, `governance_config` and threshold calls.
+/// An unknown `proposal_id` returns `exists: false` with `state: Pending` and
+/// all numeric fields zeroed rather than trapping. `exists` is authoritative
+/// in that case; the `Pending` state is only a non-optional placeholder.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalStatusReport {
+    pub proposal_id: u64,
+    pub exists: bool,
+    pub state: ProposalStatus,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    pub votes_abstain: i128,
+    pub quorum_bps: u32,
+    pub approval_bps: u32,
+    pub voting_starts: u64,
+    pub voting_ends: u64,
+    pub discussion_ends_at: u64,
+    pub execution_deadline: u64,
+}
+
+/// Build a [`ProposalStatusReport`] without mutating storage.
+pub fn get_proposal_status_report(env: &Env, proposal_id: u64) -> ProposalStatusReport {
+    let empty = ProposalStatusReport {
+        proposal_id,
+        exists: false,
+        state: ProposalStatus::Pending,
+        votes_for: 0,
+        votes_against: 0,
+        votes_abstain: 0,
+        quorum_bps: 0,
+        approval_bps: 0,
+        voting_starts: 0,
+        voting_ends: 0,
+        discussion_ends_at: 0,
+        execution_deadline: 0,
+    };
+    let proposal = match get_proposals_state(env).proposals.get(proposal_id) {
+        Some(p) => p,
+        None => return empty,
+    };
+    let cfg = get_governance_config(env);
+    let (quorum_bps, approval_bps) = resolve_category_thresholds(env, &proposal.category, &cfg);
+    ProposalStatusReport {
+        proposal_id,
+        exists: true,
+        state: effective_status(env, &proposal),
+        votes_for: proposal.votes_for,
+        votes_against: proposal.votes_against,
+        votes_abstain: proposal.votes_abstain,
+        quorum_bps,
+        approval_bps,
+        voting_starts: proposal.voting_starts,
+        voting_ends: proposal.voting_ends,
+        discussion_ends_at: proposal.discussion_ends_at,
+        execution_deadline: proposal.execution_deadline,
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VoteDelegation {
