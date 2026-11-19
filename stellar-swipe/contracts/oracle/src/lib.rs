@@ -31,6 +31,8 @@ mod test_feed_bounds;
 mod test_feed_canonical;
 #[cfg(test)]
 mod test_feed_movement;
+#[cfg(test)]
+mod test_feed_version;
 mod types;
 
 use errors::OracleError;
@@ -884,6 +886,20 @@ impl OracleContract {
     pub fn get_price(env: Env, pair: AssetPair) -> Result<i128, OracleError> {
         let (price, _) = Self::get_price_with_confidence(env, pair)?;
         Ok(price)
+    }
+
+    /// Read the accepted price together with the configuration version that
+    /// produced it (0 when the feed is unconfigured). Consumers can use this
+    /// to attribute a quote to its source set, bounds and breaker policy.
+    pub fn get_price_with_feed_version(
+        env: Env,
+        pair: AssetPair,
+    ) -> Result<(i128, u32), OracleError> {
+        let (price, _) = Self::get_price_with_confidence(env.clone(), pair.clone())?;
+        let version = feeds::get_config(&env, &pair)
+            .map(|cfg| cfg.version)
+            .unwrap_or(0);
+        Ok((price, version))
     }
 
     pub fn get_price_with_confidence(

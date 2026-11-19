@@ -198,6 +198,15 @@ fn put_config(env: &Env, pair: &AssetPair, cfg: &FeedConfig) {
         .set(&FeedKey::Config(pair.clone()), cfg);
 }
 
+/// Emit the successful configuration version for indexers (Issue #1306).
+fn emit_config_version(env: &Env, pair: &AssetPair, version: u32) {
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("oracle"), symbol_short!("feed_cfg")),
+        (pair.clone(), version),
+    );
+}
+
 fn validate_publishers(publishers: &Vec<Address>) -> Result<(), OracleError> {
     if publishers.len() > MAX_PUBLISHERS {
         return Err(OracleError::InvalidFeedConfig);
@@ -287,11 +296,7 @@ pub fn configure_batch(env: &Env, entries: &Vec<FeedConfigInput>) -> Result<(), 
                 version,
             },
         );
-        #[allow(deprecated)]
-        env.events().publish(
-            (symbol_short!("oracle"), symbol_short!("feed_cfg")),
-            (pair, version),
-        );
+        emit_config_version(env, &pair, version);
     }
     Ok(())
 }
@@ -317,8 +322,10 @@ pub fn add_publisher(
     }
     cfg.publishers.push_back(publisher);
     validate_publishers(&cfg.publishers)?;
+    let canonical = lookup_pair(env, pair);
     cfg.version += 1;
-    put_config(env, &lookup_pair(env, pair), &cfg);
+    put_config(env, &canonical, &cfg);
+    emit_config_version(env, &canonical, cfg.version);
     Ok(())
 }
 
@@ -335,8 +342,10 @@ pub fn revoke_publisher(
         .first_index_of(publisher)
         .ok_or(OracleError::OracleNotFound)?;
     cfg.publishers.remove(idx);
+    let canonical = lookup_pair(env, pair);
     cfg.version += 1;
-    put_config(env, &lookup_pair(env, pair), &cfg);
+    put_config(env, &canonical, &cfg);
+    emit_config_version(env, &canonical, cfg.version);
     Ok(())
 }
 
