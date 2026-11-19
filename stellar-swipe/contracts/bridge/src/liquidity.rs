@@ -77,6 +77,31 @@ enum LiquidityKey {
     /// LP shares minted at pool creation and permanently locked away from
     /// every provider (Issue #1314).
     LockedInitialShares(u64),
+    /// Global maximum swap price impact in basis points (Issue #1317).
+    MaxPriceImpactBps,
+}
+
+/// Default maximum price impact allowed for a swap (20%, Issue #1317).
+pub const DEFAULT_MAX_PRICE_IMPACT_BPS: u32 = 2_000;
+
+/// Maximum allowed swap price impact in basis points (Issue #1317).
+pub fn get_max_price_impact_bps(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&LiquidityKey::MaxPriceImpactBps)
+        .unwrap_or(DEFAULT_MAX_PRICE_IMPACT_BPS)
+}
+
+/// Configure the maximum allowed swap price impact. `max_bps` must be in
+/// `1..=10000`; the integrating contract checks admin authorization first.
+pub fn set_max_price_impact_bps(env: &Env, max_bps: u32) -> Result<(), BridgeError> {
+    if max_bps == 0 || max_bps > BASIS_POINTS_DENOMINATOR_I128 as u32 {
+        return Err(BridgeError::InvalidAmount);
+    }
+    env.storage()
+        .persistent()
+        .set(&LiquidityKey::MaxPriceImpactBps, &max_bps);
+    Ok(())
 }
 
 /// Minimum per-asset deposit accepted for a pool's first mint (Issue #1314).
@@ -669,6 +694,20 @@ pub fn swap(
         return Err(BridgeError::InvalidOperation);
     }
 
+    // Issue #1317: reject excessive price impact from the same pre-swap
+    // snapshot, before any reserve is written. This bound is independent of
+    // `min_amount_out`, which only protects the trader against stale quotes.
+    let (reserve_in, reserve_out) = if input_is_a {
+        (pool.reserve_a, pool.reserve_b)
+    } else {
+        (pool.reserve_b, pool.reserve_a)
+    };
+    let impact = swap_price_impact_bps(reserve_in, reserve_out, new_reserve_in, new_reserve_out)
+        .ok_or(BridgeError::InvalidAmount)?;
+    if impact > get_max_price_impact_bps(env) {
+        return Err(BridgeError::MaxPriceImpactExceeded);
+    }
+
     if input_is_a {
         pool.reserve_a = new_reserve_in;
         pool.reserve_b = new_reserve_out;
@@ -763,6 +802,37 @@ fn next_pool_id(env: &Env) -> u64 {
         .persistent()
         .set(&LiquidityKey::PoolCounter, &next);
     next
+}
+
+/// Price impact of a swap in basis points, from the pre- and post-swap
+/// reserves of the same snapshot (Issue #1317).
+///
+/// Spot price is `reserve_out / reserve_in` in output units per input unit.
+/// The relative move is computed with `u128` intermediates so it cannot
+/// overflow even at `i128::MAX` reserves. A price that improves for the pool
+/// reports zero impact.
+pub fn swap_price_impact_bps(
+    reserve_in: i128,
+    reserve_out: i128,
+    new_reserve_in: i128,
+    new_reserve_out: i128,
+) -> Option<u32> {
+    if reserve_in <= 0
+        || reserve_out <= 0
+        || new_reserve_in <= 0
+        || new_reserve_out <= 0
+    {
+        return None;
+    }
+    let before = (reserve_out as u128).checked_mul(new_reserve_in as u128)?;
+    let after = (new_reserve_out as u128).checked_mul(reserve_in as u128)?;
+    if after >= before {
+        return Some(0);
+    }
+    let impact = (before - after)
+        .checked_mul(BASIS_POINTS_DENOMINATOR_I128 as u128)?
+        .checked_div(before)?;
+    u32::try_from(impact).ok()
 }
 
 fn quote_swap(
@@ -884,6 +954,128 @@ mod tests {
             let pool = get_pool(&env, pool_id).unwrap();
             assert!(pool.reserve_a > 1_000);
             assert!(pool.reserve_b < 2_000);
+        });
+    }
+
+    // ── Issue #1317: maximum swap price impact ──────────────────────────────
+
+    #[test]
+    fn price_impact_bound_is_enforced_at_threshold_in_both_directions() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        let trader = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_a = create_pool(
+                &env,
+                soroban_sdk::String::from_str(&env, "wETH"),
+                soroban_sdk::String::from_str(&env, "wUSDC"),
+                PoolType::ConstantProduct,
+                0,
+                0,
+            )
+            .unwrap();
+            let pool_b = create_pool(
+                &env,
+                soroban_sdk::String::from_str(&env, "wBTC"),
+                soroban_sdk::String::from_str(&env, "wDAI"),
+                PoolType::ConstantProduct,
+                0,
+                0,
+            )
+            .unwrap();
+            for id in [pool_a, pool_b] {
+                add_liquidity(&env, provider.clone(), id, 1_000_000, 1_000_000).unwrap();
+            }
+
+            let amount_in = 50_000;
+            let pool = get_pool(&env, pool_a).unwrap();
+            let out = quote_swap(
+                PoolType::ConstantProduct,
+                amount_in,
+                pool.reserve_a,
+                pool.reserve_b,
+            )
+            .unwrap();
+            let impact = swap_price_impact_bps(
+                pool.reserve_a,
+                pool.reserve_b,
+                pool.reserve_a + amount_in,
+                pool.reserve_b - out,
+            )
+            .unwrap();
+            assert!(impact > 0);
+
+            // A bound below the computed impact rejects before any reserve write.
+            set_max_price_impact_bps(&env, impact - 1).unwrap();
+            let before = get_pool(&env, pool_a).unwrap();
+            assert_eq!(
+                swap(
+                    &env,
+                    trader.clone(),
+                    pool_a,
+                    soroban_sdk::String::from_str(&env, "wETH"),
+                    amount_in,
+                    1,
+                ),
+                Err(BridgeError::MaxPriceImpactExceeded)
+            );
+            assert_eq!(get_pool(&env, pool_a).unwrap(), before);
+
+            // The exact threshold is allowed in both trade directions.
+            set_max_price_impact_bps(&env, impact).unwrap();
+            let in_a = swap(
+                &env,
+                trader.clone(),
+                pool_a,
+                soroban_sdk::String::from_str(&env, "wETH"),
+                amount_in,
+                1,
+            )
+            .unwrap();
+            assert_eq!(in_a.amount_out, out);
+            let in_b = swap(
+                &env,
+                trader,
+                pool_b,
+                soroban_sdk::String::from_str(&env, "wDAI"),
+                amount_in,
+                1,
+            )
+            .unwrap();
+            assert_eq!(in_b.amount_out, out);
+
+            // min_amount_out cannot be used to bypass the impact bound.
+            assert_eq!(get_max_price_impact_bps(&env), impact);
+        });
+    }
+
+    #[test]
+    fn price_impact_helper_is_overflow_safe_and_bounds_validate() {
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            assert_eq!(
+                get_max_price_impact_bps(&env),
+                DEFAULT_MAX_PRICE_IMPACT_BPS
+            );
+            assert_eq!(set_max_price_impact_bps(&env, 0), Err(BridgeError::InvalidAmount));
+            assert_eq!(
+                set_max_price_impact_bps(&env, BASIS_POINTS_DENOMINATOR_I128 as u32 + 1),
+                Err(BridgeError::InvalidAmount)
+            );
+            assert_eq!(set_max_price_impact_bps(&env, 25), Ok(()));
+            assert_eq!(get_max_price_impact_bps(&env), 25);
+
+            assert_eq!(swap_price_impact_bps(0, 10, 1, 9), None);
+            assert_eq!(swap_price_impact_bps(1_000, 1, 1, 1_000), Some(0));
+            let reserve = 1_000_000_000i128;
+            let impact = swap_price_impact_bps(
+                reserve,
+                reserve,
+                reserve + 10_000_000,
+                reserve - 9_999_999,
+            )
+            .unwrap();
+            assert!(impact > 0 && impact < BASIS_POINTS_DENOMINATOR_I128 as u32);
         });
     }
 
