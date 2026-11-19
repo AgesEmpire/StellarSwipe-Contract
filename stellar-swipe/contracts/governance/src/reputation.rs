@@ -432,12 +432,8 @@ pub fn cast_reputation_weighted_vote(
     if proposal.discussion_ends_at > 0 && now < proposal.discussion_ends_at {
         return Err(GovernanceError::DiscussionPeriodActive);
     }
-    if now < proposal.voting_starts {
-        return Err(GovernanceError::VotingNotStarted);
-    }
-    if now >= proposal.voting_ends {
-        return Err(GovernanceError::VotingEnded);
-    }
+    // #1289: share the single voting-deadline rule with all vote paths.
+    crate::voting::require_voting_open(env, &proposal)?;
     if proposal.status != ProposalStatus::Pending && proposal.status != ProposalStatus::Active {
         return Err(GovernanceError::ProposalNotActive);
     }

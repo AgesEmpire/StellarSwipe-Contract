@@ -42,6 +42,12 @@ mod test_pause_propagation;
 mod test_portableDD;
 #[cfg(test)]
 mod test_simulation;
+#[cfg(test)]
+mod test_transition_events;
+#[cfg(test)]
+mod test_veto_window;
+#[cfg(test)]
+mod test_vote_deadline;
 
 use committees::{
     list_committees as list_registered_committees, CommitteeAction, CommitteeElection,
