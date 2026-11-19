@@ -102,6 +102,12 @@ pub enum BridgeError {
     /// The pool's trading is currently paused by its operator; swaps are
     /// rejected until it is resumed (Issue #1320).
     PoolTradingPaused = 37,
+    /// A proof, validator set, or approval vector exceeds the documented
+    /// bounded-work limit; rejected before any iteration (Issue #1298).
+    ProofLimitExceeded = 38,
+    /// Asset decimal scales differ by more than the supported maximum, or the
+    /// converted amount cannot be represented (Issue #1299).
+    AmountConversionFailed = 39,
 }
 
 impl BridgeError {
@@ -212,6 +218,12 @@ impl BridgeError {
             }
             BridgeError::PoolTradingPaused => {
                 "pool trading is paused by its operator; swaps are rejected until resumed"
+            }
+            BridgeError::ProofLimitExceeded => {
+                "validator, approval, or proof input exceeds its documented maximum size"
+            }
+            BridgeError::AmountConversionFailed => {
+                "asset amount cannot be converted between the given decimal scales"
             }
         }
     }

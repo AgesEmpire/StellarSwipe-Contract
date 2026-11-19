@@ -7,6 +7,7 @@
 
 use crate::governance::get_bridge_validators;
 use crate::monitoring::ChainId;
+use crate::validators::MAX_VALIDATOR_SET_SIZE;
 use crate::BridgeError;
 use soroban_sdk::{contracttype, Address, Bytes, Env, String, Symbol};
 use stellar_swipe_common::SECONDS_PER_DAY;
@@ -23,6 +24,9 @@ use stellar_swipe_common::SECONDS_PER_DAY;
 /// allocated, so an oversized message never consumes downstream execution
 /// resources or mutates bridge state.
 pub const MAX_MESSAGE_SIZE: u32 = 4096;
+/// Maximum bytes of signature/validator evidence accepted for one proof.
+/// Checked before the proof is inspected, so cost stays bounded (Issue #1298).
+pub const MAX_PROOF_SIZE: u32 = 1024;
 pub const MESSAGE_TIMEOUT: u64 = SECONDS_PER_DAY; // 24 h
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -147,6 +151,9 @@ fn verify_delivery_proof(
     _id: u64,
     proof: &Bytes,
 ) -> Result<(), String> {
+    if proof.len() > MAX_PROOF_SIZE {
+        return Err(String::from_str(env, "Proof exceeds maximum size"));
+    }
     if proof.is_empty() {
         return Err(String::from_str(env, "Empty delivery proof"));
     }
@@ -160,6 +167,9 @@ fn verify_callback_proof(
     _payload: &Bytes,
     proof: &Bytes,
 ) -> Result<(), String> {
+    if proof.len() > MAX_PROOF_SIZE {
+        return Err(String::from_str(env, "Proof exceeds maximum size"));
+    }
     if proof.is_empty() {
         return Err(String::from_str(env, "Empty callback proof"));
     }
@@ -252,6 +262,9 @@ pub fn relay_message_to_target_chain(
 
     let bridge_id = bridge_id_for_chain(env, msg.target_chain)?;
     let validators = get_bridge_validators(env, bridge_id)?;
+    if validators.len() > MAX_VALIDATOR_SET_SIZE {
+        return Err(String::from_str(env, "Validator set exceeds maximum size"));
+    }
     if !validators.contains(&validator) {
         return Err(String::from_str(env, "Not authorized validator"));
     }
@@ -279,6 +292,9 @@ pub fn confirm_message_delivery(
 
     let bridge_id = bridge_id_for_chain(env, msg.target_chain)?;
     let validators = get_bridge_validators(env, bridge_id)?;
+    if validators.len() > MAX_VALIDATOR_SET_SIZE {
+        return Err(String::from_str(env, "Validator set exceeds maximum size"));
+    }
     if !validators.contains(&relayer) {
         return Err(String::from_str(env, "Not authorized validator"));
     }
@@ -338,6 +354,9 @@ pub fn receive_message_callback(
 
     let bridge_id = bridge_id_for_chain(env, msg.target_chain)?;
     let validators = get_bridge_validators(env, bridge_id)?;
+    if validators.len() > MAX_VALIDATOR_SET_SIZE {
+        return Err(String::from_str(env, "Validator set exceeds maximum size"));
+    }
     if !validators.contains(&relayer) {
         return Err(String::from_str(env, "Not authorized validator"));
     }
@@ -792,6 +811,75 @@ mod tests {
                 .unwrap();
             assert!(confirm_message_delivery(&env, id, validators.get(1).unwrap(), empty(&env))
                 .is_err());
+        });
+    }
+
+    #[test]
+    fn test_delivery_proof_bounds_empty_maximum_and_over_limit() {
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            // Empty proof is rejected.
+            send_cross_chain_message(
+                &env,
+                sender.clone(),
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
+            let empty_id = 1;
+            relay_message_to_target_chain(&env, empty_id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            assert_eq!(
+                confirm_message_delivery(&env, empty_id, validators.get(1).unwrap(), empty(&env)),
+                Err(String::from_str(&env, "Empty delivery proof"))
+            );
+
+            // Exactly the documented maximum is accepted.
+            let max_id = send_cross_chain_message(
+                &env,
+                sender.clone(),
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
+            relay_message_to_target_chain(&env, max_id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            let max_proof = Bytes::from_slice(&env, &vec![0xFFu8; MAX_PROOF_SIZE as usize]);
+            env.budget().reset_tracker();
+            confirm_message_delivery(&env, max_id, validators.get(1).unwrap(), max_proof).unwrap();
+            let max_cost = env.budget().cpu_instruction_cost();
+
+            // One byte over the limit fails with the same stable error.
+            let over_id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
+            relay_message_to_target_chain(&env, over_id, validators.get(0).unwrap(), proof(&env))
+                .unwrap();
+            let over_proof = Bytes::from_slice(&env, &vec![0xFFu8; MAX_PROOF_SIZE as usize + 1]);
+            env.budget().reset_tracker();
+            let err = confirm_message_delivery(
+                &env,
+                over_id,
+                validators.get(1).unwrap(),
+                over_proof,
+            )
+            .unwrap_err();
+            let over_cost = env.budget().cpu_instruction_cost();
+            assert_eq!(err, String::from_str(&env, "Proof exceeds maximum size"));
+            assert!(over_cost <= max_cost.saturating_add(100_000));
         });
     }
 
