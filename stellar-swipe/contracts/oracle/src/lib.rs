@@ -25,6 +25,8 @@ mod sdex;
 mod sla;
 mod staleness;
 mod storage;
+#[cfg(test)]
+mod test_feed_canonical;
 mod types;
 
 use errors::OracleError;
@@ -224,8 +226,26 @@ impl OracleContract {
         feeds::configure_batch(&env, &entries)
     }
 
+    /// Admin: register new feeds. Rejects duplicates under the canonical pair
+    /// identifier; use `configure_feeds` to update an existing feed.
+    pub fn register_feeds(
+        env: Env,
+        admin: Address,
+        entries: Vec<feeds::FeedConfigInput>,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        feeds::register_batch(&env, &entries)
+    }
+
     pub fn get_feed_config(env: Env, pair: AssetPair) -> Option<feeds::FeedConfig> {
         feeds::get_config(&env, &pair)
+    }
+
+    /// Read-only: the deterministic identifier used to key this feed.
+    /// Aliased/reversed spellings return the same canonical pair.
+    pub fn get_canonical_pair(env: Env, pair: AssetPair) -> Result<AssetPair, OracleError> {
+        feeds::canonical_pair(&env, &pair)
     }
 
     /// Feed owner: delegate submission rights to `publisher`.

@@ -20,9 +20,21 @@
 //! - `Active`   — otherwise (`now - last_update < max_age`).
 //!
 //! Unconfigured feeds use the pair's staleness window as `max_age`.
+//!
+//! # Canonical feed identifiers (Issue #1303)
+//! A feed is identified by an unordered asset pair, not by the order in which
+//! the caller supplied its assets. Asset codes are upper-cased (so `xlm` and
+//! `XLM` are the same alias), and `XLM` with an issuer is normalized to native
+//! XLM. The two assets are then sorted by their deterministic identifier
+//! (code bytes, then issuer bytes). Identical assets are rejected. The
+//! canonical pair is the single storage key used for configuration and rounds,
+//! so reversed/aliased spellings can never register a second feed for the same
+//! market. Distinct quote assets remain independent feeds.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Vec};
-use stellar_swipe_common::AssetPair;
+use core::cmp::Ordering;
+
+use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env, String, Vec};
+use stellar_swipe_common::{Asset, AssetPair};
 
 use crate::{errors::OracleError, price_cb, staleness};
 
@@ -94,10 +106,79 @@ struct FeedRound {
     updated_at: u64,
 }
 
+/// Upper-case an asset code (alias normalization) and canonicalize native XLM.
+fn normalized_asset(env: &Env, asset: &Asset) -> Result<Asset, OracleError> {
+    let raw = asset.code.to_bytes();
+    if raw.is_empty() || raw.len() > 12 {
+        return Err(OracleError::InvalidFeedConfig);
+    }
+    let mut upper = [0u8; 12];
+    for i in 0..raw.len() {
+        let b = raw.get_unchecked(i);
+        let b = if b.is_ascii_lowercase() { b - 32 } else { b };
+        if !b.is_ascii_alphanumeric() {
+            return Err(OracleError::InvalidFeedConfig);
+        }
+        upper[i as usize] = b;
+    }
+    let code = Bytes::from_slice(env, &upper[..raw.len() as usize]);
+    let native = code == Bytes::from_slice(env, b"XLM");
+    Ok(Asset {
+        code: String::from_bytes(env, &upper[..raw.len() as usize]),
+        // XLM is always native; an issuer on XLM is just an alias spelling.
+        issuer: if native { None } else { asset.issuer.clone() },
+    })
+}
+
+/// Deterministic byte identifier for one normalized asset.
+fn asset_id(env: &Env, asset: &Asset) -> Bytes {
+    let mut id = asset.code.to_bytes();
+    id.append(&Bytes::from_slice(env, b":"));
+    match &asset.issuer {
+        Some(issuer) => id.append(&issuer.to_string().to_bytes()),
+        None => id.append(&Bytes::from_slice(env, b"native")),
+    }
+    id
+}
+
+fn bytes_cmp(a: &Bytes, b: &Bytes) -> Ordering {
+    let len = if a.len() < b.len() { a.len() } else { b.len() };
+    for i in 0..len {
+        match a.get_unchecked(i).cmp(&b.get_unchecked(i)) {
+            Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Return the canonical representation of `pair`, or `InvalidFeedConfig` when
+/// both sides denote the same asset. See module docs for the policy.
+pub fn canonical_pair(env: &Env, pair: &AssetPair) -> Result<AssetPair, OracleError> {
+    let base = normalized_asset(env, &pair.base)?;
+    let quote = normalized_asset(env, &pair.quote)?;
+    if bytes_cmp(&asset_id(env, &base), &asset_id(env, &quote)) == Ordering::Equal {
+        return Err(OracleError::InvalidFeedConfig);
+    }
+    if bytes_cmp(&asset_id(env, &base), &asset_id(env, &quote)) == Ordering::Greater {
+        Ok(AssetPair {
+            base: quote,
+            quote: base,
+        })
+    } else {
+        Ok(AssetPair { base, quote })
+    }
+}
+
+/// Canonical key for lookups; a malformed pair simply has no configured feed.
+fn lookup_pair(env: &Env, pair: &AssetPair) -> AssetPair {
+    canonical_pair(env, pair).unwrap_or_else(|_| pair.clone())
+}
+
 pub fn get_config(env: &Env, pair: &AssetPair) -> Option<FeedConfig> {
     env.storage()
         .persistent()
-        .get(&FeedKey::Config(pair.clone()))
+        .get(&FeedKey::Config(lookup_pair(env, pair)))
 }
 
 fn put_config(env: &Env, pair: &AssetPair, cfg: &FeedConfig) {
@@ -120,29 +201,53 @@ fn validate_publishers(publishers: &Vec<Address>) -> Result<(), OracleError> {
     Ok(())
 }
 
+/// Register feeds that must not already exist under their canonical identifier.
+pub fn register_batch(env: &Env, entries: &Vec<FeedConfigInput>) -> Result<(), OracleError> {
+    let mut pairs = Vec::new(env);
+    for e in entries.iter() {
+        let canonical = canonical_pair(env, &e.pair)?;
+        if get_config(env, &canonical).is_some() {
+            return Err(OracleError::OracleAlreadyExists);
+        }
+        for previous in pairs.iter() {
+            if previous == canonical {
+                return Err(OracleError::InvalidFeedConfig);
+            }
+        }
+        pairs.push_back(canonical);
+    }
+    configure_batch(env, entries)
+}
+
 /// Validate all entries, then write them. Nothing is written on error.
 pub fn configure_batch(env: &Env, entries: &Vec<FeedConfigInput>) -> Result<(), OracleError> {
     if entries.is_empty() || entries.len() > MAX_FEED_BATCH {
         return Err(OracleError::InvalidFeedBatch);
     }
+    let mut pairs = Vec::new(env);
     for i in 0..entries.len() {
         let e = entries.get_unchecked(i);
         if e.max_age == 0 {
             return Err(OracleError::InvalidFeedConfig);
         }
         validate_publishers(&e.publishers)?;
-        for j in (i + 1)..entries.len() {
-            if entries.get_unchecked(j).pair == e.pair {
+        // Normalize before duplicate detection: reversed pairs and aliases
+        // resolve to one canonical feed identifier.
+        let canonical = canonical_pair(env, &e.pair)?;
+        for previous in pairs.iter() {
+            if previous == canonical {
                 return Err(OracleError::InvalidFeedConfig);
             }
         }
+        pairs.push_back(canonical);
     }
 
-    for e in entries.iter() {
-        let version = get_config(env, &e.pair).map(|c| c.version).unwrap_or(0) + 1;
+    for (i, e) in entries.iter().enumerate() {
+        let pair = pairs.get_unchecked(i as u32);
+        let version = get_config(env, &pair).map(|c| c.version).unwrap_or(0) + 1;
         put_config(
             env,
-            &e.pair,
+            &pair,
             &FeedConfig {
                 owner: e.owner,
                 publishers: e.publishers,
@@ -154,7 +259,7 @@ pub fn configure_batch(env: &Env, entries: &Vec<FeedConfigInput>) -> Result<(), 
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("oracle"), symbol_short!("feed_cfg")),
-            (e.pair, version),
+            (pair, version),
         );
     }
     Ok(())
@@ -182,7 +287,7 @@ pub fn add_publisher(
     cfg.publishers.push_back(publisher);
     validate_publishers(&cfg.publishers)?;
     cfg.version += 1;
-    put_config(env, pair, &cfg);
+    put_config(env, &lookup_pair(env, pair), &cfg);
     Ok(())
 }
 
@@ -200,7 +305,7 @@ pub fn revoke_publisher(
         .ok_or(OracleError::OracleNotFound)?;
     cfg.publishers.remove(idx);
     cfg.version += 1;
-    put_config(env, pair, &cfg);
+    put_config(env, &lookup_pair(env, pair), &cfg);
     Ok(())
 }
 
@@ -225,7 +330,7 @@ pub fn authorize_publisher(
 
 /// Record an accepted round for the feed.
 pub fn record_round(env: &Env, pair: &AssetPair) {
-    let key = FeedKey::Round(pair.clone());
+    let key = FeedKey::Round(lookup_pair(env, pair));
     let round = env
         .storage()
         .persistent()
@@ -247,7 +352,7 @@ pub fn status(env: &Env, pair: &AssetPair) -> FeedStatus {
     let round: Option<FeedRound> = env
         .storage()
         .persistent()
-        .get(&FeedKey::Round(pair.clone()));
+        .get(&FeedKey::Round(lookup_pair(env, pair)));
     let (latest_round, last_update) = round.map(|r| (r.round, r.updated_at)).unwrap_or((0, 0));
     let max_age = cfg
         .as_ref()
