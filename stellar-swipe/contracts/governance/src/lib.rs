@@ -77,7 +77,10 @@ use proposals::{
     withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalType,
     SimulationEffect, SimulationResult, Vote, VoteDelegation, VoteType as GovernanceVoteType,
 };
-pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
+pub use proposals::{
+    action_identity, validate_no_duplicate_actions, CategoryThreshold, GovernanceConfig,
+    ProposalCategory, ProposalTransitionEvent,
+};
 use quadratic_voting::{
     allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
     get_quadratic_vote, get_quadratic_voting_config, get_vote_credits, reallocate_quadratic_votes,
