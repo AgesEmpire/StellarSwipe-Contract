@@ -1331,6 +1331,11 @@ pub fn delegate_voting_power(
         return Err(GovernanceError::NoVotingPower);
     }
 
+    // #1290: a delegate may hold no stake of their own but still be eligible
+    // to vote at proposal creation. Track them as a holder now so the
+    // eligibility snapshot includes their delegated power; changes made after
+    // a proposal opens cannot add or remove that eligibility retroactively.
+    crate::track_holder(env, &delegate);
     state.delegations.set(
         delegator.clone(),
         VoteDelegation {

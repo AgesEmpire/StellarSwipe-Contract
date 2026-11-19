@@ -2416,6 +2416,54 @@ fn voting_power_uses_snapshot_not_live_balance() {
 }
 
 #[test]
+fn snapshot_survives_exit_and_stake_changes_after_proposal_opens() {
+    // #1290: eligibility is frozen at proposal creation. Unstaking (exit),
+    // increasing stake, or partially reducing stake afterwards must not change
+    // the weight this proposal counts for the voter.
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let voter = recipients.community_rewards.clone();
+    client.stake(&voter, &120_000_000i128);
+    let proposal_id = client.create_proposal(
+        &voter,
+        &ProposalType::SignalProposal(String::from_str(&env, "Snapshot exit")),
+        &String::from_str(&env, "Exit/change"),
+        &String::from_str(&env, "Eligibility must be immutable after opening"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+
+    // Exit: unstake everything after the proposal opened.
+    client.unstake(&voter, &120_000_000i128);
+    assert_eq!(client.staked_balance(&voter), 0);
+    env.ledger().set_timestamp(70);
+    client.cast_vote(&proposal_id, &voter, &GovernanceVoteType::For);
+    assert_eq!(client.proposal(&proposal_id).votes_for, 120_000_000);
+
+    // Stake changes (increase and decrease) on a second proposal still use
+    // the value captured when that proposal opened.
+    client.stake(&voter, &200_000_000i128);
+    let second = client.create_proposal(
+        &voter,
+        &ProposalType::SignalProposal(String::from_str(&env, "Snapshot change")),
+        &String::from_str(&env, "Change"),
+        &String::from_str(&env, "Changing stake after opening is ignored"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    client.stake(&voter, &50_000_000i128);
+    client.unstake(&voter, &80_000_000i128);
+    assert_eq!(client.staked_balance(&voter), 170_000_000);
+    env.ledger().set_timestamp(140);
+    client.cast_vote(&second, &voter, &GovernanceVoteType::For);
+    assert_eq!(client.proposal(&second).votes_for, 200_000_000);
+}
+
+#[test]
 fn test_reputation_leaderboard_limit() {
     let (env, contract_id, admin, recipients) = setup();
     let client = client(&env, &contract_id);
