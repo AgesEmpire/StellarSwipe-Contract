@@ -1177,6 +1177,66 @@ pub fn get_all_proposals(env: &Env) -> Vec<Proposal> {
 
 // ── #796: Treasury spend proposal execution expiry ───────────────────────────
 
+/// Persist the terminal `Expired` state for a passed proposal that missed its
+/// execution deadline (Issue #1291).
+///
+/// Settlement rule: the proposal bond is settled exactly once. Finalization
+/// normally settles it already; calling `settle_proposal_deposit` here is
+/// idempotent because it removes the `LockedDeposit` record on settlement, so
+/// an expiry (or a repeated expiry call) can never refund/forfeit twice.
+///
+/// Returns `Ok(Expired)` unchanged for an already-expired proposal, making
+/// repeated expiry processing safe and idempotent.
+pub fn expire_proposal(
+    env: &Env,
+    proposal_id: u64,
+) -> Result<ProposalStatus, GovernanceError> {
+    let mut proposal = get_proposal(env, proposal_id)?;
+    if proposal.status == ProposalStatus::Expired {
+        return Ok(ProposalStatus::Expired);
+    }
+    if proposal.status != ProposalStatus::Succeeded {
+        return Err(GovernanceError::ProposalNotApproved);
+    }
+    if env.ledger().timestamp() <= proposal.execution_deadline {
+        return Err(GovernanceError::InvalidDuration);
+    }
+
+    proposal.status = ProposalStatus::Expired;
+    put_proposal(env, &proposal)?;
+
+    // The deadline is now definitive: no reserved bond stays locked.
+    let total_votes = proposal
+        .votes_for
+        .saturating_add(proposal.votes_against)
+        .saturating_add(proposal.votes_abstain);
+    let total_supply = get_total_supply(env).unwrap_or(0);
+    let treasury: Address = env
+        .storage()
+        .instance()
+        .get(&StorageKey::TreasuryAddress)
+        .unwrap_or_else(|| proposal.proposer.clone());
+    let _ = crate::proposal_deposit::settle_proposal_deposit(
+        env,
+        proposal_id,
+        total_votes,
+        total_supply,
+        &treasury,
+    );
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("treasury"), symbol_short!("propexp")),
+        (
+            proposal_id,
+            proposal.proposer.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+
+    Ok(ProposalStatus::Expired)
+}
+
 /// Reclaim a `Succeeded` proposal whose execution window has closed without
 /// ever being executed. Callable by **any** address (not admin-only) — any
 /// DAO member can clear a stale authorisation once it has expired. Removes
@@ -1194,6 +1254,11 @@ pub fn reclaim_expired_proposal(
     caller: Address,
 ) -> Result<(), GovernanceError> {
     caller.require_auth();
+
+    // Persist the terminal state (and settle any still-locked bond) before
+    // removing the entry, so expiry processing is never skipped on the reclaim
+    // path. This is idempotent for an already-expired proposal.
+    expire_proposal(env, proposal_id)?;
 
     let mut state = get_proposals_state(env);
     let proposal = state

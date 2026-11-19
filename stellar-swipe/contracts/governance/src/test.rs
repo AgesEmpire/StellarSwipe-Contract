@@ -3028,6 +3028,72 @@ fn treasury_spend_proposal_execution_past_deadline_is_rejected() {
 }
 
 #[test]
+fn execution_deadline_boundary_is_inclusive() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let (proposal_id, payout_recipient, _spend_asset) =
+        setup_succeeded_treasury_spend_proposal(&env, &client, &admin, &recipients);
+
+    let deadline = client.proposal(&proposal_id).execution_deadline;
+    assert_eq!(deadline, 1_209_660);
+
+    // Exactly at the deadline execution is still allowed; one second later it
+    // is not. This pins the boundary of the bounded execution lifetime.
+    env.ledger().set_timestamp(deadline);
+    assert_eq!(
+        client.execute_proposal(&proposal_id, &recipients.community_rewards),
+        ProposalStatus::Executed
+    );
+    assert_eq!(client.balance(&payout_recipient), 500);
+}
+
+#[test]
+fn expired_proposal_becomes_terminal_and_expiry_is_idempotent() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let (proposal_id, payout_recipient, _spend_asset) =
+        setup_succeeded_treasury_spend_proposal(&env, &client, &admin, &recipients);
+    let deadline = client.proposal(&proposal_id).execution_deadline;
+
+    // Before the deadline there is nothing to expire yet.
+    env.ledger().set_timestamp(deadline);
+    assert_eq!(
+        client.try_expire_proposal(&proposal_id),
+        Err(Ok(GovernanceError::InvalidDuration))
+    );
+
+    env.ledger().set_timestamp(deadline + 1);
+    assert_eq!(
+        client.expire_proposal(&proposal_id),
+        ProposalStatus::Expired
+    );
+    // Terminal state is persisted (not merely computed by a query).
+    assert_eq!(
+        client.try_execute_proposal(&proposal_id, &recipients.community_rewards),
+        Err(Ok(GovernanceError::ProposalNotApproved))
+    );
+
+    let proposer_balance = client.balance(&recipients.community_rewards);
+    // Repeated expiry processing is a no-op: no double bond settlement and no
+    // re-execution of the spend.
+    assert_eq!(
+        client.expire_proposal(&proposal_id),
+        ProposalStatus::Expired
+    );
+    assert_eq!(
+        client.expire_proposal(&proposal_id),
+        ProposalStatus::Expired
+    );
+    assert_eq!(client.balance(&recipients.community_rewards), proposer_balance);
+    assert_eq!(client.balance(&payout_recipient), 0);
+    assert_eq!(client.proposal(&proposal_id).status, ProposalStatus::Expired);
+}
+
+#[test]
 fn reclaim_expired_proposal_removes_entry_and_is_callable_by_anyone() {
     let (env, contract_id, admin, recipients) = setup();
     let client = client(&env, &contract_id);
