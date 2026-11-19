@@ -33,6 +33,8 @@ pub enum FeeStorageKey {
     FeeStats(u64),
     TreasuryTarget(u64),
     DailyTransfers(u64),
+    /// Accrued fees keyed explicitly by route id and asset symbol.
+    RouteAssetFee(u64, String),
 }
 
 pub fn set_bridge_treasury(env: &Env, bridge_id: u64, treasury: Address) {
@@ -111,6 +113,15 @@ pub fn collect_bridge_fee(
 
     let fee = calculate_bridge_fee(env, transfer.bridge_id, amount)?;
     let net_amount = amount - fee;
+
+    // Route/asset isolation: this fee is credited only to the transfer's own
+    // route and asset balance (Issue #1301).
+    accrue_route_asset_fee(
+        env,
+        route_id(transfer.source_chain, transfer.destination_chain),
+        transfer.stellar_asset.code.clone(),
+        fee,
+    )?;
 
     let mut stats = get_bridge_fee_stats(env, transfer.bridge_id);
     let total_fees = stats.total_fees_collected + fee;
@@ -209,6 +220,62 @@ pub enum ChainFeeKey {
     ChainMultiplier(u32),
     /// Mapping from destination-chain discriminant to bridge_id.
     DestinationBridgeId(u32),
+}
+
+/// Encode a (source chain, destination chain) route as a stable u64 id.
+pub fn route_id(source: ChainId, destination: ChainId) -> u64 {
+    ((chain_discriminant(source) as u64) << 32) | chain_discriminant(destination) as u64
+}
+
+/// Accrue a fee against one (route, asset) balance only (Issue #1301).
+pub fn accrue_route_asset_fee(
+    env: &Env,
+    route: u64,
+    asset: String,
+    amount: i128,
+) -> Result<(), String> {
+    if amount < 0 {
+        return Err(String::from_str(env, "Fee amount must not be negative"));
+    }
+    let current = get_route_asset_fee_balance(env, route, asset.clone());
+    let updated = current.checked_add(amount).ok_or_else(|| {
+        String::from_str(env, "Route asset fee balance overflow")
+    })?;
+    env.storage().persistent().set(
+        &FeeStorageKey::RouteAssetFee(route, asset),
+        &updated,
+    );
+    Ok(())
+}
+
+/// Release a fee from one (route, asset) balance only. An overdraw fails
+/// without touching any other route or asset (Issue #1301).
+pub fn release_route_asset_fee(
+    env: &Env,
+    route: u64,
+    asset: String,
+    amount: i128,
+) -> Result<(), String> {
+    if amount < 0 {
+        return Err(String::from_str(env, "Fee amount must not be negative"));
+    }
+    let current = get_route_asset_fee_balance(env, route, asset.clone());
+    let updated = current.checked_sub(amount).ok_or_else(|| {
+        String::from_str(env, "Route asset fee overdraw")
+    })?;
+    env.storage().persistent().set(
+        &FeeStorageKey::RouteAssetFee(route, asset),
+        &updated,
+    );
+    Ok(())
+}
+
+/// Read the accrued fee balance for a single (route, asset) pair.
+pub fn get_route_asset_fee_balance(env: &Env, route: u64, asset: String) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&FeeStorageKey::RouteAssetFee(route, asset))
+        .unwrap_or(0)
 }
 
 fn chain_discriminant(chain: ChainId) -> u32 {
@@ -362,6 +429,15 @@ pub fn refund_bridge_fee(env: &Env, transfer_id: u64, reason: String) -> Result<
         ));
     }
 
+    // Release from the same (route, asset) bucket that accrued the fee; an
+    // overdraw here cannot consume another route's balance (Issue #1301).
+    release_route_asset_fee(
+        env,
+        route_id(transfer.source_chain, transfer.destination_chain),
+        transfer.stellar_asset.code.clone(),
+        transfer.fee_paid,
+    )?;
+
     let mut fee_stats = get_bridge_fee_stats(env, transfer.bridge_id);
     fee_stats.total_fees_collected -= transfer.fee_paid;
     save_bridge_fee_stats(env, transfer.bridge_id, &fee_stats);
@@ -405,6 +481,68 @@ mod tests {
             code: soroban_sdk::String::from_str(env, "XLM"),
             issuer: None,
         }
+    }
+
+    #[test]
+    fn test_route_asset_fees_are_isolated_and_overdraws_fail() {
+        let (env, contract_id) = setup();
+        env.as_contract(&contract_id, || {
+            let route_a = route_id(ChainId::Stellar, ChainId::Ethereum);
+            let route_b = route_id(ChainId::Stellar, ChainId::Polygon);
+            let asset_x = String::from_str(&env, "XLM");
+            let asset_y = String::from_str(&env, "USDC");
+
+            accrue_route_asset_fee(&env, route_a, asset_x.clone(), 1_000).unwrap();
+            accrue_route_asset_fee(&env, route_a, asset_y.clone(), 500).unwrap();
+            accrue_route_asset_fee(&env, route_b, asset_x.clone(), 250).unwrap();
+
+            assert_eq!(
+                get_route_asset_fee_balance(&env, route_a, asset_x.clone()),
+                1_000
+            );
+            assert_eq!(
+                get_route_asset_fee_balance(&env, route_a, asset_y.clone()),
+                500
+            );
+            assert_eq!(
+                get_route_asset_fee_balance(&env, route_b, asset_x.clone()),
+                250
+            );
+
+            release_route_asset_fee(&env, route_a, asset_x.clone(), 400).unwrap();
+            assert_eq!(
+                get_route_asset_fee_balance(&env, route_a, asset_x.clone()),
+                600
+            );
+            // Overdrawing one bucket does not borrow from another.
+            assert_eq!(
+                release_route_asset_fee(&env, route_a, asset_x.clone(), 601),
+                Err(String::from_str(&env, "Route asset fee overdraw"))
+            );
+            assert_eq!(
+                get_route_asset_fee_balance(&env, route_a, asset_x.clone()),
+                600
+            );
+            assert_eq!(
+                get_route_asset_fee_balance(&env, route_a, asset_y.clone()),
+                500
+            );
+            assert_eq!(
+                get_route_asset_fee_balance(&env, route_b, asset_x.clone()),
+                250
+            );
+            assert_eq!(
+                accrue_route_asset_fee(&env, route_b, asset_y.clone(), i128::MAX),
+                Ok(())
+            );
+            assert_eq!(
+                accrue_route_asset_fee(&env, route_b, asset_y.clone(), 1),
+                Err(String::from_str(
+                    &env,
+                    "Route asset fee balance overflow"
+                ))
+            );
+        });
     }
 
     #[test]

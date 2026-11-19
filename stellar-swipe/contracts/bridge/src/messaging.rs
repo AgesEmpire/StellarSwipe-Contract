@@ -1013,9 +1013,13 @@ mod tests {
             .unwrap();
             relay_message_to_target_chain(&env, max_id, validators.get(0).unwrap(), proof(&env))
                 .unwrap();
-            let max_proof = Bytes::from_slice(&env, &vec![0xFFu8; MAX_PROOF_SIZE as usize]);
+            let mut max_proof = Bytes::new(&env);
+            for _ in 0..MAX_PROOF_SIZE {
+                max_proof.push_back(0xFF);
+            }
             env.budget().reset_tracker();
-            confirm_message_delivery(&env, max_id, validators.get(1).unwrap(), max_proof).unwrap();
+            confirm_message_delivery(&env, max_id, validators.get(1).unwrap(), max_proof.clone())
+                .unwrap();
             let max_cost = env.budget().cpu_instruction_cost();
 
             // One byte over the limit fails with the same stable error.
@@ -1031,7 +1035,8 @@ mod tests {
             .unwrap();
             relay_message_to_target_chain(&env, over_id, validators.get(0).unwrap(), proof(&env))
                 .unwrap();
-            let over_proof = Bytes::from_slice(&env, &vec![0xFFu8; MAX_PROOF_SIZE as usize + 1]);
+            let mut over_proof = max_proof.clone();
+            over_proof.push_back(0xFF);
             env.budget().reset_tracker();
             let err = confirm_message_delivery(
                 &env,
