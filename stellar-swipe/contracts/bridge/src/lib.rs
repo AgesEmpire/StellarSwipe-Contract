@@ -510,9 +510,10 @@ pub use liquidity::{LiquidityPool, LiquidityPosition, PoolHealth, PoolType, Swap
 
 pub use messaging::{
     confirm_message_delivery, expire_timed_out_message, get_cross_chain_message,
-    mark_message_failed, message_size, receive_message_callback, register_bridge_for_chain,
-    relay_message_to_target_chain, retry_failed_message, send_cross_chain_message,
-    CrossChainMessage, MessageStatus, MAX_MESSAGE_SIZE, MESSAGE_TIMEOUT,
+    get_message_status, mark_message_failed, message_size, receive_message_callback,
+    register_bridge_for_chain, relay_message_to_target_chain, retry_failed_message,
+    send_cross_chain_message, CrossChainMessage, LifecycleStatus, MessageStatus, MessageStatusView,
+    MAX_MESSAGE_SIZE, MESSAGE_TIMEOUT,
 };
 
 soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
@@ -1451,6 +1452,12 @@ impl BridgeContract {
     }
 
     // ── #668: Message nonce read-only entrypoint ───────────────────────────────
+
+    /// Compact lifecycle view for a message id (Issue #1300). Unknown ids
+    /// return `LifecycleStatus::Unknown`; the query never traps or writes.
+    pub fn get_message_status(env: Env, message_id: u64) -> MessageStatusView {
+        messaging::get_message_status(&env, message_id)
+    }
 
     /// Return the next expected delivery-confirmation nonce for `source_chain_id`.
     /// `source_chain_id` is the numeric value of `monitoring::ChainId`

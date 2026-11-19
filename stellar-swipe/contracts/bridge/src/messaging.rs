@@ -41,6 +41,29 @@ pub enum MessageStatus {
     CallbackReceived,
 }
 
+/// Stable lifecycle view exposed to relayers (Issue #1300).
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleStatus {
+    Unknown,
+    Pending,
+    Finalized,
+    Executed,
+    Rejected,
+}
+
+/// Compact, read-only view of a message's lifecycle. Chain ids are numeric
+/// discriminants so the result stays small and ABI-stable.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageStatusView {
+    pub id: u64,
+    pub status: LifecycleStatus,
+    pub source_chain: u32,
+    pub target_chain: u32,
+    pub nonce: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrossChainMessage {
@@ -70,6 +93,8 @@ pub enum MessagingKey {
     OutboundSeq(u32),
     /// Next expected delivery-confirmation nonce per target chain (Issue #668).
     ExpectedNonce(u32),
+    /// Compact lifecycle record, retained even after the full message is pruned.
+    Status(u64),
 }
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
@@ -107,6 +132,37 @@ fn save_message(env: &Env, msg: &CrossChainMessage) {
     env.storage()
         .persistent()
         .set(&MessagingKey::Message(msg.id), msg);
+    let status = match msg.status {
+        MessageStatus::Pending => LifecycleStatus::Pending,
+        MessageStatus::Relayed | MessageStatus::Delivered => LifecycleStatus::Finalized,
+        MessageStatus::CallbackReceived => LifecycleStatus::Executed,
+        MessageStatus::Failed => LifecycleStatus::Rejected,
+    };
+    env.storage().persistent().set(
+        &MessagingKey::Status(msg.id),
+        &MessageStatusView {
+            id: msg.id,
+            status,
+            source_chain: msg.source_chain as u32,
+            target_chain: msg.target_chain as u32,
+            nonce: msg.nonce,
+        },
+    );
+}
+
+/// Read-only lifecycle query (Issue #1300). Unknown ids return
+/// `LifecycleStatus::Unknown` with zeroed identifiers and never trap.
+pub fn get_message_status(env: &Env, id: u64) -> MessageStatusView {
+    env.storage()
+        .persistent()
+        .get(&MessagingKey::Status(id))
+        .unwrap_or(MessageStatusView {
+            id,
+            status: LifecycleStatus::Unknown,
+            source_chain: 0,
+            target_chain: 0,
+            nonce: 0,
+        })
 }
 
 fn remove_message(env: &Env, id: u64) {
@@ -811,6 +867,113 @@ mod tests {
                 .unwrap();
             assert!(confirm_message_delivery(&env, id, validators.get(1).unwrap(), empty(&env))
                 .is_err());
+        });
+    }
+
+    #[test]
+    fn test_message_status_query_covers_lifecycle_transitions() {
+        let (env, contract_id, sender, validators) = setup();
+        env.as_contract(&contract_id, || {
+            let unknown = get_message_status(&env, 999);
+            assert_eq!(unknown.status, LifecycleStatus::Unknown);
+            assert_eq!(unknown.id, 999);
+            assert_eq!(unknown.nonce, 0);
+
+            let pending_id = send_cross_chain_message(
+                &env,
+                sender.clone(),
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
+            let view = get_message_status(&env, pending_id);
+            assert_eq!(view.status, LifecycleStatus::Pending);
+            assert_eq!(view.source_chain, ChainId::Stellar as u32);
+            assert_eq!(view.target_chain, ChainId::Ethereum as u32);
+
+            relay_message_to_target_chain(
+                &env,
+                pending_id,
+                validators.get(0).unwrap(),
+                proof(&env),
+            )
+            .unwrap();
+            assert_eq!(
+                get_message_status(&env, pending_id).status,
+                LifecycleStatus::Finalized
+            );
+            confirm_message_delivery(
+                &env,
+                pending_id,
+                validators.get(1).unwrap(),
+                proof(&env),
+            )
+            .unwrap();
+            assert_eq!(
+                get_message_status(&env, pending_id).status,
+                LifecycleStatus::Finalized
+            );
+
+            let callback_id = send_cross_chain_message(
+                &env,
+                sender.clone(),
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                true,
+            )
+            .unwrap();
+            relay_message_to_target_chain(
+                &env,
+                callback_id,
+                validators.get(0).unwrap(),
+                proof(&env),
+            )
+            .unwrap();
+            confirm_message_delivery(
+                &env,
+                callback_id,
+                validators.get(1).unwrap(),
+                proof(&env),
+            )
+            .unwrap();
+            receive_message_callback(
+                &env,
+                callback_id,
+                validators.get(2).unwrap(),
+                payload(&env),
+                proof(&env),
+            )
+            .unwrap();
+            assert_eq!(
+                get_message_status(&env, callback_id).status,
+                LifecycleStatus::Executed
+            );
+
+            let rejected_id = send_cross_chain_message(
+                &env,
+                sender,
+                ChainId::Ethereum,
+                target(&env),
+                payload(&env),
+                100_000,
+                false,
+            )
+            .unwrap();
+            mark_message_failed(&env, rejected_id).unwrap();
+            assert_eq!(
+                get_message_status(&env, rejected_id).status,
+                LifecycleStatus::Rejected
+            );
+            retry_failed_message(&env, rejected_id).unwrap();
+            assert_eq!(
+                get_message_status(&env, rejected_id).status,
+                LifecycleStatus::Pending
+            );
         });
     }
 
