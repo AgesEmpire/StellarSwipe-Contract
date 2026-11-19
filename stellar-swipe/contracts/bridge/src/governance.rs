@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use crate::validators::has_duplicates;
 use soroban_sdk::{contracttype, Address, Env, Map, String, Symbol, Vec};
 use stellar_swipe_common::{
     emit_health_event, health_uninitialized, placeholder_admin, HealthStatus,
@@ -140,8 +141,8 @@ pub fn initialize_bridge_governance(
     signers: Vec<Address>,
     required_signatures: u32,
 ) -> Result<(), String> {
-    if signers.is_empty() {
-        return Err(String::from_str(env, "Signers cannot be empty"));
+    if signers.is_empty() || has_duplicates(&signers) {
+        return Err(String::from_str(env, "Signers cannot be empty or duplicated"));
     }
 
     if required_signatures == 0 || required_signatures > signers.len() {
@@ -173,8 +174,12 @@ pub fn initialize_bridge(
     min_validator_signatures: u32,
     security_config: BridgeSecurityConfig,
 ) -> Result<(), String> {
-    if validators.is_empty() {
-        return Err(String::from_str(env, "Validators cannot be empty"));
+    // #1294: a repeated address must never be stored as two validators.
+    if validators.is_empty() || has_duplicates(&validators) {
+        return Err(String::from_str(
+            env,
+            "Validators cannot be empty or duplicated",
+        ));
     }
 
     if min_validator_signatures == 0 || min_validator_signatures > validators.len() {
@@ -495,6 +500,17 @@ fn stage_validator_change(
     approved: Vec<Address>,
     min_validator_signatures: u32,
 ) -> Result<(), String> {
+    // #1294/#1295: reject malformed sets before touching active/pending state.
+    if approved.is_empty()
+        || has_duplicates(&approved)
+        || min_validator_signatures == 0
+        || min_validator_signatures > approved.len()
+    {
+        return Err(String::from_str(
+            env,
+            "Invalid validator set or threshold",
+        ));
+    }
     let delay = get_validator_activation_delay(env, bridge_id);
     let version = get_active_validator_version(env, bridge_id).saturating_add(1);
     let now = env.ledger().timestamp();
@@ -1152,6 +1168,38 @@ mod tests {
             min_validator_signatures: 2,
             transfer_delay_seconds: 300,
         }
+    }
+
+    #[test]
+    fn duplicate_validator_updates_are_rejected_before_storage() {
+        let (env, contract_id) = setup_env();
+        env.as_contract(&contract_id, || {
+            let a = Address::generate(&env);
+            let b = Address::generate(&env);
+            let mut validators = Vec::new(&env);
+            validators.push_back(a.clone());
+            validators.push_back(b.clone());
+            initialize_bridge(&env, 1, validators, 2, create_test_security_config(&env)).unwrap();
+
+            // Duplicate at a different list position must not change or stage state.
+            let mut duplicated = Vec::new(&env);
+            duplicated.push_back(a.clone());
+            duplicated.push_back(b.clone());
+            duplicated.push_back(a.clone());
+            assert!(stage_validator_change(&env, 1, duplicated, 2).is_err());
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&GovernanceDataKey::PendingValidatorSet(1))
+                == false);
+
+            // Initialization with duplicates is rejected as well.
+            let mut initial = Vec::new(&env);
+            initial.push_back(a);
+            initial.push_back(b.clone());
+            initial.push_back(b);
+            assert!(initialize_bridge(&env, 2, initial, 2, create_test_security_config(&env)).is_err());
+        });
     }
 
     #[test]
