@@ -577,6 +577,14 @@ pub fn create_proposal(
     state.proposal_ids.push_back(id);
     state.next_proposal_id = id.saturating_add(1);
     put_proposals_state(env, &state);
+    publish_transition(
+        env,
+        id,
+        ProposalStatus::Uninitialized,
+        ProposalStatus::Pending,
+        &proposer,
+        "created",
+    );
 
     #[allow(deprecated)]
     env.events().publish(
@@ -699,6 +707,14 @@ pub fn cast_vote(
 
     if proposal.status == ProposalStatus::Pending {
         proposal.status = ProposalStatus::Active;
+        publish_transition(
+            env,
+            proposal_id,
+            ProposalStatus::Pending,
+            ProposalStatus::Active,
+            &voter,
+            "voting_started",
+        );
     }
     put_proposal(env, &proposal)
 }
@@ -880,6 +896,14 @@ pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, 
 
     if !quorum_met {
         proposal.status = ProposalStatus::Failed;
+        publish_transition(
+            env,
+            proposal_id,
+            previous_status,
+            ProposalStatus::Failed,
+            &proposal.proposer,
+            "voting_completed",
+        );
         put_proposal(env, &proposal)?;
         return Ok(ProposalStatus::Failed);
     }
@@ -912,6 +936,19 @@ pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, 
         }
     }
 
+    let kind = if status == ProposalStatus::Succeeded && cfg.execution_delay > 0 {
+        "queued"
+    } else {
+        "voting_completed"
+    };
+    publish_transition(
+        env,
+        proposal_id,
+        previous_status,
+        status.clone(),
+        &proposal.proposer,
+        kind,
+    );
     put_proposal(env, &proposal)?;
 
     if status == ProposalStatus::Succeeded && cfg.execution_delay == 0 {
@@ -967,6 +1004,14 @@ pub fn execute_proposal(
     execute_proposal_action(env, &proposal)?;
     proposal.status = ProposalStatus::Executed;
     proposal.executed_at = Some(env.ledger().timestamp());
+    publish_transition(
+        env,
+        proposal_id,
+        ProposalStatus::Succeeded,
+        ProposalStatus::Executed,
+        &executor,
+        "executed",
+    );
     put_proposal(env, &proposal)?;
     Ok(ProposalStatus::Executed)
 }
@@ -1106,7 +1151,16 @@ pub fn cancel_proposal(
         return Err(GovernanceError::InvalidCommitteeAction);
     }
 
+    let previous_status = proposal.status.clone();
     proposal.status = ProposalStatus::Cancelled;
+    publish_transition(
+        env,
+        proposal_id,
+        previous_status,
+        ProposalStatus::Cancelled,
+        &canceller,
+        "cancelled",
+    );
     put_proposal(env, &proposal)?;
     Ok(ProposalStatus::Cancelled)
 }
@@ -1166,6 +1220,14 @@ pub fn withdraw_proposal(
     }
 
     proposal.status = ProposalStatus::Withdrawn;
+    publish_transition(
+        env,
+        proposal_id,
+        ProposalStatus::Pending,
+        ProposalStatus::Withdrawn,
+        &proposer,
+        "cancelled",
+    );
     put_proposal(env, &proposal)?;
 
     // Refund the spam-deposit to the proposer (see deposit handling policy above).
@@ -1325,6 +1387,14 @@ pub fn reclaim_expired_proposal(
         return Err(GovernanceError::InvalidDuration);
     }
 
+    publish_transition(
+        env,
+        proposal_id,
+        proposal.status.clone(),
+        ProposalStatus::Expired,
+        &caller,
+        "expired",
+    );
     state.proposals.remove(proposal_id);
     remove_proposal_id(&mut state.proposal_ids, proposal_id);
     put_proposals_state(env, &state);
