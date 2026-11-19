@@ -84,6 +84,8 @@ pub enum OracleError {
     InvalidFeedConfig = 35,
     /// The feed is disabled and does not accept observations (Issue #1309).
     FeedDisabled = 36,
+    /// Observation is outside the feed's configured [min, max] price bounds (Issue #1304).
+    PriceOutOfBounds = 37,
 }
 
 impl OracleError {
@@ -176,6 +178,9 @@ impl OracleError {
                 "a feed configuration entry is invalid or duplicated within the batch"
             }
             OracleError::FeedDisabled => "the feed is disabled and does not accept observations",
+            OracleError::PriceOutOfBounds => {
+                "observation is outside the feed's configured price bounds"
+            }
         }
     }
 }

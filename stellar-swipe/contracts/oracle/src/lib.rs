@@ -26,6 +26,8 @@ mod sla;
 mod staleness;
 mod storage;
 #[cfg(test)]
+mod test_feed_bounds;
+#[cfg(test)]
 mod test_feed_canonical;
 mod types;
 
@@ -197,6 +199,8 @@ impl OracleContract {
         if price <= 0 {
             return Err(OracleError::InvalidAsset);
         }
+        // #1304: reject economically impossible observations before any state change.
+        feeds::check_bounds(&env, &pair, price)?;
         // #755: single-update deviation circuit breaker check. A deviating
         // update trips the breaker and is rejected (not stored); the call
         // returns Ok so the trip flag persists (an error return would roll
@@ -1242,6 +1246,8 @@ impl OracleContract {
         if price <= 0 {
             return Err(OracleError::InvalidPrice);
         }
+        // #1304: bounds are enforced before the observation enters aggregation.
+        feeds::check_bounds(&env, &pair, price)?;
 
         // #1309: only the feed's owner or delegated publishers may submit.
         feeds::authorize_publisher(&env, &pair, &source)?;

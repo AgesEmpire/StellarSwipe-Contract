@@ -58,6 +58,10 @@ pub struct FeedConfig {
     /// Seconds after the last accepted round before the feed is stale.
     pub max_age: u64,
     pub enabled: bool,
+    /// Inclusive lower bound for accepted observations (Issue #1304).
+    pub min_price: i128,
+    /// Inclusive upper bound for accepted observations (Issue #1304).
+    pub max_price: i128,
     /// Incremented on every configuration change.
     pub version: u32,
 }
@@ -70,6 +74,9 @@ pub struct FeedConfigInput {
     pub publishers: Vec<Address>,
     pub max_age: u64,
     pub enabled: bool,
+    /// Inclusive price bounds; must satisfy `0 < min_price < max_price`.
+    pub min_price: i128,
+    pub max_price: i128,
 }
 
 #[contracttype]
@@ -201,6 +208,17 @@ fn validate_publishers(publishers: &Vec<Address>) -> Result<(), OracleError> {
     Ok(())
 }
 
+/// Reject an observation outside the configured inclusive price bounds before
+/// any latest-price state is written. Unconfigured feeds are unrestricted.
+pub fn check_bounds(env: &Env, pair: &AssetPair, price: i128) -> Result<(), OracleError> {
+    if let Some(cfg) = get_config(env, pair) {
+        if price < cfg.min_price || price > cfg.max_price {
+            return Err(OracleError::PriceOutOfBounds);
+        }
+    }
+    Ok(())
+}
+
 /// Register feeds that must not already exist under their canonical identifier.
 pub fn register_batch(env: &Env, entries: &Vec<FeedConfigInput>) -> Result<(), OracleError> {
     let mut pairs = Vec::new(env);
@@ -227,7 +245,10 @@ pub fn configure_batch(env: &Env, entries: &Vec<FeedConfigInput>) -> Result<(), 
     let mut pairs = Vec::new(env);
     for i in 0..entries.len() {
         let e = entries.get_unchecked(i);
-        if e.max_age == 0 {
+        if e.max_age == 0
+            || e.min_price <= 0
+            || e.max_price <= e.min_price
+        {
             return Err(OracleError::InvalidFeedConfig);
         }
         validate_publishers(&e.publishers)?;
@@ -253,6 +274,8 @@ pub fn configure_batch(env: &Env, entries: &Vec<FeedConfigInput>) -> Result<(), 
                 publishers: e.publishers,
                 max_age: e.max_age,
                 enabled: e.enabled,
+                min_price: e.min_price,
+                max_price: e.max_price,
                 version,
             },
         );

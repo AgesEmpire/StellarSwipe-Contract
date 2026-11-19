@@ -36,6 +36,8 @@ fn entry(env: &Env, p: AssetPair, owner: &Address) -> FeedConfigInput {
         publishers: Vec::new(env),
         max_age: 300,
         enabled: true,
+        min_price: 1,
+        max_price: i128::MAX,
     }
 }
 
