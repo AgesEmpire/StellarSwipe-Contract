@@ -130,6 +130,29 @@ const SUPER_MAJORITY_PERCENT: u32 = 75; // 75% for emergency actions
 /// same-ledger governance change from immediately authorizing transfers.
 const DEFAULT_VALIDATOR_ACTIVATION_DELAY_SECONDS: u64 = 3600;
 
+/// Quorum semantics (Issue #1295)
+///
+/// * Normal operations use an explicit `required_signatures` /
+///   `min_validator_signatures` count: exactly that many **distinct**
+///   validators must approve. A threshold of zero is never valid, and a
+///   threshold above the active set size is impossible to satisfy and is
+///   rejected.
+/// * Emergency fast-tracking uses the supported super-majority mode: at least
+///   `ceil(75% × signer_count)` distinct governance signatures.
+/// * The smallest satisfiable set is one validator with a threshold of one.
+///   Both the minimum (1) and the maximum (`validator_count`) are valid
+///   thresholds when the set is non-empty and contains no duplicates.
+fn validate_validator_threshold(
+    env: &Env,
+    validator_count: u32,
+    threshold: u32,
+) -> Result<(), String> {
+    if validator_count == 0 || threshold == 0 || threshold > validator_count {
+        return Err(String::from_str(env, "Invalid validator threshold"));
+    }
+    Ok(())
+}
+
 // ==========================
 // Initialization
 // ==========================
@@ -501,15 +524,9 @@ fn stage_validator_change(
     min_validator_signatures: u32,
 ) -> Result<(), String> {
     // #1294/#1295: reject malformed sets before touching active/pending state.
-    if approved.is_empty()
-        || has_duplicates(&approved)
-        || min_validator_signatures == 0
-        || min_validator_signatures > approved.len()
-    {
-        return Err(String::from_str(
-            env,
-            "Invalid validator set or threshold",
-        ));
+    validate_validator_threshold(env, approved.len(), min_validator_signatures)?;
+    if has_duplicates(&approved) {
+        return Err(String::from_str(env, "Duplicate validators in pending set"));
     }
     let delay = get_validator_activation_delay(env, bridge_id);
     let version = get_active_validator_version(env, bridge_id).saturating_add(1);
@@ -573,6 +590,17 @@ pub fn activate_validator_set(env: &Env, bridge_id: u64) -> Result<u32, String> 
         .persistent()
         .get(&GovernanceDataKey::PendingValidatorSet(bridge_id))
         .ok_or_else(|| String::from_str(env, "No pending validator set"))?;
+
+    // #1295: fail before any storage write if the pending set cannot form a
+    // valid quorum (empty, zero, impossible, or out-of-range threshold).
+    validate_validator_threshold(
+        env,
+        pending.validators.len(),
+        pending.min_validator_signatures,
+    )?;
+    if has_duplicates(&pending.validators) {
+        return Err(String::from_str(env, "Duplicate validators in pending set"));
+    }
 
     let now = env.ledger().timestamp();
     if now < pending.activate_at {
@@ -1199,6 +1227,54 @@ mod tests {
             initial.push_back(b.clone());
             initial.push_back(b);
             assert!(initialize_bridge(&env, 2, initial, 2, create_test_security_config(&env)).is_err());
+        });
+    }
+
+    #[test]
+    fn activation_validates_thresholds_and_boundaries() {
+        let (env, contract_id) = setup_env();
+        env.as_contract(&contract_id, || {
+            let v = Address::generate(&env);
+            let version = get_active_validator_version(&env, 7) + 1;
+
+            // Zero, impossible/out-of-range thresholds are all rejected.
+            for threshold in [0u32, 2] {
+                env.storage().persistent().set(
+                    &GovernanceDataKey::PendingValidatorSet(7),
+                    &PendingValidatorSet {
+                        validators: {
+                            let mut vals = Vec::new(&env);
+                            vals.push_back(v.clone());
+                            vals
+                        },
+                        min_validator_signatures: threshold,
+                        version,
+                        activate_at: 0,
+                    },
+                );
+                assert!(activate_validator_set(&env, 7).is_err());
+                assert!(env
+                    .storage()
+                    .persistent()
+                    .has(&GovernanceDataKey::PendingValidatorSet(7)));
+            }
+
+            // Minimum valid set size and boundary threshold (1 of 1).
+            env.storage().persistent().set(
+                &GovernanceDataKey::PendingValidatorSet(7),
+                &PendingValidatorSet {
+                    validators: {
+                            let mut vals = Vec::new(&env);
+                            vals.push_back(v.clone());
+                            vals
+                        },
+                    min_validator_signatures: 1,
+                    version,
+                    activate_at: 0,
+                },
+            );
+            assert_eq!(activate_validator_set(&env, 7), Ok(version));
+            assert_eq!(get_bridge_validators(&env, 7).unwrap().len(), 1);
         });
     }
 
