@@ -32,6 +32,8 @@ mod test_admin_timelock;
 #[cfg(test)]
 mod test_committee_elections;
 #[cfg(test)]
+mod test_duplicate_actions;
+#[cfg(test)]
 mod test_health;
 #[cfg(test)]
 mod test_pause_propagation;
@@ -671,6 +673,15 @@ impl GovernanceContract {
         proposal_deposit::lock_proposal_deposit(&env, proposal_id, &proposer)?;
         let _ = record_proposal_creation(&env, proposer);
         Ok(proposal_id)
+    }
+
+    /// #1286: validate an action list for duplicate canonical identities without
+    /// creating a proposal. Rejected lists never reserve IDs, bonds or power.
+    pub fn validate_proposal_actions(
+        env: Env,
+        actions: Vec<ProposalType>,
+    ) -> Result<(), GovernanceError> {
+        proposals::validate_no_duplicate_actions(&env, &actions)
     }
 
     pub fn proposal(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {

@@ -455,6 +455,9 @@ pub fn create_proposal(
 
     validate_proposal(env, &proposal_type)?;
     validate_execution_payload(&proposal_type, &execution_payload)?;
+    // #1286: duplicate detection runs before any ID / deposit / snapshot work.
+    let actions: Vec<ProposalType> = Vec::from_slice(env, &[proposal_type.clone()]);
+    validate_no_duplicate_actions(env, &actions)?;
 
     let mut state = get_proposals_state(env);
     let id = state.next_proposal_id;
@@ -785,6 +788,7 @@ pub fn simulate_proposal(env: &Env, proposal_id: u64) -> Result<SimulationResult
 
 pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
     let mut proposal = get_proposal(env, proposal_id)?;
+    let previous_status = proposal.status.clone();
     if env.ledger().timestamp() < proposal.voting_ends {
         return Err(GovernanceError::InvalidDuration);
     }
@@ -1387,6 +1391,101 @@ pub fn get_effective_voting_power(env: &Env, user: &Address) -> i128 {
     }
 
     own.saturating_add(delegated)
+}
+
+/// #1286: canonical action identity.
+///
+/// Every action is rendered into a single deterministic string containing its
+/// variant tag and *all* of its parameters. Two actions have the same identity
+/// exactly when they would perform the same on-chain operation, regardless of
+/// the order in which they appear in a proposal's action list.
+pub fn action_identity(env: &Env, action: &ProposalType) -> String {
+    match action {
+        ProposalType::ParameterChange(name, current, proposed) => concat_parts(
+            env,
+            &[
+                Part::Static("ParameterChange|"),
+                Part::Dynamic(name),
+                Part::Static("|"),
+                Part::Dynamic(&i128_to_string(env, *current)),
+                Part::Static("|"),
+                Part::Dynamic(&i128_to_string(env, *proposed)),
+            ],
+        ),
+        ProposalType::TreasurySpend(recipient, amount, asset, purpose) => {
+            let issuer = match &asset.issuer {
+                Some(address) => address.to_string(),
+                None => String::from_str(env, "native"),
+            };
+            concat_parts(
+                env,
+                &[
+                    Part::Static("TreasurySpend|"),
+                    Part::Dynamic(&recipient.to_string()),
+                    Part::Static("|"),
+                    Part::Dynamic(&i128_to_string(env, *amount)),
+                    Part::Static("|"),
+                    Part::Dynamic(&asset.code),
+                    Part::Static("|"),
+                    Part::Dynamic(&issuer),
+                    Part::Static("|"),
+                    Part::Dynamic(purpose),
+                ],
+            )
+        }
+        ProposalType::FeatureToggle(feature, enabled) => concat_parts(
+            env,
+            &[
+                Part::Static("FeatureToggle|"),
+                Part::Dynamic(feature),
+                Part::Static("|"),
+                Part::Dynamic(&bool_to_string(env, *enabled)),
+            ],
+        ),
+        ProposalType::ContractUpgrade(name, hash) => concat_parts(
+            env,
+            &[
+                Part::Static("ContractUpgrade|"),
+                Part::Dynamic(name),
+                Part::Static("|"),
+                Part::Dynamic(&hash.to_string()),
+            ],
+        ),
+        ProposalType::SignalProposal(text) => concat_parts(
+            env,
+            &[
+                Part::Static("SignalProposal|"),
+                Part::Dynamic(text),
+            ],
+        ),
+        ProposalType::Custom(executor) => concat_parts(
+            env,
+            &[
+                Part::Static("Custom|"),
+                Part::Dynamic(&executor.to_string()),
+            ],
+        ),
+    }
+}
+
+/// #1286: reject a proposal whose action list contains a repeated canonical
+/// action identity. Callers must invoke this *before* reserving a proposal ID,
+/// snapshotting voting power or locking a deposit.
+pub fn validate_no_duplicate_actions(
+    env: &Env,
+    actions: &Vec<ProposalType>,
+) -> Result<(), GovernanceError> {
+    let mut seen: Vec<String> = Vec::new(env);
+    let mut i = 0u32;
+    while i < actions.len() {
+        let identity = action_identity(env, &actions.get(i).unwrap());
+        if seen.contains(&identity) {
+            return Err(GovernanceError::DuplicateProposalAction);
+        }
+        seen.push_back(identity);
+        i += 1;
+    }
+    Ok(())
 }
 
 /// Validate a proposal's action and its embedded parameters against the
