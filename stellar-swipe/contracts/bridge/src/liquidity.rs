@@ -528,7 +528,8 @@ pub fn compute_mint_shares(
 }
 
 /// Withdraws `lp_amount` of `provider`'s liquidity, crediting proceeds to
-/// `recipient` (Issue #1319).
+/// `recipient` (Issue #1319). Shares burned and both asset releases are
+/// computed from one pre-withdrawal snapshot (Issue #1316).
 ///
 /// `provider.require_auth()` must already have been checked by the
 /// integrating contract entrypoint — this function additionally binds the
@@ -559,25 +560,37 @@ pub fn remove_liquidity(
         return Err(BridgeError::InvalidAmount);
     }
 
-    let amount_a = checked(
-        pool.reserve_a
-            .checked_mul(lp_amount)
-            .map(|v| v / pool.total_lp_tokens),
-    )?;
-    let amount_b = checked(
-        pool.reserve_b
-            .checked_mul(lp_amount)
-            .map(|v| v / pool.total_lp_tokens),
-    )?;
+    // Issue #1316: every amount is derived from this one pre-withdrawal
+    // snapshot, using overflow-safe floor division. A full exit releases the
+    // whole reserve so no reserve is orphaned when the supply reaches zero.
+    let (amount_a, amount_b) = if lp_amount == pool.total_lp_tokens {
+        (pool.reserve_a, pool.reserve_b)
+    } else {
+        (
+            checked(checked_mul_div_floor(
+                pool.reserve_a,
+                lp_amount,
+                pool.total_lp_tokens,
+            ))?,
+            checked(checked_mul_div_floor(
+                pool.reserve_b,
+                lp_amount,
+                pool.total_lp_tokens,
+            ))?,
+        )
+    };
+    // Pro-rata amounts can never exceed the snapshot they came from.
+    if amount_a < 0 || amount_a > pool.reserve_a || amount_b < 0 || amount_b > pool.reserve_b {
+        return Err(BridgeError::InvalidAmount);
+    }
     let reward = if position.lp_tokens == 0 {
         0
     } else {
-        checked(
-            position
-                .rewards_earned
-                .checked_mul(lp_amount)
-                .map(|v| v / position.lp_tokens),
-        )?
+        checked(checked_mul_div_floor(
+            position.rewards_earned,
+            lp_amount,
+            position.lp_tokens,
+        ))?
     };
 
     position.lp_tokens = checked(position.lp_tokens.checked_sub(lp_amount))?;
@@ -1569,6 +1582,77 @@ mod tests {
                 position_before.lp_tokens + 1,
             );
             assert!(result.is_err());
+            assert_eq!(get_pool(&env, pool_id).unwrap(), pool_before);
+            assert_eq!(get_position(&env, provider, pool_id), position_before);
+        });
+    }
+
+    // ── Issue #1316: proportional withdrawals from one snapshot ─────────────
+
+    #[test]
+    fn withdrawal_releases_each_reserve_proportionally() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            add_liquidity(&env, provider.clone(), pool_id, 10_000, 20_000).unwrap();
+            let before = get_pool(&env, pool_id).unwrap();
+            let position_before = get_position(&env, provider.clone(), pool_id);
+            let burn = position_before.lp_tokens / 4;
+
+            let (amount_a, amount_b, _) = remove_liquidity(
+                &env,
+                provider.clone(),
+                provider.clone(),
+                pool_id,
+                burn,
+            )
+            .unwrap();
+
+            assert_eq!(
+                amount_a,
+                checked_mul_div_floor(before.reserve_a, burn, before.total_lp_tokens).unwrap()
+            );
+            assert_eq!(
+                amount_b,
+                checked_mul_div_floor(before.reserve_b, burn, before.total_lp_tokens).unwrap()
+            );
+            assert!(
+                (amount_b - amount_a * 2).abs() <= 1,
+                "reserve ratio 1:2 must be preserved up to rounding"
+            );
+
+            let after = get_pool(&env, pool_id).unwrap();
+            assert_eq!(after.reserve_a, before.reserve_a - amount_a);
+            assert_eq!(after.reserve_b, before.reserve_b - amount_b);
+            assert_eq!(after.total_lp_tokens, before.total_lp_tokens - burn);
+            assert_eq!(
+                get_position(&env, provider, pool_id).lp_tokens,
+                position_before.lp_tokens - burn
+            );
+        });
+    }
+
+    #[test]
+    fn over_withdrawal_leaves_pool_and_position_unchanged() {
+        let (env, contract_id) = setup();
+        let provider = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let pool_id = new_pool(&env, 0);
+            add_liquidity(&env, provider.clone(), pool_id, 2_000, 3_000).unwrap();
+            let pool_before = get_pool(&env, pool_id).unwrap();
+            let position_before = get_position(&env, provider.clone(), pool_id);
+
+            assert_eq!(
+                remove_liquidity(
+                    &env,
+                    provider.clone(),
+                    provider.clone(),
+                    pool_id,
+                    position_before.lp_tokens + 1,
+                ),
+                Err(BridgeError::InvalidAmount)
+            );
             assert_eq!(get_pool(&env, pool_id).unwrap(), pool_before);
             assert_eq!(get_position(&env, provider, pool_id), position_before);
         });
