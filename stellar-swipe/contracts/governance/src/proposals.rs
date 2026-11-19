@@ -660,12 +660,8 @@ pub fn cast_vote(
         );
     }
 
-    if now < proposal.voting_starts {
-        return Err(GovernanceError::VotingNotStarted);
-    }
-    if now >= proposal.voting_ends {
-        return Err(GovernanceError::VotingEnded);
-    }
+    // #1289: one explicit deadline rule for both submission and replacement.
+    crate::voting::require_voting_open(env, &proposal)?;
     if proposal.status != ProposalStatus::Pending && proposal.status != ProposalStatus::Active {
         return Err(GovernanceError::ProposalNotActive);
     }

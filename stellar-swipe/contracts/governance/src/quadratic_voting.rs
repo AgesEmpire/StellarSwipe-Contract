@@ -228,12 +228,8 @@ pub fn cast_quadratic_vote(
 
     let mut proposal = get_proposal(env, proposal_id)?;
     let now = env.ledger().timestamp();
-    if now < proposal.voting_starts {
-        return Err(GovernanceError::VotingNotStarted);
-    }
-    if now >= proposal.voting_ends {
-        return Err(GovernanceError::VotingEnded);
-    }
+    // #1289: share the single voting-deadline rule with all vote paths.
+    crate::voting::require_voting_open(env, &proposal)?;
     if proposal.status != ProposalStatus::Pending && proposal.status != ProposalStatus::Active {
         return Err(GovernanceError::ProposalNotActive);
     }
