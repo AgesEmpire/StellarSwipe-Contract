@@ -11,6 +11,7 @@ use stellar_swipe_common::SECONDS_PER_DAY;
 
 mod validators;
 
+pub mod asset_amount;
 pub use validators::{ValidatorApproval, ValidatorApprovalKind, ValidatorSet};
 
 #[contracterror]
@@ -690,6 +691,42 @@ impl BridgeContract {
         )
     }
 
+    /// Register an inbound message after converting the source-chain amount
+    /// into the wrapped asset's decimal scale (Issue #1299). Conversion is
+    /// exact and checked, so dust or overflow fails before any mint can run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initiate_lock_mint_with_decimals(
+        env: Env,
+        user: Address,
+        source_chain: ChainId,
+        destination_chain: ChainId,
+        source_asset: String,
+        wrapped_asset: String,
+        amount: i128,
+        source_decimals: u32,
+        wrapped_decimals: u32,
+        source_tx_hash: String,
+        source_nonce: u64,
+        destination_recipient: String,
+        expires_at: u64,
+    ) -> Result<u64, BridgeError> {
+        let converted =
+            asset_amount::convert_asset_amount(&env, amount, source_decimals, wrapped_decimals)?;
+        initiate_lock_mint_inner(
+            env,
+            user,
+            source_chain,
+            destination_chain,
+            source_asset,
+            wrapped_asset,
+            converted,
+            source_tx_hash,
+            source_nonce,
+            destination_recipient,
+            expires_at,
+        )
+    }
+
     /// Canonical digest of a bridge message that validators sign off-chain.
     /// Covers the deployment id, route, source tx hash/nonce, user, asset,
     /// amount, recipient and `expires_at`, so an approval cannot be reused
@@ -978,6 +1015,18 @@ impl BridgeContract {
 
     pub fn get_transfer(env: Env, transfer_id: u64) -> Result<BridgeTransfer, BridgeError> {
         get_transfer(&env, transfer_id)
+    }
+
+    /// Convert an amount between decimal scales before minting or releasing.
+    /// Exact conversion only: overflow, unsupported gaps, and dust fail
+    /// before any balance or transfer state is written (Issue #1299).
+    pub fn convert_asset_amount(
+        env: Env,
+        amount: i128,
+        from_decimals: u32,
+        to_decimals: u32,
+    ) -> Result<i128, BridgeError> {
+        asset_amount::convert_asset_amount(&env, amount, from_decimals, to_decimals)
     }
 
     pub fn get_bridge_config(env: Env) -> Result<BridgeConfig, BridgeError> {
