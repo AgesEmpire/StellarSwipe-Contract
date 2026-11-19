@@ -231,6 +231,51 @@ pub enum ProposalStatus {
     /// voting opened.  This status is immutable once set — the proposal is
     /// permanently excluded from future voting-eligible listings.
     Withdrawn,
+    /// #1287: proposal was vetoed by the guardian during the veto window.
+    Vetoed,
+    /// #1288: synthetic "prior" state for a newly created proposal.
+    Uninitialized,
+}
+
+/// #1288: structured proposal lifecycle transition event.
+///
+/// Emitted for every valid state change. `previous_status` is
+/// `ProposalStatus::Uninitialized` only for creation. `kind` names the transition ("created", "voting_started",
+/// "voting_completed", "queued", "vetoed", "cancelled", "executed",
+/// "expired"), so an off-chain consumer can replay the event stream and
+/// reconstruct a proposal's state without reading contract storage.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalTransitionEvent {
+    pub proposal_id: u64,
+    pub previous_status: ProposalStatus,
+    pub new_status: ProposalStatus,
+    pub actor: Address,
+    pub ledger_time: u64,
+    pub kind: String,
+}
+
+/// Publish a documented proposal state transition (Issue #1288).
+pub fn publish_transition(
+    env: &Env,
+    proposal_id: u64,
+    previous_status: ProposalStatus,
+    new_status: ProposalStatus,
+    actor: &Address,
+    kind: &str,
+) {
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("pstate")),
+        ProposalTransitionEvent {
+            proposal_id,
+            previous_status,
+            new_status,
+            actor: actor.clone(),
+            ledger_time: env.ledger().timestamp(),
+            kind: String::from_str(env, kind),
+        },
+    );
 }
 
 #[contracttype]
@@ -282,6 +327,12 @@ pub struct Proposal {
     /// Used as the quadratic-adjusted total supply for quorum checks.
     pub quadratic_total_supply: i128,
     // ── #796: Treasury spend proposal execution expiry ───────────────────────
+    /// #1287: end of the guardian veto window. Set at creation as
+    /// `voting_ends + GovernanceConfig::veto_window`. A proposal cannot be
+    /// executed while `now < veto_ends_at`.
+    pub veto_ends_at: u64,
+    /// #1287: address of the guardian that vetoed this proposal, if any.
+    pub vetoed_by: Option<Address>,
     /// Ledger timestamp after which a `Succeeded` proposal can no longer be
     /// executed. Set at creation as `voting_ends + EXECUTION_WINDOW`. Prevents
     /// approved-but-unexecuted spend authorisations from locking treasury
@@ -308,6 +359,9 @@ pub struct GovernanceConfig {
     /// Mandatory discussion window (seconds) before votes can be cast (Issue #667).
     /// A value of 0 disables the discussion period.
     pub discussion_duration: u64,
+    /// #1287: seconds after `voting_ends` during which the guardian may veto
+    /// a passed proposal. Zero disables the veto window (legacy behaviour).
+    pub veto_window: u64,
 }
 
 #[contracttype]
@@ -357,6 +411,7 @@ pub fn default_governance_config() -> GovernanceConfig {
         approval_threshold: 5_000,
         execution_delay: 0,
         discussion_duration: 0,
+        veto_window: 0,
     }
 }
 
@@ -509,6 +564,8 @@ pub fn create_proposal(
         voters: Map::new(env),
         voter_list: Vec::new(env),
         executed_at: None,
+        veto_ends_at: voting_ends.saturating_add(config.veto_window),
+        vetoed_by: None,
         discussion_ends_at,
         category,
         use_quadratic_voting,
@@ -871,8 +928,18 @@ pub fn execute_proposal(
 ) -> Result<ProposalStatus, GovernanceError> {
     executor.require_auth();
     let mut proposal = get_proposal(env, proposal_id)?;
+    if proposal.status == ProposalStatus::Vetoed || proposal.vetoed_by.is_some() {
+        return Err(GovernanceError::ProposalVetoed);
+    }
     if proposal.status != ProposalStatus::Succeeded {
         return Err(GovernanceError::ProposalNotApproved);
+    }
+
+    let now_check = env.ledger().timestamp();
+    // #1287: execution is blocked for the whole explicit veto window,
+    // including its final ledger (interval: [voting_ends, veto_ends_at)).
+    if now_check < proposal.veto_ends_at {
+        return Err(GovernanceError::VetoWindowOpen);
     }
 
     let ready = proposal
@@ -967,6 +1034,49 @@ pub fn mark_proposal_executed(env: &Env, proposal_id: u64) -> Result<(), Governa
     proposal.status = ProposalStatus::Executed;
     proposal.executed_at = Some(env.ledger().timestamp());
     put_proposal(env, &proposal)
+}
+
+/// #1287: guardian veto of a passed proposal during its explicit veto window.
+///
+/// The window is `[voting_ends, veto_ends_at)`; at or after `veto_ends_at` the
+/// proposal is executable and can no longer be vetoed. Only the address in
+/// `StorageKey::Guardian` may call this, and it must authorize.
+pub fn veto_proposal(
+    env: &Env,
+    proposal_id: u64,
+    guardian: Address,
+) -> Result<ProposalStatus, GovernanceError> {
+    guardian.require_auth();
+    let configured: Address = env
+        .storage()
+        .instance()
+        .get(&StorageKey::Guardian)
+        .ok_or(GovernanceError::GuardianNotSet)?;
+    if configured != guardian {
+        return Err(GovernanceError::NotGuardian);
+    }
+
+    let mut proposal = get_proposal(env, proposal_id)?;
+    if proposal.status != ProposalStatus::Succeeded {
+        return Err(GovernanceError::ProposalNotApproved);
+    }
+    let now = env.ledger().timestamp();
+    if now < proposal.voting_ends || now >= proposal.veto_ends_at {
+        return Err(GovernanceError::VetoWindowOpen);
+    }
+
+    proposal.status = ProposalStatus::Vetoed;
+    publish_transition(
+        env,
+        proposal_id,
+        ProposalStatus::Succeeded,
+        ProposalStatus::Vetoed,
+        &guardian,
+        "vetoed",
+    );
+    proposal.vetoed_by = Some(guardian);
+    put_proposal(env, &proposal)?;
+    Ok(ProposalStatus::Vetoed)
 }
 
 pub fn cancel_proposal(

@@ -779,6 +779,18 @@ impl GovernanceContract {
         proposals::execute_proposal(&env, proposal_id, executor)
     }
 
+    /// #1287: veto a passed proposal during its explicit veto window.
+    /// Only the configured guardian (which must authorize) may call this.
+    pub fn veto_proposal(
+        env: Env,
+        proposal_id: u64,
+        guardian: Address,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        require_not_paused(&env)?;
+        proposals::veto_proposal(&env, proposal_id, guardian)
+    }
+
     pub fn migrate_storage(env: Env, admin: Address, from: u32) -> Result<u32, GovernanceError> {
         require_admin(&env, &admin)?;
         let current: u32 = env

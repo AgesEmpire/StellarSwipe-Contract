@@ -169,6 +169,7 @@ fn configure_governance_timelocked_rejects_without_queue() {
         approval_threshold: 6667,
         execution_delay: 0,
         discussion_duration: 0,
+        veto_window: 0,
     };
     let result = c.try_configure_governance_timelocked(&admin, &0u64, &config);
     assert_eq!(result, Err(Ok(GovernanceError::ActionNotFound)));
@@ -186,6 +187,7 @@ fn configure_governance_timelocked_succeeds_after_delay() {
         approval_threshold: 6667,
         execution_delay: 0,
         discussion_duration: 0,
+        veto_window: 0,
     };
     let id = c.queue_configure_governance(&admin, &config);
     env.ledger().set_timestamp(TWO_DAYS + 1);
@@ -409,6 +411,7 @@ fn enforcement_blocks_every_category_b_direct_entry_point() {
         approval_threshold: 6_667,
         execution_delay: 0,
         discussion_duration: 0,
+        veto_window: 0,
     };
 
     assert_bypass(c.try_set_treasury_asset(&admin, &usdc, &1i128));
