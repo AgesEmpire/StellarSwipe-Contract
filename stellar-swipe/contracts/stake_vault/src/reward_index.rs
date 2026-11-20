@@ -186,6 +186,33 @@ pub fn accrued(env: &Env, staker: &Address, asset: &Address) -> i128 {
     get_i128(env, &RewardIndexKey::Accrued(staker.clone(), asset.clone()))
 }
 
+/// Issue #1437: `accrued` only reflects rewards already committed at the
+/// staker's last checkpoint (their last deposit/withdraw/claim). Any reward
+/// funded via `notify_reward` since then sits in the global index bump but
+/// is invisible to a plain `accrued` query until the staker's next state
+/// change triggers `checkpoint`. This computes that uncommitted delta
+/// *without* mutating any storage, so callers can query a staker's true
+/// total claimable value (settled + pending) at any time.
+pub fn pending_accrual(env: &Env, staker: &Address, asset: &Address) -> i128 {
+    let stake = user_stake(env, staker);
+    if stake <= 0 {
+        return 0;
+    }
+    let g = global_index(env, asset);
+    let u = user_index(env, staker, asset).unwrap_or(g);
+    let delta = g.saturating_sub(u);
+    if delta <= 0 {
+        return 0;
+    }
+    stake.saturating_mul(delta) / INDEX_SCALE
+}
+
+/// Total value (already-settled accrued balance plus pending/unrealized
+/// accrual since the staker's last checkpoint) for `staker` in `asset`.
+pub fn total_accrued_value(env: &Env, staker: &Address, asset: &Address) -> i128 {
+    accrued(env, staker, asset).saturating_add(pending_accrual(env, staker, asset))
+}
+
 /// Checkpoint and zero the staker's accrued balance, returning the amount.
 pub fn take_accrued(env: &Env, staker: &Address, asset: &Address) -> Result<i128, StakeVaultError> {
     checkpoint(env, staker)?;

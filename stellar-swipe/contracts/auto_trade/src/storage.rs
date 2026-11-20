@@ -15,6 +15,24 @@ pub struct Signal {
     pub base_asset: u32,
 }
 
+/// Issue #1438: cumulative fill-tracking for an auto-trade "intent" (the
+/// combination of a user and a signal they are trading against). A single
+/// `execute_trade` call may only partially fill the user's desired amount;
+/// this record lets subsequent calls top up the fill instead of either
+/// silently dropping the unfilled remainder or double-counting against the
+/// originally requested amount.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntentFill {
+    pub user: Address,
+    pub signal_id: u64,
+    /// Total amount the user has asked to fill for this intent across all
+    /// `execute_trade` calls so far (grows if the user raises their ask).
+    pub total_requested: i128,
+    /// Total amount actually filled so far across all partial executions.
+    pub total_filled: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RateLimitInfo {
@@ -31,6 +49,73 @@ pub enum DataKey {
     /// Last ledger timestamp at which `(user, signal_id)` executed a trade
     /// (per-signal execution rate limit).
     LastExecution(Address, u64),
+    /// Issue #1438: cumulative fill state for a (user, signal) intent.
+    IntentFill(Address, u64),
+}
+
+/// Get the cumulative fill record for a (user, signal_id) intent, if any.
+pub fn get_intent_fill(env: &Env, user: &Address, signal_id: u64) -> Option<IntentFill> {
+    crud_get(
+        env,
+        StorageTier::Persistent,
+        &DataKey::IntentFill(user.clone(), signal_id),
+    )
+}
+
+/// Persist the cumulative fill record for a (user, signal_id) intent.
+pub fn set_intent_fill(env: &Env, fill: &IntentFill) {
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &DataKey::IntentFill(fill.user.clone(), fill.signal_id),
+        fill,
+    );
+}
+
+/// Remaining amount still to be filled for a (user, signal_id) intent,
+/// given a freshly requested `amount`. If the user has already partially
+/// filled this intent, the remaining amount is capped so the cumulative
+/// filled amount never exceeds the larger of the prior requested amount or
+/// the new request (allowing the user to top up their ask).
+pub fn remaining_intent_amount(env: &Env, user: &Address, signal_id: u64, amount: i128) -> i128 {
+    match get_intent_fill(env, user, signal_id) {
+        Some(fill) => {
+            let total_requested = if amount > fill.total_requested {
+                amount
+            } else {
+                fill.total_requested
+            };
+            let remaining = total_requested - fill.total_filled;
+            if remaining < 0 {
+                0
+            } else {
+                remaining
+            }
+        }
+        None => amount,
+    }
+}
+
+/// Record that `newly_filled` additional units were filled for a
+/// (user, signal_id) intent whose latest request was `requested_amount`.
+pub fn record_intent_fill(
+    env: &Env,
+    user: &Address,
+    signal_id: u64,
+    requested_amount: i128,
+    newly_filled: i128,
+) {
+    let mut fill = get_intent_fill(env, user, signal_id).unwrap_or(IntentFill {
+        user: user.clone(),
+        signal_id,
+        total_requested: 0,
+        total_filled: 0,
+    });
+    if requested_amount > fill.total_requested {
+        fill.total_requested = requested_amount;
+    }
+    fill.total_filled += newly_filled;
+    set_intent_fill(env, &fill);
 }
 
 /// Get a signal by ID
