@@ -699,6 +699,17 @@ impl AutoTradeContract {
             return Err(AutoTradeError::InsufficientBalance);
         }
 
+        // Issue #1438: this intent (user, signal) may already be partially
+        // filled from a previous `execute_trade` call. Only attempt to fill
+        // the remaining unfilled amount so repeated calls top up the fill
+        // instead of silently losing track of (or double-filling) the
+        // original request.
+        let remaining_amount = storage::remaining_intent_amount(&env, &user, signal_id, amount);
+        if remaining_amount <= 0 {
+            return Err(AutoTradeError::InvalidAmount);
+        }
+        let amount = remaining_amount;
+
         let is_sell = false;
 
         risk::set_asset_price(&env, signal.base_asset, signal.price);
@@ -739,9 +750,21 @@ impl AutoTradeContract {
             OrderType::Limit => sdex::execute_limit_order(&env, &user, &signal, amount)?,
         };
 
+        // Issue #1438: record this call's contribution toward the intent's
+        // cumulative fill, then derive status from the intent's total
+        // filled-vs-requested, not just this single call's amount.
+        if execution.executed_amount > 0 {
+            storage::record_intent_fill(&env, &user, signal_id, amount, execution.executed_amount);
+        }
+        let intent_fill = storage::get_intent_fill(&env, &user, signal_id);
+        let (total_requested, total_filled) = match &intent_fill {
+            Some(f) => (f.total_requested, f.total_filled),
+            None => (amount, execution.executed_amount),
+        };
+
         let status = if execution.executed_amount == 0 {
             TradeStatus::Failed
-        } else if execution.executed_amount < amount {
+        } else if total_filled < total_requested {
             TradeStatus::PartiallyFilled
         } else {
             TradeStatus::Filled
