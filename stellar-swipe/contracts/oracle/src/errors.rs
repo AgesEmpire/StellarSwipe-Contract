@@ -86,6 +86,9 @@ pub enum OracleError {
     FeedDisabled = 36,
     /// Observation is outside the feed's configured [min, max] price bounds (Issue #1304).
     PriceOutOfBounds = 37,
+    /// The submitted round ID is a replay or is older than the feed's latest
+    /// accepted round (Issue #1308).
+    StaleRound = 38,
 }
 
 impl OracleError {
@@ -180,6 +183,10 @@ impl OracleError {
             OracleError::FeedDisabled => "the feed is disabled and does not accept observations",
             OracleError::PriceOutOfBounds => {
                 "observation is outside the feed's configured price bounds"
+            }
+            OracleError::StaleRound => {
+                "observation round is a replay or older than the feed's latest accepted round"
+            }
             }
         }
     }

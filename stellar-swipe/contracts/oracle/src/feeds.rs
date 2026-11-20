@@ -368,23 +368,50 @@ pub fn authorize_publisher(
     Ok(())
 }
 
-/// Record an accepted round for the feed.
-pub fn record_round(env: &Env, pair: &AssetPair) {
-    let key = FeedKey::Round(lookup_pair(env, pair));
-    let round = env
-        .storage()
+/// Highest round accepted so far for `pair` (0 when the feed has no rounds).
+pub fn last_round(env: &Env, pair: &AssetPair) -> u64 {
+    let key = FeedKey::Round(pair.clone());
+    env.storage()
         .persistent()
         .get::<_, FeedRound>(&key)
         .map(|r| r.round)
         .unwrap_or(0)
-        + 1;
+}
+
+fn store_round(env: &Env, pair: &AssetPair, round: u64) {
     env.storage().persistent().set(
-        &key,
+        &FeedKey::Round(pair.clone()),
         &FeedRound {
             round,
             updated_at: env.ledger().timestamp(),
         },
     );
+}
+
+/// The next auto-assigned round for `pair`.
+pub fn next_round(env: &Env, pair: &AssetPair) -> u64 {
+    last_round(env, pair) + 1
+}
+
+/// Issue #1308: accept an explicitly supplied feed-local round ID.
+///
+/// Only a strictly higher round is admitted, so a replay (same round) or a
+/// regressed round is rejected and leaves the current price and round state
+/// untouched. Gaps are allowed: a higher round advances the feed's counter to
+/// the supplied value, which is what makes the bound monotonic rather than
+/// merely sequential. Round state is per asset pair, so feeds advance
+/// independently.
+pub fn accept_round(env: &Env, pair: &AssetPair, round_id: u64) -> Result<(), OracleError> {
+    if round_id == 0 || round_id <= last_round(env, pair) {
+        return Err(OracleError::StaleRound);
+    }
+    store_round(env, pair, round_id);
+    Ok(())
+}
+
+/// Record an accepted round for the feed (auto-incrementing path).
+pub fn record_round(env: &Env, pair: &AssetPair) {
+    store_round(env, pair, next_round(env, pair));
 }
 
 pub fn status(env: &Env, pair: &AssetPair) -> FeedStatus {
