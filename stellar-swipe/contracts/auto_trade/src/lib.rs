@@ -1014,6 +1014,20 @@ impl AutoTradeContract {
         history::get_trade_history(&env, &user, offset, limit)
     }
 
+    /// Get paginated trade history (newest first) using stable cursor
+    /// pagination keyed by trade id (Issue #1446). Pass `after_id = None`
+    /// for the first page, then feed back the returned cursor to continue.
+    /// Unlike `get_trade_history`'s offset parameter, this is stable under
+    /// concurrent trade recording between page fetches.
+    pub fn get_trade_history_cursor(
+        env: Env,
+        user: Address,
+        after_id: Option<u64>,
+        limit: u32,
+    ) -> (soroban_sdk::Vec<history::HistoryTrade>, Option<u64>) {
+        history::get_trade_history_by_cursor(&env, &user, after_id, limit)
+    }
+
     /// Get user portfolio with holdings and P&L
     pub fn get_portfolio(env: Env, user: Address) -> portfolio::Portfolio {
         portfolio::get_portfolio(&env, &user)
