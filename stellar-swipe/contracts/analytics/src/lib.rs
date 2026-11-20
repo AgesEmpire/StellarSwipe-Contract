@@ -412,7 +412,19 @@ impl AnalyticsContract {
         env.storage()
             .instance()
             .get(&DataKey::ProviderRiskScore(provider))
-            .unwrap_or(risk_score::ScoreResult::InsufficientData)
+            .unwrap_or_else(|| {
+                // Issue #1448: never seen this provider at all — report that
+                // plainly as zero coverage rather than reusing a stale cached
+                // result or implying a computed zero-risk score.
+                risk_score::ScoreResult::InsufficientData(risk_score::Coverage {
+                    sample_count: 0,
+                    min_required: risk_score::get_min_sample_size(&env),
+                    window_size: risk_score::get_trailing_window_size(&env),
+                    oldest_sample_timestamp: 0,
+                    newest_sample_timestamp: 0,
+                    freshness_age_secs: 0,
+                })
+            })
     }
 
     // ── Issue #753: TTL-based result cache ────────────────────────────────────
@@ -796,11 +808,14 @@ mod tests {
 
         let provider = Address::generate(&env);
 
-        // Initial state
-        assert_eq!(
-            client.get_risk_adjusted_score(&provider),
-            risk_score::ScoreResult::InsufficientData
-        );
+        // Initial state: zero coverage, nothing recorded yet.
+        match client.get_risk_adjusted_score(&provider) {
+            risk_score::ScoreResult::InsufficientData(coverage) => {
+                assert_eq!(coverage.sample_count, 0);
+                assert_eq!(coverage.min_required, 3);
+            }
+            other => panic!("expected InsufficientData, got {:?}", other),
+        }
 
         // Record 3 returns
         env.ledger().with_mut(|l| l.timestamp = 100);
@@ -809,16 +824,28 @@ mod tests {
 
         // Not enough data yet (min 3), updating shouldn't crash but return InsufficientData
         let score_intermediate = client.update_risk_adjusted_score(&provider);
-        assert_eq!(
-            score_intermediate,
-            risk_score::ScoreResult::InsufficientData
-        );
+        match &score_intermediate {
+            risk_score::ScoreResult::InsufficientData(coverage) => {
+                assert_eq!(coverage.sample_count, 2);
+                assert_eq!(coverage.min_required, 3);
+            }
+            other => panic!("expected InsufficientData, got {:?}", other),
+        }
 
+        env.ledger().with_mut(|l| l.timestamp = 150);
         client.record_provider_outcome(&provider, &1000);
 
         // Recompute
         let final_score = client.update_risk_adjusted_score(&provider);
-        assert!(matches!(final_score, risk_score::ScoreResult::Score(_)));
+        match &final_score {
+            risk_score::ScoreResult::Score(_, coverage) => {
+                assert_eq!(coverage.sample_count, 3);
+                // Freshest sample was recorded at ledger time 150.
+                assert_eq!(coverage.newest_sample_timestamp, 150);
+                assert_eq!(coverage.freshness_age_secs, 0);
+            }
+            other => panic!("expected Score, got {:?}", other),
+        }
 
         // Check view entrypoint matches what keeper updated
         let view_score = client.get_risk_adjusted_score(&provider);

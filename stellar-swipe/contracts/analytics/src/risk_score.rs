@@ -23,11 +23,41 @@ pub struct HistoricReturn {
     pub timestamp: u64,
 }
 
+/// Issue #1448: source coverage and freshness for a risk score computation,
+/// so callers can tell a well-supported score apart from one computed (or
+/// not computed) from incomplete or stale data instead of silently treating
+/// missing samples as zero risk.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Coverage {
+    /// Number of return samples actually used (bounded by the trailing
+    /// window size).
+    pub sample_count: u32,
+    /// Minimum sample count required for a score to be computed.
+    pub min_required: u32,
+    /// Maximum number of samples the trailing window retains.
+    pub window_size: u32,
+    /// Ledger timestamp of the oldest sample contributing to this result,
+    /// or `0` if there are no samples.
+    pub oldest_sample_timestamp: u64,
+    /// Ledger timestamp of the newest (most recent) sample contributing to
+    /// this result, or `0` if there are no samples.
+    pub newest_sample_timestamp: u64,
+    /// Seconds between `newest_sample_timestamp` and the current ledger
+    /// timestamp — how stale the freshest contributing data point is.
+    /// `0` if there are no samples.
+    pub freshness_age_secs: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScoreResult {
-    InsufficientData,
-    Score(i128),
+    /// Fewer than `min_required` samples were available. `Coverage` still
+    /// reports how many samples *were* found (possibly zero), so a caller
+    /// can distinguish "no data at all" from "almost enough data" instead
+    /// of treating both as an implicit zero-risk score.
+    InsufficientData(Coverage),
+    Score(i128, Coverage),
 }
 
 /// Computes fixed-point multiplication: (a * b) / SCALE
@@ -115,14 +145,49 @@ pub fn record_provider_return(env: &Env, provider: &Address, ret: HistoricReturn
         .set(&DataKey::ProviderReturns(provider.clone()), &returns);
 }
 
+/// Builds the [`Coverage`] metadata for `returns` relative to `now`.
+fn build_coverage(env: &Env, returns: &Vec<HistoricReturn>, min_sample: u32, now: u64) -> Coverage {
+    let window_size = get_trailing_window_size(env);
+    let (oldest_ts, newest_ts) = if returns.is_empty() {
+        (0u64, 0u64)
+    } else {
+        let mut oldest = u64::MAX;
+        let mut newest = 0u64;
+        for ret in returns.iter() {
+            if ret.timestamp < oldest {
+                oldest = ret.timestamp;
+            }
+            if ret.timestamp > newest {
+                newest = ret.timestamp;
+            }
+        }
+        (oldest, newest)
+    };
+    let freshness_age_secs = if newest_ts == 0 {
+        0
+    } else {
+        now.saturating_sub(newest_ts)
+    };
+    Coverage {
+        sample_count: returns.len(),
+        min_required: min_sample,
+        window_size,
+        oldest_sample_timestamp: oldest_ts,
+        newest_sample_timestamp: newest_ts,
+        freshness_age_secs,
+    }
+}
+
 pub fn compute_risk_adjusted_score(env: &Env, provider: &Address) -> ScoreResult {
     let returns = get_provider_returns(env, provider);
     let min_sample = get_min_sample_size(env);
+    let now = env.ledger().timestamp();
 
     if returns.len() < min_sample {
-        return ScoreResult::InsufficientData;
+        return ScoreResult::InsufficientData(build_coverage(env, &returns, min_sample, now));
     }
 
+    let coverage = build_coverage(env, &returns, min_sample, now);
     let len_i128 = returns.len() as i128;
 
     // Compute mean
@@ -159,13 +224,13 @@ pub fn compute_risk_adjusted_score(env: &Env, provider: &Address) -> ScoreResult
 
     let score = fp_div(mean, denominator);
 
-    ScoreResult::Score(score)
+    ScoreResult::Score(score, coverage)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     #[test]
     fn test_historic_return_struct() {
@@ -313,10 +378,10 @@ mod tests {
                     timestamp: 2,
                 },
             );
-            assert_eq!(
-                compute_risk_adjusted_score(&env, &provider),
-                ScoreResult::InsufficientData
-            );
+            match compute_risk_adjusted_score(&env, &provider) {
+                ScoreResult::InsufficientData(coverage) => assert_eq!(coverage.sample_count, 2),
+                other => panic!("expected InsufficientData, got {:?}", other),
+            }
 
             // 2. Low variance, positive mean -> high score
             record_provider_return(
@@ -328,10 +393,11 @@ mod tests {
                 },
             ); // mean = 500, var = 0, std_dev = 0
             let score_low_var = compute_risk_adjusted_score(&env, &provider);
-            if let ScoreResult::Score(val) = score_low_var {
+            if let ScoreResult::Score(val, coverage) = score_low_var {
                 // mean = 500. denominator = std_dev (0) + 1 = 1.
                 // fp_div(500, 1) = (500 * 10000) / 1 = 5,000,000
                 assert_eq!(val, 5000000);
+                assert_eq!(coverage.sample_count, 3);
             } else {
                 panic!("Expected score");
             }
@@ -372,10 +438,65 @@ mod tests {
             // denom = 1000 + 1 = 1001.
             // score = fp_div(500, 1001) = (500 * 10000) / 1001 = 4995.
             let score_high_var = compute_risk_adjusted_score(&env, &provider_high);
-            if let ScoreResult::Score(val) = score_high_var {
+            if let ScoreResult::Score(val, coverage) = score_high_var {
                 assert_eq!(val, 4995);
+                assert_eq!(coverage.sample_count, 3);
             } else {
                 panic!("Expected score");
+            }
+        });
+    }
+
+    #[test]
+    fn test_coverage_reports_freshness_and_empty_vs_stale() {
+        let env = Env::default();
+        let id = env.register(crate::AnalyticsContract, ());
+        let provider = Address::generate(&env);
+        let stale_provider = Address::generate(&env);
+
+        env.as_contract(&id, || {
+            set_min_sample_size(&env, 2);
+
+            // Empty input set: no samples at all, not treated as a score.
+            match compute_risk_adjusted_score(&env, &provider) {
+                ScoreResult::InsufficientData(coverage) => {
+                    assert_eq!(coverage.sample_count, 0);
+                    assert_eq!(coverage.oldest_sample_timestamp, 0);
+                    assert_eq!(coverage.newest_sample_timestamp, 0);
+                    assert_eq!(coverage.freshness_age_secs, 0);
+                }
+                other => panic!("expected InsufficientData, got {:?}", other),
+            }
+
+            // Record two samples at an early timestamp, then advance the
+            // ledger clock far past them before computing the score.
+            record_provider_return(
+                &env,
+                &stale_provider,
+                HistoricReturn {
+                    return_bps: 100,
+                    timestamp: 10,
+                },
+            );
+            record_provider_return(
+                &env,
+                &stale_provider,
+                HistoricReturn {
+                    return_bps: 200,
+                    timestamp: 20,
+                },
+            );
+            env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+            match compute_risk_adjusted_score(&env, &stale_provider) {
+                ScoreResult::Score(_, coverage) => {
+                    assert_eq!(coverage.sample_count, 2);
+                    assert_eq!(coverage.oldest_sample_timestamp, 10);
+                    assert_eq!(coverage.newest_sample_timestamp, 20);
+                    // Fully covered (sample_count == min_required) but stale.
+                    assert_eq!(coverage.freshness_age_secs, 1_000 - 20);
+                }
+                other => panic!("expected Score, got {:?}", other),
             }
         });
     }
