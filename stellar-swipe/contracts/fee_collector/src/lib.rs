@@ -6,7 +6,8 @@ pub use errors::ContractError;
 /// #1032: configurable protocol/provider fee split policy.
 mod fee_split_policy;
 pub use fee_split_policy::{
-    FeeSplitPolicy, BPS_TOTAL as FEE_SPLIT_BPS_TOTAL, DEFAULT_PROTOCOL_BPS, DEFAULT_PROVIDER_BPS,
+    FeeSplitPolicy, FeeSplitPolicyRevision, BPS_TOTAL as FEE_SPLIT_BPS_TOTAL, DEFAULT_PROTOCOL_BPS,
+    DEFAULT_PROVIDER_BPS,
 };
 
 mod events;
@@ -772,7 +773,6 @@ impl FeeCollector {
         amount: i128,
         claim_id: String,
     ) -> Result<(), ContractError> {
-        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
@@ -788,45 +788,61 @@ impl FeeCollector {
             return Err(ContractError::InvalidAmount);
         }
 
-        if is_insurance_claim_processed(&env, &claim_id) {
-            return Err(ContractError::ClaimAlreadyProcessed);
-        }
+        // Issue #1450: hold the reentrancy lock for the full duration of the
+        // claim-id check, balance debit, and token transfer, instead of only
+        // checking it up front. A merely-checked (never-acquired) guard
+        // would let a reentrant call slip in during the external transfer
+        // below; `guarded` actually sets the lock so any such call is
+        // rejected rather than racing this claim to a double payout.
+        reentrancy::guarded(&env, || {
+            if is_insurance_claim_processed(&env, &claim_id) {
+                return Err(ContractError::ClaimAlreadyProcessed);
+            }
 
-        let cap = get_insurance_payout_cap(&env, &token);
-        if cap > 0 && amount > cap {
-            return Err(ContractError::PayoutExceedsCap);
-        }
+            let cap = get_insurance_payout_cap(&env, &token);
+            if cap > 0 && amount > cap {
+                return Err(ContractError::PayoutExceedsCap);
+            }
 
-        let current_balance = get_insurance_balance(&env, &token);
-        if amount > current_balance {
-            return Err(ContractError::InsufficientInsuranceBalance);
-        }
+            let current_balance = get_insurance_balance(&env, &token);
+            if amount > current_balance {
+                return Err(ContractError::InsufficientInsuranceBalance);
+            }
 
-        let new_balance = current_balance
-            .checked_sub(amount)
-            .ok_or(ContractError::ArithmeticOverflow)?;
-        set_insurance_balance(&env, &token, new_balance);
-        set_insurance_claim_processed(&env, &claim_id, true);
+            let new_balance = current_balance
+                .checked_sub(amount)
+                .ok_or(ContractError::ArithmeticOverflow)?;
 
-        shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
-            &env.current_contract_address(),
-            &recipient,
-            &amount,
-        ))
-        .map_err(ContractError::from)?;
+            // Checks-effects-interactions: the claim is marked processed and
+            // the balance debited *before* the external transfer. If the
+            // transfer fails below, the `?` propagates the error out of this
+            // closure and Soroban rolls back every storage write made during
+            // this invocation (including these two), so the claim is left
+            // exactly as unprocessed as it was before the call — never
+            // debited with no payout, and never payable twice.
+            set_insurance_balance(&env, &token, new_balance);
+            set_insurance_claim_processed(&env, &claim_id, true);
 
-        emit_insurance_payout(
-            &env,
-            EvtInsurancePayout {
-                recipient,
-                token,
-                amount,
-                claim_id,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
+            shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &amount,
+            ))
+            .map_err(ContractError::from)?;
 
-        Ok(())
+            emit_insurance_payout(
+                &env,
+                EvtInsurancePayout {
+                    recipient: recipient.clone(),
+                    token: token.clone(),
+                    amount,
+                    claim_id: claim_id.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+
+            Ok(())
+        })
     }
 
     /// Returns the current fee rate in basis points.
@@ -1782,20 +1798,36 @@ impl FeeCollector {
         storage::get_fee_split_policy(&env)
     }
 
-    /// Admin: replace the protocol/provider fee split policy.
+    /// Issue #1449: returns the protocol/provider fee split policy that was
+    /// (or will be) active at the given ledger-timestamp `epoch`, selected
+    /// from the full revision history rather than always the current one.
+    /// Use this to reproduce a historical fee calculation deterministically.
+    pub fn get_fee_split_policy_at(env: Env, epoch: u64) -> FeeSplitPolicy {
+        storage::get_fee_split_policy_at(&env, epoch)
+    }
+
+    /// Admin: add a new protocol/provider fee split policy revision that
+    /// takes effect at `effective_epoch` (issue #1449).
     ///
-    /// `protocol_bps + provider_bps` must equal exactly `10_000`. The previous
-    /// and new policy are recorded on the `FeeSplitPolicyUpdated` event for
-    /// audit.
+    /// `protocol_bps + provider_bps` must equal exactly `10_000`. Revisions
+    /// are append-only and immutable once stored: `effective_epoch` must be
+    /// strictly greater than the most recently stored revision's epoch, so
+    /// a fee can never be allocated using a partially updated policy and
+    /// every historical calculation keeps reproducing the revision that was
+    /// actually active at that time. The previous and new policy are
+    /// recorded on the `FeeSplitPolicyUpdated` event for audit.
     ///
     /// # Errors
     /// - [`ContractError::NotInitialized`] — contract not initialized.
     /// - [`ContractError::Unauthorized`] — caller is not the admin.
     /// - [`ContractError::InvalidFeeConfiguration`] — shares do not sum to 100%.
+    /// - [`ContractError::InvalidEffectiveEpoch`] — `effective_epoch` is not
+    ///   strictly greater than the last stored revision's epoch.
     pub fn set_fee_split_policy(
         env: Env,
         protocol_bps: u32,
         provider_bps: u32,
+        effective_epoch: u64,
     ) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
@@ -1809,8 +1841,21 @@ impl FeeCollector {
         };
         new_policy.validate()?;
 
+        let history = storage::get_fee_split_policy_history(&env);
+        if let Some(last) = history.last() {
+            if effective_epoch <= last.effective_epoch {
+                return Err(ContractError::InvalidEffectiveEpoch);
+            }
+        }
+
         let old_policy = storage::get_fee_split_policy(&env);
-        storage::set_fee_split_policy(&env, &new_policy);
+        storage::push_fee_split_policy_revision(
+            &env,
+            &fee_split_policy::FeeSplitPolicyRevision {
+                effective_epoch,
+                policy: new_policy.clone(),
+            },
+        );
         emit_fee_split_policy_updated(&env, &old_policy, &new_policy, &admin);
         Ok(())
     }

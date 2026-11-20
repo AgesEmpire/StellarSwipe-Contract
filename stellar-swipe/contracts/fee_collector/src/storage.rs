@@ -584,22 +584,43 @@ pub fn add_provider_daily_fee_shares(env: &Env, provider: &Address, day: u64, am
 
 // ── #1032: Fee split policy ─────────────────────────────────────────────────
 
-pub fn get_fee_split_policy(env: &Env) -> crate::fee_split_policy::FeeSplitPolicy {
+/// Issue #1449: the full append-only history of fee split policy revisions,
+/// ordered ascending by `effective_epoch`. Empty until an admin configures
+/// the first revision.
+pub fn get_fee_split_policy_history(
+    env: &Env,
+) -> soroban_sdk::Vec<crate::fee_split_policy::FeeSplitPolicyRevision> {
     crud_get_or(
         env,
         StorageTier::Instance,
         &StorageKey::FeeSplitPolicy,
-        crate::fee_split_policy::default_policy(),
+        soroban_sdk::Vec::new(env),
     )
 }
 
-pub fn set_fee_split_policy(env: &Env, policy: &crate::fee_split_policy::FeeSplitPolicy) {
-    crud_set(
-        env,
-        StorageTier::Instance,
-        &StorageKey::FeeSplitPolicy,
-        policy,
-    );
+/// Append a new revision to the fee split policy history. Callers must have
+/// already validated that `revision.effective_epoch` is strictly greater
+/// than the last stored revision's epoch, so history stays sorted and every
+/// past fee calculation remains reproducible.
+pub fn push_fee_split_policy_revision(
+    env: &Env,
+    revision: &crate::fee_split_policy::FeeSplitPolicyRevision,
+) {
+    let mut history = get_fee_split_policy_history(env);
+    history.push_back(revision.clone());
+    crud_set(env, StorageTier::Instance, &StorageKey::FeeSplitPolicy, &history);
+}
+
+/// The policy active at `epoch` (a ledger timestamp), per the versioned
+/// history. Returns the protocol default if no revision is yet effective.
+pub fn get_fee_split_policy_at(env: &Env, epoch: u64) -> crate::fee_split_policy::FeeSplitPolicy {
+    let history = get_fee_split_policy_history(env);
+    crate::fee_split_policy::policy_at_epoch(&history, epoch)
+}
+
+/// The policy active right now (current ledger timestamp).
+pub fn get_fee_split_policy(env: &Env) -> crate::fee_split_policy::FeeSplitPolicy {
+    get_fee_split_policy_at(env, env.ledger().timestamp())
 }
 
 pub fn get_provider_earnings_first_day(env: &Env, provider: &Address) -> Option<u64> {

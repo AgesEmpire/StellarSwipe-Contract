@@ -39,7 +39,7 @@ fn admin_can_update_policy_and_event_is_emitted() {
     env.mock_all_auths();
     let (_admin, _id, client) = setup(&env);
 
-    client.set_fee_split_policy(&2_500, &7_500);
+    client.set_fee_split_policy(&2_500, &7_500, &0);
     // The update is auditable via an emitted event (checked on the invocation
     // that produced it, before any further calls reset the event buffer).
     assert!(!env.events().all().is_empty());
@@ -59,7 +59,7 @@ fn policy_that_does_not_sum_to_100pct_is_rejected() {
     env.mock_all_auths();
     let (_admin, _id, client) = setup(&env);
 
-    let res = client.try_set_fee_split_policy(&4_000, &4_000);
+    let res = client.try_set_fee_split_policy(&4_000, &4_000, &0);
     assert_eq!(res, Err(Ok(ContractError::InvalidFeeConfiguration)));
 
     // State is unchanged after a rejected update.
@@ -80,12 +80,82 @@ fn preview_split_uses_active_policy() {
 
     assert_eq!(client.preview_fee_split(&1_000), (300, 700));
 
-    client.set_fee_split_policy(&1_000, &9_000);
+    client.set_fee_split_policy(&1_000, &9_000, &0);
     assert_eq!(client.preview_fee_split(&1_000), (100, 900));
 
     // Dust-free: shares always reconstruct the gross amount.
     let (p, q) = client.preview_fee_split(&777);
     assert_eq!(p + q, 777);
+}
+
+#[test]
+fn historical_lookup_uses_the_revision_active_at_that_epoch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _id, client) = setup(&env);
+
+    // Revision 1 takes effect at epoch 1_000.
+    client.set_fee_split_policy(&2_000, &8_000, &1_000);
+    // Revision 2 takes effect later, at epoch 2_000.
+    client.set_fee_split_policy(&5_000, &5_000, &2_000);
+
+    // Before any revision is effective: the protocol default applies.
+    assert_eq!(
+        client.get_fee_split_policy_at(&500),
+        FeeSplitPolicy {
+            protocol_bps: 3_000,
+            provider_bps: 7_000,
+        }
+    );
+    // Exactly on revision 1's boundary: revision 1 applies.
+    assert_eq!(
+        client.get_fee_split_policy_at(&1_000),
+        FeeSplitPolicy {
+            protocol_bps: 2_000,
+            provider_bps: 8_000,
+        }
+    );
+    // Between the two revisions: revision 1 still applies.
+    assert_eq!(
+        client.get_fee_split_policy_at(&1_999),
+        FeeSplitPolicy {
+            protocol_bps: 2_000,
+            provider_bps: 8_000,
+        }
+    );
+    // Exactly on revision 2's boundary: revision 2 applies.
+    assert_eq!(
+        client.get_fee_split_policy_at(&2_000),
+        FeeSplitPolicy {
+            protocol_bps: 5_000,
+            provider_bps: 5_000,
+        }
+    );
+
+    // A later admin change cannot retroactively alter the epoch-1_000
+    // lookup: history is immutable once appended.
+    client.set_fee_split_policy(&1_000, &9_000, &3_000);
+    assert_eq!(
+        client.get_fee_split_policy_at(&1_000),
+        FeeSplitPolicy {
+            protocol_bps: 2_000,
+            provider_bps: 8_000,
+        }
+    );
+}
+
+#[test]
+fn non_increasing_effective_epoch_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _id, client) = setup(&env);
+
+    client.set_fee_split_policy(&2_000, &8_000, &1_000);
+    let res = client.try_set_fee_split_policy(&5_000, &5_000, &1_000);
+    assert_eq!(res, Err(Ok(ContractError::InvalidEffectiveEpoch)));
+
+    let res_earlier = client.try_set_fee_split_policy(&5_000, &5_000, &500);
+    assert_eq!(res_earlier, Err(Ok(ContractError::InvalidEffectiveEpoch)));
 }
 
 #[test]
@@ -95,7 +165,7 @@ fn record_from_gross_credits_provider_and_returns_protocol_share() {
     let (admin, _id, client) = setup(&env);
     let provider = Address::generate(&env);
 
-    client.set_fee_split_policy(&2_000, &8_000);
+    client.set_fee_split_policy(&2_000, &8_000, &0);
     let (protocol_amount, provider_amount) =
         client.record_provider_gross_fee_share(&admin, &provider, &10_000);
 
