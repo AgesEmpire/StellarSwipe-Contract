@@ -41,6 +41,9 @@ fn entry(env: &Env, p: AssetPair, owner: &Address, max_age: u64) -> FeedConfigIn
         publishers: Vec::new(env),
         max_age,
         enabled: true,
+        max_movement_bps: 0,
+        min_price: 1,
+        max_price: i128::MAX,
     }
 }
 
@@ -49,6 +52,59 @@ fn next_ledger(env: &Env) {
 }
 
 // ── #1309 ────────────────────────────────────────────────────────────────────
+
+// ── #1308: feed-local monotonic round IDs ───────────────────────────────────
+
+#[test]
+fn round_ids_advance_monotonically_and_are_feed_local() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let xlm = pair(&env, "XLM");
+    let btc = pair(&env, "BTC");
+    let owner = Address::generate(&env);
+    client.add_price_source(&admin, &owner, &1);
+    client.configure_feeds(
+        &admin,
+        &Vec::from_array(
+            &env,
+            [
+                entry(&env, xlm.clone(), &owner, 3_000),
+                entry(&env, btc.clone(), &owner, 3_000),
+            ],
+        ),
+    );
+
+    client.submit_pair_price_with_round(&owner, &xlm, &100, &100, &1);
+    assert_eq!(client.get_feed_status(&xlm).latest_round, 1);
+    assert_eq!(client.get_price_with_confidence(&xlm).0, 100);
+
+    // Changing the timestamp and price does not make a replay acceptable.
+    env.ledger().with_mut(|l| {
+        l.timestamp += 10;
+        l.sequence_number += 1;
+    });
+    assert_eq!(
+        client.try_submit_pair_price_with_round(&owner, &xlm, &999, &100, &1),
+        Err(Ok(OracleError::StaleRound))
+    );
+    assert_eq!(
+        client.try_submit_pair_price_with_round(&owner, &xlm, &999, &100, &0),
+        Err(Ok(OracleError::StaleRound))
+    );
+    assert_eq!(client.get_feed_status(&xlm).latest_round, 1);
+    assert_eq!(client.get_price_with_confidence(&xlm).0, 100);
+
+    // A skipped (higher) round is an advance, not a regression.
+    client.submit_pair_price_with_round(&owner, &xlm, &200, &100, &5);
+    assert_eq!(client.get_feed_status(&xlm).latest_round, 5);
+    assert_eq!(client.get_price_with_confidence(&xlm).0, 200);
+
+    // Round counters are independent per feed.
+    client.submit_pair_price_with_round(&owner, &btc, &10_000, &100, &1);
+    assert_eq!(client.get_feed_status(&btc).latest_round, 1);
+    assert_eq!(client.get_price_with_confidence(&btc).0, 10_000);
+    assert_eq!(client.get_feed_status(&xlm).latest_round, 5);
+}
 
 #[test]
 fn publisher_authorization_owner_delegate_revoked_unrelated() {

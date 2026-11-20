@@ -107,11 +107,23 @@ pub fn verify_and_record_approval(
     Ok(())
 }
 
+/// Quorum counts each distinct validator at most once. A malformed set with
+/// repeated signers can therefore never satisfy a threshold multiple times.
 pub fn has_quorum(approvals: &Vec<ValidatorApproval>, required_signatures: u32) -> bool {
-    approvals.len() >= required_signatures
+    if required_signatures == 0 {
+        return false;
+    }
+    let mut distinct = Vec::new(approvals.env());
+    for approval in approvals.iter() {
+        if !distinct.contains(&approval.validator) {
+            distinct.push_back(approval.validator);
+        }
+    }
+    distinct.len() >= required_signatures
 }
 
-fn has_duplicates(validators: &Vec<Address>) -> bool {
+/// Return true when any public key / validator address occurs more than once.
+pub fn has_duplicates(validators: &Vec<Address>) -> bool {
     for i in 0..validators.len() {
         let current = validators.get(i).unwrap();
         for j in (i + 1)..validators.len() {
@@ -211,5 +223,64 @@ mod tests {
 
         let result = build_validator_set(&env, validators, 2);
         assert_eq!(result, Err(BridgeError::InvalidValidatorSet));
+    }
+
+    #[test]
+    fn duplicate_at_any_position_is_rejected() {
+        let env = Env::default();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+
+        // Duplicates at the start, in the middle, and at the end.
+        for order in [[&a, &a, &b], [&a, &b, &a], [&b, &c, &b]] {
+            let mut validators = Vec::new(&env);
+            for v in order {
+                validators.push_back(v.clone());
+            }
+            assert!(has_duplicates(&validators));
+            assert_eq!(
+                build_validator_set(&env, validators, 2),
+                Err(BridgeError::InvalidValidatorSet)
+            );
+        }
+    }
+
+    #[test]
+    fn unique_validator_set_is_accepted_and_counts_once() {
+        let env = Env::default();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let mut validators = Vec::new(&env);
+        validators.push_back(a.clone());
+        validators.push_back(b.clone());
+
+        let set = build_validator_set(&env, validators, 2).unwrap();
+        assert_eq!(set.validators.len(), 2);
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(ValidatorApproval {
+            validator: a.clone(),
+            signature: String::from_str(&env, "s1"),
+            approved_at: 1,
+            kind: ValidatorApprovalKind::LockMint,
+        });
+        approvals.push_back(ValidatorApproval {
+            validator: a,
+            signature: String::from_str(&env, "s2"),
+            approved_at: 2,
+            kind: ValidatorApprovalKind::LockMint,
+        });
+        // Two approvals from one validator must not satisfy a threshold of two.
+        assert!(!has_quorum(&approvals, 2));
+        assert!(!has_quorum(&approvals, 0));
+
+        approvals.push_back(ValidatorApproval {
+            validator: b,
+            signature: String::from_str(&env, "s3"),
+            approved_at: 3,
+            kind: ValidatorApprovalKind::LockMint,
+        });
+        assert!(has_quorum(&approvals, 2));
     }
 }

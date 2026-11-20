@@ -109,6 +109,9 @@ pub enum BridgeError {
     /// Asset decimal scales differ by more than the supported maximum, or the
     /// converted amount cannot be represented (Issue #1299).
     AmountConversionFailed = 39,
+    /// A swap would move the pool price beyond the configured maximum impact
+    /// bound, independently of the caller's minimum-output limit (Issue #1317).
+    MaxPriceImpactExceeded = 40,
 }
 
 impl BridgeError {
@@ -225,6 +228,9 @@ impl BridgeError {
             }
             BridgeError::AmountConversionFailed => {
                 "asset amount cannot be converted between the given decimal scales"
+            }
+            BridgeError::MaxPriceImpactExceeded => {
+                "swap would exceed the pool's configured maximum price impact bound"
             }
         }
     }
@@ -808,6 +814,10 @@ impl BridgeContract {
         }
         // #1217: an expired message must not mint or touch any accounting.
         ensure_not_expired(&env, &transfer)?;
+        // #1297: persist consumption in this transaction before any minting
+        // or downstream settlement effect. On error the whole transaction
+        // rolls back, including this flag.
+        consume_message_for_execution(&env, &transfer)?;
 
         let balance_key =
             DataKey::WrappedBalance(transfer.user.clone(), transfer.wrapped_asset.clone());
@@ -828,25 +838,6 @@ impl BridgeContract {
         transfer.status = TransferStatus::Completed;
         transfer.executed_at = Some(env.ledger().timestamp());
         store_transfer(&env, &transfer);
-
-        // ── #988: mark message as consumed so it cannot be replayed ────────
-        let deployment_id: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::DeploymentId)
-            .expect("deployment id not set");
-        if !transfer.source_tx_hash.is_empty() {
-            let msg_key = build_consumed_message_key(
-                &env,
-                &deployment_id,
-                transfer.source_chain,
-                &transfer.source_tx_hash,
-                transfer.source_nonce,
-            );
-            env.storage()
-                .persistent()
-                .set(&DataKey::ConsumedMessage(msg_key), &true);
-        }
 
         #[allow(deprecated)]
         env.events().publish(
@@ -1000,6 +991,8 @@ impl BridgeContract {
         if env.ledger().timestamp() < ready_at {
             return Err(BridgeError::WithdrawalNotReady);
         }
+        // #1297: same one-time guard as lock/mint, written before settlement.
+        consume_message_for_execution(&env, &transfer)?;
 
         transfer.status = TransferStatus::Completed;
         transfer.executed_at = Some(env.ledger().timestamp());
@@ -1186,6 +1179,25 @@ impl BridgeContract {
             provider.require_auth();
         }
         liquidity::revoke_withdrawal_recipient(&env, &provider, &recipient);
+    }
+
+    /// Admin: set the maximum allowed swap price impact, in basis points
+    /// (Issue #1317). Applies to every pool, independently of the caller's
+    /// `min_amount_out` slippage limit.
+    pub fn set_max_price_impact_bps(
+        env: Env,
+        admin: Address,
+        max_price_impact_bps: u32,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        liquidity::set_max_price_impact_bps(&env, max_price_impact_bps)
+    }
+
+    pub fn get_max_price_impact_bps(env: Env) -> u32 {
+        liquidity::get_max_price_impact_bps(&env)
     }
 
     /// Designates `operator` as the account authorized to pause/resume
@@ -2006,6 +2018,35 @@ fn validate_amount_and_limits(
     Ok(())
 }
 
+/// The single consumed-message guard shared by every bridge execution path
+/// (Issue #1297). The flag is written before any mint, unlock, transfer, or
+/// downstream settlement call so a duplicate invocation cannot repeat effects.
+/// A failed transaction rolls the flag back atomically with the rest of the
+/// storage changes.
+fn consume_message_for_execution(
+    env: &Env,
+    transfer: &BridgeTransfer,
+) -> Result<(), BridgeError> {
+    let deployment_id: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::DeploymentId)
+        .expect("deployment id not set");
+    let msg_key = build_consumed_message_key(
+        env,
+        &deployment_id,
+        transfer.source_chain,
+        &transfer.source_tx_hash,
+        transfer.source_nonce,
+    );
+    let key = DataKey::ConsumedMessage(msg_key);
+    if env.storage().persistent().has(&key) {
+        return Err(BridgeError::MessageAlreadyConsumed);
+    }
+    env.storage().persistent().set(&key, &true);
+    Ok(())
+}
+
 /// Build the storage key for a consumed message, incorporating deployment_id
 /// for cross-deployment replay isolation (Issue #988).
 ///
@@ -2197,6 +2238,80 @@ mod test {
                     String::from_str(&env, "wETH")
                 ),
                 500
+            );
+        });
+    }
+
+    #[test]
+    fn consumed_guard_blocks_repeat_execution_and_rolls_back_on_early_failure() {
+        let (env, contract_id, admin, validators) = setup();
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+            let user = Address::generate(&env);
+            let tid = BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                100,
+                String::from_str(&env, "src-tx-1297"),
+                7,
+                String::from_str(&env, "recipient"),
+            )
+            .unwrap();
+            BridgeContract::approve_lock_mint(
+                env.clone(),
+                validators.get(0).unwrap(),
+                tid,
+                String::from_str(&env, "sig-a"),
+            )
+            .unwrap();
+            BridgeContract::approve_lock_mint(
+                env.clone(),
+                validators.get(1).unwrap(),
+                tid,
+                String::from_str(&env, "sig-b"),
+            )
+            .unwrap();
+
+            let deployment_id: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::DeploymentId)
+                .unwrap();
+            let key = DataKey::ConsumedMessage(build_consumed_message_key(
+                &env,
+                &deployment_id,
+                ChainId::Ethereum,
+                &String::from_str(&env, "src-tx-1297"),
+                7,
+            ));
+
+            // A failed call (unauthorized admin) happens before settlement and
+            // leaves the consumed flag untouched.
+            let rogue = Address::generate(&env);
+            assert!(BridgeContract::execute_lock_mint(env.clone(), rogue, tid).is_err());
+            assert!(!env.storage().persistent().has(&key));
+
+            // Successful execution persists the guard before settlement.
+            BridgeContract::execute_lock_mint(env.clone(), admin.clone(), tid).unwrap();
+            assert!(env.storage().persistent().has(&key));
+            assert_eq!(BridgeContract::get_wrapped_balance(env.clone(), user, String::from_str(&env, "wETH")), 100);
+
+            // Repeated invocation cannot repeat mint effects.
+            assert_eq!(
+                BridgeContract::execute_lock_mint(env.clone(), admin.clone(), tid),
+                Err(BridgeError::TransferAlreadyExecuted)
+            );
+            // Even if a status is reset, the shared guard still blocks it.
+            let mut transfer = get_transfer(&env, tid).unwrap();
+            transfer.status = TransferStatus::ReadyToExecute;
+            store_transfer(&env, &transfer);
+            assert_eq!(
+                BridgeContract::execute_lock_mint(env.clone(), admin, tid),
+                Err(BridgeError::MessageAlreadyConsumed)
             );
         });
     }

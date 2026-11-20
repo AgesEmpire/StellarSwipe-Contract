@@ -25,6 +25,14 @@ mod sdex;
 mod sla;
 mod staleness;
 mod storage;
+#[cfg(test)]
+mod test_feed_bounds;
+#[cfg(test)]
+mod test_feed_canonical;
+#[cfg(test)]
+mod test_feed_movement;
+#[cfg(test)]
+mod test_feed_version;
 mod types;
 
 use errors::OracleError;
@@ -195,6 +203,8 @@ impl OracleContract {
         if price <= 0 {
             return Err(OracleError::InvalidAsset);
         }
+        // #1304: reject economically impossible observations before any state change.
+        feeds::check_bounds(&env, &pair, price)?;
         // #755: single-update deviation circuit breaker check. A deviating
         // update trips the breaker and is rejected (not stored); the call
         // returns Ok so the trip flag persists (an error return would roll
@@ -224,8 +234,26 @@ impl OracleContract {
         feeds::configure_batch(&env, &entries)
     }
 
+    /// Admin: register new feeds. Rejects duplicates under the canonical pair
+    /// identifier; use `configure_feeds` to update an existing feed.
+    pub fn register_feeds(
+        env: Env,
+        admin: Address,
+        entries: Vec<feeds::FeedConfigInput>,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        feeds::register_batch(&env, &entries)
+    }
+
     pub fn get_feed_config(env: Env, pair: AssetPair) -> Option<feeds::FeedConfig> {
         feeds::get_config(&env, &pair)
+    }
+
+    /// Read-only: the deterministic identifier used to key this feed.
+    /// Aliased/reversed spellings return the same canonical pair.
+    pub fn get_canonical_pair(env: Env, pair: AssetPair) -> Result<AssetPair, OracleError> {
+        feeds::canonical_pair(&env, &pair)
     }
 
     /// Feed owner: delegate submission rights to `publisher`.
@@ -860,6 +888,20 @@ impl OracleContract {
         Ok(price)
     }
 
+    /// Read the accepted price together with the configuration version that
+    /// produced it (0 when the feed is unconfigured). Consumers can use this
+    /// to attribute a quote to its source set, bounds and breaker policy.
+    pub fn get_price_with_feed_version(
+        env: Env,
+        pair: AssetPair,
+    ) -> Result<(i128, u32), OracleError> {
+        let (price, _) = Self::get_price_with_confidence(env.clone(), pair.clone())?;
+        let version = feeds::get_config(&env, &pair)
+            .map(|cfg| cfg.version)
+            .unwrap_or(0);
+        Ok((price, version))
+    }
+
     pub fn get_price_with_confidence(
         env: Env,
         pair: AssetPair,
@@ -885,6 +927,7 @@ impl OracleContract {
                 source: env.current_contract_address(),
                 confidence: 100,
                 ledger_sequence: env.ledger().sequence(),
+                round_id: feeds::last_round(&env, &pair),
             });
         }
 
@@ -1206,12 +1249,39 @@ impl OracleContract {
     /// currently-fresh sources by more than the configured hard reject
     /// threshold. Existing entries older than the configured staleness
     /// window are dropped before this comparison is made.
+    /// Submit an observation bound to an explicit feed-local round ID
+    /// (Issue #1308). The round must be strictly greater than the highest
+    /// accepted round for `pair`; replays and regressions are rejected with
+    /// [`OracleError::StaleRound`] before the price can change.
+    pub fn submit_pair_price_with_round(
+        env: Env,
+        source: Address,
+        pair: AssetPair,
+        price: i128,
+        confidence: u32,
+        round_id: u64,
+    ) -> Result<(), OracleError> {
+        Self::submit_pair_price_inner(env, source, pair, price, confidence, round_id)
+    }
+
     pub fn submit_pair_price(
         env: Env,
         source: Address,
         pair: AssetPair,
         price: i128,
         confidence: u32,
+    ) -> Result<(), OracleError> {
+        let round_id = feeds::next_round(&env, &pair);
+        Self::submit_pair_price_inner(env, source, pair, price, confidence, round_id)
+    }
+
+    fn submit_pair_price_inner(
+        env: Env,
+        source: Address,
+        pair: AssetPair,
+        price: i128,
+        confidence: u32,
+        round_id: u64,
     ) -> Result<(), OracleError> {
         if admin::is_paused(&env, String::from_str(&env, CAT_ALL)) {
             return Err(OracleError::CircuitBreakerTripped);
@@ -1222,6 +1292,8 @@ impl OracleContract {
         if price <= 0 {
             return Err(OracleError::InvalidPrice);
         }
+        // #1304: bounds are enforced before the observation enters aggregation.
+        feeds::check_bounds(&env, &pair, price)?;
 
         // #1309: only the feed's owner or delegated publishers may submit.
         feeds::authorize_publisher(&env, &pair, &source)?;
@@ -1284,6 +1356,9 @@ impl OracleContract {
         source_prices.push_back((source.clone(), price));
         deviation::check_deviation(&env, &pair, &source_prices)?;
 
+        // #1308: bind the accepted observation to its feed-local round.
+        feeds::accept_round(&env, &pair, round_id)?;
+
         let new_entry = PriceData {
             asset_pair: pair.clone(),
             price,
@@ -1291,6 +1366,7 @@ impl OracleContract {
             source,
             confidence,
             ledger_sequence,
+            round_id,
         };
         match admission {
             observation::Admission::Append => fresh.push_back(new_entry),
@@ -1300,7 +1376,6 @@ impl OracleContract {
         // Cache management: Keep prices for the configured freshness window.
         env.storage().temporary().set(&key, &fresh);
         env.storage().temporary().extend_ttl(&key, 60, 60);
-        feeds::record_round(&env, &pair);
 
         Ok(())
     }

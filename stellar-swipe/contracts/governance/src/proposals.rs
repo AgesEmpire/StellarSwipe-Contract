@@ -322,6 +322,69 @@ pub struct ProposalStatistics {
     pub avg_approval_rate: u32,
 }
 
+/// Read-only, self-contained governance proposal status report (Issue #1292).
+///
+/// One call returns lifecycle state, current/final tally, effective thresholds
+/// and every relevant deadline, so clients never have to reconstruct state
+/// from separate `proposal`, `governance_config` and threshold calls.
+/// An unknown `proposal_id` returns `exists: false` with `state: Pending` and
+/// all numeric fields zeroed rather than trapping. `exists` is authoritative
+/// in that case; the `Pending` state is only a non-optional placeholder.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalStatusReport {
+    pub proposal_id: u64,
+    pub exists: bool,
+    pub state: ProposalStatus,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    pub votes_abstain: i128,
+    pub quorum_bps: u32,
+    pub approval_bps: u32,
+    pub voting_starts: u64,
+    pub voting_ends: u64,
+    pub discussion_ends_at: u64,
+    pub execution_deadline: u64,
+}
+
+/// Build a [`ProposalStatusReport`] without mutating storage.
+pub fn get_proposal_status_report(env: &Env, proposal_id: u64) -> ProposalStatusReport {
+    let empty = ProposalStatusReport {
+        proposal_id,
+        exists: false,
+        state: ProposalStatus::Pending,
+        votes_for: 0,
+        votes_against: 0,
+        votes_abstain: 0,
+        quorum_bps: 0,
+        approval_bps: 0,
+        voting_starts: 0,
+        voting_ends: 0,
+        discussion_ends_at: 0,
+        execution_deadline: 0,
+    };
+    let proposal = match get_proposals_state(env).proposals.get(proposal_id) {
+        Some(p) => p,
+        None => return empty,
+    };
+    let cfg = get_governance_config(env);
+    let (quorum_bps, approval_bps) = resolve_category_thresholds(env, &proposal.category, &cfg);
+    ProposalStatusReport {
+        proposal_id,
+        exists: true,
+        state: effective_status(env, &proposal),
+        votes_for: proposal.votes_for,
+        votes_against: proposal.votes_against,
+        votes_abstain: proposal.votes_abstain,
+        quorum_bps,
+        approval_bps,
+        voting_starts: proposal.voting_starts,
+        voting_ends: proposal.voting_ends,
+        discussion_ends_at: proposal.discussion_ends_at,
+        execution_deadline: proposal.execution_deadline,
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VoteDelegation {
@@ -1177,6 +1240,66 @@ pub fn get_all_proposals(env: &Env) -> Vec<Proposal> {
 
 // ── #796: Treasury spend proposal execution expiry ───────────────────────────
 
+/// Persist the terminal `Expired` state for a passed proposal that missed its
+/// execution deadline (Issue #1291).
+///
+/// Settlement rule: the proposal bond is settled exactly once. Finalization
+/// normally settles it already; calling `settle_proposal_deposit` here is
+/// idempotent because it removes the `LockedDeposit` record on settlement, so
+/// an expiry (or a repeated expiry call) can never refund/forfeit twice.
+///
+/// Returns `Ok(Expired)` unchanged for an already-expired proposal, making
+/// repeated expiry processing safe and idempotent.
+pub fn expire_proposal(
+    env: &Env,
+    proposal_id: u64,
+) -> Result<ProposalStatus, GovernanceError> {
+    let mut proposal = get_proposal(env, proposal_id)?;
+    if proposal.status == ProposalStatus::Expired {
+        return Ok(ProposalStatus::Expired);
+    }
+    if proposal.status != ProposalStatus::Succeeded {
+        return Err(GovernanceError::ProposalNotApproved);
+    }
+    if env.ledger().timestamp() <= proposal.execution_deadline {
+        return Err(GovernanceError::InvalidDuration);
+    }
+
+    proposal.status = ProposalStatus::Expired;
+    put_proposal(env, &proposal)?;
+
+    // The deadline is now definitive: no reserved bond stays locked.
+    let total_votes = proposal
+        .votes_for
+        .saturating_add(proposal.votes_against)
+        .saturating_add(proposal.votes_abstain);
+    let total_supply = get_total_supply(env).unwrap_or(0);
+    let treasury: Address = env
+        .storage()
+        .instance()
+        .get(&StorageKey::TreasuryAddress)
+        .unwrap_or_else(|| proposal.proposer.clone());
+    let _ = crate::proposal_deposit::settle_proposal_deposit(
+        env,
+        proposal_id,
+        total_votes,
+        total_supply,
+        &treasury,
+    );
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("treasury"), symbol_short!("propexp")),
+        (
+            proposal_id,
+            proposal.proposer.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+
+    Ok(ProposalStatus::Expired)
+}
+
 /// Reclaim a `Succeeded` proposal whose execution window has closed without
 /// ever being executed. Callable by **any** address (not admin-only) — any
 /// DAO member can clear a stale authorisation once it has expired. Removes
@@ -1194,6 +1317,11 @@ pub fn reclaim_expired_proposal(
     caller: Address,
 ) -> Result<(), GovernanceError> {
     caller.require_auth();
+
+    // Persist the terminal state (and settle any still-locked bond) before
+    // removing the entry, so expiry processing is never skipped on the reclaim
+    // path. This is idempotent for an already-expired proposal.
+    expire_proposal(env, proposal_id)?;
 
     let mut state = get_proposals_state(env);
     let proposal = state
@@ -1331,6 +1459,11 @@ pub fn delegate_voting_power(
         return Err(GovernanceError::NoVotingPower);
     }
 
+    // #1290: a delegate may hold no stake of their own but still be eligible
+    // to vote at proposal creation. Track them as a holder now so the
+    // eligibility snapshot includes their delegated power; changes made after
+    // a proposal opens cannot add or remove that eligibility retroactively.
+    crate::track_holder(env, &delegate);
     state.delegations.set(
         delegator.clone(),
         VoteDelegation {
