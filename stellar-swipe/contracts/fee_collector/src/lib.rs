@@ -6,7 +6,8 @@ pub use errors::ContractError;
 /// #1032: configurable protocol/provider fee split policy.
 mod fee_split_policy;
 pub use fee_split_policy::{
-    FeeSplitPolicy, BPS_TOTAL as FEE_SPLIT_BPS_TOTAL, DEFAULT_PROTOCOL_BPS, DEFAULT_PROVIDER_BPS,
+    FeeSplitPolicy, FeeSplitPolicyRevision, BPS_TOTAL as FEE_SPLIT_BPS_TOTAL, DEFAULT_PROTOCOL_BPS,
+    DEFAULT_PROVIDER_BPS,
 };
 
 mod events;
@@ -1601,20 +1602,36 @@ impl FeeCollector {
         storage::get_fee_split_policy(&env)
     }
 
-    /// Admin: replace the protocol/provider fee split policy.
+    /// Issue #1449: returns the protocol/provider fee split policy that was
+    /// (or will be) active at the given ledger-timestamp `epoch`, selected
+    /// from the full revision history rather than always the current one.
+    /// Use this to reproduce a historical fee calculation deterministically.
+    pub fn get_fee_split_policy_at(env: Env, epoch: u64) -> FeeSplitPolicy {
+        storage::get_fee_split_policy_at(&env, epoch)
+    }
+
+    /// Admin: add a new protocol/provider fee split policy revision that
+    /// takes effect at `effective_epoch` (issue #1449).
     ///
-    /// `protocol_bps + provider_bps` must equal exactly `10_000`. The previous
-    /// and new policy are recorded on the `FeeSplitPolicyUpdated` event for
-    /// audit.
+    /// `protocol_bps + provider_bps` must equal exactly `10_000`. Revisions
+    /// are append-only and immutable once stored: `effective_epoch` must be
+    /// strictly greater than the most recently stored revision's epoch, so
+    /// a fee can never be allocated using a partially updated policy and
+    /// every historical calculation keeps reproducing the revision that was
+    /// actually active at that time. The previous and new policy are
+    /// recorded on the `FeeSplitPolicyUpdated` event for audit.
     ///
     /// # Errors
     /// - [`ContractError::NotInitialized`] — contract not initialized.
     /// - [`ContractError::Unauthorized`] — caller is not the admin.
     /// - [`ContractError::InvalidFeeConfiguration`] — shares do not sum to 100%.
+    /// - [`ContractError::InvalidEffectiveEpoch`] — `effective_epoch` is not
+    ///   strictly greater than the last stored revision's epoch.
     pub fn set_fee_split_policy(
         env: Env,
         protocol_bps: u32,
         provider_bps: u32,
+        effective_epoch: u64,
     ) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
@@ -1628,8 +1645,21 @@ impl FeeCollector {
         };
         new_policy.validate()?;
 
+        let history = storage::get_fee_split_policy_history(&env);
+        if let Some(last) = history.last() {
+            if effective_epoch <= last.effective_epoch {
+                return Err(ContractError::InvalidEffectiveEpoch);
+            }
+        }
+
         let old_policy = storage::get_fee_split_policy(&env);
-        storage::set_fee_split_policy(&env, &new_policy);
+        storage::push_fee_split_policy_revision(
+            &env,
+            &fee_split_policy::FeeSplitPolicyRevision {
+                effective_epoch,
+                policy: new_policy.clone(),
+            },
+        );
         emit_fee_split_policy_updated(&env, &old_policy, &new_policy, &admin);
         Ok(())
     }

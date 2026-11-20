@@ -85,6 +85,11 @@ pub enum ContractError {
     /// reason other than authorization, balance, or allowance. See
     /// `shared::token_error` for the classification policy.
     TokenOperationFailed = 37,
+    /// Issue #1449: a new fee split policy revision was proposed with an
+    /// `effective_epoch` that is not strictly greater than the most recently
+    /// stored revision's epoch, so ordering/determinism could not be
+    /// guaranteed.
+    InvalidEffectiveEpoch = 38,
 }
 
 impl ContractError {
@@ -177,6 +182,9 @@ impl ContractError {
             }
             ContractError::TokenOperationFailed => {
                 "fee token or cross-contract invocation failed"
+            }
+            ContractError::InvalidEffectiveEpoch => {
+                "fee split policy revision's effective epoch must be strictly greater than the previous revision's"
             }
         }
     }
