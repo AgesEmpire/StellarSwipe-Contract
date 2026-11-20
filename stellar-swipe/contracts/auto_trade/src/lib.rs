@@ -707,7 +707,7 @@ impl AutoTradeContract {
         // Falls back to None (SDEX spot) when no oracle is configured.
         let oracle_price: Option<i128> = oracle::get_oracle_price(&env, signal.base_asset)
             .ok()
-            .map(|op| oracle::oracle_price_to_i128(&op));
+            .and_then(|op| oracle::oracle_price_to_i128(&op).ok());
 
         // Perform risk checks
         let stop_loss_triggered = risk::validate_trade(
@@ -2414,7 +2414,8 @@ mod oracle_tests {
         });
     }
 
-    /// oracle_price_to_i128 correctly scales by decimals.
+    /// oracle_price_to_i128 normalizes onto the shared 7-decimal settlement
+    /// scale (Issue #1442) rather than collapsing to whole units.
     #[test]
     fn test_oracle_price_scaling() {
         let env = Env::default();
@@ -2424,8 +2425,61 @@ mod oracle_tests {
             timestamp: 1_000,
             source: Symbol::new(&env, "mock"),
         };
-        // 1_000_000 / 10^4 = 100
-        assert_eq!(oracle::oracle_price_to_i128(&op), 100);
+        // Oracle reports 4 decimals; target is 7, so scale up by 10^3:
+        // 1_000_000 * 10^3 = 1_000_000_000.
+        assert_eq!(oracle::oracle_price_to_i128(&op).unwrap(), 1_000_000_000);
+    }
+
+    /// A low-decimal price (e.g. a whole-dollar feed, decimals = 0) is
+    /// scaled up to the 7-decimal settlement precision exactly.
+    #[test]
+    fn test_oracle_price_scaling_low_decimals() {
+        let env = Env::default();
+        let op = OraclePrice {
+            price: 5,
+            decimals: 0,
+            timestamp: 1_000,
+            source: Symbol::new(&env, "mock"),
+        };
+        assert_eq!(
+            oracle::oracle_price_to_i128(&op).unwrap(),
+            5 * 10_000_000
+        );
+    }
+
+    /// A high-decimal price (more precise than settlement scale) is
+    /// truncated down to it, not collapsed to whole units.
+    #[test]
+    fn test_oracle_price_scaling_high_decimals() {
+        let env = Env::default();
+        let op = OraclePrice {
+            price: 123_456_789_012,
+            decimals: 10,
+            timestamp: 1_000,
+            source: Symbol::new(&env, "mock"),
+        };
+        // decimals=10, target=7: divide by 10^3.
+        assert_eq!(
+            oracle::oracle_price_to_i128(&op).unwrap(),
+            123_456_789_012 / 1_000
+        );
+    }
+
+    /// An oracle reporting an unsupported (absurdly large) decimal count is
+    /// rejected rather than silently producing a garbage scaled value.
+    #[test]
+    fn test_oracle_price_scaling_rejects_unsupported_decimals() {
+        let env = Env::default();
+        let op = OraclePrice {
+            price: 100,
+            decimals: 40,
+            timestamp: 1_000,
+            source: Symbol::new(&env, "mock"),
+        };
+        assert_eq!(
+            oracle::oracle_price_to_i128(&op),
+            Err(AutoTradeError::UnsupportedDecimalScale)
+        );
     }
 }
 
