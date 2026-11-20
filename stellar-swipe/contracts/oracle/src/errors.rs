@@ -84,6 +84,9 @@ pub enum OracleError {
     InvalidFeedConfig = 35,
     /// The feed is disabled and does not accept observations (Issue #1309).
     FeedDisabled = 36,
+    /// The submitted round ID is a replay or is older than the feed's latest
+    /// accepted round (Issue #1308).
+    StaleRound = 37,
 }
 
 impl OracleError {
@@ -176,6 +179,9 @@ impl OracleError {
                 "a feed configuration entry is invalid or duplicated within the batch"
             }
             OracleError::FeedDisabled => "the feed is disabled and does not accept observations",
+            OracleError::StaleRound => {
+                "observation round is a replay or older than the feed's latest accepted round"
+            }
         }
     }
 }

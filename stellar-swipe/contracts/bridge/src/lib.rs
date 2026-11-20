@@ -102,6 +102,9 @@ pub enum BridgeError {
     /// The pool's trading is currently paused by its operator; swaps are
     /// rejected until it is resumed (Issue #1320).
     PoolTradingPaused = 37,
+    /// A swap would move the pool price beyond the configured maximum impact
+    /// bound, independently of the caller's minimum-output limit (Issue #1317).
+    MaxPriceImpactExceeded = 38,
 }
 
 impl BridgeError {
@@ -212,6 +215,9 @@ impl BridgeError {
             }
             BridgeError::PoolTradingPaused => {
                 "pool trading is paused by its operator; swaps are rejected until resumed"
+            }
+            BridgeError::MaxPriceImpactExceeded => {
+                "swap would exceed the pool's configured maximum price impact bound"
             }
         }
     }
@@ -1124,6 +1130,25 @@ impl BridgeContract {
             provider.require_auth();
         }
         liquidity::revoke_withdrawal_recipient(&env, &provider, &recipient);
+    }
+
+    /// Admin: set the maximum allowed swap price impact, in basis points
+    /// (Issue #1317). Applies to every pool, independently of the caller's
+    /// `min_amount_out` slippage limit.
+    pub fn set_max_price_impact_bps(
+        env: Env,
+        admin: Address,
+        max_price_impact_bps: u32,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        liquidity::set_max_price_impact_bps(&env, max_price_impact_bps)
+    }
+
+    pub fn get_max_price_impact_bps(env: Env) -> u32 {
+        liquidity::get_max_price_impact_bps(&env)
     }
 
     /// Designates `operator` as the account authorized to pause/resume
