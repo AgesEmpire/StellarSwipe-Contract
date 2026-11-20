@@ -2037,6 +2037,15 @@ impl AutoTradeContract {
         conditional::cancel_conditional_order(&env, id, user)
     }
 
+    /// Issue #1441: permissionless, deterministic cancellation of a
+    /// conditional order (auto-trade intent) once its `expires_at` deadline
+    /// has passed. Any address may call this — it requires no owner auth —
+    /// since it is gated purely by ledger time and only ever releases a
+    /// `Pending` order exactly once.
+    pub fn cancel_expired_order(env: Env, id: u64) -> Result<(), AutoTradeError> {
+        conditional::cancel_expired_order(&env, id)
+    }
+
     /// Get a conditional order by id.
     pub fn get_conditional_order(
         env: Env,

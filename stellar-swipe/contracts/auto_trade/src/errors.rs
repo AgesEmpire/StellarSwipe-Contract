@@ -346,6 +346,9 @@ impl AutoTradeError {
     pub const ConditionalOrderNotFound: AutoTradeError = AutoTradeError::ConditionalOrderError;
     pub const ConditionalOrderNotPending: AutoTradeError = AutoTradeError::ConditionalOrderError;
     pub const ConditionalOrderNotTriggered: AutoTradeError = AutoTradeError::ConditionalOrderError;
+    /// Issue #1441: `cancel_expired_order` was called before the order's
+    /// `expires_at` deadline has actually passed.
+    pub const ConditionalOrderNotExpired: AutoTradeError = AutoTradeError::ConditionalOrderError;
 
     pub const RateLimitPenalty: AutoTradeError = AutoTradeError::RateLimitExceeded;
     pub const BelowMinTransfer: AutoTradeError = AutoTradeError::RateLimitExceeded;
