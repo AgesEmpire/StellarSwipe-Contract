@@ -3400,6 +3400,18 @@ impl StakeVaultContract {
         Ok(queued)
     }
 
+    /// Issue #1437: like `get_index_accrued`, but also folds in reward
+    /// accrual that has happened since the staker's last checkpoint (i.e.
+    /// rewards funded by `deposit_reward`/`fund_index_rewards` after the
+    /// staker's last deposit/withdraw/claim, which the global index has
+    /// already picked up but which `get_index_accrued` cannot see until the
+    /// staker's next checkpoint). This is a read-only query — it does not
+    /// mutate any state — and gives callers the staker's true current
+    /// claimable value for `asset`.
+    pub fn get_index_accrued_with_pending(env: Env, staker: Address, asset: Address) -> i128 {
+        reward_index::total_accrued_value(&env, &staker, &asset)
+    }
+
     pub fn get_index_accrued(env: Env, staker: Address, asset: Address) -> i128 {
         reward_index::accrued(&env, &staker, &asset)
     }
