@@ -209,3 +209,12 @@ impl From<shared::TokenFailure> for ContractError {
         }
     }
 }
+
+/// Issue #1450: lets `payout_insurance` run its claim-processing and token
+/// transfer under `shared::reentrancy::guarded`, so the guard is actually
+/// held (not merely checked) for the whole claim-id-keyed operation.
+impl From<shared::reentrancy::ReentrancyError> for ContractError {
+    fn from(_: shared::reentrancy::ReentrancyError) -> Self {
+        ContractError::Unauthorized
+    }
+}

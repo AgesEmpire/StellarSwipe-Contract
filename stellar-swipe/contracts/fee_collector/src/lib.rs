@@ -725,7 +725,6 @@ impl FeeCollector {
         amount: i128,
         claim_id: String,
     ) -> Result<(), ContractError> {
-        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
@@ -741,45 +740,61 @@ impl FeeCollector {
             return Err(ContractError::InvalidAmount);
         }
 
-        if is_insurance_claim_processed(&env, &claim_id) {
-            return Err(ContractError::ClaimAlreadyProcessed);
-        }
+        // Issue #1450: hold the reentrancy lock for the full duration of the
+        // claim-id check, balance debit, and token transfer, instead of only
+        // checking it up front. A merely-checked (never-acquired) guard
+        // would let a reentrant call slip in during the external transfer
+        // below; `guarded` actually sets the lock so any such call is
+        // rejected rather than racing this claim to a double payout.
+        reentrancy::guarded(&env, || {
+            if is_insurance_claim_processed(&env, &claim_id) {
+                return Err(ContractError::ClaimAlreadyProcessed);
+            }
 
-        let cap = get_insurance_payout_cap(&env, &token);
-        if cap > 0 && amount > cap {
-            return Err(ContractError::PayoutExceedsCap);
-        }
+            let cap = get_insurance_payout_cap(&env, &token);
+            if cap > 0 && amount > cap {
+                return Err(ContractError::PayoutExceedsCap);
+            }
 
-        let current_balance = get_insurance_balance(&env, &token);
-        if amount > current_balance {
-            return Err(ContractError::InsufficientInsuranceBalance);
-        }
+            let current_balance = get_insurance_balance(&env, &token);
+            if amount > current_balance {
+                return Err(ContractError::InsufficientInsuranceBalance);
+            }
 
-        let new_balance = current_balance
-            .checked_sub(amount)
-            .ok_or(ContractError::ArithmeticOverflow)?;
-        set_insurance_balance(&env, &token, new_balance);
-        set_insurance_claim_processed(&env, &claim_id, true);
+            let new_balance = current_balance
+                .checked_sub(amount)
+                .ok_or(ContractError::ArithmeticOverflow)?;
 
-        shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
-            &env.current_contract_address(),
-            &recipient,
-            &amount,
-        ))
-        .map_err(ContractError::from)?;
+            // Checks-effects-interactions: the claim is marked processed and
+            // the balance debited *before* the external transfer. If the
+            // transfer fails below, the `?` propagates the error out of this
+            // closure and Soroban rolls back every storage write made during
+            // this invocation (including these two), so the claim is left
+            // exactly as unprocessed as it was before the call — never
+            // debited with no payout, and never payable twice.
+            set_insurance_balance(&env, &token, new_balance);
+            set_insurance_claim_processed(&env, &claim_id, true);
 
-        emit_insurance_payout(
-            &env,
-            EvtInsurancePayout {
-                recipient,
-                token,
-                amount,
-                claim_id,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
+            shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &amount,
+            ))
+            .map_err(ContractError::from)?;
 
-        Ok(())
+            emit_insurance_payout(
+                &env,
+                EvtInsurancePayout {
+                    recipient: recipient.clone(),
+                    token: token.clone(),
+                    amount,
+                    claim_id: claim_id.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+
+            Ok(())
+        })
     }
 
     /// Returns the current fee rate in basis points.
