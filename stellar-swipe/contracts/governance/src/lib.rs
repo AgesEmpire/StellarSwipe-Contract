@@ -32,6 +32,8 @@ mod test_admin_timelock;
 #[cfg(test)]
 mod test_committee_elections;
 #[cfg(test)]
+mod test_duplicate_actions;
+#[cfg(test)]
 mod test_health;
 #[cfg(test)]
 mod test_pause_propagation;
@@ -40,6 +42,12 @@ mod test_pause_propagation;
 mod test_portableDD;
 #[cfg(test)]
 mod test_simulation;
+#[cfg(test)]
+mod test_transition_events;
+#[cfg(test)]
+mod test_veto_window;
+#[cfg(test)]
+mod test_vote_deadline;
 
 use committees::{
     list_committees as list_registered_committees, CommitteeAction, CommitteeElection,
@@ -76,7 +84,10 @@ use proposals::{
     withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalStatusReport, ProposalType,
     SimulationEffect, SimulationResult, Vote, VoteDelegation, VoteType as GovernanceVoteType,
 };
-pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
+pub use proposals::{
+    action_identity, validate_no_duplicate_actions, CategoryThreshold, GovernanceConfig,
+    ProposalCategory, ProposalTransitionEvent,
+};
 use quadratic_voting::{
     allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
     get_quadratic_vote, get_quadratic_voting_config, get_vote_credits, reallocate_quadratic_votes,
@@ -674,6 +685,15 @@ impl GovernanceContract {
         Ok(proposal_id)
     }
 
+    /// #1286: validate an action list for duplicate canonical identities without
+    /// creating a proposal. Rejected lists never reserve IDs, bonds or power.
+    pub fn validate_proposal_actions(
+        env: Env,
+        actions: Vec<ProposalType>,
+    ) -> Result<(), GovernanceError> {
+        proposals::validate_no_duplicate_actions(&env, &actions)
+    }
+
     pub fn proposal(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
         require_initialized(&env)?;
         let mut proposal = get_proposal(&env, proposal_id)?;
@@ -781,6 +801,18 @@ impl GovernanceContract {
         require_initialized(&env)?;
         require_not_paused(&env)?;
         proposals::execute_proposal(&env, proposal_id, executor)
+    }
+
+    /// #1287: veto a passed proposal during its explicit veto window.
+    /// Only the configured guardian (which must authorize) may call this.
+    pub fn veto_proposal(
+        env: Env,
+        proposal_id: u64,
+        guardian: Address,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        require_not_paused(&env)?;
+        proposals::veto_proposal(&env, proposal_id, guardian)
     }
 
     pub fn migrate_storage(env: Env, admin: Address, from: u32) -> Result<u32, GovernanceError> {

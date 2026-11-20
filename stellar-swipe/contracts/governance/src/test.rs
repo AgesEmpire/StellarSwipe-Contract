@@ -828,6 +828,7 @@ fn timelock_queue_execute_and_cancel_flow() {
         approval_threshold: 5_000,
         execution_delay: 60,
         discussion_duration: 0,
+        veto_window: 0,
     };
     client.configure_governance(&admin, &cfg);
     client.initialize_timelock(&admin, &3_600u64, &(7 * 86_400u64), &admin);
@@ -886,6 +887,7 @@ fn queue_underfunded_treasury_spend_action(
         approval_threshold: 5_000,
         execution_delay: 60,
         discussion_duration: 0,
+        veto_window: 0,
     };
     client.configure_governance(admin, &cfg);
     client.initialize_timelock(admin, &3_600u64, &(7 * 86_400u64), admin);
@@ -2942,6 +2944,7 @@ fn setup_succeeded_treasury_spend_proposal(
         approval_threshold: 5_000,
         execution_delay: 60,
         discussion_duration: 0,
+        veto_window: 0,
     };
     client.configure_governance(admin, &cfg);
 

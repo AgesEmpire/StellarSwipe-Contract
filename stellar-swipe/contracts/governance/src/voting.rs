@@ -1,7 +1,21 @@
 use soroban_sdk::{Address, Env};
 
-use crate::proposals::{self, VoteType};
+use crate::proposals::{self, Proposal, VoteType};
 use crate::GovernanceError;
+
+/// #1289: the single deadline rule shared by vote submission *and* vote
+/// replacement. Votes are accepted only in `[voting_starts, voting_ends)`;
+/// the exact ledger `voting_ends` is already too late.
+pub fn require_voting_open(env: &Env, proposal: &Proposal) -> Result<(), GovernanceError> {
+    let now = env.ledger().timestamp();
+    if now < proposal.voting_starts {
+        return Err(GovernanceError::VotingNotStarted);
+    }
+    if now >= proposal.voting_ends {
+        return Err(GovernanceError::VotingEnded);
+    }
+    Ok(())
+}
 
 pub fn cast_vote(
     env: &Env,

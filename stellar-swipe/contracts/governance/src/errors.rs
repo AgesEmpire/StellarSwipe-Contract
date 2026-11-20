@@ -260,6 +260,14 @@ impl GovernanceError {
     /// `ParameterChange`) is outside the allowlisted `±MAX_PARAMETER_VALUE`
     /// range enforced by `validate_proposal`.
     pub const ProposalParameterOutOfRange: GovernanceError = GovernanceError::InvalidAmount;
+    /// A proposal contains the same canonical action identity more than once (Issue #1286).
+    pub const DuplicateProposalAction: GovernanceError = GovernanceError::InvalidProposal;
+    /// Caller is not the configured governance guardian (Issue #1287).
+    pub const NotGuardian: GovernanceError = GovernanceError::Unauthorized;
+    /// Proposal veto window is still open (Issue #1287).
+    pub const VetoWindowOpen: GovernanceError = GovernanceError::InvalidDuration;
+    /// Proposal was vetoed and can never be executed (Issue #1287).
+    pub const ProposalVetoed: GovernanceError = GovernanceError::ProposalNotApproved;
     /// A direct admin entry point was called while admin-timelock enforcement
     /// is active (Issue #942). The action must instead be routed through its
     /// `queue_*` + `*_timelocked` pair so the mandatory delay applies.
