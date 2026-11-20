@@ -1104,6 +1104,28 @@ impl StakeVaultContract {
             last_updated: 0,
         });
 
+        // Issue #1435: enforce a minimum deposit / dust floor.
+        //
+        // A configured `MinimumStake` (via `set_minimum_stake`) previously
+        // only gated whether an *existing* stake counted toward signal
+        // submission eligibility (`check_signal_submission_allowed`) — it
+        // was never checked on `deposit_stake` itself, so a staker could
+        // deposit an arbitrarily small (even 1-stroop) "dust" amount that
+        // creates on-chain bookkeeping (a StakeInfoV2 entry, reward-index
+        // participation, lock timestamps) without ever clearing the
+        // minimum. We now reject a *fresh* deposit (current.balance == 0)
+        // that is below the configured minimum outright, in the
+        // protocol's favor, rather than silently accepting dust. Top-ups to
+        // an already-qualifying stake are still allowed at any size.
+        let minimum_stake: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinimumStake)
+            .unwrap_or(0);
+        if current.balance == 0 && minimum_stake > 0 && amount < minimum_stake {
+            return Err(StakeVaultError::StakeBelowMinimum);
+        }
+
         let old_tier = stake_tier_for_amount(current.balance);
         // Issue #978: reject rather than silently saturate — clamping to
         // `i128::MAX` here would record a balance smaller than the tokens
