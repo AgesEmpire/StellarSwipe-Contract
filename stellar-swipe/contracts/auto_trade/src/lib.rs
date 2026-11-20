@@ -1037,6 +1037,20 @@ impl AutoTradeContract {
         history::get_trade_history(&env, &user, offset, limit)
     }
 
+    /// Get paginated trade history (newest first) using stable cursor
+    /// pagination keyed by trade id (Issue #1446). Pass `after_id = None`
+    /// for the first page, then feed back the returned cursor to continue.
+    /// Unlike `get_trade_history`'s offset parameter, this is stable under
+    /// concurrent trade recording between page fetches.
+    pub fn get_trade_history_cursor(
+        env: Env,
+        user: Address,
+        after_id: Option<u64>,
+        limit: u32,
+    ) -> (soroban_sdk::Vec<history::HistoryTrade>, Option<u64>) {
+        history::get_trade_history_by_cursor(&env, &user, after_id, limit)
+    }
+
     /// Get user portfolio with holdings and P&L
     pub fn get_portfolio(env: Env, user: Address) -> portfolio::Portfolio {
         portfolio::get_portfolio(&env, &user)
@@ -1869,6 +1883,34 @@ impl AutoTradeContract {
         strategies::grid::calculate_grid_performance(&env, strategy_id)
     }
 
+    /// Update a grid strategy's tunable config (order size, rebalance-on-fill),
+    /// retaining the previous config as a revision (Issue #1444). Returns the
+    /// epoch under which the prior config was archived.
+    pub fn update_grid_config(
+        env: Env,
+        caller: Address,
+        strategy_id: u64,
+        order_size_per_grid: i128,
+        rebalance_on_fill: bool,
+    ) -> Result<u32, AutoTradeError> {
+        strategies::grid::update_grid_config(
+            &env,
+            &caller,
+            strategy_id,
+            order_size_per_grid,
+            rebalance_on_fill,
+        )
+    }
+
+    /// Return the full archived config-revision history for a grid strategy,
+    /// oldest first (Issue #1444).
+    pub fn get_grid_config_history(
+        env: Env,
+        strategy_id: u64,
+    ) -> soroban_sdk::Vec<strategies::grid::GridConfigRevision> {
+        strategies::grid::get_grid_config_history(&env, strategy_id)
+    }
+
     // ── Pairs Trading Strategy (Issue #106) ───────────────────────────────────
 
     pub fn configure_pairs_strategy(
@@ -2183,6 +2225,27 @@ impl AutoTradeContract {
         epoch: u64,
     ) -> Result<Option<plan_lifecycle::DriftDecision>, AutoTradeError> {
         plan_lifecycle::process_dca_tick(&env, &keeper, plan_id, epoch)
+    }
+
+    /// Owner: set the maximum number of executions that may be in flight at
+    /// once for this plan (Issue #1443).
+    pub fn set_plan_max_concurrent_executions(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+        max_concurrent: u32,
+    ) -> Result<(), AutoTradeError> {
+        plan_lifecycle::set_max_concurrent_executions(&env, &caller, plan_id, max_concurrent)
+    }
+
+    /// Read-only: the configured concurrent-execution cap for a plan.
+    pub fn get_plan_max_concurrent_executions(env: Env, plan_id: u64) -> u32 {
+        plan_lifecycle::get_max_concurrent_executions(&env, plan_id)
+    }
+
+    /// Read-only: how many executions are currently in flight for a plan.
+    pub fn get_plan_in_flight_executions(env: Env, plan_id: u64) -> u32 {
+        plan_lifecycle::get_in_flight_executions(&env, plan_id)
     }
 
     /// Mark a triggered conditional order as executed (call after trade fill).

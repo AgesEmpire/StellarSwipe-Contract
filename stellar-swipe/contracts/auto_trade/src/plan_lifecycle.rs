@@ -91,10 +91,18 @@ pub enum PlanKey {
     Lease(u64),
     LeaseEpoch(u64),
     CatchUpPolicy(u64),
+    /// Issue #1443: admin-configurable cap on in-flight executions per plan.
+    MaxConcurrentExecutions(u64),
+    /// Issue #1443: current count of in-flight (started, not yet finished)
+    /// executions for a plan.
+    InFlightExecutions(u64),
 }
 
 pub const DEFAULT_RECOVERY_COOLDOWN_LEDGERS: u32 = 720; // ~1h at 5s ledgers
 pub const MAX_LEASE_LEDGERS: u32 = 1_000;
+/// Default per-plan concurrent-execution limit (Issue #1443) when the owner
+/// has not configured one explicitly.
+pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: u32 = 1;
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
@@ -424,6 +432,79 @@ pub fn finalize_with_lease(
     Ok(())
 }
 
+// ── #1443 Per-strategy concurrent execution limits ───────────────────────────
+
+/// Owner-configurable cap on how many executions may be in-flight at once
+/// for this plan. Must be at least 1.
+pub fn set_max_concurrent_executions(
+    env: &Env,
+    caller: &Address,
+    plan_id: u64,
+    max_concurrent: u32,
+) -> Result<(), AutoTradeError> {
+    let plan = get_plan(env, plan_id)?;
+    require_owner(&plan, caller)?;
+    if max_concurrent == 0 {
+        return Err(AutoTradeError::InvalidAmount);
+    }
+    env.storage()
+        .persistent()
+        .set(&PlanKey::MaxConcurrentExecutions(plan_id), &max_concurrent);
+    Ok(())
+}
+
+pub fn get_max_concurrent_executions(env: &Env, plan_id: u64) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&PlanKey::MaxConcurrentExecutions(plan_id))
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_EXECUTIONS)
+}
+
+/// Current count of in-flight (started, not yet finished) executions for a plan.
+pub fn get_in_flight_executions(env: &Env, plan_id: u64) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&PlanKey::InFlightExecutions(plan_id))
+        .unwrap_or(0u32)
+}
+
+/// Reserve one execution slot for the plan. Must be paired with exactly one
+/// call to `end_execution` once the execution completes or fails — callers
+/// should wrap the execution body so `end_execution` runs on every exit path
+/// (success, trade failure, or error return) to avoid leaking a slot.
+///
+/// Returns `AutoTradeError::RateLimited` (aliased here as the concurrency
+/// limit) if the plan already has `max_concurrent_executions` in flight.
+pub fn begin_execution(env: &Env, plan_id: u64) -> Result<u32, AutoTradeError> {
+    let in_flight = get_in_flight_executions(env, plan_id);
+    let max_concurrent = get_max_concurrent_executions(env, plan_id);
+    if in_flight >= max_concurrent {
+        return Err(AutoTradeError::ConcurrencyLimitExceeded);
+    }
+    let new_count = in_flight + 1;
+    env.storage()
+        .persistent()
+        .set(&PlanKey::InFlightExecutions(plan_id), &new_count);
+    env.events().publish(
+        (symbol_short!("exec_beg"), plan_id),
+        (new_count, max_concurrent),
+    );
+    Ok(new_count)
+}
+
+/// Release the execution slot reserved by `begin_execution`. Idempotent
+/// below zero: saturates instead of underflowing if called without a
+/// matching `begin_execution` (defensive against double-release bugs).
+pub fn end_execution(env: &Env, plan_id: u64) {
+    let in_flight = get_in_flight_executions(env, plan_id);
+    let new_count = in_flight.saturating_sub(1);
+    env.storage()
+        .persistent()
+        .set(&PlanKey::InFlightExecutions(plan_id), &new_count);
+    env.events()
+        .publish((symbol_short!("exec_end"), plan_id), new_count);
+}
+
 // ── #1150 DCA schedule drift detection ────────────────────────────────────────
 
 /// Set the plan's catch-up policy. Only one policy may ever apply per plan.
@@ -501,8 +582,16 @@ pub fn process_dca_tick(
     if plan.status != PlanStatus::Active {
         return Err(AutoTradeError::InvalidPlanState);
     }
-    let policy = get_catch_up_policy(env, plan_id);
-    let decision = compute_drift(env.ledger().timestamp(), plan.next_dca_at, plan.dca_interval, policy)?;
+    // Issue #1443: enforce the per-plan concurrent-execution cap around the
+    // actual execution body so a stuck/duplicate keeper call can't pile up
+    // unbounded in-flight work for a single plan.
+    begin_execution(env, plan_id)?;
+    let result = (|| {
+        let policy = get_catch_up_policy(env, plan_id);
+        compute_drift(env.ledger().timestamp(), plan.next_dca_at, plan.dca_interval, policy)
+    })();
+    end_execution(env, plan_id);
+    let decision = result?;
     if let Some(d) = &decision {
         plan.next_dca_at = d.next_dca_at;
         save_plan(env, plan_id, &plan);

@@ -331,6 +331,9 @@ impl AutoTradeError {
     pub const LeaseExpired: AutoTradeError = AutoTradeError::Unauthorized;
     /// A DCA catch-up policy is already set for the plan.
     pub const CatchUpPolicyAlreadySet: AutoTradeError = AutoTradeError::InvalidExitConfig;
+    /// Issue #1443: plan already has its configured maximum number of
+    /// executions in flight; caller must wait for one to finish.
+    pub const ConcurrencyLimitExceeded: AutoTradeError = AutoTradeError::RateLimited;
     /// Checked schedule/ledger arithmetic overflowed.
     pub const ScheduleOverflow: AutoTradeError = AutoTradeError::InvalidAmount;
     pub const SelfReferral: AutoTradeError = AutoTradeError::ReferralError;
