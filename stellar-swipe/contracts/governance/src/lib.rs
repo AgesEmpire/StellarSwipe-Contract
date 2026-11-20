@@ -69,10 +69,11 @@ use distribution::{
 };
 use proposals::{
     calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
-    default_governance_config, effective_status, execute_proposal, finalize_proposal,
-    get_active_proposals, get_all_proposals, get_category_threshold, get_governance_config,
-    get_proposal, reclaim_expired_proposal, set_category_thresholds, simulate_proposal,
-    withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalType,
+    default_governance_config, effective_status, execute_proposal, expire_proposal,
+    finalize_proposal, get_active_proposals, get_all_proposals, get_category_threshold,
+    get_governance_config, get_proposal, get_proposal_status_report, reclaim_expired_proposal,
+    set_category_thresholds, simulate_proposal,
+    withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalStatusReport, ProposalType,
     SimulationEffect, SimulationResult, Vote, VoteDelegation, VoteType as GovernanceVoteType,
 };
 pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
@@ -680,6 +681,20 @@ impl GovernanceContract {
         Ok(proposal)
     }
 
+    /// # Summary
+    /// Read-only proposal status and tally query (Issue #1292). Returns the
+    /// effective lifecycle state, current/final vote totals, resolved quorum
+    /// and approval thresholds, and all relevant deadlines in one call.
+    /// Unknown proposal IDs return `exists: false` with zeroed fields instead
+    /// of trapping.
+    pub fn proposal_status(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ProposalStatusReport, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(get_proposal_status_report(&env, proposal_id))
+    }
+
     pub fn proposals(env: Env) -> Result<Vec<Proposal>, GovernanceError> {
         require_initialized(&env)?;
         let all = get_all_proposals(&env);
@@ -855,6 +870,20 @@ impl GovernanceContract {
     pub fn get_active_proposals(env: Env) -> Result<Vec<Proposal>, GovernanceError> {
         require_initialized(&env)?;
         Ok(proposals::get_active_proposals(&env))
+    }
+
+    /// # Summary
+    /// Persist the terminal `Expired` state for a passed proposal whose
+    /// execution deadline has passed (Issue #1291). Idempotent: repeated calls
+    /// succeed without changing state or settling any bond twice.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::InvalidDuration`] — deadline has not passed yet
+    ///   (`now == execution_deadline` is still executable).
+    /// - [`GovernanceError::ProposalNotApproved`] — proposal never succeeded.
+    pub fn expire_proposal(env: Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        expire_proposal(&env, proposal_id)
     }
 
     /// # Summary
