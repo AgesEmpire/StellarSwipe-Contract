@@ -346,6 +346,15 @@ impl AutoTradeError {
     pub const ConditionalOrderNotFound: AutoTradeError = AutoTradeError::ConditionalOrderError;
     pub const ConditionalOrderNotPending: AutoTradeError = AutoTradeError::ConditionalOrderError;
     pub const ConditionalOrderNotTriggered: AutoTradeError = AutoTradeError::ConditionalOrderError;
+    /// Issue #1441: `cancel_expired_order` was called before the order's
+    /// `expires_at` deadline has actually passed.
+    pub const ConditionalOrderNotExpired: AutoTradeError = AutoTradeError::ConditionalOrderError;
+
+    // ── Issue #1442: decimal normalization in trade settlement ──────────────
+    /// A price/amount scale could not be normalized onto the shared
+    /// settlement precision with checked arithmetic (decimals too large, or
+    /// rescaling would overflow i128). Rejected before any token transfer.
+    pub const UnsupportedDecimalScale: AutoTradeError = AutoTradeError::SystemError;
 
     pub const RateLimitPenalty: AutoTradeError = AutoTradeError::RateLimitExceeded;
     pub const BelowMinTransfer: AutoTradeError = AutoTradeError::RateLimitExceeded;
