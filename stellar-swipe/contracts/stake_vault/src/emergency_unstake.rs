@@ -321,6 +321,16 @@ fn execute_early_unstake(
         .persistent()
         .set(&MigrationKey::StakesV2, &stakes);
 
+    // Issue #1436: reconcile the reward-index's share accounting after the
+    // emergency withdrawal zeroes this staker's balance. Without this, the
+    // reward index's `total_stake` kept counting this staker's now-removed
+    // balance forever, so remaining stakers' reward-per-share math would be
+    // permanently diluted against assets that no longer exist in the vault.
+    // `on_stake_change` first checkpoints (crediting any reward accrued up
+    // to this point against the *old* balance) and then removes the
+    // staker's participating stake from the global total.
+    crate::reward_index::on_stake_change(env, staker, 0)?;
+
     events::emit_emergency_executed(env, staker.clone(), gross, penalty, net);
 
     // Burn the penalty portion, transfer the net to the staker.
