@@ -11,6 +11,7 @@ use stellar_swipe_common::SECONDS_PER_DAY;
 
 mod validators;
 
+pub mod asset_amount;
 pub use validators::{ValidatorApproval, ValidatorApprovalKind, ValidatorSet};
 
 #[contracterror]
@@ -102,9 +103,15 @@ pub enum BridgeError {
     /// The pool's trading is currently paused by its operator; swaps are
     /// rejected until it is resumed (Issue #1320).
     PoolTradingPaused = 37,
+    /// A proof, validator set, or approval vector exceeds the documented
+    /// bounded-work limit; rejected before any iteration (Issue #1298).
+    ProofLimitExceeded = 38,
+    /// Asset decimal scales differ by more than the supported maximum, or the
+    /// converted amount cannot be represented (Issue #1299).
+    AmountConversionFailed = 39,
     /// A swap would move the pool price beyond the configured maximum impact
     /// bound, independently of the caller's minimum-output limit (Issue #1317).
-    MaxPriceImpactExceeded = 38,
+    MaxPriceImpactExceeded = 40,
 }
 
 impl BridgeError {
@@ -215,6 +222,12 @@ impl BridgeError {
             }
             BridgeError::PoolTradingPaused => {
                 "pool trading is paused by its operator; swaps are rejected until resumed"
+            }
+            BridgeError::ProofLimitExceeded => {
+                "validator, approval, or proof input exceeds its documented maximum size"
+            }
+            BridgeError::AmountConversionFailed => {
+                "asset amount cannot be converted between the given decimal scales"
             }
             BridgeError::MaxPriceImpactExceeded => {
                 "swap would exceed the pool's configured maximum price impact bound"
@@ -503,9 +516,10 @@ pub use liquidity::{LiquidityPool, LiquidityPosition, PoolHealth, PoolType, Swap
 
 pub use messaging::{
     confirm_message_delivery, expire_timed_out_message, get_cross_chain_message,
-    mark_message_failed, message_size, receive_message_callback, register_bridge_for_chain,
-    relay_message_to_target_chain, retry_failed_message, send_cross_chain_message,
-    CrossChainMessage, MessageStatus, MAX_MESSAGE_SIZE, MESSAGE_TIMEOUT,
+    get_message_status, mark_message_failed, message_size, receive_message_callback,
+    register_bridge_for_chain, relay_message_to_target_chain, retry_failed_message,
+    send_cross_chain_message, CrossChainMessage, LifecycleStatus, MessageStatus, MessageStatusView,
+    MAX_MESSAGE_SIZE, MESSAGE_TIMEOUT,
 };
 
 soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
@@ -677,6 +691,42 @@ impl BridgeContract {
             source_asset,
             wrapped_asset,
             amount,
+            source_tx_hash,
+            source_nonce,
+            destination_recipient,
+            expires_at,
+        )
+    }
+
+    /// Register an inbound message after converting the source-chain amount
+    /// into the wrapped asset's decimal scale (Issue #1299). Conversion is
+    /// exact and checked, so dust or overflow fails before any mint can run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initiate_lock_mint_with_decimals(
+        env: Env,
+        user: Address,
+        source_chain: ChainId,
+        destination_chain: ChainId,
+        source_asset: String,
+        wrapped_asset: String,
+        amount: i128,
+        source_decimals: u32,
+        wrapped_decimals: u32,
+        source_tx_hash: String,
+        source_nonce: u64,
+        destination_recipient: String,
+        expires_at: u64,
+    ) -> Result<u64, BridgeError> {
+        let converted =
+            asset_amount::convert_asset_amount(&env, amount, source_decimals, wrapped_decimals)?;
+        initiate_lock_mint_inner(
+            env,
+            user,
+            source_chain,
+            destination_chain,
+            source_asset,
+            wrapped_asset,
+            converted,
             source_tx_hash,
             source_nonce,
             destination_recipient,
@@ -959,6 +1009,18 @@ impl BridgeContract {
 
     pub fn get_transfer(env: Env, transfer_id: u64) -> Result<BridgeTransfer, BridgeError> {
         get_transfer(&env, transfer_id)
+    }
+
+    /// Convert an amount between decimal scales before minting or releasing.
+    /// Exact conversion only: overflow, unsupported gaps, and dust fail
+    /// before any balance or transfer state is written (Issue #1299).
+    pub fn convert_asset_amount(
+        env: Env,
+        amount: i128,
+        from_decimals: u32,
+        to_decimals: u32,
+    ) -> Result<i128, BridgeError> {
+        asset_amount::convert_asset_amount(&env, amount, from_decimals, to_decimals)
     }
 
     pub fn get_bridge_config(env: Env) -> Result<BridgeConfig, BridgeError> {
@@ -1402,6 +1464,12 @@ impl BridgeContract {
     }
 
     // ── #668: Message nonce read-only entrypoint ───────────────────────────────
+
+    /// Compact lifecycle view for a message id (Issue #1300). Unknown ids
+    /// return `LifecycleStatus::Unknown`; the query never traps or writes.
+    pub fn get_message_status(env: Env, message_id: u64) -> MessageStatusView {
+        messaging::get_message_status(&env, message_id)
+    }
 
     /// Return the next expected delivery-confirmation nonce for `source_chain_id`.
     /// `source_chain_id` is the numeric value of `monitoring::ChainId`
