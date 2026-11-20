@@ -25,6 +25,14 @@ mod sdex;
 mod sla;
 mod staleness;
 mod storage;
+#[cfg(test)]
+mod test_feed_bounds;
+#[cfg(test)]
+mod test_feed_canonical;
+#[cfg(test)]
+mod test_feed_movement;
+#[cfg(test)]
+mod test_feed_version;
 mod types;
 
 use errors::OracleError;
@@ -195,6 +203,8 @@ impl OracleContract {
         if price <= 0 {
             return Err(OracleError::InvalidAsset);
         }
+        // #1304: reject economically impossible observations before any state change.
+        feeds::check_bounds(&env, &pair, price)?;
         // #755: single-update deviation circuit breaker check. A deviating
         // update trips the breaker and is rejected (not stored); the call
         // returns Ok so the trip flag persists (an error return would roll
@@ -224,8 +234,26 @@ impl OracleContract {
         feeds::configure_batch(&env, &entries)
     }
 
+    /// Admin: register new feeds. Rejects duplicates under the canonical pair
+    /// identifier; use `configure_feeds` to update an existing feed.
+    pub fn register_feeds(
+        env: Env,
+        admin: Address,
+        entries: Vec<feeds::FeedConfigInput>,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        feeds::register_batch(&env, &entries)
+    }
+
     pub fn get_feed_config(env: Env, pair: AssetPair) -> Option<feeds::FeedConfig> {
         feeds::get_config(&env, &pair)
+    }
+
+    /// Read-only: the deterministic identifier used to key this feed.
+    /// Aliased/reversed spellings return the same canonical pair.
+    pub fn get_canonical_pair(env: Env, pair: AssetPair) -> Result<AssetPair, OracleError> {
+        feeds::canonical_pair(&env, &pair)
     }
 
     /// Feed owner: delegate submission rights to `publisher`.
@@ -860,6 +888,20 @@ impl OracleContract {
         Ok(price)
     }
 
+    /// Read the accepted price together with the configuration version that
+    /// produced it (0 when the feed is unconfigured). Consumers can use this
+    /// to attribute a quote to its source set, bounds and breaker policy.
+    pub fn get_price_with_feed_version(
+        env: Env,
+        pair: AssetPair,
+    ) -> Result<(i128, u32), OracleError> {
+        let (price, _) = Self::get_price_with_confidence(env.clone(), pair.clone())?;
+        let version = feeds::get_config(&env, &pair)
+            .map(|cfg| cfg.version)
+            .unwrap_or(0);
+        Ok((price, version))
+    }
+
     pub fn get_price_with_confidence(
         env: Env,
         pair: AssetPair,
@@ -1250,6 +1292,8 @@ impl OracleContract {
         if price <= 0 {
             return Err(OracleError::InvalidPrice);
         }
+        // #1304: bounds are enforced before the observation enters aggregation.
+        feeds::check_bounds(&env, &pair, price)?;
 
         // #1309: only the feed's owner or delegated publishers may submit.
         feeds::authorize_publisher(&env, &pair, &source)?;

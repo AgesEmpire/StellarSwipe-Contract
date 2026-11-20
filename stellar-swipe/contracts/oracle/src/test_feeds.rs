@@ -41,6 +41,9 @@ fn entry(env: &Env, p: AssetPair, owner: &Address, max_age: u64) -> FeedConfigIn
         publishers: Vec::new(env),
         max_age,
         enabled: true,
+        max_movement_bps: 0,
+        min_price: 1,
+        max_price: i128::MAX,
     }
 }
 
