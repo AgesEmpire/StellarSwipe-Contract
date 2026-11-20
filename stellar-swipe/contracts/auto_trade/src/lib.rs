@@ -1860,6 +1860,34 @@ impl AutoTradeContract {
         strategies::grid::calculate_grid_performance(&env, strategy_id)
     }
 
+    /// Update a grid strategy's tunable config (order size, rebalance-on-fill),
+    /// retaining the previous config as a revision (Issue #1444). Returns the
+    /// epoch under which the prior config was archived.
+    pub fn update_grid_config(
+        env: Env,
+        caller: Address,
+        strategy_id: u64,
+        order_size_per_grid: i128,
+        rebalance_on_fill: bool,
+    ) -> Result<u32, AutoTradeError> {
+        strategies::grid::update_grid_config(
+            &env,
+            &caller,
+            strategy_id,
+            order_size_per_grid,
+            rebalance_on_fill,
+        )
+    }
+
+    /// Return the full archived config-revision history for a grid strategy,
+    /// oldest first (Issue #1444).
+    pub fn get_grid_config_history(
+        env: Env,
+        strategy_id: u64,
+    ) -> soroban_sdk::Vec<strategies::grid::GridConfigRevision> {
+        strategies::grid::get_grid_config_history(&env, strategy_id)
+    }
+
     // ── Pairs Trading Strategy (Issue #106) ───────────────────────────────────
 
     pub fn configure_pairs_strategy(
