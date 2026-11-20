@@ -339,16 +339,44 @@ impl AnalyticsContract {
         tvl::get_protocol_tvl(&env)
     }
 
-    /// Record an incremental deposit into one TVL source.
+    /// Record an incremental deposit into one TVL source, in base-unit
+    /// (7-decimal) precision.
     /// `source`: 0 = StakeVault, 1 = LiquidityPool, 2 = Escrow.
-    pub fn record_tvl_deposit(env: Env, source: tvl::TvlSource, amount: i128) {
-        tvl::apply_delta(&env, source, amount);
+    pub fn record_tvl_deposit(env: Env, source: tvl::TvlSource, amount: i128) -> Result<(), tvl::TvlError> {
+        tvl::apply_delta(&env, source, amount)
     }
 
-    /// Record an incremental withdrawal from one TVL source.
+    /// Record an incremental withdrawal from one TVL source, in base-unit
+    /// (7-decimal) precision.
     /// `source`: 0 = StakeVault, 1 = LiquidityPool, 2 = Escrow.
-    pub fn record_tvl_withdrawal(env: Env, source: tvl::TvlSource, amount: i128) {
-        tvl::apply_delta(&env, source, -amount);
+    pub fn record_tvl_withdrawal(env: Env, source: tvl::TvlSource, amount: i128) -> Result<(), tvl::TvlError> {
+        tvl::apply_delta(&env, source, -amount)
+    }
+
+    /// Record an incremental deposit for a raw asset amount expressed in
+    /// its own `asset_decimals` precision (issue #1447). The amount is
+    /// converted to base units with documented, order-independent
+    /// truncation before being folded into the aggregate TVL.
+    /// `source`: 0 = StakeVault, 1 = LiquidityPool, 2 = Escrow.
+    pub fn record_tvl_asset_deposit(
+        env: Env,
+        source: tvl::TvlSource,
+        raw_amount: i128,
+        asset_decimals: u32,
+    ) -> Result<(), tvl::TvlError> {
+        tvl::apply_asset_delta(&env, source, raw_amount, asset_decimals)
+    }
+
+    /// Record an incremental withdrawal for a raw asset amount expressed in
+    /// its own `asset_decimals` precision (issue #1447).
+    /// `source`: 0 = StakeVault, 1 = LiquidityPool, 2 = Escrow.
+    pub fn record_tvl_asset_withdrawal(
+        env: Env,
+        source: tvl::TvlSource,
+        raw_amount: i128,
+        asset_decimals: u32,
+    ) -> Result<(), tvl::TvlError> {
+        tvl::apply_asset_delta(&env, source, -raw_amount, asset_decimals)
     }
 
     // ── Risk-Adjusted Return Score (Sharpe-style) ─────────────────────────────
