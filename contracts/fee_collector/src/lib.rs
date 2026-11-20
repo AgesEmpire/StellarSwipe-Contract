@@ -192,6 +192,44 @@ pub struct PauseChanged {
     pub actor: Address,
 }
 
+/// A single pending rebate claim considered by
+/// [`FeeCollector::preview_fee_distribution`] (issue #1452).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebateClaimInput {
+    pub claimant: Address,
+    pub amount: i128,
+}
+
+/// One claimant's share of a previewed distribution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebateClaimPreview {
+    pub claimant: Address,
+    pub requested: i128,
+    pub payout: i128,
+}
+
+/// Read-only breakdown of how the collector's current balance would be
+/// split across pending rebate claims, without mutating any state
+/// (issue #1452).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeDistributionPreview {
+    /// Collector balance the preview was computed against.
+    pub available_balance: i128,
+    /// Cap applied to the total payout, in basis points of `available_balance`.
+    pub max_rebate_bps: u32,
+    /// Sum of all requested claim amounts.
+    pub total_requested: i128,
+    /// Sum of all computed payouts (<= the bps cap of `available_balance`).
+    pub total_payout: i128,
+    /// Whether `total_requested` exceeded the cap and claims were scaled down.
+    pub cap_applied: bool,
+    /// Per-claimant breakdown, in input order.
+    pub payouts: soroban_sdk::Vec<RebateClaimPreview>,
+}
+
 #[contract]
 pub struct FeeCollector;
 
@@ -378,6 +416,79 @@ impl FeeCollector {
     /// Issue #1248: report whether new fee collection is currently paused.
     pub fn is_collection_paused(env: Env) -> bool {
         env.storage().instance().get(&PAUSED_KEY).unwrap_or(false)
+    }
+
+    /// Issue #1452: read-only preview of how the collector's current
+    /// balance would be split across `claims` if a rebate distribution ran
+    /// right now, capped at `max_rebate_bps` basis points of the balance.
+    ///
+    /// This performs no storage writes and emits no events — it is purely a
+    /// query so operators and UIs can show an accurate fee distribution
+    /// breakdown before anyone actually triggers a payout. Mirrors the
+    /// capping/scaling behavior real distribution logic must use: when the
+    /// sum of requested claims exceeds the cap, every claim is scaled down
+    /// proportionally so payouts sum to (at most) the cap.
+    pub fn preview_fee_distribution(
+        env: Env,
+        max_rebate_bps: u32,
+        claims: soroban_sdk::Vec<RebateClaimInput>,
+    ) -> FeeDistributionPreview {
+        let available_balance = Self::balance(env.clone());
+
+        let total_requested: i128 = claims.iter().map(|c| c.amount).sum();
+
+        if total_requested <= 0 {
+            return FeeDistributionPreview {
+                available_balance,
+                max_rebate_bps,
+                total_requested,
+                total_payout: 0,
+                cap_applied: false,
+                payouts: soroban_sdk::Vec::new(&env),
+            };
+        }
+
+        let cap = available_balance.saturating_mul(max_rebate_bps as i128) / 10_000i128;
+
+        if total_requested <= cap {
+            let mut payouts = soroban_sdk::Vec::new(&env);
+            for claim in claims.iter() {
+                payouts.push_back(RebateClaimPreview {
+                    claimant: claim.claimant.clone(),
+                    requested: claim.amount,
+                    payout: claim.amount,
+                });
+            }
+            return FeeDistributionPreview {
+                available_balance,
+                max_rebate_bps,
+                total_requested,
+                total_payout: total_requested,
+                cap_applied: false,
+                payouts,
+            };
+        }
+
+        let mut payouts = soroban_sdk::Vec::new(&env);
+        let mut total_payout: i128 = 0;
+        for claim in claims.iter() {
+            let adjusted = claim.amount.saturating_mul(cap) / total_requested;
+            total_payout = total_payout.saturating_add(adjusted);
+            payouts.push_back(RebateClaimPreview {
+                claimant: claim.claimant.clone(),
+                requested: claim.amount,
+                payout: adjusted,
+            });
+        }
+
+        FeeDistributionPreview {
+            available_balance,
+            max_rebate_bps,
+            total_requested,
+            total_payout,
+            cap_applied: true,
+            payouts,
+        }
     }
 
     /// Sweep a negligible dust balance to an explicit destination.
