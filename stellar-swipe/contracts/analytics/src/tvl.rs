@@ -16,9 +16,15 @@ pub enum TvlSource {
     Escrow,
 }
 
+/// Schema version for `TvlSnapshot` (Issue #1445). Bump whenever a field is
+/// added, removed, or reinterpreted so consumers can detect breaking changes
+/// instead of silently misreading an incompatible payload.
+pub const TVL_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct TvlSnapshot {
+    pub schema_version: u32,
     pub stake_vault: i128,
     pub liquidity_pool: i128,
     pub escrow: i128,
@@ -39,6 +45,7 @@ fn load(env: &Env) -> TvlSnapshot {
         .instance()
         .get(&TvlKey::Snapshot)
         .unwrap_or(TvlSnapshot {
+            schema_version: TVL_SNAPSHOT_SCHEMA_VERSION,
             stake_vault: 0,
             liquidity_pool: 0,
             escrow: 0,

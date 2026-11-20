@@ -62,6 +62,10 @@ pub struct WeeklyHealthReport {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolAnalytics {
+    /// Schema version of this response (Issue #1445) so consumers can detect
+    /// breaking changes to the payload shape rather than silently
+    /// misinterpreting fields after an upgrade.
+    pub schema_version: u32,
     pub total_trades: u64,
     pub total_volume_usd: u64,
     pub total_fees_collected: u64,
@@ -171,6 +175,7 @@ impl AnalyticsContract {
 
     pub fn get_protocol_analytics() -> ProtocolAnalytics {
         ProtocolAnalytics {
+            schema_version: SCHEMA_VERSION,
             total_trades: 0,
             total_volume_usd: 0,
             total_fees_collected: 0,
