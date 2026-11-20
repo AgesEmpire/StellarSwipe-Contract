@@ -2195,6 +2195,27 @@ impl AutoTradeContract {
         plan_lifecycle::process_dca_tick(&env, &keeper, plan_id, epoch)
     }
 
+    /// Owner: set the maximum number of executions that may be in flight at
+    /// once for this plan (Issue #1443).
+    pub fn set_plan_max_concurrent_executions(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+        max_concurrent: u32,
+    ) -> Result<(), AutoTradeError> {
+        plan_lifecycle::set_max_concurrent_executions(&env, &caller, plan_id, max_concurrent)
+    }
+
+    /// Read-only: the configured concurrent-execution cap for a plan.
+    pub fn get_plan_max_concurrent_executions(env: Env, plan_id: u64) -> u32 {
+        plan_lifecycle::get_max_concurrent_executions(&env, plan_id)
+    }
+
+    /// Read-only: how many executions are currently in flight for a plan.
+    pub fn get_plan_in_flight_executions(env: Env, plan_id: u64) -> u32 {
+        plan_lifecycle::get_in_flight_executions(&env, plan_id)
+    }
+
     /// Mark a triggered conditional order as executed (call after trade fill).
     pub fn mark_conditional_executed(env: Env, id: u64) -> Result<(), AutoTradeError> {
         conditional::mark_executed(&env, id)
