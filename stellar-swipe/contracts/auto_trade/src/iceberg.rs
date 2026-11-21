@@ -113,9 +113,9 @@ const MAX_VISIBLE_PCT: u32 = 5000; // 50%
 const MIN_VISIBLE_AMOUNT: i128 = 1000; // Minimum visible amount
 const BASIS_POINTS: i128 = 10000;
 
-/// ==========================
-/// Order Creation
-/// ==========================
+// ==========================
+// Order Creation
+// ==========================
 
 /// Create a new iceberg order
 pub fn create_iceberg_order(
@@ -185,9 +185,9 @@ pub fn create_iceberg_order(
     Ok(order_id)
 }
 
-/// ==========================
-/// Order Filling & Replenishment
-/// ==========================
+// ==========================
+// Order Filling & Replenishment
+// ==========================
 
 /// Handle SDEX order fill
 pub fn on_sdex_fill(
@@ -282,9 +282,9 @@ fn min(a: i128, b: i128) -> i128 {
     }
 }
 
-/// ==========================
-/// Order Management
-/// ==========================
+// ==========================
+// Order Management
+// ==========================
 
 /// Cancel an iceberg order
 pub fn cancel_iceberg_order(
@@ -384,9 +384,9 @@ pub fn update_iceberg_price(
     Ok(())
 }
 
-/// ==========================
-/// Query Functions
-/// ==========================
+// ==========================
+// Query Functions
+// ==========================
 
 /// Get public view of order (hides total amount)
 pub fn get_public_order_view(env: &Env, order_id: u64) -> Result<PublicOrderView, String> {
@@ -462,9 +462,9 @@ pub fn get_fill_history(env: &Env, order_id: u64) -> Vec<FillEvent> {
         .unwrap_or(Vec::new(env))
 }
 
-/// ==========================
-/// Storage Functions
-/// ==========================
+// ==========================
+// Storage Functions
+// ==========================
 
 fn get_next_order_id(env: &Env) -> u64 {
     let counter = get_order_counter(env);
@@ -544,9 +544,9 @@ fn record_fill(env: &Env, order_id: u64, filled_amount: i128, price: i128) {
         .set(&IcebergStorageKey::FillHistory(order_id), &history);
 }
 
-/// ==========================
-/// SDEX Integration (Placeholder)
-/// ==========================
+// ==========================
+// SDEX Integration (Placeholder)
+// ==========================
 
 /// Place limit order on SDEX
 fn place_sdex_limit_order(
@@ -569,9 +569,9 @@ fn cancel_sdex_order(env: &Env, _sdex_order_id: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// ==========================
-/// Tests
-/// ==========================
+// ==========================
+// Tests
+// ==========================
 
 #[cfg(test)]
 mod tests {

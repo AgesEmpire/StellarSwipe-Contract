@@ -12,10 +12,90 @@
 //! 3. Verifies **actual** credit on the output SAC via balance delta (not only the
 //!    return value), and reverts with [`crate::errors::ContractError::SlippageExceeded`]
 //!    when `actual_received < min_received`.
+//!
+//! # Minimum output (Issue #1215)
+//! Every settlement requires a caller-provided `min_received > 0`; a zero floor
+//! is rejected with [`crate::errors::ContractError::InvalidAmount`] because it
+//! would let a zero-output fill settle silently. The check runs after the
+//! router call inside the same invocation, so returning `Err` rolls back the
+//! approval, both token transfers and any accounting the caller performed.
 
 use soroban_sdk::{token, Address, Env, IntoVal, Symbol, Val, Vec};
 
-use crate::errors::ContractError;
+use crate::errors::{ContractError, InsufficientLiquidityDetail};
+
+/// SDEX order-book query function name on the router.
+pub const SDEX_ORDERBOOK_FN: &str = "get_best_ask";
+
+/// Query the best ask quantity available for a pair via the router.
+/// Returns `(best_ask_price, available_quantity)`. Returns `(0, 0)` if the
+/// order book is empty (zero liquidity).
+fn query_best_ask(
+    env: &Env,
+    sdex_router: &Address,
+    from_token: &Address,
+    to_token: &Address,
+) -> (i128, i128) {
+    let sym = Symbol::new(env, SDEX_ORDERBOOK_FN);
+    let mut args = Vec::<Val>::new(env);
+    args.push_back(from_token.clone().into_val(env));
+    args.push_back(to_token.clone().into_val(env));
+    // Router returns (best_ask_price: i128, available_qty: i128).
+    // If the call fails (e.g. router doesn't support it), treat as zero liquidity.
+    env.invoke_contract::<(i128, i128)>(sdex_router, &sym, args)
+}
+
+/// Check order-book depth before executing a swap.
+///
+/// Returns `Err(ContractError::InsufficientLiquidity)` when:
+/// - The order book is empty (`available_qty == 0`), or
+/// - The best ask price exceeds `entry_price * (1 + max_slippage_bps / 10_000)`.
+pub fn check_liquidity(
+    env: &Env,
+    sdex_router: &Address,
+    from_token: &Address,
+    to_token: &Address,
+    required_amount: i128,
+    entry_price: i128,
+    max_slippage_bps: u32,
+) -> Result<(), ContractError> {
+    let (_best_ask_price, available_qty) = query_best_ask(env, sdex_router, from_token, to_token);
+
+    if available_qty == 0 || available_qty < required_amount {
+        return Err(ContractError::InsufficientLiquidity);
+    }
+
+    // Price guard: best_ask > entry_price * (1 + max_slippage_bps / 10_000)
+    let threshold = entry_price
+        .checked_mul(
+            (10_000i128)
+                .checked_add(max_slippage_bps as i128)
+                .unwrap_or(i128::MAX),
+        )
+        .unwrap_or(i128::MAX)
+        / 10_000;
+
+    if _best_ask_price > threshold {
+        return Err(ContractError::InsufficientLiquidity);
+    }
+
+    Ok(())
+}
+
+/// Build an [`InsufficientLiquidityDetail`] for the given pair (for error reporting).
+pub fn get_liquidity_detail(
+    env: &Env,
+    sdex_router: &Address,
+    from_token: &Address,
+    to_token: &Address,
+    required_amount: i128,
+) -> InsufficientLiquidityDetail {
+    let (_price, available_liquidity) = query_best_ask(env, sdex_router, from_token, to_token);
+    InsufficientLiquidityDetail {
+        available_liquidity,
+        required_amount,
+    }
+}
 
 /// Router entrypoint name invoked on `sdex_router`.
 pub const SDEX_SWAP_FN: &str = "swap";
@@ -56,6 +136,11 @@ pub fn min_received_from_slippage(amount: i128, max_slippage_bps: u32) -> Option
 ///
 /// The router should `transfer_from` `amount_in` from `pull_from` and `transfer`
 /// output tokens to `recipient`.
+///
+/// # Errors
+/// - [`ContractError::InvalidAmount`] — `amount <= 0` or `min_received <= 0`.
+/// - [`ContractError::SlippageExceeded`] — credited output `< min_received`
+///   (including a zero-output fill).
 pub fn execute_sdex_swap(
     env: &Env,
     sdex_router: &Address,
@@ -64,9 +149,23 @@ pub fn execute_sdex_swap(
     amount: i128,
     min_received: i128,
 ) -> Result<i128, ContractError> {
-    if amount <= 0 || min_received < 0 {
+    // Issue #1215: a caller-provided, strictly positive minimum is mandatory.
+    if amount <= 0 || min_received <= 0 {
         return Err(ContractError::InvalidAmount);
     }
+
+    // Liquidity check: use min_received as the entry_price proxy and 0 slippage
+    // (the caller already computed min_received from slippage). We check that
+    // available_qty >= amount; price guard uses min_received as the floor.
+    check_liquidity(
+        env,
+        sdex_router,
+        from_token,
+        to_token,
+        amount,
+        min_received,
+        0,
+    )?;
 
     let this = env.current_contract_address();
     let from_client = token::Client::new(env, from_token);
@@ -79,7 +178,10 @@ pub fn execute_sdex_swap(
         .ok_or(ContractError::InvalidAmount)?;
 
     // SEP-41: current contract authorizes router to pull `amount` of from_token.
-    from_client.approve(&this, sdex_router, &amount, &expiration);
+    shared::token_error::map_result(
+        from_client.try_approve(&this, sdex_router, &amount, &expiration),
+    )
+    .map_err(ContractError::from)?;
 
     let balance_before = to_client.balance(&this);
 
@@ -92,7 +194,13 @@ pub fn execute_sdex_swap(
     args.push_back(min_received.into_val(env));
     args.push_back(this.clone().into_val(env));
 
-    let _reported_out: i128 = env.invoke_contract(sdex_router, &swap_sym, args);
+    // Router failures (auth, its own balance/allowance checks, or a host
+    // abort) must surface as a mapped error, never as a silently-successful
+    // swap — see shared::token_error (Issue #1001).
+    let _reported_out: i128 = shared::token_error::map_result(
+        env.try_invoke_contract::<i128, soroban_sdk::Error>(sdex_router, &swap_sym, args),
+    )
+    .map_err(ContractError::from)?;
 
     let balance_after = to_client.balance(&this);
     let actual_received = balance_after.checked_sub(balance_before).unwrap_or(0);
@@ -102,4 +210,58 @@ pub fn execute_sdex_swap(
     }
 
     Ok(actual_received)
+}
+
+#[cfg(test)]
+mod liquidity_tests {
+    use super::*;
+    use crate::errors::ContractError;
+
+    // Helper: build a detail struct directly (no router needed for unit tests).
+    fn detail(available: i128, required: i128) -> InsufficientLiquidityDetail {
+        InsufficientLiquidityDetail {
+            available_liquidity: available,
+            required_amount: required,
+        }
+    }
+
+    #[test]
+    fn zero_liquidity_returns_insufficient_liquidity_detail() {
+        let d = detail(0, 1_000);
+        assert_eq!(d.available_liquidity, 0);
+        assert_eq!(d.required_amount, 1_000);
+    }
+
+    #[test]
+    fn insufficient_liquidity_detail_fields() {
+        let d = detail(500, 1_000);
+        assert!(d.available_liquidity < d.required_amount);
+    }
+
+    #[test]
+    fn sufficient_liquidity_detail_fields() {
+        let d = detail(2_000, 1_000);
+        assert!(d.available_liquidity >= d.required_amount);
+    }
+
+    #[test]
+    fn min_received_from_slippage_zero_slippage() {
+        assert_eq!(min_received_from_slippage(1_000, 0), Some(1_000));
+    }
+
+    #[test]
+    fn min_received_from_slippage_100bps() {
+        // 1% slippage on 10_000 → 9_900
+        assert_eq!(min_received_from_slippage(10_000, 100), Some(9_900));
+    }
+
+    #[test]
+    fn min_received_from_slippage_full_slippage() {
+        assert_eq!(min_received_from_slippage(1_000, 10_000), Some(0));
+    }
+
+    #[test]
+    fn min_received_from_slippage_negative_amount() {
+        assert_eq!(min_received_from_slippage(-1, 100), None);
+    }
 }

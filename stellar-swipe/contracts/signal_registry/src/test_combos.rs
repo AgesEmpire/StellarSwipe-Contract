@@ -10,7 +10,6 @@ use crate::combos::{
 };
 use crate::categories::{SignalCategory, RiskLevel};
 
-use crate::combos::{ComboStatus, ComboType, ComponentSignal, Condition, ConditionType};
 
 // -----------------------------------------------------------------------
 // Helpers
@@ -39,7 +38,7 @@ fn make_signal(env: &Env, client: &SignalRegistryClient, provider: &Address) -> 
         &100_000,
         &String::from_str(env, "Bullish"),
         &expiry,
-        &SignalCategory::SwingTrade,
+        &SignalCategory::SWING,
         &vec![env, String::from_str(env, "test")],
         &RiskLevel::Medium,
     )
@@ -54,7 +53,7 @@ fn make_sell_signal(env: &Env, client: &SignalRegistryClient, provider: &Address
         &4_500_000,
         &String::from_str(env, "Bearish BTC"),
         &expiry,
-        &SignalCategory::DayTrade,
+        &SignalCategory::SCALP,
         &vec![env, String::from_str(env, "crypto")],
         &RiskLevel::High,
     )
@@ -119,24 +118,6 @@ fn test_create_sequential_combo() {
     let sig3 = make_signal(&env, &client, &provider);
     comps.push_back(ComponentSignal { signal_id: sig3, weight: 3334, condition: ConditionGate::None });
 
-    comps.push_back(ComponentSignal {
-        signal_id: sig1,
-        weight: 3333,
-        condition: None,
-    });
-    comps.push_back(ComponentSignal {
-        signal_id: sig2,
-        weight: 3333,
-        condition: None,
-    });
-    // 3334 to make sum exactly 10000
-    let sig3 = make_signal(&env, &client, &provider);
-    comps.push_back(ComponentSignal {
-        signal_id: sig3,
-        weight: 3334,
-        condition: None,
-    });
-
     let combo_id = client
         .create_combo_signal(
             &provider,
@@ -199,12 +180,12 @@ fn test_create_combo_invalid_weights_fails() {
     comps.push_back(ComponentSignal {
         signal_id: sig1,
         weight: 4000,
-        condition: None,
+        condition: ConditionGate::None,
     });
     comps.push_back(ComponentSignal {
         signal_id: sig2,
         weight: 4000,
-        condition: None,
+        condition: ConditionGate::None,
     });
     // total = 8000, not 10000
 
@@ -249,17 +230,6 @@ fn test_create_combo_signal_not_found_fails() {
     comps.push_back(ComponentSignal { signal_id: sig1, weight: 5000, condition: ConditionGate::None });
     comps.push_back(ComponentSignal { signal_id: 999, weight: 5000, condition: ConditionGate::None }); // non-existent
 
-    comps.push_back(ComponentSignal {
-        signal_id: sig1,
-        weight: 5000,
-        condition: None,
-    });
-    comps.push_back(ComponentSignal {
-        signal_id: 999,
-        weight: 5000,
-        condition: None,
-    }); // non-existent 
-
     let result = client.try_create_combo_signal(
         &provider,
         &String::from_str(&env, "Bad signal ref"),
@@ -295,12 +265,6 @@ fn test_create_combo_invalid_condition_reference_fails() {
 
     let mut comps = Vec::new(&env);
     comps.push_back(ComponentSignal { signal_id: sig1, weight: 5000, condition: ConditionGate::None });
-
-    comps.push_back(ComponentSignal {
-        signal_id: sig1,
-        weight: 5000,
-        condition: None,
-    });
     comps.push_back(ComponentSignal {
         signal_id: sig2,
         weight: 5000,
@@ -372,22 +336,6 @@ fn test_execute_sequential_combo() {
     comps.push_back(ComponentSignal { signal_id: sig2, weight: 3333, condition: ConditionGate::None });
     comps.push_back(ComponentSignal { signal_id: sig3, weight: 3334, condition: ConditionGate::None });
 
-    comps.push_back(ComponentSignal {
-        signal_id: sig1,
-        weight: 3333,
-        condition: None,
-    });
-    comps.push_back(ComponentSignal {
-        signal_id: sig2,
-        weight: 3333,
-        condition: None,
-    });
-    comps.push_back(ComponentSignal {
-        signal_id: sig3,
-        weight: 3334,
-        condition: None,
-    });
-
     let combo_id = client
         .create_combo_signal(
             &provider,
@@ -415,18 +363,8 @@ fn test_execute_conditional_combo_condition_met() {
     let sig1 = make_signal(&env, &client, &provider);
     let sig2 = make_signal(&env, &client, &provider);
 
-    // Record a profitable trade on sig1 so it has positive ROI
-    client.record_trade_execution(&user, &sig1, &100_000, &110_000, &1_000_000);
-    // sig1 now has avg_roi = 1000 bps (10%)
-
     let mut comps = Vec::new(&env);
     comps.push_back(ComponentSignal { signal_id: sig1, weight: 5000, condition: ConditionGate::None });
-
-    comps.push_back(ComponentSignal {
-        signal_id: sig1,
-        weight: 5000,
-        condition: None,
-    });
     comps.push_back(ComponentSignal {
         signal_id: sig2,
         weight: 5000,
@@ -443,6 +381,9 @@ fn test_execute_conditional_combo_condition_met() {
             &comps,
             &ComboType::Conditional,
         );
+
+    // Record trade after combo references signals so they stay Active at creation time.
+    client.record_trade_execution(&user, &sig1, &100_000, &110_000, &1_000_000);
 
     let executions = client
         .execute_combo_signal(&combo_id, &user, &1_000_000);
@@ -473,12 +414,6 @@ fn test_execute_conditional_combo_condition_not_met() {
 
     let mut comps = Vec::new(&env);
     comps.push_back(ComponentSignal { signal_id: sig1, weight: 5000, condition: ConditionGate::None });
-
-    comps.push_back(ComponentSignal {
-        signal_id: sig1,
-        weight: 5000,
-        condition: None,
-    });
     comps.push_back(ComponentSignal {
         signal_id: sig2,
         weight: 5000,
@@ -514,17 +449,8 @@ fn test_execute_conditional_roi_above_threshold() {
     let sig1 = make_signal(&env, &client, &provider);
     let sig2 = make_signal(&env, &client, &provider);
 
-    // Give sig1 an ROI of 500 bps
-    client.record_trade_execution(&user, &sig1, &100_000, &105_000, &1_000_000);
-
     let mut comps = Vec::new(&env);
     comps.push_back(ComponentSignal { signal_id: sig1, weight: 5000, condition: ConditionGate::None });
-
-    comps.push_back(ComponentSignal {
-        signal_id: sig1,
-        weight: 5000,
-        condition: None,
-    });
     comps.push_back(ComponentSignal {
         signal_id: sig2,
         weight: 5000,
@@ -541,6 +467,8 @@ fn test_execute_conditional_roi_above_threshold() {
             &comps,
             &ComboType::Conditional,
         );
+
+    client.record_trade_execution(&user, &sig1, &100_000, &105_000, &1_000_000);
 
     let executions = client
         .execute_combo_signal(&combo_id, &user, &1_000_000);
@@ -746,14 +674,6 @@ fn test_combo_execution_history_recorded() {
 
     client.execute_combo_signal(&combo_id, &user, &1_000_000);
     client.execute_combo_signal(&combo_id, &user, &2_000_000);
-
-    client
-        .execute_combo_signal(&combo_id, &user, &1_000_000)
-        .unwrap();
-    client
-        .execute_combo_signal(&combo_id, &user, &2_000_000)
-        .unwrap();
-
     let history = client.get_combo_executions(&combo_id);
     assert_eq!(history.len(), 2);
     assert_eq!(history.get(0).unwrap().total_amount, 1_000_000);

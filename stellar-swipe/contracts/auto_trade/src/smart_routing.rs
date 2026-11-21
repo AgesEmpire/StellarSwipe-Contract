@@ -25,6 +25,11 @@ pub struct VenueLiquidity {
     pub price: i128,
     pub fee_bps: u32,
     pub slippage_bps: u32,
+    /// Issue #1439: ledger timestamp after which this quote may no longer be
+    /// used to plan or execute a route. Bound to the owning signal's own
+    /// `expiry` at upsert time so a quote can never outlive the auto-trade
+    /// intent it was issued for.
+    pub quote_expiry: u64,
 }
 
 #[contracttype]
@@ -71,6 +76,18 @@ pub fn upsert_venue_liquidity(
 ) -> Result<(), AutoTradeError> {
     if quote.available_amount <= 0 || quote.price <= 0 {
         return Err(AutoTradeError::InvalidAmount);
+    }
+
+    // Issue #1439: a quote cannot be used past its own expiry, nor past the
+    // expiry of the auto-trade signal/intent it quotes for. Reject up front
+    // rather than silently storing a quote that can never be validly routed.
+    if quote.quote_expiry <= env.ledger().timestamp() {
+        return Err(AutoTradeError::SignalExpired);
+    }
+    if let Some(signal) = crate::storage::get_signal(env, signal_id) {
+        if quote.quote_expiry > signal.expiry {
+            return Err(AutoTradeError::SignalExpired);
+        }
     }
 
     let key = venue_key(&quote);
@@ -125,7 +142,17 @@ pub fn plan_best_execution(
         return Err(AutoTradeError::InvalidAmount);
     }
 
-    let venues = get_venue_liquidity(env, signal.signal_id);
+    let now = env.ledger().timestamp();
+    let all_venues = get_venue_liquidity(env, signal.signal_id);
+    // Issue #1439: drop any quote that has gone stale (past its own
+    // quote_expiry) or that would outlive the signal's own execution
+    // deadline before it is ever considered for planning.
+    let mut venues = Vec::new(env);
+    for v in all_venues.iter() {
+        if v.quote_expiry > now && v.quote_expiry <= signal.expiry {
+            venues.push_back(v);
+        }
+    }
     if venues.is_empty() {
         return Err(AutoTradeError::RoutingPlanNotFound);
     }
@@ -208,6 +235,12 @@ pub fn execute_plan_atomically(
         .temporary()
         .get(&SmartRoutingKey::FailVenue(signal_id));
 
+    // Issue #1439: re-validate quote freshness at the moment of execution,
+    // not just at planning time — time may have passed between the two
+    // (e.g. a keeper planned, then was delayed before submitting execution).
+    let now = env.ledger().timestamp();
+    let signal_expiry = crate::storage::get_signal(env, signal_id).map(|s| s.expiry);
+
     for segment in plan.segments.iter() {
         let key = VenueKey {
             venue: segment.venue,
@@ -221,6 +254,15 @@ pub fn execute_plan_atomically(
 
         if stored.available_amount < segment.amount || stored.price <= 0 {
             return Err(AutoTradeError::AtomicExecutionFailed);
+        }
+
+        if stored.quote_expiry <= now {
+            return Err(AutoTradeError::SignalExpired);
+        }
+        if let Some(expiry) = signal_expiry {
+            if stored.quote_expiry > expiry || now > expiry {
+                return Err(AutoTradeError::SignalExpired);
+            }
         }
 
         if fail_key.as_ref() == Some(&key) {
@@ -257,12 +299,36 @@ pub fn execute_plan_atomically(
     })
 }
 
-#[cfg(test)]
 pub fn set_execution_failure(env: &Env, signal_id: u64, venue: LiquidityVenue, venue_id: u32) {
     env.storage().temporary().set(
         &SmartRoutingKey::FailVenue(signal_id),
         &VenueKey { venue, venue_id },
     );
+}
+
+pub fn debit_venue_liquidity(
+    env: &Env,
+    signal_id: u64,
+    venue: LiquidityVenue,
+    venue_id: u32,
+    amount: i128,
+) -> Result<(), AutoTradeError> {
+    let key = VenueKey { venue, venue_id };
+    let mut stored = env
+        .storage()
+        .persistent()
+        .get::<_, VenueLiquidity>(&SmartRoutingKey::VenueQuote(signal_id, key.clone()))
+        .ok_or(AutoTradeError::AtomicExecutionFailed)?;
+
+    if stored.available_amount < amount {
+        return Err(AutoTradeError::AtomicExecutionFailed);
+    }
+
+    stored.available_amount -= amount;
+    env.storage()
+        .persistent()
+        .set(&SmartRoutingKey::VenueQuote(signal_id, key), &stored);
+    Ok(())
 }
 
 fn finalize_plan(
@@ -382,6 +448,7 @@ mod tests {
             price,
             fee_bps,
             slippage_bps,
+            quote_expiry: 5_000,
         }
     }
 

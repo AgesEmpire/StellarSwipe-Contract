@@ -1,0 +1,46 @@
+{
+  "_comment": "Baseline CPU instruction counts for key contract entrypoints. Update via: scripts/update_budget_baseline.sh",
+  "_threshold_pct": 10,
+  "signal_registry": {
+    "submit_signal": 15000000,
+    "get_active_signals_50": 50000000,
+    "update_leaderboard_index": 8000000,
+    "get_provider_leaderboard": 5000000
+  },
+  "auto_trade": {
+    "execute_auto_trade": 12000000,
+    "batch_execute": 20000000
+  },
+  "trade_executor": {
+    "execute_trade": 8000000,
+    "batch_execute": 20000000
+  },
+  "fee_collector": {
+    "collect_fee": 5500000,
+    "distribute_fees": 10000000
+  },
+  "stake_vault": {
+    "stake": 6000000,
+    "unstake": 6000000
+  },
+  "governance": {
+    "propose": 8000000,
+    "vote": 5000000,
+    "finalize_proposal": 12000000
+  },
+  "oracle": {
+    "set_price": 3000000,
+    "get_price": 2000000
+  },
+  "bridge": {
+    "initiate_transfer": 10000000,
+    "finalize_transfer": 8000000
+  },
+  "user_portfolio": {
+    "record_trade": 5000000,
+    "get_positions": 4000000
+  },
+  "analytics": {
+    "emit_weekly_health_report": 6000000
+  }
+}

@@ -1,10 +1,11 @@
-use crate::errors::VersioningError;
+use crate::errors::{SignalEditError, VersioningError};
 use crate::events;
 use crate::types::{Signal, SignalStatus};
 use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
+use stellar_swipe_common::SECONDS_PER_HOUR;
 
 const MAX_UPDATES_PER_SIGNAL: u32 = 5;
-const UPDATE_COOLDOWN_SECONDS: u64 = 3600; // 1 hour
+const UPDATE_COOLDOWN_SECONDS: u64 = SECONDS_PER_HOUR; // 1 hour
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -133,6 +134,93 @@ pub fn update_signal(
     env.storage()
         .persistent()
         .set(&last_update_key, &current_time);
+
+    // Emit event
+    events::emit_signal_updated(env, signal_id, new_version, updater.clone());
+
+    Ok(new_version)
+}
+
+/// Edit a signal with a full audit trail (Issue #686).
+///
+/// Stores the current signal state as a versioned snapshot before applying
+/// edits. The edit is only permitted if no follower has copy-traded the
+/// signal yet (`adoption_count == 0`).
+///
+/// Unlike `update_signal`, this entrypoint uses a simplified audit model
+/// without cooldown or max-update limits, and returns the new version number.
+pub fn edit_signal_with_audit(
+    env: &Env,
+    signal_id: u64,
+    updater: &Address,
+    new_price: Option<i128>,
+    new_rationale: Option<String>,
+    new_expiry: Option<u64>,
+    signal: &mut Signal,
+) -> Result<u32, SignalEditError> {
+    // Verify ownership
+    if signal.provider != *updater {
+        return Err(SignalEditError::NotSignalOwner);
+    }
+
+    // Reject if any follower has already copy-traded
+    if signal.adoption_count > 0 {
+        return Err(SignalEditError::SignalAlreadyCopied);
+    }
+
+    let current_time = env.ledger().timestamp();
+
+    // Check expiry
+    if current_time >= signal.expiry {
+        return Err(SignalEditError::EditWindowClosed);
+    }
+
+    // Get current version
+    let version_key = VersioningStorageKey::LatestVersion(signal_id);
+    let current_version: u32 = env.storage().persistent().get(&version_key).unwrap_or(1);
+    let new_version = current_version + 1;
+
+    // Store current state as a versioned snapshot (append-only audit trail)
+    let version_record = SignalVersion {
+        version: current_version,
+        signal_id,
+        price: signal.price,
+        rationale: signal.rationale.clone(),
+        expiry: signal.expiry,
+        updated_at: current_time,
+        updated_by: updater.clone(),
+    };
+
+    let version_storage_key = VersioningStorageKey::SignalVersions(signal_id, current_version);
+    env.storage()
+        .persistent()
+        .set(&version_storage_key, &version_record);
+
+    // Apply updates
+    if let Some(price) = new_price {
+        if price <= 0 {
+            return Err(SignalEditError::FieldNotEditable);
+        }
+        signal.price = price;
+    }
+
+    if let Some(rationale) = new_rationale {
+        let blen = rationale.len();
+        if blen == 0 || blen > 500 {
+            return Err(SignalEditError::FieldNotEditable);
+        }
+        signal.rationale = rationale;
+    }
+
+    if let Some(expiry) = new_expiry {
+        if expiry <= current_time {
+            return Err(SignalEditError::EditWindowClosed);
+        }
+        signal.expiry = expiry;
+    }
+
+    // Update version metadata
+    env.storage().persistent().set(&version_key, &new_version);
 
     // Emit event
     events::emit_signal_updated(env, signal_id, new_version, updater.clone());

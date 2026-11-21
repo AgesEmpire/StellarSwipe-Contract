@@ -4,8 +4,21 @@
 //! `IOracleClient` is the canonical trait for fetching manipulation-resistant
 //! prices.  The real implementation calls an on-chain oracle contract via
 //! `soroban_sdk::invoke`; the mock implementation is used in unit tests.
+//!
+//! ## Sanity-check thresholds and failure modes
+//!
+//! | Check              | Threshold                          | Error                         |
+//! |--------------------|------------------------------------|-------------------------------|
+//! | Freshness          | `MAX_PRICE_AGE_SECS` (300 s)       | `OracleError::PriceStale`     |
+//! | Zero timestamp     | `timestamp == 0`                   | `OracleError::PriceStale`     |
+//! | Price too low      | `price < MIN_ORACLE_PRICE` (1)     | `OracleError::PriceBelowMin`  |
+//! | Price too high     | `price > MAX_ORACLE_PRICE` (10^18) | `OracleError::PriceAboveMax`  |
+//! | No oracle address  | not configured                     | `OracleError::NotConfigured`  |
+//! | Cross-contract fail| oracle call panics                 | `OracleError::CallFailed`     |
+//!
+//! Callers should use `validate_oracle_price` for a single combined check.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contracttype, symbol_short, vec, Address, Env, Symbol};
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -32,11 +45,30 @@ pub enum OracleError {
     NotConfigured = 1,
     /// The oracle contract returned no price for this asset pair.
     PriceNotFound = 2,
-    /// The price is older than the acceptable staleness window.
+    /// The price is older than the acceptable staleness window (`MAX_PRICE_AGE_SECS`),
+    /// or the timestamp is zero (price was never published).
     PriceStale = 3,
     /// The oracle contract call failed.
     CallFailed = 4,
+    /// The price is zero or negative — must be ≥ `MIN_ORACLE_PRICE`.
+    PriceBelowMin = 5,
+    /// The price exceeds the safe upper bound (`MAX_ORACLE_PRICE`) and would
+    /// cause overflow in basis-point ROI calculations.
+    PriceAboveMax = 6,
 }
+
+/// Default heartbeat/freshness window for externally sourced prices.
+/// Prices older than 300 seconds are rejected as stale.
+pub const MAX_PRICE_AGE_SECS: u64 = 300;
+
+/// Minimum acceptable oracle price (inclusive). Prices must be ≥ 1 raw unit.
+/// A zero or negative price indicates a missing or corrupt feed.
+pub const MIN_ORACLE_PRICE: i128 = 1;
+
+/// Maximum acceptable oracle price (inclusive). Set to 10^18 to prevent
+/// overflow when multiplying by `BASIS_POINTS_DENOMINATOR` (10 000) during
+/// ROI and reward calculations.
+pub const MAX_ORACLE_PRICE: i128 = 1_000_000_000_000_000_000;
 
 // ── Trait ────────────────────────────────────────────────────────────────────
 
@@ -57,13 +89,14 @@ pub struct OnChainOracleClient {
 impl IOracleClient for OnChainOracleClient {
     fn get_price(&self, env: &Env, asset_pair: u32) -> Result<OraclePrice, OracleError> {
         // Cross-contract call: oracle_contract.get_price(asset_pair) -> OraclePrice
-        let result: Option<OraclePrice> = env
-            .invoke_contract(
-                &self.address,
-                &Symbol::new(env, "get_price"),
-                soroban_sdk::vec![env, asset_pair.into()],
-            );
-        result.ok_or(OracleError::PriceNotFound)
+        match env.try_invoke_contract::<OraclePrice, soroban_sdk::Error>(
+            &self.address,
+            &Symbol::new(env, "get_price"),
+            vec![env, asset_pair.into()],
+        ) {
+            Ok(Ok(price)) => Ok(price),
+            Ok(Err(_)) | Err(_) => Err(OracleError::CallFailed),
+        }
     }
 }
 
@@ -97,5 +130,53 @@ impl IOracleClient for MockOracleClient {
             .temporary()
             .get(&(symbol_short!("mock_orc"), asset_pair))
             .ok_or(OracleError::PriceNotFound)
+    }
+}
+
+/// Check that `price.timestamp` is non-zero and not older than `MAX_PRICE_AGE_SECS`.
+///
+/// Returns `OracleError::PriceStale` when:
+/// - `timestamp == 0` (price was never published), or
+/// - `now - timestamp > MAX_PRICE_AGE_SECS` (price is too old).
+pub fn validate_freshness(env: &Env, price: &OraclePrice) -> Result<(), OracleError> {
+    let now = env.ledger().timestamp();
+    if price.timestamp == 0 || now.saturating_sub(price.timestamp) > MAX_PRICE_AGE_SECS {
+        return Err(OracleError::PriceStale);
+    }
+    Ok(())
+}
+
+/// Check that `price.price` is within `[MIN_ORACLE_PRICE, MAX_ORACLE_PRICE]`.
+///
+/// Returns:
+/// - `OracleError::PriceBelowMin` when `price.price < MIN_ORACLE_PRICE` (zero or negative).
+/// - `OracleError::PriceAboveMax` when `price.price > MAX_ORACLE_PRICE` (overflow risk).
+pub fn validate_price_bounds(price: &OraclePrice) -> Result<(), OracleError> {
+    if price.price < MIN_ORACLE_PRICE {
+        return Err(OracleError::PriceBelowMin);
+    }
+    if price.price > MAX_ORACLE_PRICE {
+        return Err(OracleError::PriceAboveMax);
+    }
+    Ok(())
+}
+
+/// Combined oracle sanity check: freshness then bounds.
+///
+/// Equivalent to calling `validate_freshness` followed by `validate_price_bounds`.
+/// Use this at every point where oracle price data feeds into settlement or
+/// reward calculations to ensure both temporal validity and numeric safety.
+pub fn validate_oracle_price(env: &Env, price: &OraclePrice) -> Result<(), OracleError> {
+    validate_freshness(env, price)?;
+    validate_price_bounds(price)?;
+    Ok(())
+}
+
+pub fn oracle_price_to_i128(price: &OraclePrice) -> i128 {
+    let scale = 10i128.pow(price.decimals);
+    if scale == 0 {
+        price.price
+    } else {
+        price.price / scale
     }
 }

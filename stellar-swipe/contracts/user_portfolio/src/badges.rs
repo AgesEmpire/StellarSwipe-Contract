@@ -59,29 +59,15 @@ pub(crate) fn after_open_position(env: &Env, user: &Address, is_first_ever_open:
 
 pub(crate) fn after_close_position(env: &Env, user: &Address, realized_pnl: i128) {
     let ckey = DataKey::UserClosedTradeCount(user.clone());
-    let closed: u32 = env
-        .storage()
-        .persistent()
-        .get(&ckey)
-        .unwrap_or(0);
+    let closed: u32 = env.storage().persistent().get(&ckey).unwrap_or(0);
     let closed = closed.saturating_add(1);
     env.storage().persistent().set(&ckey, &closed);
 
     if closed == 1 {
-        try_grant(
-            env,
-            user,
-            BadgeType::FirstTrade,
-            Symbol::new(env, "first"),
-        );
+        try_grant(env, user, BadgeType::FirstTrade, Symbol::new(env, "first"));
     }
     if closed == 10 {
-        try_grant(
-            env,
-            user,
-            BadgeType::TenTrades,
-            Symbol::new(env, "ten"),
-        );
+        try_grant(env, user, BadgeType::TenTrades, Symbol::new(env, "ten"));
     }
 
     let skey = DataKey::UserProfitStreak(user.clone());
@@ -111,7 +97,7 @@ fn maybe_top10_leaderboard(env: &Env, user: &Address) {
         .persistent()
         .get(&DataKey::LeaderboardRank(user.clone()))
         .unwrap_or(0);
-    if rank >= 1 && rank <= 10 {
+    if (1..=10).contains(&rank) {
         try_grant(
             env,
             user,

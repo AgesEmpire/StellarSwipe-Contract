@@ -92,7 +92,81 @@ fn get_trade_by_index(env: &Env, user: &Address, index: u64) -> Option<HistoryTr
         .get(&HistoryDataKey::Trade(user.clone(), index))
 }
 
-/// Get trade history for user, newest first, with pagination.
+/// Get trade history for user, newest first, using stable cursor pagination
+/// (Issue #1446).
+///
+/// Unlike `get_trade_history` below, this is immune to results shifting under
+/// concurrent writes: the cursor is the trade `id` (a monotonic per-user
+/// sequence number assigned at `record_trade` time), not a positional offset.
+/// New trades recorded between page fetches always get a *larger* id, so they
+/// never shift already-returned ids earlier in the sequence and are simply
+/// not part of the chain starting at `after_id`.
+///
+/// `after_id`: `None` starts from the newest trade; `Some(id)` resumes
+/// strictly before `id` (exclusive), i.e. continues from the cursor returned
+/// by the previous page.
+///
+/// Returns `(page, next_cursor)` where `next_cursor` is `Some(last_id_returned)`
+/// to pass as `after_id` on the next call, or `None` once there are no more
+/// older trades.
+pub fn get_trade_history_by_cursor(
+    env: &Env,
+    user: &Address,
+    after_id: Option<u64>,
+    limit: u32,
+) -> (Vec<HistoryTrade>, Option<u64>) {
+    let count = get_user_trade_count(env, user);
+    if count == 0 {
+        return (Vec::new(env), None);
+    }
+
+    let limit = if limit == 0 {
+        DEFAULT_HISTORY_LIMIT
+    } else if limit > MAX_HISTORY_LIMIT {
+        MAX_HISTORY_LIMIT
+    } else {
+        limit
+    };
+
+    // Start strictly before `after_id`, or from the newest id if no cursor
+    // was supplied. `start` is exclusive upper bound (we iterate downward).
+    let start = match after_id {
+        Some(id) if id == 0 => return (Vec::new(env), None),
+        Some(id) => id, // iterate ids < id
+        None => count,  // iterate ids < count, i.e. from the newest
+    };
+
+    let mut result = Vec::new(env);
+    let mut taken = 0u32;
+    let mut last_id: Option<u64> = None;
+
+    let mut i = start;
+    while i > 0 && taken < limit {
+        i -= 1;
+        if let Some(trade) = get_trade_by_index(env, user, i) {
+            result.push_back(trade);
+            last_id = Some(i);
+            taken += 1;
+        }
+    }
+
+    // There is a next page only if we stopped above id 0.
+    let next_cursor = match last_id {
+        Some(id) if id > 0 => Some(id),
+        _ => None,
+    };
+
+    (result, next_cursor)
+}
+
+/// Get trade history for user, newest first, with offset-based pagination.
+///
+/// NOTE (Issue #1446): offset pagination is unstable under concurrent writes
+/// — a trade recorded between two page fetches shifts every subsequent id
+/// "behind" it, which can cause skipped or duplicated entries across pages.
+/// New integrations should prefer `get_trade_history_by_cursor`, which keys
+/// off the stable trade id rather than a positional offset. This entrypoint
+/// is retained for backward compatibility.
 pub fn get_trade_history(env: &Env, user: &Address, offset: u32, limit: u32) -> Vec<HistoryTrade> {
     let count = get_user_trade_count(env, user);
     if count == 0 {

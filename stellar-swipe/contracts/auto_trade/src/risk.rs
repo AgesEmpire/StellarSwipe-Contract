@@ -3,9 +3,9 @@ use soroban_sdk::{contracttype, Address, Env, Map, Vec};
 
 use crate::errors::AutoTradeError;
 
-/// ==========================
-/// Risk Configuration Types
-/// ==========================
+// ==========================
+// Risk Configuration Types
+// ==========================
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,9 +81,9 @@ pub enum RiskDataKey {
 pub const DEFAULT_VOLATILITY_BPS: i128 = 2000;
 pub const MIN_PRICE_HISTORY: usize = 2;
 
-/// ==========================
-/// Risk Configuration Management
-/// ==========================
+// ==========================
+// Risk Configuration Management
+// ==========================
 pub fn get_risk_config(env: &Env, user: &Address) -> RiskConfig {
     env.storage()
         .persistent()
@@ -110,9 +110,9 @@ pub fn set_risk_parity_config(env: &Env, user: &Address, config: &RiskParityConf
         .set(&RiskDataKey::UserRiskParityConfig(user.clone()), config);
 }
 
-/// ==========================
-/// Volatility Calculation
-/// ==========================
+// ==========================
+// Volatility Calculation
+// ==========================
 
 pub fn record_price(env: &Env, asset_id: u32, price: i128) {
     let count: u32 = env
@@ -207,9 +207,9 @@ pub fn calculate_volatility(env: &Env, asset_id: u32, window: u32) -> i128 {
     }
 }
 
-/// ==========================
-/// Position Management
-/// ==========================
+// ==========================
+// Position Management
+// ==========================
 pub fn get_user_positions(env: &Env, user: &Address) -> Map<u32, Position> {
     env.storage()
         .persistent()
@@ -261,9 +261,9 @@ pub fn update_position(env: &Env, user: &Address, asset_id: u32, amount: i128, p
         .set(&RiskDataKey::UserPositions(user.clone()), &positions);
 }
 
-/// ==========================
-/// Trade History Management
-/// ==========================
+// ==========================
+// Trade History Management
+// ==========================
 pub fn get_trade_history(env: &Env, user: &Address) -> Vec<TradeRecord> {
     env.storage()
         .persistent()
@@ -287,9 +287,9 @@ pub fn add_trade_record(env: &Env, user: &Address, signal_id: u64, amount: i128)
         .set(&RiskDataKey::UserTradeHistory(user.clone()), &history);
 }
 
-/// ==========================
-/// Price Management
-/// ==========================
+// ==========================
+// Price Management
+// ==========================
 pub fn get_asset_price(env: &Env, asset_id: u32) -> Option<i128> {
     env.storage()
         .temporary()
@@ -302,9 +302,9 @@ pub fn set_asset_price(env: &Env, asset_id: u32, price: i128) {
         .set(&RiskDataKey::AssetPrice(asset_id), &price);
 }
 
-/// ==========================
-/// Risk Checks
-/// ==========================
+// ==========================
+// Risk Checks
+// ==========================
 /// Check if daily trade limit is exceeded
 pub fn check_daily_trade_limit(
     env: &Env,
@@ -613,6 +613,76 @@ mod tests {
 
             let triggered = check_stop_loss(&env, &user, 1, 80, None, &config);
             assert!(triggered);
+        });
+    }
+
+    // ── Issue #268: Flash Loan Attack Surface Tests ────────────────────────────
+
+    /// Flash loan pumps SDEX spot above stop-loss, but oracle price (below stop-loss)
+    /// still triggers the stop-loss. SDEX spot cannot suppress the trigger.
+    #[test]
+    fn test_oracle_price_triggers_stop_loss_despite_high_sdex_spot() {
+        let env = setup_env();
+        let user = test_user(&env);
+        let contract_addr = env.register(TestContract, ());
+
+        env.as_contract(&contract_addr, || {
+            let config = RiskConfig::default();
+            // Entry 100, stop-loss threshold = 85
+            update_position(&env, &user, 1, 1_000, 100);
+
+            // SDEX spot = 95 (above stop-loss) — flash loan pumped it
+            // Oracle TWAP = 80 (below stop-loss) — manipulation-resistant
+            let triggered = check_stop_loss(&env, &user, 1, 95, Some(80), &config);
+            assert!(
+                triggered,
+                "oracle price below stop-loss must trigger even if SDEX spot is high"
+            );
+        });
+    }
+
+    /// Flash loan dumps SDEX spot below stop-loss, but oracle price (above stop-loss)
+    /// prevents a false trigger. SDEX spot cannot force a premature stop-loss.
+    #[test]
+    fn test_oracle_price_prevents_false_stop_loss_from_sdex_dump() {
+        let env = setup_env();
+        let user = test_user(&env);
+        let contract_addr = env.register(TestContract, ());
+
+        env.as_contract(&contract_addr, || {
+            let config = RiskConfig::default();
+            // Entry 100, stop-loss threshold = 85
+            update_position(&env, &user, 1, 1_000, 100);
+
+            // SDEX spot = 70 (below stop-loss) — flash loan dumped it
+            // Oracle TWAP = 92 (above stop-loss) — manipulation-resistant
+            let triggered = check_stop_loss(&env, &user, 1, 70, Some(92), &config);
+            assert!(
+                !triggered,
+                "oracle price above stop-loss must not trigger even if SDEX spot is low"
+            );
+        });
+    }
+
+    /// When no oracle is configured, stop-loss falls back to signal price (not live SDEX spot).
+    #[test]
+    fn test_stop_loss_fallback_uses_signal_price_not_live_sdex() {
+        let env = setup_env();
+        let user = test_user(&env);
+        let contract_addr = env.register(TestContract, ());
+
+        env.as_contract(&contract_addr, || {
+            let config = RiskConfig::default();
+            update_position(&env, &user, 1, 1_000, 100);
+
+            // No oracle (None) — fallback to current_price (signal.price, not live SDEX)
+            // Signal price = 80 (below stop-loss at 85) → triggers
+            let triggered = check_stop_loss(&env, &user, 1, 80, None, &config);
+            assert!(triggered);
+
+            // Signal price = 90 (above stop-loss at 85) → no trigger
+            let not_triggered = check_stop_loss(&env, &user, 1, 90, None, &config);
+            assert!(!not_triggered);
         });
     }
 

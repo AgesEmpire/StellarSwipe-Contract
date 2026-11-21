@@ -1,0 +1,8 @@
+{
+  "_comment": "Mainnet configuration — NEVER used in automated tests or CI. Deploy manually with explicit STELLAR_NETWORK=mainnet.",
+  "network": "mainnet",
+  "min_stake": 100000000,
+  "max_fee_rate": 100,
+  "oracle_address": "REPLACE_WITH_MAINNET_ORACLE_ADDRESS",
+  "admin": "REPLACE_WITH_MAINNET_ADMIN_ADDRESS"
+}

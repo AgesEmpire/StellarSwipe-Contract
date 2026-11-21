@@ -11,6 +11,7 @@ use soroban_sdk::{
 };
 
 use crate::errors::OracleError;
+use stellar_swipe_common::structured_panic;
 
 // ---------------------------------------------------------------------------
 // Governance constants
@@ -744,13 +745,13 @@ impl OracleGovernance {
     // -----------------------------------------------------------------------
 
     /// Initialise the governance admin (called once by the oracle contract owner).
+    ///
+    /// # Panics
+    /// Panics with structured code `SSW-9000` if governance is already
+    /// initialized — see `stellar_swipe_common::structured_panic!` (issue #596).
     pub fn initialize(env: &Env, admin: Address) {
-        if env
-            .storage()
-            .instance()
-            .has(&GovernanceKey::GovAdmin)
-        {
-            panic!("governance already initialized");
+        if env.storage().instance().has(&GovernanceKey::GovAdmin) {
+            structured_panic!(9000, "governance already initialized");
         }
         env.storage()
             .instance()
