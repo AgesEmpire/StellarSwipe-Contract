@@ -139,6 +139,10 @@ pub enum AutoTradeError {
     // ── Issue #1001: standardized token/cross-contract error mapping ─────────
     /// A router-required allowance was insufficient or expired.
     InsufficientAllowance = 51,
+
+    // ── Issue #1361: strategy revision binding ───────────────────────────────
+    /// The intent was authorized against an older strategy revision.
+    StaleStrategyRevision = 52,
 }
 
 /// Maps the shared token/cross-contract invocation failure classification

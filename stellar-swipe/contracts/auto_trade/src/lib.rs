@@ -1450,12 +1450,16 @@ impl AutoTradeContract {
 
     pub fn pause_dca(env: Env, user: Address, strategy_id: u64) -> Result<(), AutoTradeError> {
         user.require_auth();
-        strategies::dca::pause_dca_strategy(&env, strategy_id)
+        strategies::dca::pause_dca_strategy(&env, strategy_id)?;
+        intent::bump_strategy_revision(&env, strategy_id);
+        Ok(())
     }
 
     pub fn resume_dca(env: Env, user: Address, strategy_id: u64) -> Result<(), AutoTradeError> {
         user.require_auth();
-        strategies::dca::resume_dca_strategy(&env, strategy_id)
+        strategies::dca::resume_dca_strategy(&env, strategy_id)?;
+        intent::bump_strategy_revision(&env, strategy_id);
+        Ok(())
     }
 
     pub fn update_dca(
@@ -1466,7 +1470,75 @@ impl AutoTradeContract {
         new_frequency: Option<strategies::dca::DCAFrequency>,
     ) -> Result<(), AutoTradeError> {
         user.require_auth();
-        strategies::dca::update_dca_schedule(&env, strategy_id, new_amount, new_frequency)
+        strategies::dca::update_dca_schedule(&env, strategy_id, new_amount, new_frequency)?;
+        intent::bump_strategy_revision(&env, strategy_id);
+        Ok(())
+    }
+
+    /// Execute an auto-trade intent exactly once (Issues #1360, #1361).
+    ///
+    /// The intent identity is `(user, strategy_id, signal_id, sequence)`. If it
+    /// already executed, the stored result is returned and no trade is placed.
+    /// Otherwise `strategy_revision` must equal the strategy's current revision
+    /// (else [`AutoTradeError::StaleStrategyRevision`]); the trade executes and
+    /// its result is persisted in the same transaction as settlement.
+    pub fn execute_intent(
+        env: Env,
+        user: Address,
+        strategy_id: u64,
+        strategy_revision: u64,
+        signal_id: u64,
+        sequence: u64,
+        order_type: OrderType,
+        amount: i128,
+    ) -> Result<TradeResult, AutoTradeError> {
+        let id = intent::IntentId {
+            user: user.clone(),
+            strategy_id,
+            signal_id,
+            sequence,
+        };
+        if let Some(record) = intent::get_record(&env, &id) {
+            return Ok(record.result);
+        }
+        if strategy_revision != intent::strategy_revision(&env, strategy_id) {
+            return Err(AutoTradeError::StaleStrategyRevision);
+        }
+        let result = Self::execute_trade(env.clone(), user, signal_id, order_type, amount)?;
+        intent::save_record(
+            &env,
+            &id,
+            &intent::IntentRecord {
+                revision: strategy_revision,
+                executed_at: env.ledger().timestamp(),
+                result: result.clone(),
+            },
+        );
+        Ok(result)
+    }
+
+    /// Current monotonic revision of a strategy's settings (Issue #1361).
+    pub fn get_strategy_revision(env: Env, strategy_id: u64) -> u64 {
+        intent::strategy_revision(&env, strategy_id)
+    }
+
+    /// Stored outcome of a previously executed intent, if any (Issue #1360).
+    pub fn get_intent_record(
+        env: Env,
+        user: Address,
+        strategy_id: u64,
+        signal_id: u64,
+        sequence: u64,
+    ) -> Option<intent::IntentRecord> {
+        intent::get_record(
+            &env,
+            &intent::IntentId {
+                user,
+                strategy_id,
+                signal_id,
+                sequence,
+            },
+        )
     }
 
     pub fn handle_missed_dca(env: Env, strategy_id: u64) -> Result<u32, AutoTradeError> {
