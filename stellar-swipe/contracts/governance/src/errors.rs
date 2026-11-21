@@ -272,4 +272,12 @@ impl GovernanceError {
     /// is active (Issue #942). The action must instead be routed through its
     /// `queue_*` + `*_timelocked` pair so the mandatory delay applies.
     pub const TimelockBypassBlocked: GovernanceError = GovernanceError::Unauthorized;
+    /// A proposal amendment targeted a field that is immutable after
+    /// creation (Issue #1431). See `proposal_revisions` for the field classes.
+    pub const ImmutableProposalField: GovernanceError = GovernanceError::InvalidProposal;
+    /// The proposal has already been amended `MAX_PROPOSAL_REVISIONS` times (Issue #1431).
+    pub const RevisionLimitReached: GovernanceError = GovernanceError::InvalidProposal;
+    /// An amendment would reset cast votes with less than
+    /// `MIN_REVOTE_WINDOW_SECS` of voting time left (Issue #1431).
+    pub const RevisionWindowClosed: GovernanceError = GovernanceError::VotingEnded;
 }
