@@ -686,6 +686,9 @@ impl AutoTradeContract {
             return Err(AutoTradeError::SignalExpired);
         }
 
+        if storage::get_signal_status(&env, signal_id) != storage::SignalStatus::Active {
+            return Err(AutoTradeError::SignalInactive);
+        }
         // Issue #992: reject unsupported asset pairs before any external call
         // or state mutation (enforced when an asset registry is configured).
         amm_bridge::validate_signal_pair(&env, signal_id)?;
@@ -940,6 +943,82 @@ impl AutoTradeContract {
     }
 
     /// Fetch executed trade by user + signal
+    // ── Auto-trade intents (#1362–#1365) ────────────────────────────────────
+
+    /// Set the cumulative spend budget for one of `owner`'s strategies.
+    pub fn set_strategy_budget(
+        env: Env,
+        owner: Address,
+        strategy_id: u64,
+        budget: i128,
+    ) -> Result<(), AutoTradeError> {
+        intent::set_budget(&env, &owner, strategy_id, budget)
+    }
+
+    /// Owner-only pause of a single strategy; other strategies are unaffected.
+    pub fn pause_strategy(env: Env, owner: Address, strategy_id: u64) {
+        intent::set_paused(&env, &owner, strategy_id, true);
+    }
+
+    /// Owner-only resume of a single strategy.
+    pub fn resume_strategy(env: Env, owner: Address, strategy_id: u64) {
+        intent::set_paused(&env, &owner, strategy_id, false);
+    }
+
+    pub fn get_strategy_state(env: Env, owner: Address, strategy_id: u64) -> intent::StrategyState {
+        intent::get_strategy(&env, &owner, strategy_id)
+    }
+
+    /// Create an intent executable while `now <= deadline` (deadline must be > now).
+    /// Reserves `amount` against the strategy budget.
+    pub fn create_intent(
+        env: Env,
+        owner: Address,
+        strategy_id: u64,
+        signal_id: u64,
+        amount: i128,
+        deadline: u64,
+    ) -> Result<u64, AutoTradeError> {
+        intent::create(&env, &owner, strategy_id, signal_id, amount, deadline)
+    }
+
+    /// Execute a pending intent. Validates deadline, strategy pause and signal
+    /// freshness before trading; settles budget only on success.
+    pub fn execute_intent(env: Env, intent_id: u64) -> Result<TradeResult, AutoTradeError> {
+        let it = intent::validate_execution(&env, intent_id)?;
+        let res = Self::execute_trade(
+            env.clone(),
+            it.owner.clone(),
+            it.signal_id,
+            OrderType::Market,
+            it.amount,
+        )?;
+        intent::settle(&env, it);
+        Ok(res)
+    }
+
+    /// Cancel a pending intent and release its budget reservation.
+    pub fn cancel_intent(env: Env, owner: Address, intent_id: u64) -> Result<(), AutoTradeError> {
+        intent::cancel(&env, &owner, intent_id)
+    }
+
+    pub fn get_intent(env: Env, intent_id: u64) -> Option<intent::Intent> {
+        intent::get_intent(&env, intent_id)
+    }
+
+    /// Admin: archive or invalidate a signal so executions consuming it fail.
+    pub fn set_signal_status(
+        env: Env,
+        caller: Address,
+        signal_id: u64,
+        status: storage::SignalStatus,
+    ) -> Result<(), AutoTradeError> {
+        caller.require_auth();
+        admin::require_admin(&env, &caller)?;
+        storage::set_signal_status(&env, signal_id, status);
+        Ok(())
+    }
+
     pub fn get_trade(env: Env, user: Address, signal_id: u64) -> Option<Trade> {
         env.storage()
             .persistent()
