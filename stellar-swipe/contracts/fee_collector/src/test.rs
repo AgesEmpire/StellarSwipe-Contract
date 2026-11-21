@@ -1,6 +1,12 @@
 #![cfg(test)]
 
 use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    token::{Client as TokenClient, StellarAssetClient},
+    Address, Env,
+};
+
+use crate::{set_treasury_balance, ContractError, FeeCollector, FeeCollectorClient};
     contract, contractimpl,
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
@@ -2005,6 +2011,9 @@ fn test_insurance_payout_when_paused() {
     let res = client.try_payout_insurance(&admin, &provider, &token, &1_000i128, &claim_id);
     assert_eq!(res, Err(Ok(ContractError::ContractPaused)));
 }
+// ---------------------------------------------------------------------------
+// Fee rate tests
+// ---------------------------------------------------------------------------
 
 #[test]
 fn test_insurance_payout_authorized_caller() {
@@ -2346,6 +2355,85 @@ fn test_rebate_cap_second_claim_uses_remaining_headroom() {
     let claimed_a = client.claim_fees(&provider_a, &token);
     assert_eq!(claimed_a, 600); // under cap
 
+
+// ---------------------------------------------------------------------------
+// Fee distribution end-to-end (#939)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fee_distribution_end_to_end() {
+    use crate::ProviderShare;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+    let mut shares = soroban_sdk::Vec::new(&env);
+    shares.push_back(ProviderShare { provider: p1.clone(), share_bps: 5_000 });
+    shares.push_back(ProviderShare { provider: p2.clone(), share_bps: 3_000 });
+    shares.push_back(ProviderShare { provider: p3.clone(), share_bps: 2_000 });
+    client.set_provider_shares(&shares);
+
+    // Two copy-trade executions (amounts chosen to produce rounding dust).
+    client.record_fee(&token, &700_001i128);
+    client.record_fee(&token, &300_002i128);
+    let total = 1_000_003i128;
+    assert_eq!(client.epoch_fees(&token), total);
+
+    let retained = client.close_epoch(&token);
+
+    let b1 = client.provider_balance(&p1, &token);
+    let b2 = client.provider_balance(&p2, &token);
+    let b3 = client.provider_balance(&p3, &token);
+    assert!((b1 - total * 50 / 100).abs() <= 1);
+    assert!((b2 - total * 30 / 100).abs() <= 1);
+    assert!((b3 - total * 20 / 100).abs() <= 1);
+
+    let treasury = client.treasury_balance(&token);
+    assert_eq!(treasury, retained);
+    assert_eq!(treasury, total - (b1 + b2 + b3));
+    // No dust lost.
+    assert_eq!(b1 + b2 + b3 + treasury, total);
+    assert_eq!(client.epoch_fees(&token), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Deprecated entry-point shims (#943)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_deprecated_shims_route_to_current_impl() {
+    use soroban_sdk::testutils::Events;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Legacy and current read paths agree.
+    assert_eq!(client.get_fee_rate(), client.fee_rate());
+    assert!(!env.events().all().is_empty(), "deprecation warning must be emitted");
+
+    // Legacy write path routes to set_fee_rate.
+    client.update_fee_rate(&40u32);
+    assert_eq!(client.fee_rate(), 40);
+    assert_eq!(client.get_fee_rate(), 40);
+
+    // Legacy validation preserved.
+    assert_eq!(client.try_update_fee_rate(&1_000u32), Err(Ok(ContractError::FeeRateTooHigh)));
+
+    assert_eq!(client.get_treasury_balance(&token), client.treasury_balance(&token));
     let claimed_b = client.claim_fees(&provider_b, &token);
     assert_eq!(claimed_b, 200); // only headroom remaining (800 - 600 = 200)
 
