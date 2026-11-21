@@ -15,7 +15,11 @@ pub mod reward_vault;
 /// Reward dust tracking and reconciliation (Issue #1135).
 pub mod reward_dust;
 pub mod slash_strategy;
+/// Slashing decisions with evidence references (Issue #1433).
+pub mod slash_evidence;
 pub mod storage_version;
+/// Independent partial unbonding requests (Issue #1432).
+pub mod unbonding;
 pub mod withdrawal_claims;
 
 use emergency_unstake::{EmergencyMultiSigConfig, EmergencyRequest};
@@ -665,6 +669,18 @@ impl StakeVaultError {
             }
         }
     }
+}
+
+/// Logical errors that share an existing code, because the enum is at the
+/// Soroban `#[contracterror]` variant cap (Issue #1326).
+#[allow(non_upper_case_globals)]
+impl StakeVaultError {
+    /// Slash evidence reference or decision reason is empty or exceeds its
+    /// size bound (Issue #1433).
+    pub const InvalidEvidence: StakeVaultError = StakeVaultError::InvalidAmount;
+    /// The evidence was already used for a slash decision, or the slash
+    /// already has an audit record (Issue #1433).
+    pub const DuplicateSlashDecision: StakeVaultError = StakeVaultError::AlreadyApproved;
 }
 
 impl From<reward_campaign::CampaignError> for StakeVaultError {
@@ -2187,6 +2203,194 @@ impl StakeVaultContract {
         Ok(amount)
     }
 
+    // ── Issue #1432: independent partial unbonding requests ───────────────────
+
+    /// Move `amount` of `staker`'s active stake into a new unbonding request.
+    ///
+    /// The request tracks its own amount and unlock time
+    /// (`max(now + withdrawal_cooldown, locked_until)`). The remaining position
+    /// keeps its original `locked_until`, `last_updated` and deposit timestamp,
+    /// and rewards accrued on the full balance up to now stay credited (the
+    /// reward index checkpoints before the participating stake drops). See
+    /// [`unbonding`] for the full policy. Returns the request id.
+    ///
+    /// The remainder must be `0` or at least `minimum_stake`; at most
+    /// [`unbonding::MAX_PENDING_UNBONDING_REQUESTS`] requests may be pending.
+    pub fn request_unbonding(
+        env: Env,
+        staker: Address,
+        amount: i128,
+    ) -> Result<u64, StakeVaultError> {
+        reentrancy::require_not_locked(&env).map_err(|_| StakeVaultError::ReentrancyDetected)?;
+        staker.require_auth();
+        Self::require_not_paused(&env)?;
+        if amount <= 0 {
+            return Err(StakeVaultError::InvalidAmount);
+        }
+
+        let mut stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+            .storage()
+            .persistent()
+            .get(&MigrationKey::StakesV2)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+        let info = stakes.get(staker.clone()).ok_or(StakeVaultError::NoStake)?;
+        if info.balance == 0 {
+            return Err(StakeVaultError::NoStake);
+        }
+        if amount > info.balance {
+            return Err(StakeVaultError::InvalidAmount);
+        }
+
+        // Slash/reward lockups block stake-decreasing operations (Issue #1123).
+        require_lockup_released(&env, &staker)?;
+
+        let current_ledger = env.ledger().sequence();
+        let last_stake_ledger = env
+            .storage()
+            .temporary()
+            .get::<_, u32>(&StorageKey::LastStakeLedger(staker.clone()))
+            .unwrap_or(0);
+        if last_stake_ledger == current_ledger && current_ledger != 0 {
+            events::emit_flash_loan_attempt(&env, staker.clone(), info.balance, current_ledger);
+            return Err(StakeVaultError::FlashLoanDetected);
+        }
+
+        let remaining = info.balance - amount;
+        let minimum_stake: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinimumStake)
+            .unwrap_or(0);
+        if remaining > 0 && minimum_stake > 0 && remaining < minimum_stake {
+            return Err(StakeVaultError::RemainingStakeBelowMinimum);
+        }
+
+        let now = env.ledger().timestamp();
+        let unlock_at = core::cmp::max(
+            now.saturating_add(get_withdrawal_cooldown_secs(&env)),
+            info.locked_until,
+        );
+        let request = unbonding::create(&env, &staker, amount, unlock_at)?;
+
+        // Only the active balance changes; the remainder's lock and
+        // accounting basis are carried over untouched.
+        let old_tier = stake_tier_for_amount(info.balance);
+        stakes.set(
+            staker.clone(),
+            StakeInfoV2 {
+                balance: remaining,
+                locked_until: info.locked_until,
+                last_updated: info.last_updated,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&MigrationKey::StakesV2, &stakes);
+        reward_index::on_stake_change(&env, &staker, remaining)?;
+        emit_provider_tier_change(
+            &env,
+            &staker,
+            old_tier,
+            stake_tier_for_amount(remaining),
+            remaining,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "unbonding"), Symbol::new(&env, "requested")),
+            (staker, request.id, amount, unlock_at, remaining),
+        );
+        Ok(request.id)
+    }
+
+    /// Withdraw one unlocked unbonding request. Each request can be paid once.
+    pub fn withdraw_unbonded(
+        env: Env,
+        staker: Address,
+        request_id: u64,
+    ) -> Result<i128, StakeVaultError> {
+        staker.require_auth();
+        Self::require_not_paused(&env)?;
+        let mut ids: Vec<u64> = Vec::new(&env);
+        ids.push_back(request_id);
+        Self::pay_unbonded(&env, &staker, ids)
+    }
+
+    /// Withdraw every unlocked unbonding request of `staker` (bounded by
+    /// [`unbonding::MAX_PENDING_UNBONDING_REQUESTS`]). Returns the total paid.
+    pub fn withdraw_all_unbonded(env: Env, staker: Address) -> Result<i128, StakeVaultError> {
+        staker.require_auth();
+        Self::require_not_paused(&env)?;
+        let ids = unbonding::unlocked_ids(&env, &staker);
+        if ids.is_empty() {
+            return Err(StakeVaultError::NoUnstakeQueued);
+        }
+        Self::pay_unbonded(&env, &staker, ids)
+    }
+
+    /// Mark each request withdrawn, then transfer the total. A failed
+    /// transfer reverts the whole call, so no request is consumed unpaid.
+    fn pay_unbonded(env: &Env, staker: &Address, ids: Vec<u64>) -> Result<i128, StakeVaultError> {
+        let lock_key = Symbol::new(env, EXECUTION_LOCK);
+        if env
+            .storage()
+            .temporary()
+            .get::<_, bool>(&lock_key)
+            .unwrap_or(false)
+        {
+            return Err(StakeVaultError::ReentrancyDetected);
+        }
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .ok_or(StakeVaultError::NotInitialized)?;
+
+        let mut total: i128 = 0;
+        for i in 0..ids.len() {
+            let id = ids.get_unchecked(i);
+            let amount = unbonding::consume(env, staker, id)?;
+            total = total
+                .checked_add(amount)
+                .ok_or(StakeVaultError::StakeOverflow)?;
+            env.events().publish(
+                (Symbol::new(env, "unbonding"), Symbol::new(env, "withdrawn")),
+                (staker.clone(), id, amount),
+            );
+        }
+
+        env.storage().temporary().set(&lock_key, &true);
+        let result = shared::token_error::map_result(
+            token::Client::new(env, &token).try_transfer(
+                &env.current_contract_address(),
+                staker,
+                &total,
+            ),
+        )
+        .map_err(StakeVaultError::from);
+        env.storage().temporary().remove(&lock_key);
+        result?;
+        Ok(total)
+    }
+
+    /// One unbonding request of `staker` (pending or withdrawn).
+    pub fn get_unbonding_request(
+        env: Env,
+        staker: Address,
+        request_id: u64,
+    ) -> Option<unbonding::UnbondingRequest> {
+        unbonding::get(&env, &staker, request_id)
+    }
+
+    /// Pending (not yet withdrawn) unbonding requests of `staker`.
+    pub fn get_pending_unbonding(env: Env, staker: Address) -> Vec<unbonding::UnbondingRequest> {
+        unbonding::pending_requests(&env, &staker)
+    }
+
+    /// Total amount held in pending unbonding requests for `staker`.
+    pub fn get_unbonding_total(env: Env, staker: Address) -> i128 {
+        unbonding::pending_total(&env, &staker)
+    }
+
     // ── Slash ──────────────────────────────────────────────────────────────────
 
     /// Configure the slash percentage for each severity tier (in basis points).
@@ -2278,6 +2482,62 @@ impl StakeVaultContract {
         caller.require_auth();
         Self::require_signal_registry(&env, &caller)?;
         Self::do_slash(&env, &provider, severity, reason)
+    }
+
+    /// Slash `provider` and record an immutable audit record carrying a
+    /// bounded evidence reference and decision reason (Issue #1433).
+    ///
+    /// Evidence (`1..=slash_evidence::MAX_EVIDENCE_LEN` bytes) and reason
+    /// (`1..=slash_evidence::MAX_DECISION_REASON_LEN` bytes) are validated
+    /// first, and evidence already used by an earlier decision is rejected with
+    /// `DuplicateSlashDecision` — both before any slash state is touched. The
+    /// slash accounting and the audit record are then written in the same
+    /// invocation; any failure reverts both. Returns the slashed amount; the
+    /// record is readable via [`Self::get_slash_evidence`].
+    pub fn slash_stake_with_evidence(
+        env: Env,
+        caller: Address,
+        provider: Address,
+        severity: SlashSeverity,
+        reason: Symbol,
+        evidence: Bytes,
+        decision_reason: String,
+    ) -> Result<i128, StakeVaultError> {
+        reentrancy::require_not_locked(&env).map_err(|_| StakeVaultError::ReentrancyDetected)?;
+        caller.require_auth();
+        Self::require_signal_registry(&env, &caller)?;
+
+        let evidence_hash = slash_evidence::validate(&env, &evidence, &decision_reason)?;
+
+        // `do_slash` assigns the current counter value as the slash id.
+        let slash_id: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::SlashCounter)
+            .unwrap_or(0u64);
+        let slash_amount = Self::do_slash(&env, &provider, severity, reason)?;
+
+        slash_evidence::record(
+            &env,
+            &slash_evidence::SlashEvidence {
+                slash_id,
+                provider,
+                evidence,
+                evidence_hash,
+                decision_reason,
+                slash_amount,
+                recorded_at: env.ledger().timestamp(),
+            },
+        )?;
+        Ok(slash_amount)
+    }
+
+    /// Audit record attached to `slash_id` by `slash_stake_with_evidence`.
+    pub fn get_slash_evidence(
+        env: Env,
+        slash_id: u64,
+    ) -> Option<slash_evidence::SlashEvidence> {
+        slash_evidence::get(&env, slash_id)
     }
 
     /// Slash multiple providers in a single call (issue #815).
@@ -3507,6 +3767,41 @@ impl StakeVaultContract {
         Ok(totals)
     }
 
+    /// Provider: claim the next bounded page of reward positions
+    /// (Issue #1434).
+    ///
+    /// Visits at most `max_positions` of the provider's reward positions —
+    /// `1..=`[`reward_vault::MAX_REWARD_BATCH`] (50), checked before any
+    /// position is read — starting from a stored per-provider cursor, claims
+    /// every unclaimed one, and advances the cursor. Call repeatedly until
+    /// `remaining == 0` to drain any number of positions; already-claimed
+    /// positions are skipped, so nothing is ever paid twice.
+    pub fn claim_rewards_page(
+        env: Env,
+        provider: Address,
+        max_positions: u32,
+    ) -> Result<reward_vault::RewardClaimPage, StakeVaultError> {
+        provider.require_auth();
+        Self::require_not_paused(&env)?;
+        let page = reward_vault::claim_rewards_page(&env, &provider, max_positions)
+            .map_err(StakeVaultError::from)?;
+        if !page.claims.is_empty() {
+            // Issue #1123: claiming rewards locks the provider's stake briefly.
+            lock_provider(&env, &provider, default_lockup_ledgers(&env));
+        }
+        Ok(page)
+    }
+
+    /// Number of reward positions indexed for `provider` (Issue #1434).
+    pub fn get_reward_position_count(env: Env, provider: Address) -> u64 {
+        reward_vault::get_provider_position_count(&env, &provider)
+    }
+
+    /// Next position index `claim_rewards_page` will visit (Issue #1434).
+    pub fn get_reward_claim_cursor(env: Env, provider: Address) -> u64 {
+        reward_vault::get_provider_claim_cursor(&env, &provider)
+    }
+
     /// Returns the claimable reward balance for `provider` in `asset`.
     pub fn get_provider_reward_balance(env: Env, provider: Address, asset: Address) -> i128 {
         reward_vault::get_provider_reward_balance(&env, &provider, &asset)
@@ -3821,3 +4116,6 @@ mod tests_emergency;
 
 #[cfg(test)]
 mod test_lockup;
+
+#[cfg(test)]
+mod test_unbonding_evidence;

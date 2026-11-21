@@ -9,6 +9,7 @@ mod distribution;
 pub mod errors;
 pub use errors::GovernanceError;
 mod proposal_deposit;
+pub mod proposal_revisions;
 mod proposals;
 mod quadratic_voting;
 mod reputation;
@@ -48,6 +49,8 @@ mod test_transition_events;
 mod test_veto_window;
 #[cfg(test)]
 mod test_vote_deadline;
+#[cfg(test)]
+mod test_proposal_revisions;
 
 use committees::{
     list_committees as list_registered_committees, CommitteeAction, CommitteeElection,
@@ -88,6 +91,7 @@ pub use proposals::{
     action_identity, validate_no_duplicate_actions, CategoryThreshold, GovernanceConfig,
     ProposalCategory, ProposalTransitionEvent,
 };
+use proposal_revisions::{ProposalAmendment, ProposalRevision};
 use quadratic_voting::{
     allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
     get_quadratic_vote, get_quadratic_voting_config, get_vote_credits, reallocate_quadratic_votes,
@@ -205,6 +209,9 @@ pub enum StorageKey {
     /// action must be routed through its `queue_*` + `*_timelocked` pair. This
     /// is a one-way latch — see `enforce_admin_timelock`.
     EnforceAdminTimelock,
+    /// Issue #1431: revision version / vote-reset bookkeeping for an amended
+    /// proposal. Absent for proposals that were never amended.
+    ProposalRevision(u64),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -974,6 +981,45 @@ impl GovernanceContract {
         require_initialized(&env)?;
         require_not_paused(&env)?;
         proposals::withdraw_proposal(&env, proposal_id, proposer)
+    }
+
+    /// # Summary
+    /// Amend one field of a proposal while it is `Pending` or `Active`
+    /// (Issue #1431). Only `title` and `description` are mutable; every other
+    /// field is rejected with `ImmutableProposalField`. See
+    /// `proposal_revisions` for the full field list and the version /
+    /// vote-reset policy: each amendment bumps the revision version, clears
+    /// already-cast votes, and keeps the creation-time voting snapshot.
+    ///
+    /// # Returns
+    /// The new revision version.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::Unauthorized`] — caller is not the proposer.
+    /// - [`GovernanceError::ProposalNotActive`] — proposal is not Pending/Active.
+    /// - [`GovernanceError::VotingEnded`] — voting has closed, or a vote reset
+    ///   would leave less than `MIN_REVOTE_WINDOW_SECS` to re-vote.
+    /// - [`GovernanceError::InvalidProposal`] — immutable field, revision limit
+    ///   reached, or empty/unchanged/invalid text.
+    pub fn revise_proposal(
+        env: Env,
+        proposal_id: u64,
+        proposer: Address,
+        amendment: ProposalAmendment,
+    ) -> Result<u32, GovernanceError> {
+        require_initialized(&env)?;
+        require_not_paused(&env)?;
+        proposal_revisions::revise_proposal(&env, proposal_id, proposer, amendment)
+    }
+
+    /// Current revision version of a proposal (1 when never amended).
+    pub fn get_proposal_revision_version(env: Env, proposal_id: u64) -> u32 {
+        proposal_revisions::get_revision_version(&env, proposal_id)
+    }
+
+    /// Revision bookkeeping for an amended proposal (`None` if never amended).
+    pub fn get_proposal_revision(env: Env, proposal_id: u64) -> Option<ProposalRevision> {
+        proposal_revisions::get_revision(&env, proposal_id)
     }
 
     // ── Issue #666: Proposal execution payload simulation (dry-run) ───────────

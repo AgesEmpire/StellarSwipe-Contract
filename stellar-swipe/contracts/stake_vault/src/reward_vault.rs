@@ -47,6 +47,12 @@ pub enum RewardKey {
     Bucket(u64),
     /// Claimed flag per (provider, bucket_id) – present means already claimed.
     Claimed(Address, u64),
+    /// Issue #1434: number of reward positions (buckets) indexed for a provider.
+    ProviderBucketCount(Address),
+    /// Issue #1434: (provider, n) → bucket id of the provider's n-th position.
+    ProviderBucketAt(Address, u64),
+    /// Issue #1434: index of the next position `claim_rewards_page` will visit.
+    ProviderClaimCursor(Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -60,6 +66,21 @@ pub struct RewardBucket {
     pub asset: Address,
     pub amount: i128,
     pub epoch: u64,
+}
+
+/// Result of one bounded [`claim_rewards_page`] call (Issue #1434).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RewardClaimPage {
+    /// Per-asset totals transferred by this call (empty if every visited
+    /// position had already been claimed).
+    pub claims: Vec<(Address, i128)>,
+    /// Number of positions visited by this call.
+    pub processed: u32,
+    /// Cursor after this call; the next call resumes here.
+    pub next_cursor: u64,
+    /// Indexed positions not yet visited. `0` means the provider is caught up.
+    pub remaining: u64,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -184,6 +205,18 @@ pub fn deposit_reward(
     env.storage()
         .persistent()
         .set(&RewardKey::Bucket(bucket_id), &bucket);
+
+    // Issue #1434: index the bucket under its provider so claims can walk the
+    // provider's positions in bounded pages instead of an unbounded scan.
+    let count_key = RewardKey::ProviderBucketCount(provider.clone());
+    let position: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    env.storage().persistent().set(
+        &RewardKey::ProviderBucketAt(provider.clone(), position),
+        &bucket_id,
+    );
+    env.storage()
+        .persistent()
+        .set(&count_key, &position.saturating_add(1));
 
     // Update per-asset total.
     let prev_total: i128 = env
@@ -337,6 +370,87 @@ pub fn batch_claim_rewards(
     }
 
     Ok(results)
+}
+
+/// Provider: claim the next page of at most `max_positions` reward
+/// positions (Issue #1434).
+///
+/// Each provider's buckets are indexed in deposit order, and a per-provider
+/// cursor records how far claims have progressed.  One call visits at most
+/// `max_positions` positions (`1..=`[`MAX_REWARD_BATCH`], checked before
+/// anything is read) starting at the cursor, claims every unclaimed one via
+/// [`batch_claim_rewards`] (same all-or-nothing and CEI rules), and advances
+/// the cursor past the visited range.  A large position set is therefore
+/// drained over several successful calls.
+///
+/// No double claims: positions already claimed — by an earlier page or by an
+/// explicit [`batch_claim_rewards`] call — are skipped via the `Claimed`
+/// flag, and the cursor never revisits a range.  If the claim fails the host
+/// reverts the call, including the cursor move, so the page can be retried.
+pub fn claim_rewards_page(
+    env: &Env,
+    provider: &Address,
+    max_positions: u32,
+) -> Result<RewardClaimPage, RewardVaultError> {
+    if max_positions == 0 || max_positions > MAX_REWARD_BATCH {
+        return Err(RewardVaultError::BatchSizeInvalid);
+    }
+    let count: u64 = env
+        .storage()
+        .persistent()
+        .get(&RewardKey::ProviderBucketCount(provider.clone()))
+        .unwrap_or(0);
+    let cursor_key = RewardKey::ProviderClaimCursor(provider.clone());
+    let cursor: u64 = env.storage().persistent().get(&cursor_key).unwrap_or(0);
+    let end = core::cmp::min(cursor.saturating_add(max_positions as u64), count);
+
+    let mut ids: Vec<u64> = Vec::new(env);
+    let mut n = cursor;
+    while n < end {
+        let bid: u64 = env
+            .storage()
+            .persistent()
+            .get(&RewardKey::ProviderBucketAt(provider.clone(), n))
+            .ok_or(RewardVaultError::BucketNotFound)?;
+        if !env
+            .storage()
+            .persistent()
+            .has(&RewardKey::Claimed(provider.clone(), bid))
+        {
+            ids.push_back(bid);
+        }
+        n += 1;
+    }
+
+    env.storage().persistent().set(&cursor_key, &end);
+    let claims = if ids.is_empty() {
+        Vec::new(env)
+    } else {
+        batch_claim_rewards(env, provider, ids)?
+    };
+
+    Ok(RewardClaimPage {
+        claims,
+        processed: (end - cursor) as u32,
+        next_cursor: end,
+        remaining: count - end,
+    })
+}
+
+/// Number of reward positions indexed for `provider` (Issue #1434).
+pub fn get_provider_position_count(env: &Env, provider: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&RewardKey::ProviderBucketCount(provider.clone()))
+        .unwrap_or(0)
+}
+
+/// Cursor of the next position `claim_rewards_page` will visit (Issue #1434).
+pub fn get_provider_claim_cursor(env: &Env, provider: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&RewardKey::ProviderClaimCursor(provider.clone()))
+        .unwrap_or(0)
 }
 
 /// Returns the claimable balance for `provider` in `asset`.
@@ -764,5 +878,102 @@ mod tests {
         assert_eq!(err, RewardVaultError::Overflow);
         assert!(!is_claimed(&env, &vault, &provider, a));
         assert!(!is_claimed(&env, &vault, &provider, b));
+    }
+
+    // ── Issue #1434: bounded, resumable reward claims ─────────────────────────
+
+    #[test]
+    fn claim_page_rejects_zero_and_oversized_batches() {
+        let (env, vault) = setup();
+        let provider = Address::generate(&env);
+        env.as_contract(&vault, || {
+            assert_eq!(
+                claim_rewards_page(&env, &provider, 0).unwrap_err(),
+                RewardVaultError::BatchSizeInvalid
+            );
+            assert_eq!(
+                claim_rewards_page(&env, &provider, MAX_REWARD_BATCH + 1).unwrap_err(),
+                RewardVaultError::BatchSizeInvalid
+            );
+            // The documented maximum itself is accepted (nothing to claim yet).
+            let page = claim_rewards_page(&env, &provider, MAX_REWARD_BATCH).unwrap();
+            assert_eq!(page.processed, 0);
+            assert_eq!(page.remaining, 0);
+        });
+    }
+
+    #[test]
+    fn large_position_set_drains_over_multiple_pages_without_double_claims() {
+        let (env, vault) = setup();
+        let provider = Address::generate(&env);
+        let positions: u64 = MAX_REWARD_BATCH as u64 * 2 + 7;
+        let asset = funded_asset(&env, &vault, positions as i128 * 10);
+        for _ in 0..positions {
+            deposit(&env, &vault, &provider, &asset, 10);
+        }
+        assert_eq!(
+            env.as_contract(&vault, || get_provider_position_count(&env, &provider)),
+            positions
+        );
+
+        let mut calls = 0u32;
+        let mut paid: i128 = 0;
+        loop {
+            let page = env
+                .as_contract(&vault, || {
+                    claim_rewards_page(&env, &provider, MAX_REWARD_BATCH)
+                })
+                .unwrap();
+            calls += 1;
+            assert!(page.processed <= MAX_REWARD_BATCH);
+            for i in 0..page.claims.len() {
+                paid += page.claims.get(i).unwrap().1;
+            }
+            if page.remaining == 0 {
+                break;
+            }
+        }
+        assert_eq!(calls, 3);
+        assert_eq!(paid, positions as i128 * 10);
+        assert_eq!(token_balance(&env, &asset, &provider), paid);
+
+        // Caught up: another page visits nothing and pays nothing.
+        let page = env
+            .as_contract(&vault, || claim_rewards_page(&env, &provider, 5))
+            .unwrap();
+        assert_eq!(page.processed, 0);
+        assert_eq!(page.claims.len(), 0);
+        assert_eq!(token_balance(&env, &asset, &provider), paid);
+    }
+
+    #[test]
+    fn claim_page_skips_positions_claimed_explicitly() {
+        let (env, vault) = setup();
+        let provider = Address::generate(&env);
+        let asset = funded_asset(&env, &vault, 30);
+        let a = deposit(&env, &vault, &provider, &asset, 10);
+        let _b = deposit(&env, &vault, &provider, &asset, 10);
+        let _c = deposit(&env, &vault, &provider, &asset, 10);
+
+        env.as_contract(&vault, || {
+            batch_claim_rewards(&env, &provider, Vec::from_array(&env, [a])).unwrap()
+        });
+        assert_eq!(token_balance(&env, &asset, &provider), 10);
+
+        let page = env
+            .as_contract(&vault, || claim_rewards_page(&env, &provider, 2))
+            .unwrap();
+        assert_eq!(page.processed, 2);
+        assert_eq!(page.remaining, 1);
+        // Only `b` was unclaimed in the first two positions.
+        assert_eq!(page.claims.get(0).unwrap().1, 10);
+        assert_eq!(token_balance(&env, &asset, &provider), 20);
+
+        let page = env
+            .as_contract(&vault, || claim_rewards_page(&env, &provider, 2))
+            .unwrap();
+        assert_eq!(page.processed, 1);
+        assert_eq!(page.remaining, 0);
+        assert_eq!(token_balance(&env, &asset, &provider), 30);
     }
 }
