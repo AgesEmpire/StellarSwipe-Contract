@@ -43,6 +43,7 @@
 mod achievements;
 mod badges;
 mod exposure_cap;
+mod lifecycle;
 mod migration;
 mod onboarding;
 #[cfg(test)]
@@ -191,6 +192,12 @@ pub enum PortfolioError {
     ExposureCapExceeded = 1,
     /// Cap amount must be > 0.
     InvalidCapAmount = 2,
+    /// Portfolio already holds `MAX_PORTFOLIO_ASSETS` distinct active assets (#1370).
+    AssetCapacityReached = 3,
+    /// Snapshot write supplied a revision older than the stored one (#1371).
+    StaleSnapshotRevision = 4,
+    /// Portfolio still has open or closing trades and cannot be closed (#1372).
+    UnsettledTrades = 5,
 }
 
 /// A user's position in a single asset. See the [module-level invariants list](self)
@@ -966,8 +973,18 @@ impl UserPortfolio {
 
         let pkey = DataKey::Position(position_id);
         let remaining = pos.amount;
+        lifecycle::on_partial_close(&env, &user, position_id, close_amount);
 
         if remaining == 0 {
+            // #1373: zero-balance position leaves active holdings; keep a settlement receipt.
+            lifecycle::record_settlement_receipt(
+                &env,
+                &user,
+                position_id,
+                &pos,
+                close_amount,
+                realized_pnl_delta,
+            );
             // Fully consumed by this partial close: finalize exactly like a full close.
             pos.status = PositionStatus::Closing;
             env.storage().persistent().set(&pkey, &pos);
@@ -1216,6 +1233,8 @@ impl UserPortfolio {
 
         // Cap check — uses current live state.
         exposure_cap::check_cap(&env, &user, asset_id, amount)?;
+        // Bounded asset count (#1370): new assets fail at capacity.
+        lifecycle::check_asset_capacity(&env, &user, asset_id)?;
 
         // Open the position.
         let id: u64 = env
@@ -1261,6 +1280,7 @@ impl UserPortfolio {
 
         // Track exposure for cap enforcement.
         exposure_cap::add_exposure(&env, &user, asset_id, amount);
+        lifecycle::track_asset_open(&env, &user, asset_id);
 
         Ok(id)
     }
@@ -1303,6 +1323,40 @@ impl UserPortfolio {
             timestamp: now,
             total_value,
         }
+    }
+
+    /// Replace `user`'s snapshot only if `expected_revision` matches the stored
+    /// revision (#1371). On success the revision advances exactly once; stale
+    /// writers receive `StaleSnapshotRevision` and nothing is written.
+    pub fn replace_snapshot(
+        env: Env,
+        user: Address,
+        expected_revision: u64,
+    ) -> Result<(PortfolioSnapshot, u64), PortfolioError> {
+        let revision = lifecycle::advance_snapshot_revision(&env, &user, expected_revision)?;
+        Ok((Self::take_snapshot(env, user), revision))
+    }
+
+    /// Current snapshot revision for `user` (0 if never written).
+    pub fn get_snapshot_revision(env: Env, user: Address) -> u64 {
+        lifecycle::snapshot_revision(&env, &user)
+    }
+
+    /// Distinct assets currently held in active positions (#1370).
+    pub fn get_active_assets(env: Env, user: Address) -> Vec<u32> {
+        lifecycle::active_assets(&env, &user)
+    }
+
+    /// Close `user`'s portfolio (#1372). Fails with `UnsettledTrades` while any
+    /// position is open or closing, leaving all state untouched. Settlement
+    /// receipts (tax events) are retained.
+    pub fn close_portfolio(env: Env, user: Address) -> Result<(), PortfolioError> {
+        user.require_auth();
+        if lifecycle::has_unsettled_trades(&env, &user) {
+            return Err(PortfolioError::UnsettledTrades);
+        }
+        lifecycle::delete_portfolio(&env, &user);
+        Ok(())
     }
 
     /// Keeper- or admin-triggerable batch snapshot: records the current portfolio
@@ -1622,6 +1676,13 @@ impl UserPortfolio {
     }
 
     fn mark_position_closed(env: &Env, user: &Address, position_id: u64) {
+        let remaining = env
+            .storage()
+            .persistent()
+            .get::<_, Position>(&DataKey::Position(position_id))
+            .map(|p| p.amount)
+            .unwrap_or(0);
+        lifecycle::on_position_closed(env, user, position_id, remaining);
         let open_key = DataKey::UserOpenPositions(user.clone());
         let open_ids: Vec<u64> = env
             .storage()
