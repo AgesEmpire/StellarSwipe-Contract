@@ -2,12 +2,11 @@ use soroban_sdk::Env;
 use soroban_sdk::{Address, Vec};
 
 use crate::errors::OracleError;
+use crate::heartbeat;
 use crate::observation::{self, Admission};
 use crate::staleness;
-use crate::storage::rescale_price;
+use crate::storage::{self, normalize_price_checked, CANONICAL_DECIMALS};
 use crate::types::ExternalPrice;
-
-const CANONICAL_DECIMALS: u32 = 7;
 
 /// Aggregate external oracle reports, normalizing each price to canonical
 /// 7-decimal precision before averaging so feeds with different native
@@ -25,6 +24,17 @@ const CANONICAL_DECIMALS: u32 = 7;
 /// Issue #1212: reports are identified by `(oracle_address, round_id)`. Each
 /// oracle contributes at most one sample — its highest round in the batch —
 /// so replayed or repeated reports cannot add weight to the average.
+///
+/// Issue #1405: decimals are validated at ingestion. A report whose
+/// `decimals` exceeds `MAX_FEED_DECIMALS`, or differs from the scale
+/// configured for its feed via `set_feed_decimals`, rejects the batch with
+/// `OracleError::UnsupportedPrecision` before any report is aggregated.
+/// Normalization to the canonical precision uses checked arithmetic and
+/// rejects the batch with `OracleError::ConversionOverflow` on overflow.
+///
+/// Issue #1406: reports from a source that exceeded its configured heartbeat
+/// are dropped; if no report survives and at least one was dropped for its
+/// heartbeat the batch is rejected with `OracleError::HeartbeatExpired`.
 pub fn process_external_prices(env: &Env, prices: Vec<ExternalPrice>) -> Result<i128, OracleError> {
     if prices.is_empty() {
         return Err(OracleError::InsufficientOracles);
@@ -32,20 +42,30 @@ pub fn process_external_prices(env: &Env, prices: Vec<ExternalPrice>) -> Result<
 
     for p in prices.iter() {
         observation::ensure_not_future(env, p.timestamp)?;
+        storage::validate_decimals(p.decimals)?;
+        if let Some(configured) = storage::get_feed_decimals(env, &p.asset_pair) {
+            if configured != p.decimals {
+                return Err(OracleError::UnsupportedPrecision);
+            }
+        }
     }
 
     let now = env.ledger().timestamp();
     // (oracle, round_id, normalized price) — one entry per oracle.
     let mut accepted: Vec<(Address, u64, i128)> = Vec::new(env);
     let mut any_stale = false;
+    let mut any_heartbeat_expired = false;
     for p in prices.iter() {
         let window = staleness::get_staleness_window(env, &p.asset_pair);
         if now.saturating_sub(p.timestamp) >= window {
             any_stale = true;
             continue;
         }
-        let normalized = rescale_price(p.price, p.decimals, CANONICAL_DECIMALS)
-            .ok_or(OracleError::ConversionOverflow)?;
+        if !heartbeat::is_within_heartbeat(env, &p.asset_pair, &p.oracle_address, p.timestamp) {
+            any_heartbeat_expired = true;
+            continue;
+        }
+        let normalized = normalize_price_checked(p.price, p.decimals, CANONICAL_DECIMALS)?;
         if normalized <= 0 {
             continue;
         }
@@ -66,6 +86,9 @@ pub fn process_external_prices(env: &Env, prices: Vec<ExternalPrice>) -> Result<
     }
 
     if accepted.is_empty() {
+        if any_heartbeat_expired {
+            return Err(OracleError::HeartbeatExpired);
+        }
         if any_stale {
             return Err(OracleError::StalePrice);
         }

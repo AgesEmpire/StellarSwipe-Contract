@@ -1,7 +1,10 @@
 //! Price conversion system for multi-asset portfolio aggregation
 
 use crate::errors::OracleError;
-use crate::storage::{get_base_currency, get_feed_decimals, get_price, rescale_price};
+use crate::storage::{
+    feed_decimals_or_canonical, get_base_currency, get_price, normalize_price_checked,
+    CANONICAL_DECIMALS,
+};
 use shared::math::normalize_amount;
 use soroban_sdk::{contracttype, vec, Env, Map, Vec};
 use stellar_swipe_common::{Asset, AssetPair};
@@ -34,9 +37,10 @@ pub fn convert_to_base(env: &Env, amount: i128, asset: Asset) -> Result<i128, Or
 
 /// Normalize a raw `price` from `from_decimals` to canonical 7-decimal precision.
 ///
-/// Returns `None` if the rescaling overflows `i128`.
+/// Returns `None` if the rescaling overflows `i128` or `from_decimals` is an
+/// unsupported precision (> `MAX_FEED_DECIMALS`, Issue #1405).
 pub fn normalize_price(price: i128, from_decimals: u32) -> Option<i128> {
-    shared::math::normalize_amount(price, from_decimals, 7)
+    normalize_price_checked(price, from_decimals, CANONICAL_DECIMALS).ok()
 }
 
 /// Read the live price for `pair` rescaled to canonical 7-decimal precision.
@@ -47,8 +51,8 @@ pub fn normalize_price(price: i128, from_decimals: u32) -> Option<i128> {
 /// different native precisions produce deterministic results.
 fn get_normalized_price(env: &Env, pair: &AssetPair) -> Result<i128, OracleError> {
     let raw_price = get_price(env, pair)?;
-    let from_decimals = get_feed_decimals(env, pair).unwrap_or(7);
-    rescale_price(raw_price, from_decimals, 7).ok_or(OracleError::ConversionOverflow)
+    let from_decimals = feed_decimals_or_canonical(env, pair);
+    normalize_price_checked(raw_price, from_decimals, CANONICAL_DECIMALS)
 }
 
 /// Direct conversion: asset → base

@@ -92,3 +92,17 @@ pub struct ExternalPrice {
     /// Decimal precision of the raw `price` value (e.g. 6 for USDC, 7 for XLM).
     pub decimals: u32,
 }
+
+/// Accepted price state bound to its feed-local round (Issue #1407).
+///
+/// `round_id` is strictly increasing within a feed and persisted, so
+/// downstream contracts can bind an action to the exact price state they
+/// observed and later detect whether the feed has moved on.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceRound {
+    pub round_id: u64,
+    pub price: i128,
+    /// Ledger timestamp at which `round_id` was accepted.
+    pub timestamp: u64,
+}

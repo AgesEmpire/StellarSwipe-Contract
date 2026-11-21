@@ -16,30 +16,19 @@
 
 extern crate std;
 
-use fee_collector::{FeeCollector, FeeCollectorClient, ReportPeriod};
+#[path = "fixtures/mod.rs"]
+mod fixtures;
+
+use fee_collector::ReportPeriod;
+use fixtures::{FeeCollectorBuilder, FeeCollectorFixture};
 use soroban_sdk::{
-    contract, contractimpl,
     testutils::{Address as _, Ledger},
-    token::{Client as TokenClient, StellarAssetClient},
+    token::Client as TokenClient,
     Address, Env, String,
 };
 use stellar_swipe_common::Asset;
 
 const SECONDS_PER_DAY: u64 = 86_400;
-
-// ── Minimal oracle stub ─────────────────────────────────────────────────────
-// `collect_fee` routes trade volume through the configured oracle to convert
-// to a USD base value; 1:1 conversion keeps the fee math in this test legible.
-
-#[contract]
-struct MockOracle;
-
-#[contractimpl]
-impl MockOracle {
-    pub fn convert_to_base(_env: Env, amount: i128, _asset: Asset) -> i128 {
-        amount
-    }
-}
 
 fn trade_asset(env: &Env) -> Asset {
     Asset {
@@ -48,44 +37,33 @@ fn trade_asset(env: &Env) -> Asset {
     }
 }
 
-/// Registers `fee_collector`, wires up the oracle, disables burn and revenue
-/// share so 100% of the net fee lands in the treasury, and funds two traders.
-fn setup() -> (Env, Address, Address, Address, Address, Address) {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().set_timestamp(10 * SECONDS_PER_DAY);
-
-    let admin = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-    let token = env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
-
-    let contract_id = env.register(FeeCollector, ());
-    let client = FeeCollectorClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    let oracle_id = env.register(MockOracle, ());
-    client.set_oracle_contract(&oracle_id);
-
-    // Isolate the fee math: no burn, no revenue-share diversion, max fee rate
-    // (1%) so two modest trades add up to a round total.
-    client.set_burn_rate(&0u32);
-    client.set_revenue_share_rate_bps(&0u32);
-    client.set_fee_rate(&100u32);
-
-    let trader_a = Address::generate(&env);
-    let trader_b = Address::generate(&env);
-    StellarAssetClient::new(&env, &token).mint(&trader_a, &10_000_000);
-    StellarAssetClient::new(&env, &token).mint(&trader_b, &10_000_000);
-
-    (env, token, contract_id, admin, trader_a, trader_b)
+/// Builds the shared fee-collector fixture (Issue #1404): `fee_collector`
+/// wired to the 1:1 oracle stub (`collect_fee` routes trade volume through
+/// the oracle to a USD base value; 1:1 keeps the fee math legible), burn and
+/// revenue share disabled so 100% of the net fee lands in the treasury, the
+/// max fee rate (1%) so two modest trades add up to a round total, and two
+/// funded traders.
+fn setup() -> FeeCollectorFixture {
+    FeeCollectorBuilder::new()
+        .at_timestamp(10 * SECONDS_PER_DAY)
+        .burn_rate_bps(0)
+        .revenue_share_rate_bps(0)
+        .fee_rate_bps(100)
+        .fund_trader(10_000_000)
+        .fund_trader(10_000_000)
+        .build()
+        .expect("fee collector fixture")
 }
 
 #[test]
 fn test_fee_distribution_end_to_end() {
-    let (env, token, contract_id, admin, trader_a, trader_b) = setup();
-    let client = FeeCollectorClient::new(&env, &contract_id);
+    let fixture = setup();
+    let env = fixture.env.clone();
+    let client = &fixture.client;
+    let token = fixture.token.clone();
+    let admin = fixture.admin.clone();
+    let trader_a = fixture.traders[0].clone();
+    let trader_b = fixture.traders[1].clone();
     let asset = trade_asset(&env);
 
     // ── 1. Fees collected from two copy-trade executions ────────────────────
