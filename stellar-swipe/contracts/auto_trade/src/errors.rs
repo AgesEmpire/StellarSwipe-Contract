@@ -73,6 +73,9 @@ pub enum AutoTradeError {
     RankingDisabled = 46,
     LastOracleForPair = 47,
     NotPaused = 48,
+    // ── Auto-trade intents (NotFound / Expired / NotPending / InvalidDeadline) ─
+    IntentError = 49,
+    BudgetExceeded = 50,
 }
 
 // ── Backward-compatible aliases ───────────────────────────────────────────────
@@ -124,4 +127,11 @@ impl AutoTradeError {
     pub const BridgePaused: AutoTradeError = AutoTradeError::SystemError;
     pub const RecoveryNotFound: AutoTradeError = AutoTradeError::SystemError;
     pub const RecoveryIncomplete: AutoTradeError = AutoTradeError::SystemError;
+
+    pub const IntentNotFound: AutoTradeError = AutoTradeError::IntentError;
+    pub const IntentExpired: AutoTradeError = AutoTradeError::IntentError;
+    pub const IntentNotPending: AutoTradeError = AutoTradeError::IntentError;
+    pub const InvalidDeadline: AutoTradeError = AutoTradeError::IntentError;
+    pub const StrategyPaused: AutoTradeError = AutoTradeError::TradingPaused;
+    pub const SignalInactive: AutoTradeError = AutoTradeError::SignalExpired;
 }

@@ -16,6 +16,28 @@ pub struct Signal {
 pub enum DataKey {
     Trades(Address, u64),
     Signal(u64),
+    SignalStatus(u64),
+}
+
+/// Lifecycle status of a signal, checked at execution time (#1365).
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalStatus {
+    Active,
+    Archived,
+    Invalidated,
+}
+
+/// Current signal status; signals with no recorded status are `Active`.
+pub fn get_signal_status(env: &Env, id: u64) -> SignalStatus {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SignalStatus(id))
+        .unwrap_or(SignalStatus::Active)
+}
+
+pub fn set_signal_status(env: &Env, id: u64, status: SignalStatus) {
+    env.storage().persistent().set(&DataKey::SignalStatus(id), &status);
 }
 
 /// Get a signal by ID
