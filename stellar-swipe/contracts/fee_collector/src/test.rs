@@ -1,172 +1,5 @@
 #![cfg(test)]
 
- feature/reputation-score
-use super::*;
-use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
-use soroban_sdk::{token, Address, Env, IntoVal};
-
-fn create_test_env() -> Env {
-    let env = Env::default();
-    env.mock_all_auths();
-    env
-}
-
-fn setup_contract(env: &Env) -> Address {
-    let contract_id = env.register_contract(None, FeeCollectorContract);
-    let admin = Address::generate(env);
-
-    let client = FeeCollectorContractClient::new(env, &contract_id);
-    client.initialize(&admin);
-
-    contract_id
-}
-
-#[test]
-fn test_normal_trade() {
-    let env = create_test_env();
-    let contract_id = setup_contract(&env);
-    let client = FeeCollectorContractClient::new(&env, &contract_id);
-
-    let trade_amount = 10_000_000_000; // 1000 XLM
-    let calculated_fee = 10_000_000;   // 1 XLM
-
-    let result = client.collect_fee(&trade_amount, &calculated_fee);
-    assert_eq!(result, 10_000_000); // Should return the calculated fee as is
-}
-
-#[test]
-fn test_large_trade_cap() {
-    let env = create_test_env();
-    let contract_id = setup_contract(&env);
-    let client = FeeCollectorContractClient::new(&env, &contract_id);
-
-    let trade_amount = 1_000_000_000_000; // 100,000 XLM
-    let calculated_fee = 2_000_000_000;   // 200 XLM (above max)
-
-    let result = client.collect_fee(&trade_amount, &calculated_fee);
-    assert_eq!(result, 1_000_000_000); // Should be capped at max_fee_per_trade (100 XLM)
-}
-
-#[test]
-fn test_small_trade_floor() {
-    let env = create_test_env();
-    let contract_id = setup_contract(&env);
-    let client = FeeCollectorContractClient::new(&env, &contract_id);
-
-    let trade_amount = 1_000_000_000; // 100 XLM
-    let calculated_fee = 10_000;       // 0.001 XLM (below min)
-
-    let result = client.collect_fee(&trade_amount, &calculated_fee);
-    assert_eq!(result, 100_000); // Should be floored at min_fee_per_trade (0.01 XLM)
-}
-
-#[test]
-fn test_tiny_trade_reject() {
-    let env = create_test_env();
-    let contract_id = setup_contract(&env);
-    let client = FeeCollectorContractClient::new(&env, &contract_id);
-
-    let trade_amount = 50_000; // 0.005 XLM (below min_fee_per_trade)
-    let calculated_fee = 5_000;
-
-    let result = client.try_collect_fee(&trade_amount, &calculated_fee);
-    assert_eq!(result, Err(Ok(FeeCollectorError::TradeTooSmall)));
-}
-
-#[test]
-fn test_set_fee_config() {
-    let env = create_test_env();
-    let contract_id = setup_contract(&env);
-    let client = FeeCollectorContractClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
-    let new_config = FeeConfig {
-        max_fee_per_trade: 2_000_000_000, // 200 XLM
-        min_fee_per_trade: 200_000,       // 0.02 XLM
-    };
-
-    client.set_fee_config(&admin, &new_config);
-
-    let retrieved_config = client.get_fee_config();
-    assert_eq!(retrieved_config, new_config);
-}
-
-#[test]
-fn test_claim_fees_normal() {
-    let env = create_test_env();
-    let contract_id = setup_contract(&env);
-    let client = FeeCollectorContractClient::new(&env, &contract_id);
-
-    let provider = Address::generate(&env);
-    let amount: i128 = 1_000_000; // 0.1 XLM
-
-    // Register a real token contract and mint `amount` to the fee_collector contract
-    let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
-    token_admin_client.mint(&contract_id, &amount);
-
-    // Seed pending fees in storage
-    let key = StorageKey::ProviderPendingFees(provider.clone(), token_id.clone());
-    env.as_contract(&contract_id, || {
-        env.storage().persistent().set(&key, &amount);
-    });
-
-    let claimed = client.claim_fees(&provider, &token_id);
-    assert_eq!(claimed, amount);
-
-    // Pending balance must be reset
-    let remaining: i128 = env.as_contract(&contract_id, || {
-        env.storage().persistent().get(&key).unwrap_or(0)
-    });
-    assert_eq!(remaining, 0);
-
-    // Provider must have received the tokens
-    let token_client = token::Client::new(&env, &token_id);
-    assert_eq!(token_client.balance(&provider), amount);
-}
-
-#[test]
-fn test_claim_fees_zero_balance() {
-    let env = create_test_env();
-    let contract_id = setup_contract(&env);
-    let client = FeeCollectorContractClient::new(&env, &contract_id);
-
-    let provider = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    // No pending fees set, should return 0
-    let claimed = client.claim_fees(&provider, &token);
-    assert_eq!(claimed, 0);
-}
-
-#[test]
-fn test_claim_fees_unauthorized() {
-    let env = Env::default(); // No mock_all_auths — auth is enforced
-    let contract_id = env.register_contract(None, FeeCollectorContract);
-    let admin = Address::generate(&env);
-
-    // initialize requires admin auth; mock only that call
-    env.mock_auths(&[MockAuth {
-        address: &admin,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "initialize",
-            args: (admin.clone(),).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    let client = FeeCollectorContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    let provider = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    // Attempt to claim as `provider` without providing auth — must fail
-    let result = client.try_claim_fees(&provider, &token);
-    assert!(result.is_err());
-}
-=======
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
@@ -823,7 +656,6 @@ mod property_tests {
         }
     }
 }
- main
 // ---------------------------------------------------------------------------
 // Fee rate tests
 // ---------------------------------------------------------------------------
@@ -1003,5 +835,83 @@ fn test_set_fee_rate_unauthorized() {
     assert!(result.is_err(), "non-admin call to set_fee_rate must fail");
 }
 
- main
- main
+
+// ---------------------------------------------------------------------------
+// Fee distribution end-to-end (#939)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fee_distribution_end_to_end() {
+    use crate::ProviderShare;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+    let mut shares = soroban_sdk::Vec::new(&env);
+    shares.push_back(ProviderShare { provider: p1.clone(), share_bps: 5_000 });
+    shares.push_back(ProviderShare { provider: p2.clone(), share_bps: 3_000 });
+    shares.push_back(ProviderShare { provider: p3.clone(), share_bps: 2_000 });
+    client.set_provider_shares(&shares);
+
+    // Two copy-trade executions (amounts chosen to produce rounding dust).
+    client.record_fee(&token, &700_001i128);
+    client.record_fee(&token, &300_002i128);
+    let total = 1_000_003i128;
+    assert_eq!(client.epoch_fees(&token), total);
+
+    let retained = client.close_epoch(&token);
+
+    let b1 = client.provider_balance(&p1, &token);
+    let b2 = client.provider_balance(&p2, &token);
+    let b3 = client.provider_balance(&p3, &token);
+    assert!((b1 - total * 50 / 100).abs() <= 1);
+    assert!((b2 - total * 30 / 100).abs() <= 1);
+    assert!((b3 - total * 20 / 100).abs() <= 1);
+
+    let treasury = client.treasury_balance(&token);
+    assert_eq!(treasury, retained);
+    assert_eq!(treasury, total - (b1 + b2 + b3));
+    // No dust lost.
+    assert_eq!(b1 + b2 + b3 + treasury, total);
+    assert_eq!(client.epoch_fees(&token), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Deprecated entry-point shims (#943)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_deprecated_shims_route_to_current_impl() {
+    use soroban_sdk::testutils::Events;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let contract_id = env.register(FeeCollector, ());
+    let client = FeeCollectorClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Legacy and current read paths agree.
+    assert_eq!(client.get_fee_rate(), client.fee_rate());
+    assert!(!env.events().all().is_empty(), "deprecation warning must be emitted");
+
+    // Legacy write path routes to set_fee_rate.
+    client.update_fee_rate(&40u32);
+    assert_eq!(client.fee_rate(), 40);
+    assert_eq!(client.get_fee_rate(), 40);
+
+    // Legacy validation preserved.
+    assert_eq!(client.try_update_fee_rate(&1_000u32), Err(Ok(ContractError::FeeRateTooHigh)));
+
+    assert_eq!(client.get_treasury_balance(&token), client.treasury_balance(&token));
+}

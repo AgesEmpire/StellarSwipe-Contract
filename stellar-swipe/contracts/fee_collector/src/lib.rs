@@ -1,140 +1,14 @@
 #![no_std]
 
- feature/reputation-score
-use soroban_sdk::{contract, contractimpl, contracterror, contracttype, Address, Env, Symbol, symbol_short, token};
-
-use stellar_swipe_common::assets::Asset;
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum FeeCollectorError {
-    TradeTooSmall = 1,
-    ArithmeticOverflow = 2,
-    InvalidAmount = 3,
-    Unauthorized = 4,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FeeConfig {
-    pub max_fee_per_trade: i128, // 100 XLM equivalent
-    pub min_fee_per_trade: i128, // 0.01 XLM equivalent
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub enum StorageKey {
-    ProviderPendingFees(Address, Address),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DataKey {
-    Admin,
-    FeeConfig,
-}
-
-#[contract]
-pub struct FeeCollectorContract;
-
-#[contractimpl]
-impl FeeCollectorContract {
-    /// Initialize the contract with admin and default fee config
-    pub fn initialize(env: Env, admin: Address) {
-        env.storage().instance().set(&DataKey::Admin, &admin);
-
-        // Default config: 100 XLM = 100 * 10^7 stroops = 1_000_000_000
-        // 0.01 XLM = 0.01 * 10^7 = 100_000
-        let default_config = FeeConfig {
-            max_fee_per_trade: 1_000_000_000, // 100 XLM
-            min_fee_per_trade: 100_000,       // 0.01 XLM
-        };
-        env.storage().instance().set(&DataKey::FeeConfig, &default_config);
-    }
-
-    /// Set fee config (admin only)
-    pub fn set_fee_config(env: Env, caller: Address, config: FeeConfig) -> Result<(), FeeCollectorError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != admin {
-            return Err(FeeCollectorError::Unauthorized);
-        }
-
-        if config.min_fee_per_trade <= 0 || config.max_fee_per_trade <= config.min_fee_per_trade {
-            return Err(FeeCollectorError::InvalidAmount);
-        }
-
-        env.storage().instance().set(&DataKey::FeeConfig, &config);
-        Ok(())
-    }
-
-    /// Get current fee config
-    pub fn get_fee_config(env: Env) -> FeeConfig {
-        env.storage().instance().get(&DataKey::FeeConfig).unwrap()
-    }
-
-    /// Collect fee with cap and floor applied
-    /// Returns the clamped fee amount
-    pub fn collect_fee(env: Env, trade_amount: i128, calculated_fee: i128) -> Result<i128, FeeCollectorError> {
-        if trade_amount <= 0 || calculated_fee < 0 {
-            return Err(FeeCollectorError::InvalidAmount);
-        }
-
-        let config = Self::get_fee_config(env);
-
-        // Check if trade amount is too small to cover minimum fee
-        if trade_amount < config.min_fee_per_trade {
-            return Err(FeeCollectorError::TradeTooSmall);
-        }
-
-        // Clamp the fee between min and max
-        let clamped_fee = if calculated_fee < config.min_fee_per_trade {
-            config.min_fee_per_trade
-        } else if calculated_fee > config.max_fee_per_trade {
-            config.max_fee_per_trade
-        } else {
-            calculated_fee
-        };
-
-        // Ensure the clamped fee doesn't exceed the trade amount
-        if clamped_fee > trade_amount {
-            return Err(FeeCollectorError::TradeTooSmall);
-        }
-
-        Ok(clamped_fee)
-    }
-
-    /// Claim pending fees for a provider and token
-    pub fn claim_fees(env: Env, provider: Address, token: Address) -> i128 {
-        provider.require_auth();
-
-        let key = StorageKey::ProviderPendingFees(provider.clone(), token.clone());
-        let amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-
-        if amount > 0 {
-            // Transfer tokens from contract to provider
-            let token_client = token::Client::new(&env, &token);
-            token_client.transfer(&env.current_contract_address(), &provider, &amount);
-
-            // Reset pending balance to 0
-            env.storage().persistent().set(&key, &0);
-        }
-
-        // Emit FeesClaimed event
-        env.events().publish(
-            (symbol_short!("fees"), symbol_short!("claimed")),
-            (provider, amount, token),
-        );
-
-        amount
-    }
-}
-=======
 mod errors;
 pub use errors::ContractError;
 
 mod events;
-pub use events::{FeeRateUpdated, TreasuryWithdrawal, WithdrawalQueued};
+pub use events::{DeprecatedCall, FeeRateUpdated, TreasuryWithdrawal, WithdrawalQueued};
+
+pub mod distribution;
+pub mod fee_cache;
+pub use distribution::ProviderShare;
 
 mod storage;
 pub use storage::{
@@ -144,7 +18,7 @@ pub use storage::{
     MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS,
 };
 
-use soroban_sdk::{contract, contractimpl, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol, Vec};
 
 #[cfg(test)]
 mod test;
@@ -266,7 +140,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
-        Ok(get_fee_rate(&env))
+        Ok(fee_cache::cached_fee_rate(&env))
     }
 
     /// Admin-only: update the fee rate (in basis points).
@@ -288,6 +162,7 @@ impl FeeCollector {
 
         let old_rate = get_fee_rate(&env);
         set_fee_rate_storage(&env, new_rate_bps);
+        fee_cache::invalidate_fee_cache(&env);
 
         FeeRateUpdated {
             old_rate,
@@ -298,5 +173,73 @@ impl FeeCollector {
 
         Ok(())
     }
+
+    // ── Fee distribution ────────────────────────────────────────────────────
+
+    /// Admin-only: configure provider fee shares (bps of epoch fees, sum <= 10_000).
+    pub fn set_provider_shares(env: Env, providers: Vec<ProviderShare>) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        get_admin(&env).require_auth();
+        distribution::set_providers(&env, &providers)
+    }
+
+    /// Admin-only: record a fee collected from a copy-trade execution.
+    pub fn record_fee(env: Env, token: Address, amount: i128) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        get_admin(&env).require_auth();
+        distribution::record_fee(&env, &token, amount)
+    }
+
+    /// Admin-only: close the epoch, crediting providers and retaining the rest in treasury.
+    /// Returns the amount retained by treasury.
+    pub fn close_epoch(env: Env, token: Address) -> Result<i128, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        get_admin(&env).require_auth();
+        distribution::close_epoch(&env, &token)
+    }
+
+    pub fn provider_balance(env: Env, provider: Address, token: Address) -> i128 {
+        distribution::provider_balance(&env, &provider, &token)
+    }
+
+    pub fn epoch_fees(env: Env, token: Address) -> i128 {
+        distribution::epoch_fees(&env, &token)
+    }
 }
- main
+
+// ── Deprecated entry-point compatibility shims ──────────────────────────────
+//
+// Legacy entry points kept so existing integrations keep working across
+// upgrades. Each shim emits a `DeprecatedCall` event naming its replacement
+// and routes to the current implementation. Remove after the deprecation window.
+
+fn warn_deprecated(env: &Env, entry_point: Symbol, replacement: Symbol) {
+    DeprecatedCall { entry_point, replacement }.publish(env);
+}
+
+#[contractimpl]
+impl FeeCollector {
+    /// Deprecated: use `fee_rate`.
+    pub fn get_fee_rate(env: Env) -> Result<u32, ContractError> {
+        warn_deprecated(&env, symbol_short!("get_fee"), symbol_short!("fee_rate"));
+        Self::fee_rate(env)
+    }
+
+    /// Deprecated: use `set_fee_rate`.
+    pub fn update_fee_rate(env: Env, new_rate_bps: u32) -> Result<(), ContractError> {
+        warn_deprecated(&env, symbol_short!("upd_fee"), symbol_short!("set_fee"));
+        Self::set_fee_rate(env, new_rate_bps)
+    }
+
+    /// Deprecated: use `treasury_balance`.
+    pub fn get_treasury_balance(env: Env, token: Address) -> Result<i128, ContractError> {
+        warn_deprecated(&env, symbol_short!("get_trsy"), symbol_short!("trsy_bal"));
+        Self::treasury_balance(env, token)
+    }
+}

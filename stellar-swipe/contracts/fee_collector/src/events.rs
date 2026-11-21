@@ -1,4 +1,4 @@
-use soroban_sdk::{contractevent, Address};
+use soroban_sdk::{contractevent, Address, Symbol};
 
 #[contractevent]
 pub struct WithdrawalQueued {
@@ -21,4 +21,11 @@ pub struct TreasuryWithdrawal {
     pub token: Address,
     pub amount: i128,
     pub remaining_balance: i128,
+}
+
+/// Emitted whenever a deprecated entry point is invoked via a compatibility shim.
+#[contractevent]
+pub struct DeprecatedCall {
+    pub entry_point: Symbol,
+    pub replacement: Symbol,
 }
