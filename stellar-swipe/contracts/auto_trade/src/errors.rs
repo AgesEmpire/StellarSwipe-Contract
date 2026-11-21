@@ -139,10 +139,13 @@ pub enum AutoTradeError {
     // ── Issue #1001: standardized token/cross-contract error mapping ─────────
     /// A router-required allowance was insufficient or expired.
     InsufficientAllowance = 51,
-
     // ── Issue #1361: strategy revision binding ───────────────────────────────
     /// The intent was authorized against an older strategy revision.
     StaleStrategyRevision = 52,
+    /// Slippage setting is outside protocol safety bounds (issue #1367).
+    InvalidSlippageSetting = 53,
+    /// A receipt already exists for this intent id (issue #1366).
+    IntentReceiptExists = 54,
 }
 
 /// Maps the shared token/cross-contract invocation failure classification
@@ -316,6 +319,10 @@ impl AutoTradeError {
             AutoTradeError::InsufficientAllowance => {
                 "router token operation failed: insufficient or expired allowance"
             }
+            AutoTradeError::InvalidSlippageSetting => {
+                "slippage setting is outside protocol safety bounds"
+            }
+            AutoTradeError::IntentReceiptExists => "receipt already recorded for this intent",
         }
     }
 }

@@ -31,6 +31,7 @@ mod logging;
 mod loss_streak;
 mod multi_asset;
 mod oracle;
+pub mod outcomes;
 pub mod plan_lifecycle;
 mod portfolio;
 mod portfolio_insurance;
@@ -49,6 +50,7 @@ mod risk;
 mod risk_parity;
 pub mod rollback;
 mod sdex;
+pub mod slippage_bounds;
 pub mod signal_ordering;
 #[cfg(feature = "testutils")]
 pub mod smart_routing;
@@ -160,6 +162,48 @@ pub struct AutoTradeStorageStats {
 
 #[contractimpl]
 impl AutoTradeContract {
+    /// Configure a strategy-level slippage bound (issue #1367).
+    pub fn set_strategy_slippage(
+        env: Env,
+        user: Address,
+        strategy_id: u64,
+        max_slippage_bps: u32,
+    ) -> Result<(), AutoTradeError> {
+        user.require_auth();
+        slippage_bounds::set(&env, &user, strategy_id, max_slippage_bps)
+    }
+
+    pub fn get_strategy_slippage(env: Env, user: Address, strategy_id: u64) -> Option<u32> {
+        slippage_bounds::get(&env, &user, strategy_id)
+    }
+
+    /// Recheck the effective slippage bound immediately before execution.
+    pub fn effective_slippage(
+        env: Env,
+        user: Address,
+        strategy_id: u64,
+        requested_bps: u32,
+    ) -> Result<u32, AutoTradeError> {
+        slippage_bounds::effective(&env, &user, strategy_id, requested_bps)
+    }
+
+    /// Record a terminal execution receipt for an intent (admin only, issue #1366).
+    pub fn record_intent_receipt(
+        env: Env,
+        caller: Address,
+        receipt: outcomes::ExecutionReceipt,
+    ) -> Result<(), AutoTradeError> {
+        admin::require_admin(&env, &caller)?;
+        let mut receipt = receipt;
+        receipt.recorded_at = env.ledger().timestamp();
+        outcomes::record(&env, receipt)
+    }
+
+    /// Read-only receipt lookup by intent id; `None` for unknown intents.
+    pub fn get_intent_receipt(env: Env, intent_id: u64) -> Option<outcomes::ExecutionReceipt> {
+        outcomes::get(&env, intent_id)
+    }
+
     pub fn simulate_copy_trade(
         env: Env,
         user: Address,
@@ -169,6 +213,9 @@ impl AutoTradeContract {
     ) -> TradeSimulation {
         if amount <= 0 {
             return Self::failed_simulation(&env, "invalid_amount");
+        }
+        if slippage_bounds::validate(max_slippage_bps).is_err() {
+            return Self::failed_simulation(&env, "slippage_out_of_bounds");
         }
 
         let signal = match storage::get_signal(&env, signal_id) {
