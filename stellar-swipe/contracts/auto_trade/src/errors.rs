@@ -126,6 +126,12 @@ pub enum AutoTradeError {
     /// Executed price would deviate from the reference price by more than the allowed slippage.
     SlippageExceeded = 48,
     // ── Misc ─────────────────────────────────────────────────────────────────
+    RankingDisabled = 46,
+    LastOracleForPair = 47,
+    NotPaused = 48,
+    // ── Auto-trade intents (NotFound / Expired / NotPending / InvalidDeadline) ─
+    IntentError = 49,
+    BudgetExceeded = 50,
     /// Cannot remove the last remaining whitelisted oracle for a pair.
     LastOracleForPair = 49,
     /// Action requires the contract to be paused, but it is not.
@@ -391,6 +397,12 @@ impl AutoTradeError {
     pub const RecoveryNotFound: AutoTradeError = AutoTradeError::SystemError;
     pub const RecoveryIncomplete: AutoTradeError = AutoTradeError::SystemError;
 
+    pub const IntentNotFound: AutoTradeError = AutoTradeError::IntentError;
+    pub const IntentExpired: AutoTradeError = AutoTradeError::IntentError;
+    pub const IntentNotPending: AutoTradeError = AutoTradeError::IntentError;
+    pub const InvalidDeadline: AutoTradeError = AutoTradeError::IntentError;
+    pub const StrategyPaused: AutoTradeError = AutoTradeError::TradingPaused;
+    pub const SignalInactive: AutoTradeError = AutoTradeError::SignalExpired;
     // ── Escrow (per-trade isolated custody) ──────────────────────────────────
     /// No escrow record exists for the given trade_id.
     pub const EscrowNotFound: AutoTradeError = AutoTradeError::StrategyNotFound;
