@@ -92,6 +92,9 @@ pub enum BridgeError {
     /// A liquidity pool already exists for this unordered asset pair, in
     /// either order (Issue #1313).
     PoolAlreadyExists = 34,
+    /// The number of stored (undelivered) bridge messages reached
+    /// `MAX_PENDING_MESSAGES` (Issue #1302).
+    PendingMessageLimitReached = 35,
 }
 
 impl BridgeError {

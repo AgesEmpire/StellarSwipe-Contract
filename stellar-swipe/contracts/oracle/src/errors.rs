@@ -78,6 +78,10 @@ pub enum OracleError {
     /// the configured deviation bound and no fallback set resolved the
     /// conflict (Issue #1122).
     ConflictingObservations = 33,
+    /// The feed is not in the `Active` lifecycle state (Issue #1307).
+    FeedNotActive = 34,
+    /// The requested feed lifecycle transition is not allowed (Issue #1307).
+    InvalidFeedTransition = 35,
 }
 
 impl OracleError {

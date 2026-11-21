@@ -24,6 +24,12 @@ use stellar_swipe_common::SECONDS_PER_DAY;
 /// resources or mutates bridge state.
 pub const MAX_MESSAGE_SIZE: u32 = 4096;
 pub const MESSAGE_TIMEOUT: u64 = SECONDS_PER_DAY; // 24 h
+/// Upper bound on stored, not-yet-finalized message records (Issue #1302).
+/// New sends are rejected once reached until cleanup frees capacity.
+pub const MAX_PENDING_MESSAGES: u32 = 1_000;
+/// Extra time a Failed record is kept after [`MESSAGE_TIMEOUT`] so it can still
+/// be inspected or retried before becoming eligible for cleanup (Issue #1302).
+pub const FAILED_MESSAGE_RETENTION: u64 = 7 * SECONDS_PER_DAY;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -66,6 +72,8 @@ pub enum MessagingKey {
     OutboundSeq(u32),
     /// Next expected delivery-confirmation nonce per target chain (Issue #668).
     ExpectedNonce(u32),
+    /// Number of message records currently held in storage (Issue #1302).
+    PendingCount,
 }
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
@@ -106,10 +114,78 @@ fn save_message(env: &Env, msg: &CrossChainMessage) {
 }
 
 fn remove_message(env: &Env, id: u64) {
-    env.storage()
-        .persistent()
-        .remove(&MessagingKey::Message(id));
+    let key = MessagingKey::Message(id);
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().remove(&key);
+        let count = pending_message_count(env);
+        set_pending_count(env, count.saturating_sub(1));
+    }
 }
+
+/// Number of message records currently held in storage (Issue #1302).
+pub fn pending_message_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&MessagingKey::PendingCount)
+        .unwrap_or(0)
+}
+
+fn set_pending_count(env: &Env, count: u32) {
+    env.storage()
+        .instance()
+        .set(&MessagingKey::PendingCount, &count);
+}
+
+/// Whether a stored message may be removed by [`cleanup_message`] at `now`.
+///
+/// Only `Failed` records whose retention window
+/// (`sent_at + MESSAGE_TIMEOUT + FAILED_MESSAGE_RETENTION`) has elapsed are
+/// removable. `Pending`/`Relayed` (still executable) and `Delivered` /
+/// `CallbackReceived` (finalized, awaiting callback or removal by the normal
+/// flow) are never removed by cleanup.
+pub fn is_cleanup_eligible(msg: &CrossChainMessage, now: u64) -> bool {
+    msg.status == MessageStatus::Failed
+        && now
+            >= msg
+                .sent_at
+                .saturating_add(MESSAGE_TIMEOUT)
+                .saturating_add(FAILED_MESSAGE_RETENTION)
+}
+
+/// Remove an abandoned message record (Issue #1302).
+///
+/// Returns `Ok(true)` when the record was removed, `Ok(false)` when it is
+/// already gone (repeated cleanup is a harmless no-op), and an error when the
+/// record is still active, finalized, or within its retention window.
+pub fn cleanup_message(env: &Env, message_id: u64) -> Result<bool, String> {
+    let Some(msg) = get_cross_chain_message(env, message_id) else {
+        return Ok(false);
+    };
+    if !is_cleanup_eligible(&msg, env.ledger().timestamp()) {
+        return Err(String::from_str(env, "Message not eligible for cleanup"));
+    }
+    remove_message(env, message_id);
+    env.events().publish(
+        (Symbol::new(env, "msg_cleaned"), message_id),
+        env.ledger().timestamp(),
+    );
+    Ok(true)
+}
+
+/// Clean up a bounded batch of message ids; returns how many were removed.
+/// Ineligible or missing ids are skipped rather than aborting the batch.
+pub fn cleanup_messages(env: &Env, message_ids: soroban_sdk::Vec<u64>) -> u32 {
+    let mut removed = 0u32;
+    for id in message_ids.iter().take(MAX_CLEANUP_BATCH as usize) {
+        if let Ok(true) = cleanup_message(env, id) {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Maximum ids processed by one [`cleanup_messages`] call (Issue #1302).
+pub const MAX_CLEANUP_BATCH: u32 = 50;
 
 fn next_message_id(env: &Env) -> u64 {
     let id: u64 = env
@@ -205,6 +281,11 @@ pub fn send_cross_chain_message(
         return Err(BridgeError::MessageTooLarge);
     }
 
+    let stored = pending_message_count(env);
+    if stored >= MAX_PENDING_MESSAGES {
+        return Err(BridgeError::PendingMessageLimitReached);
+    }
+
     let id = next_message_id(env);
     let nonce = assign_outbound_nonce(env, target_chain);
 
@@ -224,6 +305,7 @@ pub fn send_cross_chain_message(
     };
 
     save_message(env, &msg);
+    set_pending_count(env, stored + 1);
 
     env.events().publish(
         (Symbol::new(env, "msg_sent"), id),

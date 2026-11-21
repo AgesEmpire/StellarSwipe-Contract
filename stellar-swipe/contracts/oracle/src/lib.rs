@@ -10,6 +10,7 @@ mod errors;
 #[allow(deprecated)]
 mod events;
 mod external_adapter;
+pub mod feed_state;
 mod freshness_policy;
 mod history;
 mod multi_hop;
@@ -462,6 +463,7 @@ impl OracleContract {
         if !oracles.contains(&oracle) {
             return Err(OracleError::OracleNotFound);
         }
+        feed_state::require_active(&env, &oracle)?;
 
         // Check reputation
         let stats = get_oracle_stats(&env, &oracle);
@@ -1133,6 +1135,35 @@ impl OracleContract {
         Ok(())
     }
 
+    /// Move a feed through its lifecycle (Issue #1307). Admin only.
+    pub fn set_feed_state(
+        env: Env,
+        admin: Address,
+        source: Address,
+        state: feed_state::FeedState,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        feed_state::transition(&env, &source, state)
+    }
+
+    /// Register a feed in the `Pending` state; it cannot submit until
+    /// activated via [`set_feed_state`] (Issue #1307). Admin only.
+    pub fn register_pending_feed(
+        env: Env,
+        admin: Address,
+        source: Address,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        feed_state::register_pending(&env, &source)
+    }
+
+    /// Current lifecycle state of a feed (Issue #1307).
+    pub fn get_feed_state(env: Env, source: Address) -> feed_state::FeedState {
+        feed_state::get_state(&env, &source)
+    }
+
     /// Submit a price observation for aggregation (`PriceMap` path).
     ///
     /// Issue #864: rejects the quote before it is accepted if its confidence
@@ -1171,6 +1202,7 @@ impl OracleContract {
         if weight == 0 {
             return Err(OracleError::Unauthorized);
         }
+        feed_state::require_active(&env, &source)?;
 
         let key = StorageKey::PriceMap(pair.clone());
         let prices: Vec<PriceData> = env
