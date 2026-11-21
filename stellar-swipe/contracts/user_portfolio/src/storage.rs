@@ -85,4 +85,10 @@ pub enum DataKey {
     UserAssetExposure(Address, u32),
     /// Per-position record of which asset_id it belongs to (for exposure tracking).
     PositionAsset(u64),
+    /// Distinct assets with at least one active position (#1370).
+    UserActiveAssets(Address),
+    /// Number of active positions a user holds in an asset (#1370).
+    UserAssetPositionCount(Address, u32),
+    /// Monotonic revision of a user's portfolio snapshot (#1371).
+    SnapshotRevision(Address),
 }
