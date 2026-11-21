@@ -2,6 +2,8 @@
 
 /// Asset decimal compatibility checks (Issue #1136).
 pub mod asset_decimals;
+/// Authorization configuration preservation across upgrades (Issue #1398).
+pub mod auth_config;
 pub mod emergency_unstake;
 pub mod events;
 /// Deterministic fee accrual accumulator (Issue #1016).
@@ -18,6 +20,8 @@ pub mod slash_strategy;
 /// Slashing decisions with evidence references (Issue #1433).
 pub mod slash_evidence;
 pub mod storage_version;
+/// TTL renewal for critical entries touched by mutating entrypoints (Issue #1397).
+pub mod ttl_guard;
 /// Independent partial unbonding requests (Issue #1432).
 pub mod unbonding;
 pub mod withdrawal_claims;
@@ -400,6 +404,15 @@ pub enum StorageKey {
     /// Admin-configurable default lockup length (in ledgers) applied when a
     /// provider is locked.
     DefaultProviderLockupLedgers,
+    // ── Issue #1395: unstake queue reservations ──────────────────────────────
+    /// Stake amount reserved by `staker`'s single active unstake request.
+    /// Present only while the request is active; never exceeds the position's
+    /// withdrawable balance (see `get_unstake_reservation`).
+    UnstakeReservation(Address),
+    // ── Issue #1396: idempotent unstake queue completion ─────────────────────
+    /// Terminal completion record for a queue ticket. Tickets are monotonic
+    /// and never reused, so once written a ticket can never be paid again.
+    UnstakeCompletion(u64),
 }
 
 #[contracterror]
@@ -782,6 +795,21 @@ pub struct UnstakeRequest {
     pub queued_at: u64,
 }
 
+/// Terminal record of a processed unstake ticket (issue #1396).
+///
+/// Written in the same invocation that releases the stake, so a retried or
+/// replayed `process_unstake_queue` sees the ticket as closed and never pays
+/// or accounts for it a second time.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnstakeCompletion {
+    pub ticket: u64,
+    pub user: Address,
+    /// Amount actually released (0 when the position was already empty).
+    pub amount: i128,
+    pub completed_at: u64,
+}
+
 // ── Issue #689: Slash appeal types ─────────────────────────────────────────────
 
 /// Status of a slash appeal.
@@ -874,6 +902,89 @@ fn decode_i128_from_bytes(env: &Env, payload: &Bytes, offset: u32) -> i128 {
         i += 1;
     }
     i128::from_le_bytes(buf)
+}
+
+// ── Issue #1395 / #1396: unstake queue reservation helpers ────────────────────
+
+/// The ticket of `staker`'s *active* unstake request, if any.
+///
+/// A pointer is only active when its queue entry still exists, belongs to
+/// `staker`, and has no terminal completion record. Anything else is a stale
+/// pointer and does not block a new request.
+fn active_unstake_ticket(env: &Env, staker: &Address) -> Option<u64> {
+    let ticket: u64 = env
+        .storage()
+        .persistent()
+        .get(&StorageKey::UserUnstakeTicket(staker.clone()))?;
+    if env
+        .storage()
+        .persistent()
+        .has(&StorageKey::UnstakeCompletion(ticket))
+    {
+        return None;
+    }
+    let entry: UnstakeRequest = env
+        .storage()
+        .persistent()
+        .get(&StorageKey::UnstakeQueueEntry(ticket))?;
+    if &entry.user != staker || entry.ticket != ticket {
+        return None;
+    }
+    Some(ticket)
+}
+
+/// Rejects a direct withdrawal while `staker` has an active queued request,
+/// so reserved stake cannot be released through two paths (issue #1395).
+fn require_no_active_unstake(env: &Env, staker: &Address) -> Result<(), StakeVaultError> {
+    if active_unstake_ticket(env, staker).is_some() {
+        return Err(StakeVaultError::UnstakeAlreadyQueued);
+    }
+    Ok(())
+}
+
+/// Clear `staker`'s queue pointer and reservation. With `Some(ticket)` the
+/// pointer is only cleared when it still names that ticket, so closing an
+/// old ticket never releases a newer request.
+fn release_unstake_pointer(env: &Env, staker: &Address, ticket: Option<u64>) {
+    let key = StorageKey::UserUnstakeTicket(staker.clone());
+    if let Some(expected) = ticket {
+        let current: Option<u64> = env.storage().persistent().get(&key);
+        if current != Some(expected) {
+            return;
+        }
+    }
+    env.storage().persistent().remove(&key);
+    env.storage()
+        .persistent()
+        .remove(&StorageKey::UnstakeReservation(staker.clone()));
+}
+
+/// Record the terminal completion of `request` and close it (issue #1396).
+fn complete_unstake_ticket(env: &Env, request: &UnstakeRequest, amount: i128) {
+    let completion_key = StorageKey::UnstakeCompletion(request.ticket);
+    env.storage().persistent().set(
+        &completion_key,
+        &UnstakeCompletion {
+            ticket: request.ticket,
+            user: request.user.clone(),
+            amount,
+            completed_at: env.ledger().timestamp(),
+        },
+    );
+    ttl_guard::renew_persistent(env, &completion_key);
+    env.storage()
+        .persistent()
+        .remove(&StorageKey::UnstakeQueueEntry(request.ticket));
+    release_unstake_pointer(env, &request.user, Some(request.ticket));
+}
+
+fn current_stake_balance(env: &Env, staker: &Address) -> i128 {
+    let stakes: soroban_sdk::Map<Address, StakeInfoV2> = env
+        .storage()
+        .persistent()
+        .get(&MigrationKey::StakesV2)
+        .unwrap_or_else(|| soroban_sdk::Map::new(env));
+    stakes.get(staker.clone()).map(|i| i.balance).unwrap_or(0)
 }
 
 #[contract]
@@ -972,10 +1083,37 @@ impl StakeVaultContract {
         shared::version::guard_upgrade(current_version, new_version)
             .map_err(|_| StakeVaultError::IncompatibleContractVersion)?;
 
+        // Issue #1397: keep the instance (admin, auth config) alive.
+        ttl_guard::renew_instance(&env);
+
+        // Issue #1398: reject malformed authorization state and record the
+        // exact principals/assignments the upgraded code must retain.
+        let auth_snapshot = auth_config::record_pre_upgrade(&env)?;
+
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         shared::version::set_contract_version(&env, new_version);
+        auth_config::require_unchanged(&env, &auth_snapshot)?;
         shared::version::emit_contract_upgraded(&env, current_version, new_version);
         Ok(())
+    }
+
+    /// Read-only: the live authorization configuration (admin, governance,
+    /// multisig signers, emergency approvers), validated (issue #1398).
+    pub fn get_auth_config(env: Env) -> Result<auth_config::AuthConfigSnapshot, StakeVaultError> {
+        auth_config::capture(&env)
+    }
+
+    /// Read-only: the authorization snapshot recorded by the last upgrade.
+    pub fn get_pre_upgrade_auth_config(env: Env) -> Option<auth_config::AuthConfigSnapshot> {
+        auth_config::get_pre_upgrade(&env)
+    }
+
+    /// Post-upgrade check (issue #1398): asserts the live authorization
+    /// configuration matches the snapshot recorded before the last upgrade
+    /// exactly, and rejects malformed authorization state. Returns the
+    /// verified configuration.
+    pub fn verify_auth_config(env: Env) -> Result<auth_config::AuthConfigSnapshot, StakeVaultError> {
+        auth_config::verify_against_recorded(&env)
     }
 
     // ── Emergency pause (shared::pausable) ────────────────────────────────────
@@ -1100,6 +1238,9 @@ impl StakeVaultContract {
         if amount <= 0 {
             return Err(StakeVaultError::NoStake);
         }
+
+        // Issue #1397: renew critical entries before any write.
+        ttl_guard::renew_stake_state(&env, &staker);
 
         let token: Address = env
             .storage()
@@ -1781,10 +1922,17 @@ impl StakeVaultContract {
             return Ok(());
         }
 
+        // Issue #1397: renew critical entries before any write.
+        ttl_guard::renew_stake_state(&env, &staker);
+
         let now = env.ledger().timestamp();
         env.storage().persistent().set(
             &StorageKey::LargeWithdrawalRequestedAt(staker.clone()),
             &now,
+        );
+        ttl_guard::renew_persistent(
+            &env,
+            &StorageKey::LargeWithdrawalRequestedAt(staker.clone()),
         );
 
         let cooldown = get_withdrawal_cooldown_secs(&env);
@@ -1826,6 +1974,13 @@ impl StakeVaultContract {
         {
             return Err(StakeVaultError::RateLimitExceeded);
         }
+
+        // Issue #1395: stake reserved by an active queued request can only be
+        // released by `process_unstake_queue`.
+        require_no_active_unstake(&env, &staker)?;
+
+        // Issue #1397: renew critical entries before any write.
+        ttl_guard::renew_stake_state(&env, &staker);
 
         // Read the stake balance first so we can scope the auth signature to
         // the exact amount being withdrawn, preventing signature reuse attacks.
@@ -2038,6 +2193,12 @@ impl StakeVaultContract {
         }
 
         staker.require_auth();
+
+        // Issue #1395: a queued request reserves the whole position.
+        require_no_active_unstake(&env, &staker)?;
+
+        // Issue #1397: renew critical entries before any write.
+        ttl_guard::renew_stake_state(&env, &staker);
 
         // Reentrancy guard and checks-interactions-effects ordering live
         // inside `do_partial_unstake` — see `do_partial_unstake_locked` for
@@ -3217,15 +3378,26 @@ impl StakeVaultContract {
     /// not already have a pending request in the queue.
     ///
     /// Emits `unstake_queued` with the assigned ticket number and queue position.
+    ///
+    /// # Single active reservation (issue #1395)
+    ///
+    /// A position may hold at most one active request. A retry while the
+    /// request is still active is rejected with
+    /// [`StakeVaultError::UnstakeAlreadyQueued`] and changes nothing, so
+    /// queue entries can never over-reserve the position. While a request is
+    /// active, `withdraw_stake` and `partial_unstake` are rejected the same
+    /// way, so the reserved stake cannot be withdrawn through a second path.
+    /// Once the request is closed (processed, or a stale pointer left by a
+    /// removed/completed entry), a new request may be made.
     pub fn queue_unstake(env: Env, staker: Address) -> Result<u64, StakeVaultError> {
         staker.require_auth();
         Self::require_not_paused(&env)?;
 
-        if env
-            .storage()
-            .persistent()
-            .has(&StorageKey::UserUnstakeTicket(staker.clone()))
-        {
+        // Issue #1397: renew before any write so expiry cannot interrupt the
+        // transition, and a renewal trap aborts with nothing persisted.
+        ttl_guard::renew_stake_state(&env, &staker);
+
+        if active_unstake_ticket(&env, &staker).is_some() {
             return Err(StakeVaultError::UnstakeAlreadyQueued);
         }
 
@@ -3268,15 +3440,27 @@ impl StakeVaultContract {
             queued_at: env.ledger().timestamp(),
         };
 
+        // Any pointer still present here is stale (its request was closed or
+        // its entry removed) — release it so the new request starts clean.
+        release_unstake_pointer(&env, &staker, None);
+
         env.storage()
             .persistent()
             .set(&StorageKey::UnstakeQueueEntry(ticket), &request);
         env.storage()
             .persistent()
             .set(&StorageKey::UserUnstakeTicket(staker.clone()), &ticket);
+        // Reserve exactly the position's current withdrawable balance.
+        env.storage()
+            .persistent()
+            .set(&StorageKey::UnstakeReservation(staker.clone()), &info.balance);
         env.storage()
             .instance()
             .set(&StorageKey::UnstakeQueueTail, &tail.saturating_add(1));
+
+        // Entries created above start at the network minimum TTL; give them
+        // the configured extension too (issue #1397).
+        ttl_guard::renew_unstake_request(&env, &staker);
 
         events::emit_unstake_queued(&env, staker, ticket, queue_position);
 
@@ -3405,6 +3589,11 @@ impl StakeVaultContract {
             return Err(StakeVaultError::QueueEmpty);
         }
 
+        // Issue #1397: queue pointers and the stake map are renewed before
+        // the first write of this call.
+        ttl_guard::renew_instance(&env);
+        ttl_guard::renew_persistent(&env, &MigrationKey::StakesV2);
+
         let mut processed: u32 = 0;
         let mut current_head = head;
 
@@ -3419,12 +3608,50 @@ impl StakeVaultContract {
                 }
             };
 
+            ttl_guard::renew_unstake_request(&env, &request.user);
+
+            // Issue #1396: a ticket with a terminal completion record has
+            // already released its stake. Clean up any leftover entry without
+            // paying or accounting for it again.
+            if env
+                .storage()
+                .persistent()
+                .has(&StorageKey::UnstakeCompletion(current_head))
+            {
+                env.storage().persistent().remove(&entry_key);
+                release_unstake_pointer(&env, &request.user, Some(current_head));
+                current_head = current_head.saturating_add(1);
+                continue;
+            }
+
+            // Issue #1395/#1396: conflicting state — the entry is not the
+            // user's single active request (its ticket field disagrees with
+            // its slot, or the user's pointer names another ticket). Paying
+            // it would release the position a second time, so drop it.
+            let pointer: Option<u64> = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::UserUnstakeTicket(request.user.clone()));
+            if request.ticket != current_head || pointer != Some(current_head) {
+                env.storage().persistent().remove(&entry_key);
+                current_head = current_head.saturating_add(1);
+                continue;
+            }
+
+            // The position was already emptied by another path (slash to
+            // zero, emergency unstake): close the ticket terminally with a
+            // zero payout instead of blocking the head forever.
+            if current_stake_balance(&env, &request.user) <= 0 {
+                complete_unstake_ticket(&env, &request, 0);
+                current_head = current_head.saturating_add(1);
+                processed = processed.saturating_add(1);
+                events::emit_unstake_processed(&env, request.user, request.ticket, 0);
+                continue;
+            }
+
             match Self::do_withdraw(&env, &request.user) {
                 Ok(amount) => {
-                    env.storage().persistent().remove(&entry_key);
-                    env.storage()
-                        .persistent()
-                        .remove(&StorageKey::UserUnstakeTicket(request.user.clone()));
+                    complete_unstake_ticket(&env, &request, amount);
                     current_head = current_head.saturating_add(1);
                     processed = processed.saturating_add(1);
 
@@ -3465,6 +3692,36 @@ impl StakeVaultContract {
             .get(&StorageKey::UnstakeQueueHead)
             .unwrap_or(0);
         Some(ticket.saturating_sub(head))
+    }
+
+    /// Stake currently reserved by `user`'s active unstake request (issue
+    /// #1395), or `0` when no request is active.
+    ///
+    /// Clamped to the position's current balance, so the reservation reported
+    /// here never exceeds withdrawable stake even after a slash.
+    pub fn get_unstake_reservation(env: Env, user: Address) -> i128 {
+        if active_unstake_ticket(&env, &user).is_none() {
+            return 0;
+        }
+        let reserved: i128 = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::UnstakeReservation(user.clone()))
+            .unwrap_or(0);
+        let balance = current_stake_balance(&env, &user);
+        if reserved < balance {
+            reserved.max(0)
+        } else {
+            balance.max(0)
+        }
+    }
+
+    /// Terminal completion record for `ticket` (issue #1396), or `None` if
+    /// the ticket has not been processed.
+    pub fn get_unstake_completion(env: Env, ticket: u64) -> Option<UnstakeCompletion> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::UnstakeCompletion(ticket))
     }
 
     // ── Issue #1020 + #1022: Reward vault (batch claim, multi-asset) ──────────
@@ -3509,9 +3766,13 @@ impl StakeVaultContract {
             &old,
             &new_stake_token,
         )?;
+        // Issue #1398: the migration must not touch authorization state.
+        let auth_snapshot = auth_config::capture(&env)?;
+        ttl_guard::renew_instance(&env);
         env.storage()
             .instance()
             .set(&StorageKey::StakeToken, &new_stake_token);
+        auth_config::require_unchanged(&env, &auth_snapshot)?;
         Ok(decimals)
     }
 
@@ -4087,6 +4348,13 @@ impl StakeVaultContract {
         shared::version::guard_upgrade(current_version, new_version)
             .map_err(|_| StakeVaultError::IncompatibleContractVersion)?;
 
+        // Issue #1397: keep the instance (admin, auth config) alive.
+        ttl_guard::renew_instance(&env);
+
+        // Issue #1398: reject malformed authorization state before anything
+        // is migrated, and record what must survive the upgrade.
+        let auth_snapshot = auth_config::record_pre_upgrade(&env)?;
+
         // Storage layout compatibility guard (#1023).
         storage_version::guard_storage_upgrade(&env, next_layout_version, &required_storage_keys)
             .map_err(|e| match e {
@@ -4103,6 +4371,7 @@ impl StakeVaultContract {
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         shared::version::set_contract_version(&env, new_version);
+        auth_config::require_unchanged(&env, &auth_snapshot)?;
         shared::version::emit_contract_upgraded(&env, current_version, new_version);
         Ok(())
     }
@@ -4116,6 +4385,10 @@ mod tests_emergency;
 
 #[cfg(test)]
 mod test_lockup;
+
+#[cfg(test)]
+#[cfg(test)]
+mod tests_queue_ttl_auth;
 
 #[cfg(test)]
 mod test_unbonding_evidence;
