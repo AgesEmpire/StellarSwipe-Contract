@@ -428,3 +428,43 @@ Emitted when admin sets or updates a lock-duration voting-power multiplier tier.
 |---|---|---|
 | `weeks` | `u32` | Minimum remaining lock duration (in whole weeks) this tier applies to |
 | `bps` | `u32` | Voting-power multiplier in basis points (`10_000` = 1x) |
+
+---
+
+## Bridge (`bridge`) — validator accounting
+
+Defined in `contracts/bridge/src/validator_accounting.rs`. Topics carry the
+validator and epoch so indexers can filter per validator without decoding the
+body: `("bridge", <event_name>, validator: Address, epoch: u64)`. Both events
+are published only after the balance change has been written; a rejected
+credit or slash publishes nothing. XDR encodings are pinned by
+`event-fixtures/evt_bridge_validator_*.hex`.
+
+### `validator_reward_credited`
+Emitted when an admin credits a reward to an active validator.
+
+| Field | Type | Description |
+|---|---|---|
+| `schema_version` | `u32` | `1` |
+| `validator` | `Address` | Credited validator |
+| `amount` | `i128` | Amount credited (`> 0`) |
+| `reason` | `u32` | `1` RelayFee, `2` Attestation, `3` Uptime |
+| `epoch` | `u64` | Epoch the reward relates to (`<=` current epoch; epoch = ledger time / 86 400) |
+| `balance_after` | `i128` | Validator balance after the credit |
+| `total_rewarded` | `i128` | Lifetime rewards after the credit |
+
+### `validator_slashed`
+Emitted when an admin slashes an active validator.
+
+| Field | Type | Description |
+|---|---|---|
+| `schema_version` | `u32` | `1` |
+| `validator` | `Address` | Slashed validator |
+| `amount` | `i128` | Amount debited (`> 0`, `<=` balance) |
+| `reason` | `u32` | `1` DoubleSign, `2` InvalidAttestation, `3` Downtime |
+| `epoch` | `u64` | Epoch the misbehaviour relates to |
+| `balance_after` | `i128` | Validator balance after the debit |
+| `total_slashed` | `i128` | Lifetime slashes after the debit |
+
+Reconciliation: `balance = Σ reward.amount − Σ slash.amount` per validator,
+and each event's `balance_after` must equal the running total at that point.

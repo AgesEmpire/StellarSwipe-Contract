@@ -1,3 +1,4 @@
+use soroban_sdk::{contractevent, Address, Symbol};
 use crate::storage::WaterfallTierResult;
 use shared::errors::{ErrorCategory, RecoveryStrategy};
 use soroban_sdk::{contractevent, Address, Env, String, Symbol, Vec};
@@ -39,6 +40,11 @@ pub struct TreasuryWithdrawal {
     pub remaining_balance: i128,
 }
 
+/// Emitted whenever a deprecated entry point is invoked via a compatibility shim.
+#[contractevent]
+pub struct DeprecatedCall {
+    pub entry_point: Symbol,
+    pub replacement: Symbol,
 #[contractevent]
 pub struct FeesClaimed {
     pub provider: Address,

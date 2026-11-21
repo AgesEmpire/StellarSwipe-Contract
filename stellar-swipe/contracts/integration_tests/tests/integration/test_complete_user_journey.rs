@@ -9,28 +9,25 @@
 
 extern crate std;
 
+#[path = "fixtures/mod.rs"]
+mod fixtures;
+
+use fixtures::SignalRegistryBuilder;
 use signal_registry::{
     reputation::signal_success_rate, FeeBreakdown, ProviderMetric, RiskLevel, SignalAction,
     SignalCategory, SignalOutcome, SignalRegistry, SignalRegistryClient, SignalStatus,
 };
 use soroban_sdk::{
-    contract, contractimpl,
     testutils::{Address as _, Ledger},
     Address, Env, String, Vec,
 };
 
-// ── Minimal trade-executor stub ───────────────────────────────────────────────
-// increment_adoption and record_signal_outcome require the caller to be the
-// registered TradeExecutor contract. We register this stub at a known address
-// and use it as the executor throughout the test.
-
-#[contract]
-struct TradeExecutorStub;
-
-#[contractimpl]
-impl TradeExecutorStub {}
-
 // ── Setup ─────────────────────────────────────────────────────────────────────
+// Built from the shared deterministic fixture (Issue #1404): the registry is
+// initialized, a trade-executor stub is registered and wired via
+// `set_trade_executor` (increment_adoption and record_signal_outcome require
+// the caller to be the registered TradeExecutor contract), Sara stakes 200 XLM
+// (above the 100 XLM minimum) and Alex is an unstaked copier.
 
 struct Ctx<'a> {
     env: Env,
@@ -42,25 +39,26 @@ struct Ctx<'a> {
 }
 
 fn setup() -> (Env, Address, Address, Address, Address, Address) {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().set_timestamp(1_000_000);
+    let fixture = SignalRegistryBuilder::new()
+        .at_timestamp(1_000_000)
+        .with_trade_executor()
+        .staked_provider(200_000_000i128)
+        .account()
+        .build()
+        .expect("signal registry fixture");
 
-    let admin = Address::generate(&env);
-    let sara = Address::generate(&env);
-    let alex = Address::generate(&env);
-
-    let registry_id = env.register(SignalRegistry, ());
-    let executor_id = env.register(TradeExecutorStub, ());
-
-    let registry = SignalRegistryClient::new(&env, &registry_id);
-    registry.initialize(&admin);
-    registry.set_trade_executor(&admin, &executor_id);
-
-    // Sara stakes 200 XLM (above 100 XLM minimum)
-    registry.stake_tokens(&sara, &200_000_000i128);
-
-    (env, registry_id, executor_id, admin, sara, alex)
+    let executor_id = fixture
+        .executor_id
+        .clone()
+        .expect("fixture registers a trade executor");
+    (
+        fixture.env.clone(),
+        fixture.registry_id.clone(),
+        executor_id,
+        fixture.admin.clone(),
+        fixture.providers[0].clone(),
+        fixture.accounts[0].clone(),
+    )
 }
 
 // ── Journey ───────────────────────────────────────────────────────────────────

@@ -18,3 +18,10 @@ Only update a fixture when the schema change is intentional:
 2. Run `UPDATE_EVENT_FIXTURES=1 cargo test -p shared event_fixtures_tests`
    to regenerate the `.hex` file.
 3. Commit the updated `.hex` file alongside the schema-version bump.
+
+## Bridge validator accounting fixtures
+
+`evt_bridge_validator_reward_credited.hex` and `evt_bridge_validator_slashed.hex`
+pin the bridge's validator reward/slash events (issue #1418). They are checked
+by `contracts/bridge/src/test_validator_accounting.rs`; regenerate with
+`UPDATE_EVENT_FIXTURES=1 cargo test -p bridge test_validator_accounting`.
