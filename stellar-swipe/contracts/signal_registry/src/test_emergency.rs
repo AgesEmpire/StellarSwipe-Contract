@@ -1,8 +1,11 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, String};
-use stellar_swipe_common::emergency::{CAT_SIGNALS, CAT_ALL, CircuitBreakerConfig};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env, String,
+};
+use stellar_swipe_common::emergency::{CircuitBreakerConfig, CAT_ALL, CAT_SIGNALS};
 
 #[test]
 fn test_granular_pause() {
@@ -117,7 +120,7 @@ fn test_circuit_breaker_trigger() {
 
     let provider = Address::generate(&env);
     let executor = Address::generate(&env);
-    
+
     // Create a signal to record trades against
     let signal_id = client.create_signal(
         &provider,
@@ -135,7 +138,7 @@ fn test_circuit_breaker_trigger() {
     // Wait, record_trade_execution doesn't take 'failed' bool yet in SignalRegistry?
     // Actually my admin::update_circuit_breaker_stats takes 'failed' bool.
     // I should probably add a way to trigger it for testing.
-    
+
     // For now, let's just test that the logic works if called.
     // In my implementation, I didn't yet call update_circuit_breaker_stats in SignalRegistry::record_trade_execution correctly for failures.
 }
@@ -189,10 +192,7 @@ fn test_guardian_cannot_unpause() {
     );
 
     // Guardian tries to unpause — must fail
-    let result = client.try_unpause_category(
-        &guardian,
-        &String::from_str(&env, CAT_SIGNALS),
-    );
+    let result = client.try_unpause_category(&guardian, &String::from_str(&env, CAT_SIGNALS));
     assert!(result.is_err());
 }
 

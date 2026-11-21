@@ -509,6 +509,18 @@ await invokeContract("governance", "refill_conviction_pool", [poolId], wallet);
 await invokeContract("governance", "withdraw_conviction_vote", [voter, proposalId], wallet);
 await invokeContract("governance", "analyze_conviction_proposal", [proposalId], wallet);
 await invokeContract("governance", "conviction_growth_curve", [proposalId], wallet);
+// Conviction Calibration (admin-only):
+//   set_conviction_calibration(admin, { penalty_threshold_days, penalty_multiplier, reward_bonus_pct, max_conviction_cap })
+//   conviction_calibration() // read current config
+await invokeContract("governance", "conviction_calibration", [], wallet);
+await invokeContract("governance", "set_conviction_calibration", [admin, {
+  penalty_threshold_days: 7,    // votes <7 days old get penalised
+  penalty_multiplier: 2,        // penalty = weight / 2  (i.e. halved)
+  reward_bonus_pct: 10,         // +10% bonus for votes >= 7 days old
+  max_conviction_cap: 0,        // 0 = no cap
+}], wallet);
+// Effects: low-conviction (short) votes contribute less to proposal funding,
+//          sustained voters earn a bonus. Caps prevent whales from dominating.
 await invokeContract("governance", "distribution", [], wallet);
 await invokeContract("governance", "create_vesting_schedule", [admin, beneficiary, schedule], wallet);
 await invokeContract("governance", "get_vesting_schedule", [beneficiary], wallet);

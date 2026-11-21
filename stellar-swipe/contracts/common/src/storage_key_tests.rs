@@ -7,7 +7,26 @@
 #[cfg(test)]
 mod tests {
     use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{contracttype, Address, Env};
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+    #[contract]
+    struct StorageKeyHarness;
+
+    #[contractimpl]
+    impl StorageKeyHarness {}
+
+    fn setup() -> (Env, Address) {
+        let env = Env::default();
+        let contract_id = env.register(StorageKeyHarness, ());
+        (env, contract_id)
+    }
+
+    fn run<F>(env: &Env, contract_id: &Address, f: F)
+    where
+        F: FnOnce(),
+    {
+        env.as_contract(contract_id, f);
+    }
 
     // ---------------------------------------------------------------------------
     // Minimal reproductions of every user-keyed storage key pattern used across
@@ -79,19 +98,57 @@ mod tests {
 
     #[test]
     fn single_addr_variants_differ_for_different_users() {
-        let env = Env::default();
-        let user_a = Address::generate(&env);
-        let user_b = Address::generate(&env);
+        let (env, contract_id) = setup();
+        run(&env, &contract_id, || {
+            let user_a = Address::generate(&env);
+            let user_b = Address::generate(&env);
 
-        assert_keys_distinct(&env, &SingleAddrKey::UserPositions(user_a.clone()), &SingleAddrKey::UserPositions(user_b.clone()));
-        assert_keys_distinct(&env, &SingleAddrKey::UserBadges(user_a.clone()), &SingleAddrKey::UserBadges(user_b.clone()));
-        assert_keys_distinct(&env, &SingleAddrKey::Authorization(user_a.clone()), &SingleAddrKey::Authorization(user_b.clone()));
-        assert_keys_distinct(&env, &SingleAddrKey::PositionLimitExempt(user_a.clone()), &SingleAddrKey::PositionLimitExempt(user_b.clone()));
-        assert_keys_distinct(&env, &SingleAddrKey::LastInsufficientBalance(user_a.clone()), &SingleAddrKey::LastInsufficientBalance(user_b.clone()));
-        assert_keys_distinct(&env, &SingleAddrKey::ProviderReputationScore(user_a.clone()), &SingleAddrKey::ProviderReputationScore(user_b.clone()));
-        assert_keys_distinct(&env, &SingleAddrKey::TreasuryBalance(user_a.clone()), &SingleAddrKey::TreasuryBalance(user_b.clone()));
-        assert_keys_distinct(&env, &SingleAddrKey::MonthlyTradeVolume(user_a.clone()), &SingleAddrKey::MonthlyTradeVolume(user_b.clone()));
-        assert_keys_distinct(&env, &SingleAddrKey::ProviderTerms(user_a.clone()), &SingleAddrKey::ProviderTerms(user_b.clone()));
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::UserPositions(user_a.clone()),
+                &SingleAddrKey::UserPositions(user_b.clone()),
+            );
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::UserBadges(user_a.clone()),
+                &SingleAddrKey::UserBadges(user_b.clone()),
+            );
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::Authorization(user_a.clone()),
+                &SingleAddrKey::Authorization(user_b.clone()),
+            );
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::PositionLimitExempt(user_a.clone()),
+                &SingleAddrKey::PositionLimitExempt(user_b.clone()),
+            );
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::LastInsufficientBalance(user_a.clone()),
+                &SingleAddrKey::LastInsufficientBalance(user_b.clone()),
+            );
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::ProviderReputationScore(user_a.clone()),
+                &SingleAddrKey::ProviderReputationScore(user_b.clone()),
+            );
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::TreasuryBalance(user_a.clone()),
+                &SingleAddrKey::TreasuryBalance(user_b.clone()),
+            );
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::MonthlyTradeVolume(user_a.clone()),
+                &SingleAddrKey::MonthlyTradeVolume(user_b.clone()),
+            );
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::ProviderTerms(user_a.clone()),
+                &SingleAddrKey::ProviderTerms(user_b.clone()),
+            );
+        });
     }
 
     // ---------------------------------------------------------------------------
@@ -100,21 +157,23 @@ mod tests {
 
     #[test]
     fn two_addr_variants_differ_for_different_users() {
-        let env = Env::default();
-        let user_a = Address::generate(&env);
-        let user_b = Address::generate(&env);
-        let provider = Address::generate(&env);
+        let (env, contract_id) = setup();
+        run(&env, &contract_id, || {
+            let user_a = Address::generate(&env);
+            let user_b = Address::generate(&env);
+            let provider = Address::generate(&env);
 
-        assert_two_addr_keys_distinct(
-            &env,
-            &TwoAddrKey::ProviderPendingFees(user_a.clone(), provider.clone()),
-            &TwoAddrKey::ProviderPendingFees(user_b.clone(), provider.clone()),
-        );
-        assert_two_addr_keys_distinct(
-            &env,
-            &TwoAddrKey::Subscription(user_a.clone(), provider.clone()),
-            &TwoAddrKey::Subscription(user_b.clone(), provider.clone()),
-        );
+            assert_two_addr_keys_distinct(
+                &env,
+                &TwoAddrKey::ProviderPendingFees(user_a.clone(), provider.clone()),
+                &TwoAddrKey::ProviderPendingFees(user_b.clone(), provider.clone()),
+            );
+            assert_two_addr_keys_distinct(
+                &env,
+                &TwoAddrKey::Subscription(user_a.clone(), provider.clone()),
+                &TwoAddrKey::Subscription(user_b.clone(), provider.clone()),
+            );
+        });
     }
 
     // ---------------------------------------------------------------------------
@@ -123,15 +182,17 @@ mod tests {
 
     #[test]
     fn two_addr_variant_argument_order_matters() {
-        let env = Env::default();
-        let user = Address::generate(&env);
-        let provider = Address::generate(&env);
+        let (env, contract_id) = setup();
+        run(&env, &contract_id, || {
+            let user = Address::generate(&env);
+            let provider = Address::generate(&env);
 
-        assert_two_addr_keys_distinct(
-            &env,
-            &TwoAddrKey::Subscription(user.clone(), provider.clone()),
-            &TwoAddrKey::Subscription(provider.clone(), user.clone()),
-        );
+            assert_two_addr_keys_distinct(
+                &env,
+                &TwoAddrKey::Subscription(user.clone(), provider.clone()),
+                &TwoAddrKey::Subscription(provider.clone(), user.clone()),
+            );
+        });
     }
 
     // ---------------------------------------------------------------------------
@@ -140,12 +201,26 @@ mod tests {
 
     #[test]
     fn different_variants_same_address_do_not_collide() {
-        let env = Env::default();
-        let addr = Address::generate(&env);
+        let (env, contract_id) = setup();
+        run(&env, &contract_id, || {
+            let addr = Address::generate(&env);
 
-        assert_keys_distinct(&env, &SingleAddrKey::UserPositions(addr.clone()), &SingleAddrKey::UserBadges(addr.clone()));
-        assert_keys_distinct(&env, &SingleAddrKey::TreasuryBalance(addr.clone()), &SingleAddrKey::MonthlyTradeVolume(addr.clone()));
-        assert_keys_distinct(&env, &SingleAddrKey::PositionLimitExempt(addr.clone()), &SingleAddrKey::LastInsufficientBalance(addr.clone()));
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::UserPositions(addr.clone()),
+                &SingleAddrKey::UserBadges(addr.clone()),
+            );
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::TreasuryBalance(addr.clone()),
+                &SingleAddrKey::MonthlyTradeVolume(addr.clone()),
+            );
+            assert_keys_distinct(
+                &env,
+                &SingleAddrKey::PositionLimitExempt(addr.clone()),
+                &SingleAddrKey::LastInsufficientBalance(addr.clone()),
+            );
+        });
     }
 
     // ---------------------------------------------------------------------------
@@ -154,24 +229,50 @@ mod tests {
 
     #[test]
     fn stake_vault_migration_keys_are_distinct() {
-        let env = Env::default();
+        let (env, contract_id) = setup();
+        run(&env, &contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&StakeVaultMigrationKey::StakesV1, &1u32);
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&StakeVaultMigrationKey::StakesV2));
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&StakeVaultMigrationKey::MigrationState));
+            env.storage()
+                .persistent()
+                .remove(&StakeVaultMigrationKey::StakesV1);
 
-        env.storage().persistent().set(&StakeVaultMigrationKey::StakesV1, &1u32);
-        assert!(!env.storage().persistent().has(&StakeVaultMigrationKey::StakesV2));
-        assert!(!env.storage().persistent().has(&StakeVaultMigrationKey::MigrationState));
-        env.storage().persistent().remove(&StakeVaultMigrationKey::StakesV1);
-
-        env.storage().persistent().set(&StakeVaultMigrationKey::StakesV2, &1u32);
-        assert!(!env.storage().persistent().has(&StakeVaultMigrationKey::MigrationState));
-        env.storage().persistent().remove(&StakeVaultMigrationKey::StakesV2);
+            env.storage()
+                .persistent()
+                .set(&StakeVaultMigrationKey::StakesV2, &1u32);
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&StakeVaultMigrationKey::MigrationState));
+            env.storage()
+                .persistent()
+                .remove(&StakeVaultMigrationKey::StakesV2);
+        });
     }
 
     #[test]
     fn stake_vault_storage_keys_are_distinct() {
-        let env = Env::default();
-
-        env.storage().instance().set(&StakeVaultStorageKey::Admin, &1u32);
-        assert!(!env.storage().instance().has(&StakeVaultStorageKey::StakeToken));
-        env.storage().instance().remove(&StakeVaultStorageKey::Admin);
+        let (env, contract_id) = setup();
+        run(&env, &contract_id, || {
+            env.storage()
+                .instance()
+                .set(&StakeVaultStorageKey::Admin, &1u32);
+            assert!(!env
+                .storage()
+                .instance()
+                .has(&StakeVaultStorageKey::StakeToken));
+            env.storage()
+                .instance()
+                .remove(&StakeVaultStorageKey::Admin);
+        });
     }
 }

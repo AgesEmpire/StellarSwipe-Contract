@@ -1,51 +1,104 @@
 #![no_std]
 
+#[cfg(target_family = "wasm")]
+#[global_allocator]
+static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
 mod admin;
 mod analytics;
+pub mod param_bounds;
+pub use param_bounds::{ParamBounds, get_param_bounds};
 mod categories;
+pub mod reward_ledger;
+mod churn_risk;
+mod cohort_retention;
 mod collaboration;
 mod combos;
+mod community_voting;
 mod contests;
 mod cross_chain;
 mod errors;
+#[allow(deprecated)]
 mod events;
 mod expiry;
 mod fees;
 mod import;
 mod leaderboard;
+mod migration;
 mod ml_scoring;
+mod multisig_approvals;
 mod performance;
+mod provider_onboarding;
+mod providers;
+pub mod provider_status;
 mod query;
-mod reputation;
+/// Contract-wide cross-contract reentrancy guard (Issue #781).
+mod reentrancy;
+mod reports;
+pub mod reputation;
 mod scheduling;
+mod scoring;
 mod social;
 mod stake;
+/// Storage-layout XDR snapshot regression tests (Issue #580).
+#[cfg(test)]
+mod storage_layout_tests;
+mod storage_monitor;
 mod submission;
+pub mod submission_quota;
+mod template_presets;
 mod templates;
+/// Active signal provider cap tests (Issue #743).
+#[cfg(test)]
+mod test_active_signal_cap;
 mod test_reputation;
+/// Provider submission cooldown tests (Issue #661).
+#[cfg(test)]
+mod test_submission_cooldown;
 mod types;
-mod migration;
+mod validation;
 mod versioning;
 
+pub use admin::{AdminConfig, AdminRole};
 pub use categories::{RiskLevel, SignalCategory};
+/// Re-exported so downstream / integration-test callers (e.g.
+/// `contracts/integration_tests`) can pattern-match on contract errors —
+/// including `AdminError::ReentrancyDetected` — without duplicating the enum.
+pub use errors::AdminError;
+pub use expiry::SignalExpiryState;
+pub use migration::{MigrationSnapshot, MigrationVerification, UpgradePreflight, UpgradeReadiness};
+pub use multisig_approvals::CriticalActionPayload;
 pub use types::SignalAction;
+pub use types::{FeeBreakdown, ProviderPerformance, SignalOutcome, SignalStatus};
+/// Re-exported so migration tooling and tests can seed legacy v1 records and
+/// build query arguments.
+pub use types::{SignalV1, SortOption};
 
 use admin::{
     get_admin, get_admin_config, init_admin, is_trading_paused,
-    require_not_paused_legacy as require_not_paused, AdminConfig,
+    require_not_paused_legacy as require_not_paused,
 };
-use stellar_swipe_common::emergency::PauseState;
+use shared::version::{
+    emit_contract_upgraded, get_contract_version as shared_get_contract_version, guard_upgrade,
+    set_contract_version, SIGNAL_REGISTRY_VERSION,
+};
+use stellar_swipe_common::emergency::{PauseState, CAT_SIGNALS, CAT_TRADING};
 use stellar_swipe_common::rate_limit::{self as rl, ActionType as RLAction, RateLimitConfig};
 use stellar_swipe_common::SECONDS_PER_30_DAY_MONTH;
+use stellar_swipe_common::{emit_health_event, HealthStatus};
 
 use combos::{
     cancel_combo, create_combo_signal, execute_combo_signal, get_combo, get_combo_executions_pub,
     get_combo_performance, ComboExecution, ComboPerformanceSummary, ComboSignal, ComboType,
     ComponentExecution, ComponentSignal,
 };
+use community_voting::{
+    get_dispute, process_appeal_timeout, resolve_appeal, resolve_dispute, submit_appeal,
+    DisputeError, DisputeRecord,
+};
 use contests::{Contest, ContestEntry, ContestMetric, ContestStatus};
 use errors::{
-    AdminError, AiScoreError, ComboError, ContestError, CrossChainError, SignalEditError,
+    AiScoreError, ComboError, ContestError, CrossChainError, SignalCancelError, SignalEditError,
     SignalOutcomeError, TemplateError, VersioningError,
 };
 pub use leaderboard::{
@@ -53,22 +106,37 @@ pub use leaderboard::{
     ProviderLeaderboard, ProviderLeaderboardEntry, ProviderMetric,
 };
 pub use ml_scoring::{MLModel, SignalFeatures, SignalScore};
+use providers::VerificationEligibility;
 use reputation::{
     calculate_trust_score, get_trust_score, update_median_values, update_trust_score,
-    TrustScoreDetails, TrustScoreTier,
+    ReputationSnapshot, TrustScoreDetails, TrustScoreTier,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
-use stellar_swipe_common::{health_uninitialized, placeholder_admin, HealthStatus};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal, Map, String,
+    Symbol, Val, Vec,
+};
+use stellar_swipe_common::placeholder_admin;
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
-use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
+use stellar_swipe_common::{ApprovalProposal, MultisigTimelockConfig, ProposalStatus};
+pub use template_presets::{SignalTemplateOverrides, SignalTemplatePreset, StoredSignalTemplate};
+pub use templates::SignalTemplate;
+use templates::DEFAULT_TEMPLATE_EXPIRY_HOURS;
 use types::{
-    AddressMapping, Asset, CrossChainSignal, FeeBreakdown, ImportResultView, ProviderPerformance,
-    RecurrencePattern, Signal, SignalData, SignalEditInput, SignalOutcome, SignalPerformanceView,
-    SignalStatus, SignalSummary, SortOption, SyncStatus, TradeExecution,
+    AddressMapping, Asset, CrossChainSignal, ImportResultView, ProviderMonthlyReport,
+    RecurrencePattern, RegistryHealthStatus, Signal, SignalDataV2, SignalEditInput,
+    SignalPerformanceView, SignalSummary, SyncStatus, TradeExecution,
 };
+// SignalData is a type alias for SignalDataV2; keep the alias re-export for
+// any external clients compiled against the old name (Issue #568).
+pub use cohort_retention::{get_cohort_retention as cohort_retention_get, CohortRetention};
+pub use types::SignalData;
 use versioning::{CopyRecord, SignalVersion};
 
 const MAX_EXPIRY_SECONDS: u64 = SECONDS_PER_30_DAY_MONTH;
+const WARNING_WINDOW_LEDGERS: u64 = 720;
+
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct SignalRegistry;
@@ -76,6 +144,7 @@ pub struct SignalRegistry;
 #[contracttype]
 #[derive(Clone)]
 pub enum StorageKey {
+    PendingRewards(Address),
     SignalCounter,
     Signals,
     /// Legacy v1 signal map (pre-upgrade). Cleared as rows migrate to [`StorageKey::Signals`].
@@ -84,10 +153,19 @@ pub enum StorageKey {
     MigrationCursor,
     /// Snapshot count of v1 keys at migration start (for `MigrationProgress.total_count`).
     MigrationV1TargetTotal,
+    /// Pre-migration invariant snapshot, captured at migration start (issue #597).
+    MigrationPreSnapshot,
+    /// Result of reconciling the pre-migration snapshot against migrated v2 data (issue #597).
+    MigrationVerification,
+    /// Issue #812: on-chain storage schema version. Checked by
+    /// `migration::verify_storage_layout` before any migration logic runs.
+    /// See [`migration::SIGNAL_SCHEMA_V1`] / [`migration::SIGNAL_SCHEMA_V2`].
+    SchemaVersion,
     ProviderStats,
     /// Per-provider stake balances for trust and submission gates.
     ProviderStakes,
     TradeExecutions,
+    SignalTemplates,
     TradeCounter,
     TemplateCounter,
     Templates,
@@ -109,6 +187,34 @@ pub enum StorageKey {
     RecordedSignalOutcomes,
     /// Rolling reputation score per provider (Issue #170).
     ProviderReputationScore(Address),
+    /// Minimum number of seconds a signal must remain active before the provider
+    /// may cancel it. Set by admin; 0 means no minimum (issue #687).
+    MinSignalLifetime,
+    /// Minimum number of seconds a provider must wait between signal submissions.
+    /// 0 (default) disables cooldown enforcement (issue #661).
+    SubmissionCooldown,
+    /// Timestamp of a provider's most recent successful signal submission (issue #661).
+    ProviderLastSignal(Address),
+    /// Keeper addresses allowlisted (by the admin) to call
+    /// `prune_expired_signals` alongside the admin (issue #779).
+    PruneKeepers,
+    /// Admin-configured maximum signals a provider may create per ledger day.
+    /// 0 (default) disables the daily cap (issue #778).
+    DailySignalLimit,
+    /// Per-provider count of signals created on the current ledger day (issue #778).
+    /// Key: (provider, day_bucket) where day_bucket = timestamp / 86400.
+    ProviderDailySignalCount(Address, u64),
+    /// Last signal id examined by `cleanup_expired_signals` (issue #1219).
+    ExpiryCleanupCursor,
+    /// Last signal id examined by `archive_old_signals` (issue #1219).
+    ArchiveCursor,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingRewards {
+    pub fee: i128,
+    pub roi: i128,
 }
 #[contractimpl]
 impl SignalRegistry {
@@ -129,7 +235,55 @@ impl SignalRegistry {
     /// # Errors
     /// - [`AdminError::AlreadyInitialized`] if the contract has already been initialized.
     pub fn initialize(env: Env, admin: Address) -> Result<(), AdminError> {
-        init_admin(&env, admin)
+        init_admin(&env, admin)?;
+        set_contract_version(&env, SIGNAL_REGISTRY_VERSION);
+        // Issue #812: a freshly-deployed contract has no legacy `SignalsV1`
+        // rows (new signals are written directly in the current `Signal`
+        // (v2) shape), so it starts at the current schema version. Contracts
+        // upgraded in place from before this guard existed never call
+        // `initialize` again; for them `migration::get_schema_version`
+        // defaults to `SIGNAL_SCHEMA_V1`, which is what they actually are.
+        migration::set_schema_version(&env, migration::SIGNAL_SCHEMA_V2);
+        Ok(())
+    }
+
+    // ── Issue #811: upgrade-safe contract versioning ─────────────────────────
+
+    /// Returns this contract's stored version. Cross-contract callers can use
+    /// this to enforce a minimum compatible version before invoking this
+    /// contract (see `shared::version::validate_callee_version`).
+    pub fn get_contract_version(env: Env) -> u32 {
+        shared_get_contract_version(&env)
+    }
+
+    /// Admin-only: replace this contract's executable with `new_wasm_hash`
+    /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
+    /// `new_version` as the contract's version.
+    ///
+    /// `new_version` must be strictly greater than the currently stored
+    /// version, rejecting accidental or malicious downgrades.
+    ///
+    /// # Errors
+    /// - [`AdminError::Unauthorized`] — caller is not the admin.
+    /// - [`AdminError::IncompatibleContractVersion`] — `new_version` is not
+    ///   strictly greater than the currently stored version.
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) -> Result<(), AdminError> {
+        admin::require_admin(&env, &caller)?;
+        caller.require_auth();
+
+        let current_version = shared_get_contract_version(&env);
+        guard_upgrade(current_version, new_version)
+            .map_err(|_| AdminError::IncompatibleContractVersion)?;
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        set_contract_version(&env, new_version);
+        emit_contract_upgraded(&env, current_version, new_version);
+        Ok(())
     }
 
     /// Register the TradeExecutor contract address (admin only). Required before `increment_adoption`.
@@ -138,11 +292,25 @@ impl SignalRegistry {
         caller: Address,
         executor: Address,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         env.storage()
             .instance()
             .set(&StorageKey::TradeExecutor, &executor);
+        Ok(())
+    }
+
+    /// Register the UserPortfolio contract used for PREMIUM subscription checks.
+    pub fn set_user_portfolio(
+        env: Env,
+        caller: Address,
+        portfolio: Address,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::UserPortfolio, &portfolio);
         Ok(())
     }
 
@@ -153,20 +321,184 @@ impl SignalRegistry {
         caller: Address,
         batch_size: u32,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         migration::migrate_signals_v1_to_v2(&env, &caller, batch_size)
+    }
+
+    /// Result of the most recently completed v1→v2 migration's post-migration
+    /// invariant check (issue #597): `None` until a migration run has fully
+    /// drained v1 at least once; `verified: false` flags a reconciliation
+    /// mismatch that needs manual review.
+    pub fn get_migration_verification(env: Env) -> Option<migration::MigrationVerification> {
+        migration::get_migration_verification(&env)
+    }
+
+    /// Read-only upgrade preflight (issue #1223): reports the stored contract
+    /// version, whether `target_version` is accepted, and the v1→v2 migration
+    /// state. Performs no storage writes, emits no events and requires no
+    /// authorization, so operators can simulate it before calling `upgrade`.
+    pub fn upgrade_preflight(env: Env, target_version: u32) -> UpgradePreflight {
+        migration::upgrade_preflight(&env, target_version)
     }
 
     /* =========================
        ADMIN FUNCTIONS
     ========================== */
 
+    /// Check storage usage across instance maps. Emits `StorageCapacityWarning`
+    /// if total entry count exceeds 80% of the configured limit.
+    pub fn check_storage_capacity(env: Env) -> storage_monitor::StorageUsage {
+        storage_monitor::check_storage_capacity(&env)
+    }
+
+    /// Admin: archive old expired signals to free instance storage.
+    /// Returns the number of signals removed.
+    pub fn admin_cleanup_storage(
+        env: Env,
+        caller: Address,
+        batch_size: u32,
+    ) -> Result<u32, AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        Ok(storage_monitor::admin_cleanup_storage(&env, batch_size))
+    }
+
+    /// Admin: declare the legal [min, max] range for a named strategy parameter.
+    /// Subsequent calls to `validate_strategy_param` will enforce this range.
+    ///
+    /// # Errors
+    /// - [`AdminError::Unauthorized`] — caller is not the config admin.
+    /// - [`AdminError::InvalidParameter`] — min > max.
+    pub fn set_param_bounds(
+        env: Env,
+        caller: Address,
+        param: Symbol,
+        min: i128,
+        max: i128,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        param_bounds::set_param_bounds(&env, param, param_bounds::ParamBounds { min, max })
+    }
+
+    /// Validate `value` against the declared bounds for `param`.
+    /// Returns `Ok(())` if within range or no bounds declared.
+    ///
+    /// # Errors
+    /// - [`AdminError::InvalidParameter`] — value is outside [min, max].
+    pub fn validate_strategy_param(
+        env: Env,
+        param: Symbol,
+        value: i128,
+    ) -> Result<(), AdminError> {
+        param_bounds::validate_param(&env, param, value)
+    }
+
     pub fn set_min_stake(env: Env, caller: Address, new_amount: i128) -> Result<(), AdminError> {
         admin::set_min_stake(&env, &caller, new_amount)
     }
 
+    /// Admin: configure the minimum seconds between signal submissions per provider.
+    /// A value of 0 disables cooldown enforcement (issue #661).
+    pub fn set_submission_cooldown(
+        env: Env,
+        caller: Address,
+        cooldown_secs: u64,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::SubmissionCooldown, &cooldown_secs);
+        Ok(())
+    }
+
+    /// Returns the current submission cooldown in seconds (0 = disabled).
+    pub fn get_submission_cooldown(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::SubmissionCooldown)
+            .unwrap_or(0u64)
+    }
+
+    /// Admin: set the maximum number of signals a provider may create per ledger day.
+    /// A value of 0 disables the daily cap (issue #778).
+    pub fn set_daily_signal_limit(env: Env, caller: Address, limit: u32) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::DailySignalLimit, &limit);
+        Ok(())
+    }
+
+    /// Admin: configure bounded ledger-window submission quotas (Issue #1138).
+    pub fn set_submission_quota(
+        env: Env,
+        caller: Address,
+        config: submission_quota::QuotaConfig,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        submission_quota::set_config(&env, &config)
+    }
+
+    /// Returns the configured submission quota, if any.
+    pub fn get_submission_quota(env: Env) -> Option<submission_quota::QuotaConfig> {
+        submission_quota::get_config(&env)
+    }
+
+    /// Returns `(provider_used, global_used)` in the current quota window.
+    pub fn get_submission_quota_usage(env: Env, provider: Address) -> (u32, u32) {
+        submission_quota::usage(&env, &provider)
+    }
+
+    /// Transition a provider's lifecycle status (Issue #1137).
+    /// Returns the previous status.
+    pub fn set_provider_status(
+        env: Env,
+        caller: Address,
+        provider: Address,
+        next: provider_status::ProviderStatus,
+    ) -> Result<provider_status::ProviderStatus, errors::ProviderStatusError> {
+        provider_status::transition(&env, &caller, &provider, next)
+    }
+
+    /// Canonical lifecycle status of `provider` (Issue #1137).
+    pub fn get_provider_status(env: Env, provider: Address) -> provider_status::ProviderStatus {
+        provider_status::get_status(&env, &provider)
+    }
+
+    /// Returns the current per-provider daily signal creation cap (0 = disabled).
+    pub fn get_daily_signal_limit(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DailySignalLimit)
+            .unwrap_or(0u32)
+    }
+
+    /// Admin: configure the maximum concurrent active-signal count per provider tier.
+    pub fn set_tier_signal_limits(
+        env: Env,
+        caller: Address,
+        bronze: u32,
+        silver: u32,
+        gold: u32,
+    ) -> Result<(), AdminError> {
+        admin::set_tier_signal_limits(&env, &caller, bronze, silver, gold)
+    }
+
     /// User stakes tokens. Rate-limited to 5 changes per day.
+    ///
+    /// # Reentrancy risk assessment (Issue #781)
+    /// `amount` is bookkeeping against the in-contract `ProviderStakes` map
+    /// only ([`stake::stake`]) — this entrypoint makes **no cross-contract
+    /// call** (no token transfer, no `StakeVault` invocation), so there is no
+    /// external callee that could reenter during this call. No guard needed.
+    /// If a real token transfer is added here in the future, it must go
+    /// through [`reentrancy::guarded`] the same way [`Self::ban_provider`] and
+    /// [`Self::unstake_tokens`] do.
     pub fn stake_tokens(env: Env, provider: Address, amount: i128) -> Result<(), AdminError> {
         provider.require_auth();
         let trust = reputation::get_trust_score(&env, &provider)
@@ -189,25 +521,23 @@ impl SignalRegistry {
     }
 
     /// User unstakes tokens. Rate-limited to 5 changes per day.
+    ///
+    /// # Reentrancy risk assessment (Issue #781)
+    /// Like [`Self::stake_tokens`], this entrypoint makes no cross-contract
+    /// call today — `amount` is bookkeeping against the in-contract
+    /// `ProviderStakes` map only ([`stake::unstake`]). It is nonetheless
+    /// guarded (originally Issue #264, now on the shared
+    /// [`reentrancy::guarded`] primitive) as defense in depth for a
+    /// fund-affecting flow, and so that a future token transfer added here
+    /// is automatically covered by the same contract-wide lock used by
+    /// [`Self::ban_provider`].
     pub fn unstake_tokens(env: Env, provider: Address) -> Result<(), AdminError> {
         provider.require_auth();
 
-        // ── Reentrancy guard ──────────────────────────────────────────────────
-        let lock_key = soroban_sdk::Symbol::new(&env, "UnstakeLock");
-        if env
-            .storage()
-            .temporary()
-            .get::<_, bool>(&lock_key)
-            .unwrap_or(false)
-        {
-            return Err(AdminError::ReentrancyDetected);
-        }
-        env.storage().temporary().set(&lock_key, &true);
-
-        let trust = reputation::get_trust_score(&env, &provider)
-            .map(|d| d.score)
-            .unwrap_or(0);
-        let result = (|| -> Result<(), AdminError> {
+        reentrancy::guarded(&env, || {
+            let trust = reputation::get_trust_score(&env, &provider)
+                .map(|d| d.score)
+                .unwrap_or(0);
             rl::check_rate_limit(&env, &provider, RLAction::StakeChange, trust)
                 .map_err(|_| AdminError::RateLimitExceeded)?;
 
@@ -222,10 +552,7 @@ impl SignalRegistry {
             Self::save_provider_stakes_map(&env, &stakes);
             rl::record_action(&env, &provider, RLAction::StakeChange);
             Ok(())
-        })();
-
-        env.storage().temporary().remove(&lock_key);
-        result
+        })
     }
 
     pub fn set_trade_fee(env: Env, caller: Address, new_fee_bps: u32) -> Result<(), AdminError> {
@@ -249,7 +576,7 @@ impl SignalRegistry {
         window_secs: u64,
         max_actions: u32,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
         rl::set_config(
             &env,
@@ -337,10 +664,28 @@ impl SignalRegistry {
         get_admin(&env)
     }
 
+    /// Root admin: assign the scoped admin for configuration, emergency, or treasury operations.
+    pub fn set_admin_role(
+        env: Env,
+        caller: Address,
+        role: AdminRole,
+        account: Address,
+    ) -> Result<(), AdminError> {
+        admin::set_admin_role(&env, &caller, role, account)
+    }
+
+    /// Read the configured scoped admin for a role, if one has been assigned.
+    pub fn get_admin_role(env: Env, role: AdminRole) -> Option<Address> {
+        admin::get_admin_role(&env, role)
+    }
+
+    /// Schedule a signal for future publication. `signal_data` must use the
+    /// current V2 shape; stored internally as `VersionedSignalData::V2` so
+    /// that legacy V1 records coexist transparently (Issue #568).
     pub fn schedule(
         env: Env,
         provider: Address,
-        signal_data: SignalData,
+        signal_data: SignalDataV2,
         publish_at: u64,
         recurrence: RecurrencePattern,
     ) -> Result<u64, AdminError> {
@@ -363,22 +708,197 @@ impl SignalRegistry {
         get_admin_config(&env)
     }
 
+    /// Returns the semantic version and git commit hash embedded at build time.
+    pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
+        let mut m = soroban_sdk::Map::new(&env);
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
+        );
+        m
+    }
+
+    /// Keeper entrypoint: proactively bump TTL for all hot leaderboard keys.
+    ///
+    /// Open to any caller — no admin auth required — since this is a purely
+    /// additive/protective operation.  Callers pay the transaction fee.
+    pub fn bump_leaderboard_ttl(env: Env) {
+        leaderboard::bump_all_leaderboard_keys(&env);
+    }
+
+    /// Keeper entrypoint: bump TTL for the active-signals storage key.
+    ///
+    /// Extend the top-level `StorageKey::Signals` map so active signal data
+    /// is never unexpectedly archived.  Open to any caller.
+    pub fn bump_signals_ttl(env: Env) {
+        stellar_swipe_common::ttl_manager::force_bump_persistent(&env, &StorageKey::Signals);
+        stellar_swipe_common::ttl_manager::force_bump_persistent(
+            &env,
+            &StorageKey::ActiveSignalsByCategory,
+        );
+    }
+
     /// Read-only health probe for monitoring and front-ends (no auth).
-    pub fn health_check(env: Env) -> HealthStatus {
+    ///
+    /// `expired_signal_count` reports how many stored signals are past their
+    /// expiry timestamp and thus reclaimable via `prune_expired_signals`
+    /// (issue #779).
+    pub fn health_check(env: Env) -> RegistryHealthStatus {
         let version = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+        let signals = Self::get_signals_map(&env);
+        let expired_signal_count = expiry::count_prunable_signals(&env, &signals);
         if !admin::has_admin(&env) {
-            return health_uninitialized(&env, version);
+            let status = RegistryHealthStatus {
+                is_initialized: false,
+                is_paused: false,
+                version,
+                admin: placeholder_admin(&env),
+                expired_signal_count,
+                initialized_at: 0,
+            };
+            emit_health_event(
+                &env,
+                &HealthStatus {
+                    is_initialized: status.is_initialized,
+                    is_paused: status.is_paused,
+                    version: status.version.clone(),
+                    admin: status.admin.clone(),
+                    initialized_at: status.initialized_at,
+                },
+            );
+            return status;
         }
         let admin_addr = match get_admin(&env) {
             Ok(a) => a,
             Err(_) => placeholder_admin(&env),
         };
-        HealthStatus {
+        let status = RegistryHealthStatus {
             is_initialized: true,
             is_paused: is_trading_paused(&env),
             version,
             admin: admin_addr,
+            expired_signal_count,
+            initialized_at: env.ledger().timestamp(),
+        };
+        emit_health_event(
+            &env,
+            &HealthStatus {
+                is_initialized: status.is_initialized,
+                is_paused: status.is_paused,
+                version: status.version.clone(),
+                admin: status.admin.clone(),
+                initialized_at: status.initialized_at,
+            },
+        );
+        status
+    }
+
+    /// Permanently remove up to `max_entries` expired signals from instance
+    /// storage to bound rent costs and keep `get_active_signals` scans cheap
+    /// (issue #779). Only the admin or an allowlisted keeper may call this.
+    ///
+    /// Pruned signal ids are also dropped from the per-category index.
+    /// Returns the number of signals removed; `max_entries == 0` is a no-op
+    /// that returns 0.
+    ///
+    /// # Errors
+    /// - [`AdminError::Unauthorized`] if `caller` is neither admin nor an
+    ///   allowlisted keeper.
+    pub fn prune_expired_signals(
+        env: Env,
+        caller: Address,
+        max_entries: u32,
+    ) -> Result<u32, AdminError> {
+        caller.require_auth();
+        if admin::require_admin(&env, &caller).is_err() && !Self::is_prune_keeper(&env, &caller) {
+            return Err(AdminError::Unauthorized);
         }
+        if max_entries == 0 {
+            return Ok(0);
+        }
+
+        let signals = Self::get_signals_map(&env);
+        let pruned = expiry::prune_expired_signals(&env, &signals, max_entries);
+
+        if !pruned.is_empty() {
+            let mut cat_map = Self::get_category_index_map(&env);
+            for signal in pruned.iter() {
+                if signal.status == SignalStatus::Active {
+                    validation::decrement_provider_active_count(&env, &signal.provider);
+                }
+                let old_list = cat_map
+                    .get(signal.category.clone())
+                    .unwrap_or(Vec::new(&env));
+                let mut new_list = Vec::new(&env);
+                for j in 0..old_list.len() {
+                    let sid = old_list.get(j).unwrap();
+                    if sid != signal.id {
+                        new_list.push_back(sid);
+                    }
+                }
+                cat_map.set(signal.category.clone(), new_list);
+            }
+            Self::save_category_index_map(&env, &cat_map);
+        }
+
+        Ok(pruned.len())
+    }
+
+    /// Allowlist a keeper address permitted to call `prune_expired_signals`
+    /// (admin only). Adding an already-listed keeper is a no-op.
+    pub fn add_prune_keeper(env: Env, caller: Address, keeper: Address) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        let mut keepers = Self::get_prune_keepers(env.clone());
+        if !keepers.contains(&keeper) {
+            keepers.push_back(keeper);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PruneKeepers, &keepers);
+        }
+        Ok(())
+    }
+
+    /// Remove a keeper address from the prune allowlist (admin only).
+    pub fn remove_prune_keeper(
+        env: Env,
+        caller: Address,
+        keeper: Address,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        let keepers = Self::get_prune_keepers(env.clone());
+        let mut remaining = Vec::new(&env);
+        for i in 0..keepers.len() {
+            let addr = keepers.get(i).unwrap();
+            if addr != keeper {
+                remaining.push_back(addr);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::PruneKeepers, &remaining);
+        Ok(())
+    }
+
+    /// Current prune-keeper allowlist (read-only).
+    pub fn get_prune_keepers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::PruneKeepers)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    fn is_prune_keeper(env: &Env, caller: &Address) -> bool {
+        Self::get_prune_keepers(env.clone()).contains(caller)
     }
 
     pub fn set_circuit_breaker_config(
@@ -452,9 +972,96 @@ impl SignalRegistry {
     }
 
     /* =========================
+       MULTISIG APPROVAL WORKFLOW
+    ========================== */
+
+    /// Propose a critical admin action for M-of-N approval.
+    pub fn propose_critical_action(
+        env: Env,
+        caller: Address,
+        payload: multisig_approvals::CriticalActionPayload,
+    ) -> Result<u64, AdminError> {
+        multisig_approvals::propose_critical_action(&env, &caller, payload)
+    }
+
+    /// Approve a pending critical action proposal.
+    pub fn approve_proposal(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<ProposalStatus, AdminError> {
+        multisig_approvals::approve_proposal(&env, &caller, proposal_id)
+    }
+
+    /// Cancel a pending or timelocked proposal.
+    pub fn cancel_proposal(env: Env, caller: Address, proposal_id: u64) -> Result<(), AdminError> {
+        multisig_approvals::cancel_proposal(&env, &caller, proposal_id)
+    }
+
+    /// Execute an approved proposal after the timelock elapses.
+    pub fn execute_proposal(env: Env, caller: Address, proposal_id: u64) -> Result<(), AdminError> {
+        multisig_approvals::execute_proposal(&env, &caller, proposal_id)
+    }
+
+    /// Read a proposal by id.
+    pub fn get_approval_proposal(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ApprovalProposal, AdminError> {
+        multisig_approvals::get_approval_proposal(&env, proposal_id)
+    }
+
+    /// Read timelock delay configuration for critical actions.
+    pub fn get_multisig_timelock_config(env: Env) -> MultisigTimelockConfig {
+        multisig_approvals::get_timelock_config(&env)
+    }
+
+    /// Update timelock delays (requires single-admin or direct signer when multisig disabled).
+    pub fn set_multisig_timelock_config(
+        env: Env,
+        caller: Address,
+        config: MultisigTimelockConfig,
+    ) -> Result<(), AdminError> {
+        multisig_approvals::set_timelock_config(&env, &caller, config)
+    }
+
+    pub fn claim_pending_rewards(env: Env, caller: Address) -> (i128, i128) {
+        caller.require_auth();
+        let pending = Self::get_pending_rewards(&env, &caller);
+        if pending.fee == 0 && pending.roi == 0 {
+            return (0, 0);
+        }
+        // Clear storage before transfer (reentrancy-safe)
+        Self::store_pending_rewards(&env, &caller, &PendingRewards { fee: 0, roi: 0 });
+
+        // TODO: Transfer tokens from the fee collector to the caller.
+        // Use the token contract address stored in your contract (e.g., fee_collector).
+        // Example:
+        // let token_client = TokenClient::new(&env, &fee_collector_address);
+        // token_client.transfer(&fee_collector_address, &caller, &pending.fee);
+        // Similarly for ROI token.
+
+        (pending.fee, pending.roi)
+    }
+
+    /* =========================
        INTERNAL HELPERS
     ========================== */
 
+    /// Allocates the next signal id from a persistent monotonic counter.
+    ///
+    /// # Invariant (issue #977)
+    /// `StorageKey::SignalCounter` only ever increases, and every id it has
+    /// ever produced is permanently retired — ids are never reused, even if
+    /// the corresponding record is later removed. `migrate_signals_v1_to_v2`
+    /// relies on this: it never calls `next_signal_id`, instead re-writing
+    /// each legacy `SignalV1` row into the v2 map at its *original* id, so a
+    /// migration can only collide with a freshly-created signal if the
+    /// counter were smaller than the highest legacy id — which is why the
+    /// counter itself (not the v1/v2 map lengths) is the bound the migration
+    /// scans against. A restart or replay is safe because the counter is
+    /// read fresh from persistent storage on every call; nothing in this
+    /// path is order- or session-dependent.
     fn next_signal_id(env: &Env) -> u64 {
         let mut counter: u64 = env
             .storage()
@@ -547,6 +1154,19 @@ impl SignalRegistry {
             .set(&StorageKey::ProviderStats, map);
     }
 
+    fn get_signal_templates_map(env: &Env) -> Map<Address, Vec<StoredSignalTemplate>> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::SignalTemplates)
+            .unwrap_or(Map::new(env))
+    }
+
+    fn save_signal_templates_map(env: &Env, map: &Map<Address, Vec<StoredSignalTemplate>>) {
+        env.storage()
+            .instance()
+            .set(&StorageKey::SignalTemplates, map);
+    }
+
     fn validate_asset_pair(env: &Env, asset_pair: &String) -> Result<(), AdminError> {
         validate_asset_pair_common(env, asset_pair).map_err(|e| match e {
             AssetPairError::InvalidFormat
@@ -556,6 +1176,47 @@ impl SignalRegistry {
         })
     }
 
+    /// Returns `true` if the Stellar account for `provider` still exists on-chain.
+    /// A merged (deleted) account returns `false`.
+    fn check_provider_exists(_env: &Env, _provider: &Address) -> bool {
+        // Account existence is not queryable from contract WASM; assume present.
+        true
+    }
+
+    /// Mark a signal as orphaned (provider account deleted), emit the event, and persist.
+    fn orphan_signal(env: &Env, signals: &mut Map<u64, Signal>, signal_id: u64) {
+        if let Some(mut signal) = signals.get(signal_id) {
+            signal.status = SignalStatus::ProviderDeleted;
+            signals.set(signal_id, signal);
+            Self::save_signals_map(env, signals);
+            events::emit_signal_orphaned(
+                env,
+                signal_id,
+                String::from_str(env, "provider_account_deleted"),
+            );
+        }
+    }
+
+    fn get_pending_rewards(env: &Env, address: &Address) -> PendingRewards {
+        env.storage()
+            .instance()
+            .get(&StorageKey::PendingRewards(address.clone()))
+            .unwrap_or(PendingRewards { fee: 0, roi: 0 })
+    }
+
+    fn store_pending_rewards(env: &Env, address: &Address, rewards: &PendingRewards) {
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingRewards(address.clone()), rewards);
+    }
+
+    fn add_pending_rewards(env: &Env, address: &Address, fee_add: i128, roi_add: i128) {
+        let mut current = Self::get_pending_rewards(env, address);
+        current.fee += fee_add;
+        current.roi += roi_add;
+        Self::store_pending_rewards(env, address, &current);
+    }
+
     /* =========================
        PUBLIC API
     ========================== */
@@ -563,6 +1224,12 @@ impl SignalRegistry {
     /// # Summary
     /// Create a new trading signal. The provider must authorize the call.
     /// Signals are rate-limited and subject to pause state checks.
+    ///
+    /// # Reentrancy risk assessment (Issue #781)
+    /// The provider's stake tier is read from local storage
+    /// (`ProviderStakes` / the provider's `stake_tier` profile field) — this
+    /// function makes **no cross-contract call**, so there is no external
+    /// callee that could reenter during signal creation. No guard needed.
     ///
     /// # Parameters
     /// - `env`: Soroban environment.
@@ -619,6 +1286,101 @@ impl SignalRegistry {
     ) -> Result<u64, AdminError> {
         // Check if signals are paused
         admin::require_not_paused(env, String::from_str(env, CAT_SIGNALS))?;
+        admin::require_not_paused(env, String::from_str(env, CAT_TRADING))?;
+
+        // Comprehensive input validation (issue #634)
+        validation::validate_signal_input(env, &asset_pair, price, &rationale, expiry, tags.len())
+            .map_err(|e| match e {
+                errors::SignalValidationError::InvalidAssetPair => AdminError::InvalidAssetPair,
+                errors::SignalValidationError::InvalidPrice
+                | errors::SignalValidationError::EmptyRationale
+                | errors::SignalValidationError::RationaleTooLong
+                | errors::SignalValidationError::InvalidExpiry
+                | errors::SignalValidationError::TooManyTags => AdminError::InvalidParameter,
+                errors::SignalValidationError::DailyLimitExceeded => {
+                    AdminError::SignalLimitExceeded
+                }
+            })?;
+
+        // Issue #424: Banned providers cannot submit signals
+        if providers::is_provider_banned(env, &provider) {
+            return Err(AdminError::Unauthorized);
+        }
+
+        // Issue #1137: canonical lifecycle status must be Active.
+        if !provider_status::can_submit(env, &provider) {
+            return Err(AdminError::Unauthorized);
+        }
+
+        // Issue #1138: ledger-window quotas (read-only check, no writes yet).
+        submission_quota::check(env, &provider)?;
+
+        // Verify provider account still exists on Stellar
+        if !Self::check_provider_exists(env, &provider) {
+            return Err(AdminError::Unauthorized);
+        }
+
+        let provider_stake_tier = providers::get_provider_profile(env, &provider)
+            .map(|profile| profile.stake_tier)
+            .unwrap_or_else(|| {
+                let stakes = Self::get_provider_stakes_map(env);
+                let amount = stakes
+                    .get(provider.clone())
+                    .map(|info| info.amount)
+                    .unwrap_or(0);
+                if amount >= providers::GOLD_TIER_STAKE {
+                    3
+                } else if amount >= providers::GOLD_TIER_STAKE / 2 {
+                    2
+                } else if amount >= providers::GOLD_TIER_STAKE / 10 {
+                    1
+                } else {
+                    0
+                }
+            });
+
+        validation::validate_provider_signal_limit(
+            env,
+            &Self::get_signals_map(env),
+            &provider,
+            provider_stake_tier,
+        )?;
+
+        // Submission cooldown check (issue #661)
+        {
+            let cooldown: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::SubmissionCooldown)
+                .unwrap_or(0u64);
+            if cooldown > 0 {
+                let last_signal_time: u64 = env
+                    .storage()
+                    .persistent()
+                    .get(&StorageKey::ProviderLastSignal(provider.clone()))
+                    .unwrap_or(0u64);
+                if last_signal_time > 0 && env.ledger().timestamp() < last_signal_time + cooldown {
+                    return Err(AdminError::CooldownNotElapsed);
+                }
+            }
+        }
+
+        // Per-provider daily signal creation rate limit (issue #778)
+        {
+            let daily_limit: u32 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::DailySignalLimit)
+                .unwrap_or(0u32);
+            if daily_limit > 0 {
+                let day_bucket = env.ledger().timestamp() / 86_400;
+                let count_key = StorageKey::ProviderDailySignalCount(provider.clone(), day_bucket);
+                let daily_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
+                if daily_count >= daily_limit {
+                    return Err(AdminError::SignalLimitExceeded);
+                }
+            }
+        }
 
         // Rate limit: signal submission
         let trust = reputation::get_trust_score(env, &provider)
@@ -658,7 +1420,6 @@ impl SignalRegistry {
             submitted_at: now,
             expiry,
             status: SignalStatus::Active,
-            // Initialize performance tracking fields
             executions: 0,
             successful_executions: 0,
             total_volume: 0,
@@ -667,7 +1428,6 @@ impl SignalRegistry {
             category: category.clone(),
             tags: unique_tags.clone(),
             risk_level,
-            // Collaboration field
             is_collaborative: false,
             rationale_hash,
             confidence: 50,
@@ -675,6 +1435,9 @@ impl SignalRegistry {
             ai_validation_score: None,
             avg_copier_roi_bps: 0,
             copier_closed_count: 0,
+            warning_emitted: false,
+            benchmark_return_bps: None,
+            alpha_bps: None,
         };
 
         // Auto-enter signal into active contests (before moving signal)
@@ -684,6 +1447,7 @@ impl SignalRegistry {
         let mut signals = Self::get_signals_map(env);
         signals.set(id, signal);
         Self::save_signals_map(env, &signals);
+        validation::increment_provider_active_count(env, &provider);
 
         // Update tag popularity
         categories::increment_tag_popularity(env, &unique_tags);
@@ -705,23 +1469,147 @@ impl SignalRegistry {
             reputation::record_first_signal(env, &provider);
         }
 
+        // Record submission timestamp for cooldown tracking (issue #661)
+        env.storage()
+            .persistent()
+            .set(&StorageKey::ProviderLastSignal(provider.clone()), &now);
+
+        // Increment per-provider daily signal count (issue #778)
+        {
+            let day_bucket = now / 86_400;
+            let count_key = StorageKey::ProviderDailySignalCount(provider.clone(), day_bucket);
+            let current: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
+            env.storage()
+                .persistent()
+                .set(&count_key, &current.saturating_add(1));
+        }
+
+        // Issue #1138: consume quota only once the submission fully succeeded.
+        submission_quota::consume(env, &provider);
+
         Ok(id)
     }
 
     pub fn get_signal(env: Env, signal_id: u64) -> Option<Signal> {
-        let signals = Self::get_signals_map(&env);
-        signals.get(signal_id)
+        let mut signals = Self::get_signals_map(&env);
+        let mut signal = signals.get(signal_id)?;
+
+        // If signal is still active, check whether the provider account still exists.
+        // If the provider has merged/deleted their account, orphan the signal in-place.
+        if signal.status == SignalStatus::Active
+            && !Self::check_provider_exists(&env, &signal.provider)
+        {
+            Self::orphan_signal(&env, &mut signals, signal_id);
+            return signals.get(signal_id);
+        }
+
+        // Check for expiry warning (Issue #417)
+        let now = env.ledger().timestamp();
+        if signal.status == SignalStatus::Active && crate::expiry::is_expired(&env, &signal) {
+            crate::expiry::check_and_update_expiry(&env, &mut signal);
+            signals.set(signal_id, signal.clone());
+            Self::save_signals_map(&env, &signals);
+            validation::decrement_provider_active_count(&env, &signal.provider);
+        }
+
+        let time_to_expiry = signal.expiry.saturating_sub(now);
+        if time_to_expiry <= WARNING_WINDOW_LEDGERS && !signal.warning_emitted {
+            events::emit_signal_expiry_warning(
+                &env,
+                signal_id,
+                signal.provider.clone(),
+                signal.expiry,
+                time_to_expiry,
+            );
+            signal.warning_emitted = true;
+            signals.set(signal_id, signal.clone());
+            Self::save_signals_map(&env, &signals);
+        }
+
+        Some(signal)
+    }
+
+    pub fn save_signal_template(
+        env: Env,
+        provider: Address,
+        template: SignalTemplatePreset,
+    ) -> Result<u32, AdminError> {
+        provider.require_auth();
+        Self::validate_asset_pair(&env, &template.asset_pair)?;
+
+        let mut templates_map = Self::get_signal_templates_map(&env);
+        let template_id =
+            template_presets::save_signal_template(&env, &mut templates_map, provider, template)
+                .map_err(|_| AdminError::InvalidParameter)?;
+        Self::save_signal_templates_map(&env, &templates_map);
+
+        Ok(template_id)
+    }
+
+    pub fn submit_signal_from_template(
+        env: Env,
+        provider: Address,
+        template_id: u32,
+        overrides: SignalTemplateOverrides,
+    ) -> Result<u64, AdminError> {
+        let templates_map = Self::get_signal_templates_map(&env);
+        let template =
+            template_presets::get_signal_template(&templates_map, provider.clone(), template_id)
+                .map_err(|_| AdminError::InvalidParameter)?;
+        let (asset_pair, action, expiry_hours, price, rationale) =
+            template_presets::merge_template(template, overrides);
+        let expiry = env.ledger().timestamp() + expiry_hours * 60 * 60;
+        let tags = Vec::new(&env);
+
+        Self::create_signal(
+            env,
+            provider,
+            asset_pair,
+            action,
+            price,
+            rationale,
+            expiry,
+            SignalCategory::SWING,
+            tags,
+            RiskLevel::Medium,
+        )
+    }
+
+    /* =========================
+       PERFORMANCE TRACKING FUNCTIONS
+    ========================== */
+    /// Get the composite quality score for a signal (0-100).
+    ///
+    /// Combines success rate, adoption count, stake tier, and AI validation score
+    /// into a single quality metric. If AI score is absent, its weight is redistributed
+    /// to the success rate component.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment
+    /// - `signal_id`: ID of the signal to score
+    ///
+    /// # Returns
+    /// Quality score from 0 to 100, or None if signal not found
+    pub fn get_signal_quality_score(env: Env, signal_id: u64) -> Option<u32> {
+        scoring::get_signal_quality_score(&env, signal_id)
     }
 
     /// Return the signal if `viewer` is allowed to see it. Non-[`SignalCategory::PREMIUM`]
     /// signals are visible to any viewer. PREMIUM signals require an active on-chain
     /// subscription (via UserPortfolio [`check_subscription`]) unless the viewer is the
     /// signal provider.
-    pub fn get_signal_for_viewer(
-        env: Env,
-        signal_id: u64,
-        viewer: Address,
-    ) -> Option<Signal> {
+    ///
+    /// # Reentrancy risk assessment (Issue #781)
+    /// Calls out to `UserPortfolio::check_subscription`
+    /// ([`Self::invoke_check_subscription`]) for PREMIUM signals. This is a
+    /// **read-only query path**: it never authorizes a fund movement or
+    /// mutates business-logic state, so it cannot be used to double-spend or
+    /// corrupt state via reentrancy regardless of what the callee does. The
+    /// one write on this path — `emit_session_started_once`'s per-session
+    /// dedup flag — is explicitly documented as "No business-logic state is
+    /// changed" (see `shared::events`) and only suppresses a duplicate
+    /// analytics event; it carries no reentrancy risk. No guard needed.
+    pub fn get_signal_for_viewer(env: Env, signal_id: u64, viewer: Address) -> Option<Signal> {
         let signals = Self::get_signals_map(&env);
         let signal = signals.get(signal_id)?;
 
@@ -742,10 +1630,7 @@ impl SignalRegistry {
         if viewer == signal.provider {
             return Some(signal);
         }
-        let portfolio: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::UserPortfolio)?;
+        let portfolio: Address = env.storage().instance().get(&StorageKey::UserPortfolio)?;
         let allowed = Self::invoke_check_subscription(&env, &portfolio, &viewer, &signal.provider);
         if allowed {
             Some(signal)
@@ -824,12 +1709,57 @@ impl SignalRegistry {
         Ok(())
     }
 
+    /// Edit signal with an append-only audit trail (Issue #686).
+    /// Stores a snapshot of the current signal state before applying changes,
+    /// creating a versioned history that can be retrieved via get_signal_version_history.
+    /// Only the original provider may edit, and only before any follower has
+    /// copy-traded the signal.
+    pub fn edit_signal_audit(
+        env: Env,
+        provider: Address,
+        signal_id: u64,
+        new_price: Option<i128>,
+        new_rationale: Option<soroban_sdk::String>,
+        new_expiry: Option<u64>,
+    ) -> Result<u32, SignalEditError> {
+        provider.require_auth();
+        admin::require_not_paused(&env, String::from_str(&env, CAT_SIGNALS))
+            .map_err(|_| SignalEditError::TradingPaused)?;
+
+        let mut signals = Self::get_signals_map(&env);
+        let mut signal = signals
+            .get(signal_id)
+            .ok_or(SignalEditError::SignalNotFound)?;
+
+        let new_version = versioning::edit_signal_with_audit(
+            &env,
+            signal_id,
+            &provider,
+            new_price,
+            new_rationale,
+            new_expiry,
+            &mut signal,
+        )?;
+
+        signals.set(signal_id, signal.clone());
+        Self::save_signals_map(&env, &signals);
+        Ok(new_version)
+    }
+
+    /// Retrieve the full version history for a signal (audit trail, Issue #686).
+    /// Returns all stored versions in chronological order.
+    pub fn get_signal_version_history(env: Env, signal_id: u64) -> Vec<versioning::SignalVersion> {
+        versioning::get_signal_history(&env, signal_id)
+    }
+
     /// Record closed-signal outcome and update provider reputation (Issue #170).
     pub fn record_signal_outcome(
         env: Env,
         caller: Address,
         signal_id: u64,
         outcome: SignalOutcome,
+        total_fee: i128,
+        total_roi: i128,
     ) -> Result<(), SignalOutcomeError> {
         caller.require_auth();
         let executor: Address = env
@@ -857,6 +1787,32 @@ impl SignalRegistry {
         if signal.status == SignalStatus::Active {
             return Err(SignalOutcomeError::SignalNotClosed);
         }
+        if collaboration::is_collaborative_signal(&env, signal_id) {
+            let authors = collaboration::get_collaborative_signal(&env, signal_id)
+                .ok_or(SignalOutcomeError::SignalNotFound)?;
+
+            let distributions = collaboration::distribute_collaborative_rewards(
+                &env, &authors, total_fee, total_roi,
+            );
+
+            // Emit event
+            let mut event_data = Vec::new(&env);
+            for (addr, fee, roi) in distributions.iter() {
+                event_data.push_back((addr.clone(), fee, roi));
+            }
+            env.events()
+                .publish(("CollaborativeRewardDistributed", signal_id), event_data);
+
+            // Credit pending rewards for each author
+            for (addr, fee_share, roi_share) in distributions.iter() {
+                if fee_share > 0 || roi_share > 0 {
+                    Self::add_pending_rewards(&env, &addr, fee_share, roi_share);
+                }
+            }
+        } else {
+            // Single-author: credit all to the signal provider
+            Self::add_pending_rewards(&env, &signal.provider, total_fee, total_roi);
+        }
 
         let provider = signal.provider.clone();
         let rep_key = StorageKey::ProviderReputationScore(provider.clone());
@@ -878,9 +1834,138 @@ impl SignalRegistry {
         env.storage().instance().get(&rep_key).unwrap_or(50)
     }
 
+    // ── Minimum signal lifetime (issue #687) ────────────────────────────────────
+
+    /// Admin: set the minimum number of seconds a signal must remain active
+    /// before the provider may cancel it. Set to 0 to disable the minimum.
+    pub fn set_min_signal_lifetime(
+        env: Env,
+        caller: Address,
+        min_lifetime_secs: u64,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinSignalLifetime, &min_lifetime_secs);
+        Ok(())
+    }
+
+    /// Returns the configured minimum signal lifetime in seconds (0 if not set).
+    pub fn get_min_signal_lifetime(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinSignalLifetime)
+            .unwrap_or(0)
+    }
+
+    /// Provider-initiated cancellation of an active signal.
+    ///
+    /// Fails with [`SignalCancelError::LifetimeNotElapsed`] if the signal has not
+    /// yet been active for the admin-configured minimum lifetime. Natural expiry
+    /// is not affected — signals that pass their `expiry` timestamp are handled
+    /// separately by the expiry cleanup path and this restriction does not apply.
+    pub fn cancel_signal(
+        env: Env,
+        provider: Address,
+        signal_id: u64,
+    ) -> Result<(), SignalCancelError> {
+        provider.require_auth();
+
+        let mut signals = Self::get_signals_map(&env);
+        let mut signal = signals.get(signal_id).ok_or(SignalCancelError::NotFound)?;
+
+        if signal.provider != provider {
+            return Err(SignalCancelError::NotOwner);
+        }
+
+        if signal.status != SignalStatus::Active {
+            return Err(SignalCancelError::NotActive);
+        }
+
+        let min_lifetime: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinSignalLifetime)
+            .unwrap_or(0);
+
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(signal.submitted_at);
+
+        if elapsed < min_lifetime {
+            return Err(SignalCancelError::LifetimeNotElapsed);
+        }
+
+        signal.status = SignalStatus::Cancelled;
+        signals.set(signal_id, signal);
+        Self::save_signals_map(&env, &signals);
+
+        validation::decrement_provider_active_count(&env, &provider);
+        events::emit_signal_cancelled(&env, signal_id, provider);
+
+        Ok(())
+    }
+
+    /// Provider appeals an open community-voting dispute against them (Issue #539).
+    /// Only the disputed provider may submit the appeal, and only once per dispute.
+    pub fn submit_dispute_appeal(env: Env, provider: Address) -> Result<(), DisputeError> {
+        submit_appeal(&env, provider)
+    }
+
+    /// Admin decides a pending dispute appeal (admin only). Approving resolves the
+    /// dispute in the provider's favor; rejecting leaves the dispute open for the
+    /// admin to resolve separately via `resolve_provider_dispute`.
+    pub fn resolve_dispute_appeal(
+        env: Env,
+        admin: Address,
+        provider: Address,
+        approve: bool,
+    ) -> Result<(), DisputeError> {
+        admin::require_admin(&env, &admin).map_err(|_| DisputeError::Unauthorized)?;
+        admin.require_auth();
+        resolve_appeal(&env, provider, approve)
+    }
+
+    /// Auto-rejects a dispute appeal that has sat pending for more than the appeal
+    /// window without an admin decision (Issue #539). Callable by anyone — it only
+    /// enforces a deterministic timeout, so it can't be misused to change an outcome.
+    pub fn process_dispute_appeal_timeout(env: Env, provider: Address) -> Result<(), DisputeError> {
+        process_appeal_timeout(&env, provider)
+    }
+
+    /// Admin resolves a community-voting dispute directly (admin only). If `restore`
+    /// is true, the provider's reputation score is unfrozen and one recovery step is
+    /// applied immediately.
+    pub fn resolve_provider_dispute(
+        env: Env,
+        admin: Address,
+        provider: Address,
+        restore: bool,
+    ) -> Result<(), AdminError> {
+        admin::require_admin(&env, &admin)?;
+        admin.require_auth();
+        resolve_dispute(&env, provider, restore);
+        Ok(())
+    }
+
+    /// Get the current community-voting dispute record for a provider, if any.
+    pub fn get_provider_dispute(env: Env, provider: Address) -> Option<DisputeRecord> {
+        get_dispute(&env, &provider)
+    }
+
     pub fn get_provider_stats(env: Env, provider: Address) -> Option<ProviderPerformance> {
         let stats = Self::get_provider_stats_map(&env);
         stats.get(provider)
+    }
+
+    pub fn get_provider_monthly_report(
+        env: Env,
+        provider: Address,
+        month: u32,
+        year: u32,
+    ) -> types::ProviderMonthlyReport {
+        let signals = Self::get_signals_map(&env);
+        reports::get_provider_monthly_report(&env, &signals, &provider, month, year)
     }
 
     pub fn create_template(
@@ -1030,6 +2115,16 @@ impl SignalRegistry {
             return Err(errors::PerformanceError::InvalidVolume);
         }
 
+        // Oracle price sanity: prices must not exceed 10^18.
+        // Prevents overflow in `calculate_roi` which multiplies price_diff by
+        // BASIS_POINTS_DENOMINATOR (10 000). Mirrors MAX_ORACLE_PRICE in
+        // stellar_swipe_common::oracle so settlement rejects the same values
+        // that the oracle layer would reject at ingestion time.
+        const MAX_SETTLEMENT_PRICE: i128 = 1_000_000_000_000_000_000;
+        if entry_price > MAX_SETTLEMENT_PRICE || exit_price > MAX_SETTLEMENT_PRICE {
+            return Err(errors::PerformanceError::OraclePriceOutOfBounds);
+        }
+
         // Load signal
         let mut signals = Self::get_signals_map(&env);
         let mut signal = signals
@@ -1055,7 +2150,10 @@ impl SignalRegistry {
 
         // Update signal stats (general perf) and copier ROI (Issue #367)
         performance::update_signal_stats(&mut signal, &trade);
-        performance::update_copier_roi_stats(&mut signal, roi.clamp(i32::MIN as i128, i32::MAX as i128) as i32);
+        performance::update_copier_roi_stats(
+            &mut signal,
+            roi.clamp(i32::MIN as i128, i32::MAX as i128) as i32,
+        );
 
         // Evaluate new status
         let now = env.ledger().timestamp();
@@ -1065,6 +2163,10 @@ impl SignalRegistry {
         // Save updated signal
         signals.set(signal_id, signal.clone());
         Self::save_signals_map(&env, &signals);
+
+        if old_status == SignalStatus::Active && new_status != SignalStatus::Active {
+            validation::decrement_provider_active_count(&env, &signal.provider);
+        }
 
         let provider_for_contest = signal.provider.clone();
 
@@ -1160,6 +2262,115 @@ impl SignalRegistry {
         Self::get_provider_stats(env, provider)
     }
 
+    /// Record provider stake amount for verification checks.
+    pub fn set_provider_stake(env: Env, provider: Address, amount: i128) -> Result<(), AdminError> {
+        provider.require_auth();
+        if amount < 0 {
+            return Err(AdminError::InvalidParameter);
+        }
+
+        let mut stakes = Self::get_provider_stakes_map(&env);
+        let mut info = stakes.get(provider.clone()).unwrap_or(stake::StakeInfo {
+            amount: 0,
+            last_signal_time: 0,
+            locked_until: 0,
+        });
+        info.amount = amount;
+        stakes.set(provider, info);
+        Self::save_provider_stakes_map(&env, &stakes);
+        Ok(())
+    }
+
+    /// Read-only: the total staked amount for `provider`, or `0` when not staked.
+    pub fn get_stake(env: Env, provider: Address) -> i128 {
+        stake::get_stake_info(&env, &provider)
+            .map(|info| info.amount)
+            .unwrap_or(0)
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Issue #424: Provider Ban Mechanism
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Ban a provider, cancelling all active signals and slashing full stake.
+    /// Admin only. Emits `ProviderBanned` event.
+    ///
+    /// # Reentrancy risk assessment (Issue #781)
+    /// This entrypoint makes a cross-contract call into the admin-supplied
+    /// `stake_vault` (see [`providers::slash_stake`]), which — unlike a
+    /// hardcoded protocol contract — cannot be assumed non-malicious. It is
+    /// therefore hardened two ways:
+    /// - **Checks-effects-interactions**: the ban reason and every cancelled
+    ///   signal ([`providers::apply_ban`]) are persisted *before* the
+    ///   `stake_vault` call, so a reentrant call during that call sees the
+    ///   fully-banned state, never an intermediate one.
+    /// - **Reentrancy guard**: the whole body runs under
+    ///   [`reentrancy::guarded`], so any reentrant call back into another
+    ///   guarded `signal_registry` entrypoint (including `ban_provider`
+    ///   itself) is rejected with [`AdminError::ReentrancyDetected`].
+    ///
+    /// # Arguments
+    /// * `caller` - Must be the current admin.
+    /// * `provider` - Provider address to ban.
+    /// * `reason_hash` - On-chain evidence hash (e.g. IPFS CID of dispute docs).
+    /// * `stake_vault` - Address of the StakeVault contract for slashing.
+    pub fn ban_provider(
+        env: Env,
+        caller: Address,
+        provider: Address,
+        reason_hash: String,
+        stake_vault: Address,
+    ) -> Result<(), AdminError> {
+        admin::require_emergency_admin(&env, &caller)?;
+        caller.require_auth();
+
+        let (signals_cancelled, stake_slashed) = reentrancy::guarded(&env, || {
+            // Effects: persist the ban and cancel signals before the external call.
+            let mut signals = Self::get_signals_map(&env);
+            let signals_cancelled =
+                providers::apply_ban(&env, &mut signals, &provider, &reason_hash);
+            Self::save_signals_map(&env, &signals);
+
+            // Interaction: cross-contract call to StakeVault to slash the stake.
+            let stake_slashed = providers::slash_stake(&env, &provider, &stake_vault);
+
+            Ok((signals_cancelled, stake_slashed))
+        })?;
+
+        providers::emit_provider_banned(
+            &env,
+            &provider,
+            &reason_hash,
+            signals_cancelled,
+            stake_slashed,
+        );
+
+        Ok(())
+    }
+
+    /// Check if a provider is banned
+    pub fn is_provider_banned(env: Env, provider: Address) -> bool {
+        providers::is_provider_banned(&env, &provider)
+    }
+
+    /// Get the ban reason hash for a provider (None if not banned)
+    pub fn get_ban_reason(env: Env, provider: Address) -> Option<String> {
+        providers::get_ban_reason(&env, &provider)
+    }
+
+    /// Check whether a provider meets automated verification criteria.
+    pub fn check_verification_eligibility(env: Env, provider: Address) -> VerificationEligibility {
+        let stakes = Self::get_provider_stakes_map(&env);
+        let stats = Self::get_provider_stats_map(&env);
+        let stake = stakes
+            .get(provider.clone())
+            .map(|info| info.amount)
+            .unwrap_or(0);
+        let performance = stats.get(provider.clone()).unwrap_or_default();
+
+        providers::check_verification_eligibility(&env, provider, stake, performance)
+    }
+
     /// Get leaderboard of top providers by metric
     ///
     /// # Arguments
@@ -1233,6 +2444,13 @@ impl SignalRegistry {
        SIGNAL ADOPTION (Issue #169)
     ========================== */
 
+    /// # Reentrancy risk assessment (Issue #781)
+    /// This is an *inbound* trust boundary, not an outbound call site: the
+    /// caller must equal the registered `TradeExecutor` address, checked via
+    /// `caller.require_auth()` (a signature check, not a cross-contract
+    /// invocation). `increment_adoption` itself makes **no cross-contract
+    /// call** — nothing here can be reentered mid-execution by an external
+    /// contract. No guard needed.
     pub fn increment_adoption(
         env: Env,
         caller: Address,
@@ -1267,12 +2485,29 @@ impl SignalRegistry {
             return Err(AdminError::InvalidParameter);
         }
 
+        // Block new copies of orphaned signals (provider account deleted)
+        if !Self::check_provider_exists(&env, &signal.provider) {
+            Self::orphan_signal(&env, &mut signals, signal_id);
+            return Err(AdminError::InvalidParameter);
+        }
+
         signal.adoption_count = signal
             .adoption_count
             .checked_add(1)
             .ok_or(AdminError::InvalidParameter)?;
         signals.set(signal_id, signal.clone());
         Self::save_signals_map(&env, &signals);
+
+        let provider = signal.provider.clone();
+        let mut provider_stats_map = Self::get_provider_stats_map(&env);
+        let mut provider_stats = provider_stats_map.get(provider.clone()).unwrap_or_default();
+        provider_stats.total_copies = provider_stats
+            .total_copies
+            .checked_add(1)
+            .ok_or(AdminError::InvalidParameter)?;
+        provider_stats_map.set(provider.clone(), provider_stats.clone());
+        Self::save_provider_stats_map(&env, &provider_stats_map);
+        update_leaderboard_index(&env, provider, &provider_stats);
 
         // Save nonce
         let mut nonces = nonces;
@@ -1292,6 +2527,9 @@ impl SignalRegistry {
             },
         );
 
+        // #672: record copy-trade activity for cohort retention
+        cohort_retention::record_activity(&env, &signal.provider, &caller);
+
         // Emit event
         events::emit_signal_adopted(&env, signal_id, caller.clone(), signal.adoption_count);
 
@@ -1307,7 +2545,7 @@ impl SignalRegistry {
         caller: Address,
         treasury: Address,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_treasury_admin(&env, &caller)?;
         caller.require_auth();
         fees::set_platform_treasury(&env, treasury);
         Ok(())
@@ -1358,6 +2596,26 @@ impl SignalRegistry {
         )
     }
 
+    pub fn get_active_signals_personalized(
+        env: Env,
+        user: Address,
+        offset: u32,
+        limit: u32,
+        sort_by: SortOption,
+        category_filter: Option<SignalCategory>,
+    ) -> Vec<SignalSummary> {
+        let signals_map = Self::get_signals_map(&env);
+        query::get_active_signals_personalized(
+            &env,
+            &signals_map,
+            user,
+            offset,
+            limit,
+            sort_by,
+            category_filter,
+        )
+    }
+
     /// Legacy fallback if front-ends rely on Old behavior
     /// (Wait, let's keep it as another name if needed, or just let users migrate to the new `get_active_signals`)
     pub fn get_active_signals_archived(
@@ -1372,6 +2630,23 @@ impl SignalRegistry {
         } else {
             expiry::get_active_signals(&env, &signals)
         }
+    }
+
+    /// Read-only, cursor-paginated history of all signals a provider has
+    /// ever submitted. Newest-first with deterministic ordering; pages are
+    /// bounded to at most [`query::MAX_HISTORY_PAGE_SIZE`] records so large
+    /// histories do not exceed Soroban resource limits.
+    ///
+    /// See [`query::get_provider_signal_history`] for the full pagination
+    /// semantics (cursor exclusivity, clamping, out-of-range / empty pages).
+    pub fn get_provider_signal_history(
+        env: Env,
+        provider: Address,
+        cursor: Option<u64>,
+        limit: u32,
+    ) -> query::ProviderSignalHistoryPage {
+        let signals_map = Self::get_signals_map(&env);
+        query::get_provider_signal_history(&env, &signals_map, &provider, cursor, limit)
     }
 
     /* =========================
@@ -1391,7 +2666,10 @@ impl SignalRegistry {
         social::follow_provider(&env, user.clone(), provider.clone())
             .map_err(|_| AdminError::CannotFollowSelf)?;
 
-        // Update trust score when follower count changes
+        // #672: record cohort membership on first follow
+        cohort_retention::record_follow(&env, &provider, &user);
+
+        Self::sync_provider_social_metrics(&env, &provider);
         Self::update_provider_trust_score(env, provider);
 
         Ok(())
@@ -1402,7 +2680,7 @@ impl SignalRegistry {
         social::unfollow_provider(&env, user, provider.clone())
             .map_err(|_| AdminError::Unauthorized)?;
 
-        // Update trust score when follower count changes
+        Self::sync_provider_social_metrics(&env, &provider);
         Self::update_provider_trust_score(env, provider);
 
         Ok(())
@@ -1418,19 +2696,54 @@ impl SignalRegistry {
         social::get_follower_count(&env, &provider)
     }
 
-    /// Cleanup expired signals in batches
+    // ── Issue #672: Cohort retention ──────────────────────────────────────────
+
+    /// Read-only: return cohort retention summary for a provider and week slot.
+    /// `cohort_week_slot` = first_follow_timestamp / (7 * 24 * 3600).
+    pub fn get_cohort_retention(
+        env: Env,
+        provider: Address,
+        cohort_week_slot: u64,
+    ) -> cohort_retention::CohortRetention {
+        cohort_retention::get_cohort_retention(&env, &provider, cohort_week_slot)
+    }
+
+    fn sync_provider_social_metrics(env: &Env, provider: &Address) {
+        let mut stats_map = Self::get_provider_stats_map(env);
+        let mut stats = stats_map.get(provider.clone()).unwrap_or_default();
+        stats.follower_count = social::get_follower_count(env, provider);
+        stats_map.set(provider.clone(), stats.clone());
+        Self::save_provider_stats_map(env, &stats_map);
+        update_leaderboard_index(env, provider.clone(), &stats);
+    }
+
+    /// Mark expired `Active` signals as `Expired` in bounded, resumable batches
+    /// (at most 100 entries examined per call; see `docs/signal_expiration.md`).
+    /// Open to any caller and safe to retry.
     /// Returns (signals_processed, signals_expired)
     pub fn cleanup_expired_signals(env: Env, limit: u32) -> (u32, u32) {
         let signals = Self::get_signals_map(&env);
         let result = expiry::cleanup_expired_signals(&env, &signals, limit);
+        for signal in result.expired_signals.iter() {
+            validation::decrement_provider_active_count(&env, &signal.provider);
+        }
         (result.signals_processed, result.signals_expired)
     }
 
-    /// Archive old expired signals (30+ days old)
+    /// Archive (remove) signals expired for more than 30 days, in bounded,
+    /// resumable batches. Open to any caller and safe to retry.
     /// Returns number of signals archived
     pub fn archive_old_signals(env: Env, limit: u32) -> u32 {
         let signals = Self::get_signals_map(&env);
         expiry::archive_old_signals(&env, &signals, limit)
+    }
+
+    /// Read-only: where `signal_id` is in the expiry lifecycle (issue #1219).
+    /// `Live` is exactly the set returned by active-signal queries; see
+    /// `docs/signal_expiration.md`.
+    pub fn get_signal_expiry_state(env: Env, signal_id: u64) -> SignalExpiryState {
+        let signals = Self::get_signals_map(&env);
+        expiry::expiry_state(&env, &signals, signal_id)
     }
 
     /// Get count of expired signals
@@ -1466,6 +2779,69 @@ impl SignalRegistry {
     pub fn get_global_analytics(env: Env) -> analytics::GlobalAnalytics {
         let signals = Self::get_signals_map(&env);
         analytics::calculate_global_analytics(&env, &signals)
+    }
+
+    /// Budget-aware, resumable version of `get_global_analytics` (issue #598).
+    /// Pass `cursor: None` and `accumulator: None` on the first call; if the
+    /// returned `cursor` is `Some`, pass it (and the returned accumulator)
+    /// back in to continue from where the previous call left off instead of
+    /// risking a mid-query instruction-budget failure on large datasets.
+    pub fn get_global_analytics_paginated(
+        env: Env,
+        cursor: Option<u64>,
+        accumulator: Option<analytics::GlobalAnalyticsAccumulator>,
+    ) -> analytics::PagedGlobalAnalytics {
+        let signals = Self::get_signals_map(&env);
+        let acc = accumulator.unwrap_or_else(analytics::GlobalAnalyticsAccumulator::new);
+        analytics::calculate_global_analytics_paginated(&env, &signals, cursor, acc)
+    }
+
+    /// Get category-level performance analytics (Issue #419)
+    /// Returns analytics for the given category, including avg success rate,
+    /// avg ROI, total signals, total adopters, and top provider.
+    /// Empty categories return zero-valued analytics (no error).
+    pub fn get_category_analytics(
+        env: Env,
+        category: SignalCategory,
+    ) -> analytics::CategoryAnalytics {
+        let signals = Self::get_signals_map(&env);
+        analytics::calculate_category_analytics(&env, &signals, &category)
+    }
+
+    // ── Churn-risk scoring (Issue #churn) ────────────────────────────────────
+
+    /// Read-only: compute the churn-risk score for a provider.
+    ///
+    /// Combines trailing signal-frequency decline (40 %), follower-unsubscribe
+    /// rate (30 %), and performance trend (30 %) into a composite 0–100 score.
+    /// Emits `churn_risk_elevated` when the composite score meets or exceeds the
+    /// admin-configured threshold.
+    pub fn get_provider_churn_risk(env: Env, provider: Address) -> churn_risk::ChurnRiskScore {
+        let signals = Self::get_signals_map(&env);
+        let stats_map = Self::get_provider_stats_map(&env);
+        let stats = stats_map.get(provider.clone());
+        churn_risk::get_provider_churn_risk(&env, &provider, &signals, stats.as_ref())
+    }
+
+    /// Admin: set the composite-score threshold above which `churn_risk_elevated`
+    /// is emitted. Valid range 0–100. Default is 67 (high-risk boundary).
+    pub fn set_churn_risk_threshold(
+        env: Env,
+        caller: Address,
+        threshold: u32,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        if threshold > 100 {
+            return Err(AdminError::InvalidParameter);
+        }
+        churn_risk::set_churn_threshold(&env, threshold);
+        Ok(())
+    }
+
+    /// Admin: get the current churn-risk threshold.
+    pub fn get_churn_risk_threshold(env: Env) -> u32 {
+        churn_risk::get_churn_threshold(&env)
     }
 
     /* =========================
@@ -1618,6 +2994,48 @@ impl SignalRegistry {
     /// Auto-suggest tags based on signal rationale
     pub fn suggest_tags(env: Env, rationale: String) -> Vec<String> {
         categories::auto_suggest_tags(&env, &rationale)
+    }
+
+    /// Return active, non-expired signals for `category` with pagination.
+    ///
+    /// Uses the pre-built per-category index (`ActiveSignalsByCategory`) so
+    /// callers do not have to scan the entire signals map.  Only signals whose
+    /// `status == Active` and `expiry > now` are included in the result.
+    ///
+    /// `offset` is the number of qualifying signals to skip; `limit` caps how
+    /// many are returned (clamped to 50 to bound response size).
+    pub fn list_signals_by_category(
+        env: Env,
+        category: SignalCategory,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Signal> {
+        let limit = limit.min(50);
+        let cat_map = Self::get_category_index_map(&env);
+        let ids: Vec<u64> = cat_map.get(category).unwrap_or(Vec::new(&env));
+        let signals_map = Self::get_signals_map(&env);
+        let now = env.ledger().timestamp();
+
+        let mut result = Vec::new(&env);
+        let mut seen: u32 = 0;
+        for i in 0..ids.len() {
+            if result.len() >= limit {
+                break;
+            }
+            let id = ids.get(i).unwrap();
+            let Some(signal) = signals_map.get(id) else {
+                continue;
+            };
+            if signal.status != SignalStatus::Active || signal.expiry <= now {
+                continue;
+            }
+            if seen < offset {
+                seen += 1;
+                continue;
+            }
+            result.push_back(signal);
+        }
+        result
     }
 
     /* =======
@@ -2027,6 +3445,22 @@ impl SignalRegistry {
         Ok(())
     }
 
+    pub fn get_cross_chain_signal(
+        env: Env,
+        source_chain: String,
+        source_id: String,
+    ) -> Option<CrossChainSignal> {
+        cross_chain::get_cross_chain_signal(&env, &source_chain, &source_id)
+    }
+
+    pub fn get_cross_chain_address_mapping(
+        env: Env,
+        source_chain: String,
+        source_address: String,
+    ) -> Option<AddressMapping> {
+        cross_chain::get_address_mapping(&env, &source_chain, &source_address)
+    }
+
     pub fn import_verified_signal(
         env: Env,
         source_chain: String,
@@ -2143,6 +3577,30 @@ impl SignalRegistry {
         ))
     }
 
+    /// Cross-contract read-only reputation snapshot (issue #1027).
+    ///
+    /// Returns a stable, self-describing [`ReputationSnapshot`] for `provider`,
+    /// derived entirely from canonical contract state (provider stats, stake and
+    /// rolling reputation score) as of the current ledger timestamp. It performs
+    /// no authentication and no storage writes, so other contracts can call it
+    /// during risk assessment or incentive determination without mutating this
+    /// contract. An unknown provider yields a well-formed, zeroed snapshot with
+    /// `has_sufficient_history == false`.
+    pub fn reputation_snapshot(env: Env, provider: Address) -> ReputationSnapshot {
+        let performance =
+            Self::get_provider_stats(env.clone(), provider.clone()).unwrap_or_default();
+        let stake_info = stake::get_stake_info(&env, &provider);
+        let reputation_score = Self::get_provider_reputation_score(env.clone(), provider.clone());
+
+        reputation::build_reputation_snapshot(
+            &env,
+            &provider,
+            &performance,
+            &stake_info,
+            reputation_score,
+        )
+    }
+
     /// Update trust score for a provider (called after performance changes)
     ///
     /// This should be called when:
@@ -2218,7 +3676,7 @@ impl SignalRegistry {
         median_stake: i128,
         median_followers: u64,
     ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
+        admin::require_config_admin(&env, &caller)?;
         caller.require_auth();
 
         update_median_values(&env, median_stake, median_followers);
@@ -2253,6 +3711,48 @@ impl SignalRegistry {
         }
 
         (highly_trusted, trusted, emerging, new_unproven)
+    }
+
+    // ── Provider specialization tags (Issue #704) ─────────────────────────────
+
+    /// Admin: add a specialization tag to the admin-defined set.
+    pub fn add_specialization_tag(env: Env, admin: Address, tag: String) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &admin)?;
+        providers::add_specialization_tag(&env, &admin, tag)
+            .map_err(|_| AdminError::InvalidParameter)
+    }
+
+    /// Admin: remove a specialization tag from the admin-defined set.
+    pub fn remove_specialization_tag(
+        env: Env,
+        admin: Address,
+        tag: String,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &admin)?;
+        providers::remove_specialization_tag(&env, &admin, tag);
+        Ok(())
+    }
+
+    /// Returns the admin-defined set of specialization tags.
+    pub fn get_specialization_tags(env: Env) -> Vec<String> {
+        providers::get_specialization_tags(&env)
+    }
+
+    /// Provider: set your specialization tags (self-selected).
+    /// Replaces any existing tags. Validates against admin-defined set
+    /// and enforces the per-provider tag count limit.
+    pub fn set_provider_specializations(env: Env, provider: Address, tags: Vec<String>) {
+        providers::set_provider_specializations(&env, &provider, tags);
+    }
+
+    /// Returns the specialization tags for a given provider.
+    pub fn get_provider_specializations(env: Env, provider: Address) -> Vec<String> {
+        providers::get_provider_specializations(&env, &provider)
+    }
+
+    /// Returns all providers that have selected the given specialization tag.
+    pub fn list_providers_by_specialization(env: Env, tag: String) -> Vec<Address> {
+        providers::list_providers_by_specialization(&env, tag)
     }
 
     /* =========================
@@ -2292,6 +3792,51 @@ impl SignalRegistry {
             estimated_rent_xlm,
         }
     }
+
+    // ── Issue #1038: Claimable rewards emission ledger tie-in ─────────────────────
+
+    /// Admin: open a new reward window anchored to the current ledger sequence.
+    ///
+    /// All claims within this epoch use `anchor_ledger` as their snapshot
+    /// reference, ensuring stable, reproducible eligibility calculations.
+    pub fn open_reward_window(
+        env: Env,
+        caller: Address,
+        window_duration_ledgers: u32,
+        total_pool: i128,
+    ) -> Result<reward_ledger::RewardWindow, AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        Ok(reward_ledger::open_reward_window(&env, window_duration_ledgers, total_pool))
+    }
+
+    /// Returns the currently active reward window, if any.
+    pub fn get_reward_window(env: Env) -> Option<reward_ledger::RewardWindow> {
+        reward_ledger::get_active_window(&env)
+    }
+
+    /// Provider: claim rewards for the active window.
+    ///
+    /// Eligibility is validated against the window's `anchor_ledger` snapshot.
+    /// Emits `reward_claimed` with the anchor ledger for auditability.
+    pub fn claim_ledger_rewards(
+        env: Env,
+        provider: Address,
+        amount: i128,
+    ) -> Result<reward_ledger::ClaimRecord, AdminError> {
+        provider.require_auth();
+        reward_ledger::record_claim(&env, &provider, amount)
+            .map_err(|_| AdminError::InvalidParameter)
+    }
+
+    /// Returns the claim record for `provider` in `epoch_id`, if any.
+    pub fn get_reward_claim_record(
+        env: Env,
+        provider: Address,
+        epoch_id: u64,
+    ) -> Option<reward_ledger::ClaimRecord> {
+        reward_ledger::get_claim_record(&env, &provider, epoch_id)
+    }
 }
 
 #[contracttype]
@@ -2307,20 +3852,38 @@ pub struct StorageStats {
 #[cfg(test)]
 mod test;
 #[cfg(test)]
-mod test_adoption;
+mod test_admin_roles;
 #[cfg(test)]
-mod tests;
+mod test_param_bounds;
 #[cfg(test)]
 mod test_admin_transfer;
 #[cfg(test)]
 mod test_adoption;
+/// Signal categorization query tests (Issue #660).
+#[cfg(test)]
+mod test_categorization;
+/// Composite churn-risk scoring tests (Issue #944).
+#[cfg(test)]
+mod test_churn_risk;
+/// Collaborative signal reward distribution tests (Issue #957).
+#[cfg(test)]
+mod test_collaboration;
+#[cfg(test)]
+mod test_daily_signal_limit;
 #[cfg(test)]
 mod test_emergency;
 #[cfg(test)]
 mod test_health;
 #[cfg(test)]
+mod test_multisig_approval;
+/// Paginated signal expiry pruning tests (Issue #779).
+#[cfg(test)]
+mod test_prune_expiry;
+#[cfg(test)]
+mod test_reward_stress;
+#[cfg(test)]
 mod test_scheduling;
 #[cfg(test)]
 mod test_signal_issues;
 #[cfg(test)]
-mod test_admin_transfer;
+mod tests;

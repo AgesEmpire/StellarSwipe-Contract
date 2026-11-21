@@ -6,8 +6,11 @@
 //!
 //! Qualification: provider must have >= MIN_CLOSED_SIGNALS (10) closed signals.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
+use stellar_swipe_common::ttl_manager::{bump_persistent_if_needed, force_bump_persistent};
 
+use crate::events::emit_deprecated_entry_point_used;
+use crate::social;
 use crate::stake;
 use crate::types::ProviderPerformance;
 
@@ -62,6 +65,14 @@ pub enum LeaderboardKey {
 
 // ── Index entry ───────────────────────────────────────────────────────────────
 
+/// # Tie-breaking rule (applied when primary scores are equal)
+///
+/// 1. **Earlier registration timestamp** ranks higher (smaller `registered_at` wins).
+/// 2. **Lexicographic address bytes** as a final fallback for byte-exact determinism
+///    (earlier / smaller raw bytes wins).
+///
+/// This guarantees repeated queries against unchanged data always return entries
+/// in the same order regardless of insertion order.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct IndexEntry {
@@ -72,11 +83,14 @@ pub struct IndexEntry {
     pub total_profit_delta: i128,
     pub stake_amount: i128,
     pub verified: bool,
+    /// Ledger timestamp when this provider first registered (used for tie-breaking).
+    pub registered_at: u64,
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn load_index(env: &Env, key: LeaderboardKey) -> Vec<IndexEntry> {
+    bump_persistent_if_needed(env, &key);
     env.storage()
         .persistent()
         .get(&key)
@@ -85,10 +99,20 @@ fn load_index(env: &Env, key: LeaderboardKey) -> Vec<IndexEntry> {
 
 fn save_index(env: &Env, key: LeaderboardKey, index: &Vec<IndexEntry>) {
     env.storage().persistent().set(&key, index);
+    bump_persistent_if_needed(env, &key);
+}
+
+/// Force-extend TTL for all four leaderboard index keys.  Intended to be
+/// called by a keeper via the `bump_leaderboard_ttl` contract entrypoint.
+pub fn bump_all_leaderboard_keys(env: &Env) {
+    force_bump_persistent(env, &LeaderboardKey::SuccessRateIndex);
+    force_bump_persistent(env, &LeaderboardKey::AdoptersIndex);
+    force_bump_persistent(env, &LeaderboardKey::ProfitDeltaIndex);
+    force_bump_persistent(env, &LeaderboardKey::StakeIndex);
 }
 
 fn is_qualified(entry: &IndexEntry) -> bool {
-    entry.closed_signals >= MIN_CLOSED_SIGNALS
+    entry.closed_signals >= MIN_CLOSED_SIGNALS && entry.total_adopters > 0
 }
 
 fn upsert_sorted<F>(env: &Env, index: &mut Vec<IndexEntry>, entry: IndexEntry, score_fn: F)
@@ -111,9 +135,28 @@ where
     let entry_score = score_fn(&entry);
     let mut insert_at = without.len();
     for i in 0..without.len() {
-        if score_fn(&without.get(i).unwrap()) < entry_score {
+        let existing = without.get(i).unwrap();
+        let existing_score = score_fn(&existing);
+        if existing_score < entry_score {
             insert_at = i;
             break;
+        }
+        // Tie-break: same primary score
+        if existing_score == entry_score {
+            // Rule 1: earlier registration timestamp ranks higher
+            if entry.registered_at < existing.registered_at {
+                insert_at = i;
+                break;
+            }
+            if entry.registered_at == existing.registered_at {
+                // Rule 2: lexicographic address bytes — smaller raw bytes ranks higher
+                let entry_bytes = entry.provider.to_string();
+                let existing_bytes = existing.provider.to_string();
+                if entry_bytes < existing_bytes {
+                    insert_at = i;
+                    break;
+                }
+            }
         }
     }
 
@@ -145,6 +188,13 @@ pub fn update_leaderboard_index(env: &Env, provider: Address, stats: &ProviderPe
         .successful_signals
         .saturating_add(stats.failed_signals);
 
+    // Retrieve registration timestamp for tie-breaking; fall back to 0 if not
+    // yet profiled (providers registered before the profile feature are sorted
+    // after properly-profiled ones with the same score).
+    let registered_at = crate::providers::get_provider_profile(env, &provider)
+        .map(|p| p.created_at)
+        .unwrap_or(0);
+
     let entry = IndexEntry {
         provider: provider.clone(),
         closed_signals,
@@ -153,6 +203,7 @@ pub fn update_leaderboard_index(env: &Env, provider: Address, stats: &ProviderPe
         total_profit_delta: stats.avg_return.saturating_mul(closed_signals as i128),
         stake_amount,
         verified,
+        registered_at,
     };
 
     let mut sr = load_index(env, LeaderboardKey::SuccessRateIndex);
@@ -218,18 +269,81 @@ pub fn get_provider_leaderboard(
 }
 
 /// Legacy wrapper kept for backward-compat with existing get_leaderboard callers.
+///
+/// Issue #948: this is a deprecated entry point — `get_provider_leaderboard`
+/// (and `get_followers_leaderboard` for the `Followers` metric) is the
+/// current implementation. The shim still routes every call through to the
+/// current logic so behavior is unchanged, but it now emits
+/// `DeprecatedEntryPointUsed` so integrators calling the old signature are
+/// visible on-chain and can migrate off it.
 pub fn get_leaderboard(
     env: &Env,
-    _stats_map: &soroban_sdk::Map<Address, ProviderPerformance>,
+    stats_map: &soroban_sdk::Map<Address, ProviderPerformance>,
     metric: LeaderboardMetric,
     limit: u32,
 ) -> Vec<ProviderLeaderboardEntry> {
-    let pm = match metric {
-        LeaderboardMetric::SuccessRate => ProviderMetric::BySuccessRate,
-        LeaderboardMetric::Volume => ProviderMetric::ByTotalProfitDelta,
-        LeaderboardMetric::Followers => return Vec::new(env),
-    };
-    get_provider_leaderboard(env, pm, limit)
+    emit_deprecated_entry_point_used(
+        env,
+        Symbol::new(env, "get_leaderboard"),
+        Symbol::new(env, "get_provider_leaderboard"),
+    );
+    match metric {
+        LeaderboardMetric::SuccessRate => {
+            get_provider_leaderboard(env, ProviderMetric::BySuccessRate, limit)
+        }
+        LeaderboardMetric::Volume => {
+            get_provider_leaderboard(env, ProviderMetric::ByTotalProfitDelta, limit)
+        }
+        LeaderboardMetric::Followers => get_followers_leaderboard(env, stats_map, limit),
+    }
+}
+
+fn get_followers_leaderboard(
+    env: &Env,
+    stats_map: &soroban_sdk::Map<Address, ProviderPerformance>,
+    limit: u32,
+) -> Vec<ProviderLeaderboardEntry> {
+    let mut providers: Vec<ProviderLeaderboardEntry> = Vec::new(env);
+    for key in stats_map.keys() {
+        if let Some(stats) = stats_map.get(key.clone()) {
+            let follower_count = social::get_follower_count(env, &key);
+            if follower_count == 0 {
+                continue;
+            }
+            let stake_amount = stake::get_stake_info(env, &key)
+                .as_ref()
+                .map(|s| s.amount)
+                .unwrap_or(0);
+            providers.push_back(ProviderLeaderboardEntry {
+                rank: 0,
+                provider: key.clone(),
+                metric_value: follower_count as i128,
+                total_signals: stats.total_signals,
+                verified: stake_amount >= stake::DEFAULT_MINIMUM_STAKE,
+            });
+        }
+    }
+
+    let len = providers.len();
+    for i in 0..len {
+        for j in 0..(len - i - 1) {
+            let curr = providers.get(j).unwrap();
+            let next = providers.get(j + 1).unwrap();
+            if curr.metric_value < next.metric_value {
+                providers.set(j, next);
+                providers.set(j + 1, curr);
+            }
+        }
+    }
+
+    let take = limit.min(providers.len());
+    let mut result = Vec::new(env);
+    for i in 0..take {
+        let mut entry = providers.get(i).unwrap();
+        entry.rank = i + 1;
+        result.push_back(entry);
+    }
+    result
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -238,7 +352,7 @@ pub fn get_leaderboard(
 mod tests {
     use super::*;
     use crate::types::ProviderPerformance;
-    use soroban_sdk::testutils::Address as TestAddress;
+    use soroban_sdk::testutils::{Address as TestAddress, Events as _};
     use soroban_sdk::{contract, Env};
 
     #[contract]
@@ -259,7 +373,35 @@ mod tests {
             success_rate,
             avg_return,
             total_volume: 0,
+            follower_count: 0,
         }
+    }
+
+    #[test]
+    fn test_zero_adoption_excluded_from_leaderboard() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p = Address::generate(&env);
+            // 10 closed signals but zero adopters
+            let stats = make_stats(8000, 0, 100, 5, 5);
+            update_leaderboard_index(&env, p, &stats);
+            let lb = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
+            assert_eq!(lb.len(), 0);
+        });
+    }
+
+    #[test]
+    fn test_one_adoption_included_in_leaderboard() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p = Address::generate(&env);
+            let stats = make_stats(8000, 1, 100, 5, 5);
+            update_leaderboard_index(&env, p, &stats);
+            let lb = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
+            assert_eq!(lb.len(), 1);
+        });
     }
 
     /// 30 providers with varied metrics — verify top-10 by each metric.
@@ -269,6 +411,7 @@ mod tests {
         let cid = env.register(TestContract, ());
 
         env.as_contract(&cid, || {
+            env.cost_estimate().budget().reset_unlimited();
             // Provider i:
             //   success_rate   = (i+1)*100   bps  (100..=3000)
             //   total_copies   = (i+1)*5          (5..=150)
@@ -293,9 +436,7 @@ mod tests {
             assert_eq!(lb.get(0).unwrap().metric_value, 3000);
             assert_eq!(lb.get(0).unwrap().rank, 1);
             for i in 0..9u32 {
-                assert!(
-                    lb.get(i).unwrap().metric_value >= lb.get(i + 1).unwrap().metric_value
-                );
+                assert!(lb.get(i).unwrap().metric_value >= lb.get(i + 1).unwrap().metric_value);
             }
 
             // BY_TOTAL_ADOPTERS
@@ -303,18 +444,14 @@ mod tests {
             assert_eq!(lb.len(), 10);
             assert_eq!(lb.get(0).unwrap().metric_value, 150);
             for i in 0..9u32 {
-                assert!(
-                    lb.get(i).unwrap().metric_value >= lb.get(i + 1).unwrap().metric_value
-                );
+                assert!(lb.get(i).unwrap().metric_value >= lb.get(i + 1).unwrap().metric_value);
             }
 
             // BY_TOTAL_PROFIT_DELTA
             let lb = get_provider_leaderboard(&env, ProviderMetric::ByTotalProfitDelta, 10);
             assert_eq!(lb.len(), 10);
             for i in 0..9u32 {
-                assert!(
-                    lb.get(i).unwrap().metric_value >= lb.get(i + 1).unwrap().metric_value
-                );
+                assert!(lb.get(i).unwrap().metric_value >= lb.get(i + 1).unwrap().metric_value);
             }
 
             // BY_STAKE — no stakes set, all zero; verify <= 10 and descending
@@ -397,6 +534,175 @@ mod tests {
             assert_eq!(lb.len(), 1);
             let lb_f = get_leaderboard(&env, &empty_map, LeaderboardMetric::Followers, 10);
             assert_eq!(lb_f.len(), 0);
+        });
+    }
+
+    // ── Tie-breaking tests (#611) ─────────────────────────────────────────────
+
+    /// Helper: build an IndexEntry directly so `registered_at` can be controlled.
+    fn make_entry(
+        env: &Env,
+        provider: Address,
+        success_rate: u32,
+        registered_at: u64,
+    ) -> IndexEntry {
+        IndexEntry {
+            provider,
+            closed_signals: 10,
+            success_rate,
+            total_adopters: 5,
+            total_profit_delta: 0,
+            stake_amount: 0,
+            verified: false,
+            registered_at,
+        }
+    }
+
+    /// Two providers with identical success-rate scores: the one that registered
+    /// *earlier* (smaller `registered_at`) must rank first.
+    #[test]
+    fn test_tiebreak_earlier_registration_ranks_higher() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p_early = Address::generate(&env);
+            let p_late = Address::generate(&env);
+
+            let score = 7500u32;
+            let mut idx = Vec::new(&env);
+            // Insert later-registered first, then earlier-registered
+            upsert_sorted(
+                &env,
+                &mut idx,
+                make_entry(&env, p_late.clone(), score, 2000),
+                |e| e.success_rate as i128,
+            );
+            upsert_sorted(
+                &env,
+                &mut idx,
+                make_entry(&env, p_early.clone(), score, 1000),
+                |e| e.success_rate as i128,
+            );
+
+            // Earlier registration (t=1000) should rank first
+            assert_eq!(idx.get(0).unwrap().provider, p_early);
+            assert_eq!(idx.get(1).unwrap().provider, p_late);
+        });
+    }
+
+    /// Repeated queries must return the exact same order (no non-determinism).
+    #[test]
+    fn test_tiebreak_repeated_queries_stable() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p1 = Address::generate(&env);
+            let p2 = Address::generate(&env);
+            let p3 = Address::generate(&env);
+
+            let stats = make_stats(8000, 10, 50, 5, 5);
+            update_leaderboard_index(&env, p1.clone(), &stats);
+            update_leaderboard_index(&env, p2.clone(), &stats);
+            update_leaderboard_index(&env, p3.clone(), &stats);
+
+            // Query three times — result must be identical every time
+            let q1 = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
+            let q2 = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
+            let q3 = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
+
+            assert_eq!(q1.len(), q2.len());
+            assert_eq!(q2.len(), q3.len());
+            for i in 0..q1.len() {
+                assert_eq!(q1.get(i).unwrap().provider, q2.get(i).unwrap().provider);
+                assert_eq!(q2.get(i).unwrap().provider, q3.get(i).unwrap().provider);
+            }
+        });
+    }
+
+    /// Entries with *distinct* primary scores must not be reordered by tie-breaking.
+    #[test]
+    fn test_tiebreak_does_not_alter_distinct_score_order() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p_high = Address::generate(&env);
+            let p_low = Address::generate(&env);
+
+            let mut idx = Vec::new(&env);
+            // p_high has score 9000, p_low has score 6000
+            // p_high registered later — tie-break would put p_low first if primary score didn't dominate
+            upsert_sorted(
+                &env,
+                &mut idx,
+                make_entry(&env, p_high.clone(), 9000, 5000),
+                |e| e.success_rate as i128,
+            );
+            upsert_sorted(
+                &env,
+                &mut idx,
+                make_entry(&env, p_low.clone(), 6000, 1000),
+                |e| e.success_rate as i128,
+            );
+
+            // Higher primary score must still win regardless of registration time
+            assert_eq!(idx.get(0).unwrap().provider, p_high);
+            assert_eq!(idx.get(1).unwrap().provider, p_low);
+        });
+    }
+
+    // ── Issue #948: deprecated entry point shim ─────────────────────────────
+    use soroban_sdk::TryFromVal;
+
+    fn has_deprecation_event(env: &Env) -> bool {
+        env.events().all().iter().any(|e| {
+            let topics: Vec<soroban_sdk::Val> = e.1.clone();
+            topics
+                .get(0)
+                .and_then(|t| soroban_sdk::Symbol::try_from_val(env, &t).ok())
+                .map(|s| s == Symbol::new(env, "deprecated_entry_point_used"))
+                .unwrap_or(false)
+        })
+    }
+
+    #[test]
+    fn test_legacy_get_leaderboard_emits_deprecation_event() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p = Address::generate(&env);
+            let stats = make_stats(8000, 1, 100, 5, 5);
+            update_leaderboard_index(&env, p, &stats);
+
+            let empty_stats_map: soroban_sdk::Map<Address, ProviderPerformance> =
+                soroban_sdk::Map::new(&env);
+            let board = get_leaderboard(&env, &empty_stats_map, LeaderboardMetric::SuccessRate, 10);
+
+            // Legacy path still returns correct data...
+            assert_eq!(board.len(), 1);
+            // ...but is now flagged on-chain as deprecated so callers can migrate.
+            assert!(
+                has_deprecation_event(&env),
+                "legacy get_leaderboard must emit DeprecatedEntryPointUsed"
+            );
+        });
+    }
+
+    #[test]
+    fn test_current_get_provider_leaderboard_emits_no_deprecation_event() {
+        let env = Env::default();
+        let cid = env.register(TestContract, ());
+        env.as_contract(&cid, || {
+            let p = Address::generate(&env);
+            let stats = make_stats(8000, 1, 100, 5, 5);
+            update_leaderboard_index(&env, p, &stats);
+
+            let board = get_provider_leaderboard(&env, ProviderMetric::BySuccessRate, 10);
+
+            assert_eq!(board.len(), 1);
+            assert!(
+                !has_deprecation_event(&env),
+                "current get_provider_leaderboard must not emit DeprecatedEntryPointUsed"
+            );
         });
     }
 }

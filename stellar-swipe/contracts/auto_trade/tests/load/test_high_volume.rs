@@ -109,16 +109,15 @@ fn test_1000_sequential_trades() {
     // Create 1 000 users and set up their auth + balance.
     // Reset budget to unlimited before bulk setup to avoid hitting limits.
     env.cost_estimate().budget().reset_unlimited();
-    let users: Vec<Address> = (0..NUM_USERS)
-        .map(|_| Address::generate(&env))
-        .collect();
+    let users: Vec<Address> = (0..NUM_USERS).map(|_| Address::generate(&env)).collect();
 
     env.as_contract(&contract_id, || {
         for user in &users {
             authorize_user_with_limits(&env, user, 1_000_000_000i128, 30);
-            env.storage()
-                .temporary()
-                .set(&(user.clone(), symbol_short!("balance")), &1_000_000_000i128);
+            env.storage().temporary().set(
+                &(user.clone(), symbol_short!("balance")),
+                &1_000_000_000i128,
+            );
         }
     });
 
@@ -200,7 +199,12 @@ fn test_1000_sequential_trades() {
         "expected ≥{NUM_TRADES} events, got {total_events}"
     );
 
-    print_metrics(&instruction_samples, max_instructions, total_events, &storage_snapshots);
+    print_metrics(
+        &instruction_samples,
+        max_instructions,
+        total_events,
+        &storage_snapshots,
+    );
 }
 
 /// Assert that the number of successful trades grows linearly across snapshots.
@@ -241,20 +245,39 @@ fn print_metrics(
     println!("\n╔══════════════════════════════════════════════════════╗");
     println!("║     StellarSwipe High-Volume Load Test Results       ║");
     println!("╠══════════════════════════════════════════════════════╣");
-    println!("║ Trades executed          : {:<6} / {:<6}             ║", samples.len(), NUM_TRADES);
+    println!(
+        "║ Trades executed          : {:<6} / {:<6}             ║",
+        samples.len(),
+        NUM_TRADES
+    );
     println!("╠══════════════════════════════════════════════════════╣");
     println!("║ CPU Instructions per trade                           ║");
     println!("║   Min                    : {:<12}              ║", min);
     println!("║   Avg                    : {:<12}              ║", avg);
-    println!("║   Max                    : {:<12}              ║", max_instructions);
-    println!("║   Max as % of budget     : {:<11}%              ║", budget_pct);
-    println!("║   80% threshold          : {:<12}              ║", SOROBAN_INSTRUCTION_LIMIT * 80 / 100);
+    println!(
+        "║   Max                    : {:<12}              ║",
+        max_instructions
+    );
+    println!(
+        "║   Max as % of budget     : {:<11}%              ║",
+        budget_pct
+    );
+    println!(
+        "║   80% threshold          : {:<12}              ║",
+        SOROBAN_INSTRUCTION_LIMIT * 80 / 100
+    );
     println!("╠══════════════════════════════════════════════════════╣");
-    println!("║ Total events emitted     : {:<6}                      ║", total_events);
+    println!(
+        "║ Total events emitted     : {:<6}                      ║",
+        total_events
+    );
     println!("╠══════════════════════════════════════════════════════╣");
     println!("║ Storage growth (successful trades, every 100)        ║");
     for (trade_idx, count) in storage_snapshots {
-        println!("║   After {:>4} trades       : {:>6} completed           ║", trade_idx, count);
+        println!(
+            "║   After {:>4} trades       : {:>6} completed           ║",
+            trade_idx, count
+        );
     }
     println!("╚══════════════════════════════════════════════════════╝\n");
 }

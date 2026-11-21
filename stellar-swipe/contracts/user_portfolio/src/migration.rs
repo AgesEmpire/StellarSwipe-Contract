@@ -41,7 +41,7 @@ pub fn migrate_user(env: &Env, user: &Address) -> (u32, u32) {
             .expect("position data missing during migration");
         match pos.status {
             PositionStatus::Open => open_ids.push_back(id),
-            PositionStatus::Closed => closed_ids.push_back(id),
+            PositionStatus::Closed | PositionStatus::Closing => closed_ids.push_back(id),
         }
     }
 
@@ -113,8 +113,24 @@ pub fn migrate_batch(env: &Env, batch_size: u32) -> u32 {
 }
 
 fn emit_migration_complete(env: &Env, user: &Address, open: u32, closed: u32) {
-    env.events().publish(
-        (symbol_short!("mig_done"), user.clone()),
-        (open, closed),
-    );
+    env.events()
+        .publish((symbol_short!("mig_done"), user.clone()), (open, closed));
+}
+
+/// Append `users` to the migration queue. Safe to call multiple times; duplicates
+/// are allowed — already-migrated users are skipped when the batch runs.
+pub fn register_migration_users(env: &Env, users: &Vec<Address>) {
+    let mut queue: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::MigrationQueue)
+        .unwrap_or_else(|| Vec::new(env));
+
+    for i in 0..users.len() {
+        queue.push_back(users.get_unchecked(i));
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::MigrationQueue, &queue);
 }

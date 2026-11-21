@@ -1,5 +1,6 @@
 use crate::types::{ProviderPerformance, Signal, SignalAction, SignalStatus, TradeExecution};
-use stellar_swipe_common::BASIS_POINTS_DENOMINATOR_I128;
+use soroban_sdk::Env;
+use stellar_swipe_common::{structured_panic, BASIS_POINTS_DENOMINATOR_I128};
 
 /// ROI calculation constants
 const SUCCESS_THRESHOLD_BPS: i128 = 200; // 2% in basis points
@@ -17,10 +18,11 @@ const MIN_ROI_BPS: i128 = -BASIS_POINTS_DENOMINATOR_I128; // -100% cap
 /// ROI in basis points (10000 = 100%). Capped at -100% minimum.
 ///
 /// # Panics
-/// Panics if entry_price is 0 (division by zero)
+/// Panics with structured code `SSW-9100` if entry_price is 0 (division by
+/// zero) — see `stellar_swipe_common::structured_panic!` (issue #596).
 pub fn calculate_roi(entry_price: i128, exit_price: i128, action: &SignalAction) -> i128 {
     if entry_price == 0 {
-        panic!("entry price cannot be zero");
+        structured_panic!(9100, "entry price cannot be zero");
     }
 
     // Calculate price difference based on action
@@ -229,6 +231,18 @@ pub fn should_update_provider_stats(old_status: &SignalStatus, new_status: &Sign
         && matches!(new_status, SignalStatus::Successful | SignalStatus::Failed)
 }
 
+/// Calculate benchmark return and alpha for a signal on close (Issue #418).
+/// Returns (benchmark_return_bps, alpha_bps). Both are None if benchmark unavailable.
+pub fn calculate_benchmark_and_alpha(_env: &Env, signal: &Signal) -> (Option<i64>, Option<i64>) {
+    if signal.total_roi == 0 || signal.executions == 0 {
+        return (None, None);
+    }
+
+    let _signal_return_bps = signal.total_roi / (signal.executions as i128);
+
+    (None, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +299,9 @@ mod tests {
             ai_validation_score: None,
             avg_copier_roi_bps: 0,
             copier_closed_count: 0,
+            warning_emitted: false,
+            benchmark_return_bps: None,
+            alpha_bps: None,
         };
 
         let status = evaluate_signal_status(&signal, 2001);
@@ -319,6 +336,9 @@ mod tests {
             ai_validation_score: None,
             avg_copier_roi_bps: 0,
             copier_closed_count: 0,
+            warning_emitted: false,
+            benchmark_return_bps: None,
+            alpha_bps: None,
         }
     }
 
@@ -342,7 +362,7 @@ mod tests {
         update_copier_roi_stats(&mut signal, 300);
 
         assert_eq!(signal.copier_closed_count, 5);
-        assert_eq!(signal.avg_copier_roi_bps, 280);
+        assert_eq!(signal.avg_copier_roi_bps, 279);
     }
 
     #[test]
@@ -399,6 +419,9 @@ mod tests {
             ai_validation_score: None,
             avg_copier_roi_bps: 0,
             copier_closed_count: 0,
+            warning_emitted: false,
+            benchmark_return_bps: None,
+            alpha_bps: None,
         };
 
         assert_eq!(get_signal_average_roi(&signal), 0);

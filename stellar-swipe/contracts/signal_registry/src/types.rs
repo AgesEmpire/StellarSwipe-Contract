@@ -1,6 +1,24 @@
 use crate::categories::{RiskLevel, SignalCategory};
 use soroban_sdk::{contracttype, Address, String, Symbol, Vec};
 
+/// Health probe response for the signal registry. Extends the shared
+/// `HealthStatus` shape with `expired_signal_count` so monitoring dashboards
+/// can surface storage-bloat pressure from expired signals (issue #779).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryHealthStatus {
+    pub is_initialized: bool,
+    pub is_paused: bool,
+    pub version: String,
+    pub admin: Address,
+    /// Signals past their expiry timestamp still occupying instance storage —
+    /// what `prune_expired_signals` would remove given a large enough budget.
+    pub expired_signal_count: u32,
+    /// Ledger timestamp (seconds) when the contract was initialized,
+    /// used by off-chain monitoring to compute uptime.
+    pub initialized_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SortOption {
@@ -31,6 +49,11 @@ pub enum SignalStatus {
     Expired,
     Successful,
     Failed,
+    /// Provider's Stellar account was deleted (merged). Signal is orphaned.
+    /// Existing copiers may still close open positions; new copies are blocked.
+    ProviderDeleted,
+    /// Provider explicitly cancelled the signal after the minimum lifetime elapsed.
+    Cancelled,
 }
 
 #[contracttype]
@@ -78,6 +101,25 @@ pub struct Signal {
     pub avg_copier_roi_bps: i32,
     /// Number of copiers whose positions have closed (denominator for avg_copier_roi_bps).
     pub copier_closed_count: u32,
+    /// Whether expiry warning has been emitted for this signal (Issue #417).
+    pub warning_emitted: bool,
+    /// Benchmark return in basis points at signal close (Issue #418).
+    pub benchmark_return_bps: Option<i64>,
+    /// Alpha (outperformance) in basis points at signal close (Issue #418).
+    pub alpha_bps: Option<i64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProviderMonthlyReport {
+    pub signals_submitted: u32,
+    pub signals_closed: u32,
+    pub success_rate: u32,
+    pub total_adopters: u32,
+    pub fees_earned: i128,
+    pub reputation_change: i32,
+    pub best_signal_id: Option<u64>,
+    pub worst_signal_id: Option<u64>,
 }
 
 /// Legacy on-chain format (v1) before v2 added `submitted_at`, `rationale_hash`,
@@ -135,7 +177,6 @@ pub struct SignalEditInput {
     pub confidence: u32,
 }
 
-
 #[contracttype]
 #[derive(Clone, Debug, Default)]
 pub struct ProviderPerformance {
@@ -146,6 +187,22 @@ pub struct ProviderPerformance {
     pub success_rate: u32,
     pub avg_return: i128,
     pub total_volume: i128,
+    pub follower_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Win,
+    Loss,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProviderProfile {
+    pub provider: Address,
+    pub last_5_outcomes: Vec<Outcome>,
+    pub cooling_off_ends_at: u64,
 }
 
 #[contracttype]
@@ -227,13 +284,71 @@ pub struct ImportResultView {
 // NEW SCHEDULING TYPES (Issue #42)
 // ==========================================
 
+/// V1 shape of SignalData — the original 4-field layout stored before the
+/// versioned-enum pattern was introduced (Issue #568). Kept for backward
+/// compatibility: any records written under the old shape decode as
+/// `VersionedSignalData::V1(SignalDataV1 { .. })` and are transparently
+/// upgraded to V2 on read.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SignalData {
+pub struct SignalDataV1 {
     pub asset_pair: String,
     pub action: SignalAction,
     pub price: i128,
     pub rationale: String,
+}
+
+/// Current (V2) shape of SignalData. Extends V1 with provider confidence
+/// and risk level, enabling richer scheduling context without a full
+/// migration pass over existing records (Issue #568).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalDataV2 {
+    pub asset_pair: String,
+    pub action: SignalAction,
+    pub price: i128,
+    pub rationale: String,
+    /// Provider confidence in this signal, 0–100.
+    pub confidence: u32,
+    /// Risk classification carried through to the published signal.
+    pub risk_level: crate::categories::RiskLevel,
+}
+
+/// Convenience alias so call-sites can refer to the current shape as
+/// `SignalData` without knowing the version number.
+pub type SignalData = SignalDataV2;
+
+/// Versioned wrapper stored in [`ScheduledSignal`]. Old records serialised as
+/// V1 remain readable; new records are always written as V2 (Issue #568).
+///
+/// Match / upgrade pattern:
+/// ```text
+/// let current: SignalDataV2 = versioned.resolve();
+/// ```
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum VersionedSignalData {
+    V1(SignalDataV1),
+    V2(SignalDataV2),
+}
+
+impl VersionedSignalData {
+    /// Resolve to the current V2 shape, upgrading a V1 record with sensible
+    /// defaults when encountered. All new data is written as V2, so this path
+    /// is only exercised for records that pre-date the versioned-enum pattern.
+    pub fn resolve(self) -> SignalDataV2 {
+        match self {
+            VersionedSignalData::V2(v2) => v2,
+            VersionedSignalData::V1(v1) => SignalDataV2 {
+                asset_pair: v1.asset_pair,
+                action: v1.action,
+                price: v1.price,
+                rationale: v1.rationale,
+                confidence: 50,
+                risk_level: crate::categories::RiskLevel::Medium,
+            },
+        }
+    }
 }
 
 #[contracttype]
@@ -258,7 +373,10 @@ pub struct RecurrencePattern {
 pub struct ScheduledSignal {
     pub id: u64,
     pub provider: Address,
-    pub signal_data: SignalData,
+    /// Versioned storage field — always written as V2 for new records.
+    /// Legacy V1 records are upgraded transparently via
+    /// [`VersionedSignalData::resolve`] (Issue #568).
+    pub signal_data: VersionedSignalData,
     pub publish_at: u64,
     pub recurrence: RecurrencePattern,
     pub status: ScheduleStatus,

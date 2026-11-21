@@ -31,8 +31,7 @@ use auto_trade::{
     Signal,
 };
 use soroban_sdk::{
-    contract, contractimpl,
-    symbol_short,
+    contract, contractimpl, symbol_short,
     testutils::{Address as _, Ledger as _},
     Address, BytesN, Env, String,
 };
@@ -178,9 +177,7 @@ fn test_position_state_preserved_after_upgrade() {
 
     // --- v1: open a position ---
     let trade_id: BytesN<32> = env.as_contract(&contract_id, || {
-        auto_trade::positions::open_position(
-            &env, &user, 1, 1, 500, 100, 80, 130,
-        )
+        auto_trade::positions::open_position(&env, &user, 1, 1, 500, 100, 80, 130)
     });
 
     // --- simulate upgrade ---
@@ -284,7 +281,10 @@ fn test_all_v1_state_accessible_in_v2() {
     });
 
     // v2 function works
-    assert_eq!(client.get_contract_version(), String::from_str(&env, "v2.0.0"));
+    assert_eq!(
+        client.get_contract_version(),
+        String::from_str(&env, "v2.0.0")
+    );
 }
 
 /// Verify that upgrade is only callable by admin.

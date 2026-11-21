@@ -1,29 +1,58 @@
 import WalletButton from "@/components/WalletButton";
+import { getNetworkMetadata } from "@/src/config/rpc-endpoints";
 
 export default function Home() {
-  return (
-    <>
-      <nav
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          padding: "16px 24px",
-          borderBottom: "1px solid #2a2a4a",
-        }}
-      >
-        <span style={{ fontWeight: 700, fontSize: 20, letterSpacing: 1 }}>
-          ✦ StellarSwipe
-        </span>
-        <WalletButton />
-      </nav>
+  const network = getNetworkMetadata();
 
-      <main style={{ padding: "48px 24px", textAlign: "center" }}>
-        <h1 style={{ fontSize: 36, marginBottom: 12 }}>Swipe. Copy. Trade.</h1>
-        <p style={{ color: "#9090c0" }}>
-          Connect your Freighter wallet to start copy-trading on Stellar.
-        </p>
-      </main>
-    </>
+  return (
+    <main className="shell">
+      <section className="hero">
+        <div className="brand-row">
+          <span className="brand-mark">✦</span>
+          <span className="brand-name">StellarSwipe</span>
+        </div>
+
+        <div className="hero-copy">
+          <p className="eyebrow">Network-aware contract dashboard</p>
+          <h1>Swipe. Copy. Trade.</h1>
+          <p className="lede">
+            The frontend now resolves the active Stellar network from{" "}
+            <code>NEXT_PUBLIC_STELLAR_NETWORK</code> and uses the matching RPC,
+            Horizon, and network passphrase from the shared config file.
+          </p>
+        </div>
+
+        <div className="network-card">
+          <div>
+            <span className="label">Selected network</span>
+            <strong>{network.network}</strong>
+          </div>
+          <div>
+            <span className="label">RPC</span>
+            <code>{network.rpc}</code>
+          </div>
+          <div>
+            <span className="label">Fallback RPC</span>
+            <code>{network.fallbackRpc}</code>
+          </div>
+          <div>
+            <span className="label">Horizon</span>
+            <code>{network.horizonUrl}</code>
+          </div>
+        </div>
+
+        <div className="cta-row">
+          <WalletButton />
+          <a
+            className="secondary-link"
+            href={network.horizonUrl}
+            target="_blank"
+            rel="noreferrer"
+          >
+            Open Horizon
+          </a>
+        </div>
+      </section>
+    </main>
   );
 }

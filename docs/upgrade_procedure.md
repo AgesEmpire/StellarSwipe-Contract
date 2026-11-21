@@ -94,6 +94,23 @@ Treat this as **procedure validation**; capture evidence in the ticket.
 - [ ] **On-call** roster for 24h post-upgrade (see Post-upgrade).
 - [ ] Stakeholders notified of **maintenance window** (if user-visible).
 
+### 8. Storage preflight (signal_registry)
+
+Before submitting `upgrade`, simulate the read-only `upgrade_preflight(target_version)` query. It writes no storage, emits no events and needs no authorization, so it is safe to run against mainnet at any time.
+
+| `readiness` | Meaning | Action |
+|---|---|---|
+| `Upgradeable` | Target is newer than the stored version and storage is ready. | Proceed. |
+| `Current` | Target equals the stored version. | Nothing to upgrade; check the target. |
+| `MigrationRequired` | `pending_v1_records > 0`: legacy v1 signals remain. | Run `migrate_signals_v1_to_v2` in batches until the preflight stops reporting this. |
+| `MigrationUnverified` | The last migration failed its invariant reconciliation (`migration_verified == false`). | Stop. Investigate with `get_migration_verification` before any upgrade. |
+| `IncompatibleVersion` | Target is lower than the stored version; `upgrade` would reject it as a downgrade. | Fix the target version. |
+| `IncompatibleSchema` | Stored `schema_version` is not one this code understands. | Stop. Do not upgrade or migrate; escalate. |
+
+When several conditions hold, the one lowest in the table wins. For example, an incompatible schema is reported even if v1 records are also pending. The report also returns `current_version`, `schema_version`, `supported_schema_version` and `migration_cursor` for the change record.
+
+- [ ] Preflight output for the target version attached to the change ticket, with `readiness` = `Upgradeable`.
+
 ---
 
 ## Upgrade (execution day)
@@ -211,6 +228,17 @@ soroban contract invoke \
 ```bash
 # Upload or install per your CLI; record the returned hash and compare to governance-approved 32-byte hash.
 soroban contract install --wasm WASM_PATH --source SOURCE --network NETWORK
+```
+
+**Storage preflight (read-only, signal_registry)**
+
+```bash
+soroban contract invoke \
+  --source SOURCE \
+  --network NETWORK \
+  --id CONTRACT_ID \
+  --send=no \
+  -- upgrade_preflight --target_version TARGET_VERSION
 ```
 
 **Post-upgrade verification**

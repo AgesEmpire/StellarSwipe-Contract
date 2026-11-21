@@ -59,7 +59,7 @@ pub fn calculate_reputation(env: &Env, oracle: &Address) -> u32 {
     };
 
     let total = accuracy_score as i128 + deviation_score + consistency_score as i128;
-    total.min(100).max(0) as u32
+    total.clamp(0, 100) as u32
 }
 
 pub fn adjust_oracle_weight(env: &Env, oracle: &Address) -> u32 {

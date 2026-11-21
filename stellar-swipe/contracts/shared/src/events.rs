@@ -342,6 +342,29 @@ pub fn emit_kyc_status_updated(env: &Env, evt: EvtKycStatusUpdated) {
     );
 }
 
+// ── Fee fallback event (Issue #390) ──────────────────────────────────────────
+
+/// Emitted when the primary fee deduction fails and the fee is instead
+/// deducted from the received trade amount.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtFeeDeductedFromReceived {
+    pub schema_version: u32,
+    pub user: Address,
+    pub fee_amount: i128,
+    pub trade_id: u64,
+}
+
+pub fn emit_fee_deducted_from_received(env: &Env, evt: EvtFeeDeductedFromReceived) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "fee_from_received"),
+        ),
+        evt,
+    );
+}
+
 // ── DCA event structs (Issue #360) ───────────────────────────────────────────
 
 #[contracttype]
@@ -372,6 +395,11 @@ pub struct EvtDCAPlanCancelled {
     pub signal_id: u64,
     pub intervals_completed: u32,
     pub reason: u32, // 0 = signal_expired, 1 = manual
+    /// Unexecuted capital returned to the user. DCA intervals are funded
+    /// per-interval rather than escrowed up front (see `dca::cancel_dca_plan`),
+    /// so this is always 0 today; the field exists so a future pre-funded
+    /// plan type can report a real refund without changing the event shape.
+    pub refunded_amount: i128,
 }
 
 pub fn emit_dca_interval_executed(env: &Env, evt: EvtDCAIntervalExecuted) {
@@ -399,6 +427,37 @@ pub fn emit_dca_plan_cancelled(env: &Env, evt: EvtDCAPlanCancelled) {
         (
             Symbol::new(env, "trade_executor"),
             Symbol::new(env, "dca_plan_cancelled"),
+        ),
+        evt,
+    );
+}
+
+// ── Partial fill event (Issue #959) ──────────────────────────────────────────
+
+/// Emitted when a copy-trade SDEX offer is only partially matched.
+/// Indexers should record the shortfall (`remaining_amount`) and surface it to
+/// the follower so they can decide whether to place a follow-up order.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtPartialFill {
+    pub schema_version: u32,
+    /// Address of the follower whose copy-trade was partially filled.
+    pub user: Address,
+    /// Monotonic receipt / trade ID assigned by the executor.
+    pub trade_id: u64,
+    /// Amount originally requested for the copy-trade.
+    pub requested_amount: i128,
+    /// Amount actually filled by the SDEX (may be 0 for a zero-fill).
+    pub filled_amount: i128,
+    /// Unfilled remainder (`requested_amount - filled_amount`).
+    pub remaining_amount: i128,
+}
+
+pub fn emit_partial_fill(env: &Env, evt: EvtPartialFill) {
+    env.events().publish(
+        (
+            Symbol::new(env, "trade_executor"),
+            Symbol::new(env, "partial_fill"),
         ),
         evt,
     );
@@ -441,6 +500,17 @@ pub struct EvtTradeExecuted {
     pub timestamp: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtInteractionLogged {
+    pub schema_version: u32,
+    pub user: Address,
+    pub function_name: String,
+    pub contract: String,
+    pub timestamp: u64,
+    pub success: bool,
+}
+
 // ── Analytics emit helpers (Issue #365) ──────────────────────────────────────
 
 pub fn emit_user_session_started(env: &Env, evt: EvtUserSessionStarted) {
@@ -480,6 +550,92 @@ pub fn emit_analytics_trade_executed(env: &Env, evt: EvtTradeExecuted) {
             Symbol::new(env, "trade_executed"),
         ),
         evt,
+    );
+}
+
+pub fn emit_interaction_logged(env: &Env, evt: EvtInteractionLogged) {
+    env.events().publish(
+        (
+            Symbol::new(env, "audit"),
+            Symbol::new(env, "interaction_logged"),
+        ),
+        evt,
+    );
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtStreakUpdated {
+    pub schema_version: u32,
+    pub user: Address,
+    pub current_streak: u32,
+    pub best_streak: u32,
+}
+
+pub fn emit_streak_updated(env: &Env, evt: EvtStreakUpdated) {
+    env.events().publish(
+        (
+            Symbol::new(env, "user_portfolio"),
+            Symbol::new(env, "streak_updated"),
+        ),
+        evt,
+    );
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtStreakBroken {
+    pub schema_version: u32,
+    pub user: Address,
+    pub streak_length: u32,
+}
+
+pub fn emit_streak_broken(env: &Env, evt: EvtStreakBroken) {
+    env.events().publish(
+        (
+            Symbol::new(env, "user_portfolio"),
+            Symbol::new(env, "streak_broken"),
+        ),
+        evt,
+    );
+}
+
+// ── Data access audit events (Issue: access logging) ────────────────────────
+
+/// Sensitive data types that trigger an access log event.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataType {
+    UserPortfolio,
+    StakeBalance,
+    ProviderProfile,
+}
+
+/// Emitted when an external caller reads sensitive storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvtDataAccessed {
+    pub schema_version: u32,
+    pub accessor: Address,
+    pub data_type: DataType,
+    pub owner: Address,
+    pub timestamp: u64,
+}
+
+/// Emit a `DataAccessed` event for an external read of sensitive data.
+///
+/// Call this only from public entry-points (not from internal helpers) so that
+/// internal reads do not produce spurious audit events.
+pub fn emit_data_accessed(env: &Env, accessor: Address, data_type: DataType, owner: Address) {
+    env.events().publish(
+        (Symbol::new(env, "audit"), Symbol::new(env, "data_accessed")),
+        EvtDataAccessed {
+            schema_version: SCHEMA_VERSION,
+            accessor,
+            data_type,
+            owner,
+            timestamp: env.ledger().timestamp(),
+        },
     );
 }
 
@@ -563,7 +719,11 @@ pub fn emit_once<F: FnOnce()>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{contract, contractimpl, testutils::{Address as _, Events, Ledger}, Env};
+    use soroban_sdk::{
+        contract, contractimpl,
+        testutils::{Address as _, Events, Ledger},
+        Env,
+    };
 
     #[contract]
     struct TestContract;
@@ -973,6 +1133,58 @@ mod tests {
         });
     }
 
+    // ── DataAccessed event tests ───────────────────────────────────────────────
+
+    #[test]
+    fn emit_data_accessed_emits_event_with_all_fields() {
+        let (env, contract_id) = setup();
+        let accessor = soroban_sdk::Address::generate(&env);
+        let owner = soroban_sdk::Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            emit_data_accessed(
+                &env,
+                accessor.clone(),
+                DataType::UserPortfolio,
+                owner.clone(),
+            );
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+
+    #[test]
+    fn emit_data_accessed_stake_balance() {
+        let (env, contract_id) = setup();
+        let accessor = soroban_sdk::Address::generate(&env);
+        let owner = soroban_sdk::Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            emit_data_accessed(
+                &env,
+                accessor.clone(),
+                DataType::StakeBalance,
+                owner.clone(),
+            );
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+
+    #[test]
+    fn emit_data_accessed_provider_profile() {
+        let (env, contract_id) = setup();
+        let accessor = soroban_sdk::Address::generate(&env);
+        let owner = soroban_sdk::Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            emit_data_accessed(
+                &env,
+                accessor.clone(),
+                DataType::ProviderProfile,
+                owner.clone(),
+            );
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
+
+    // ── Replay-envelope regression test (Issue: replay-compatible envelopes) ────
+
     #[test]
     fn test_retry_scenario_emits_single_event() {
         let (env, contract_id) = setup();
@@ -987,6 +1199,139 @@ mod tests {
                     .publish((Symbol::new(&env, "signal_adopted"),), 7u64);
             });
             assert_eq!(env.events().all().len(), 1);
+        });
+    }
+}
+
+// ── Replay-compatible event envelope (Issue: replay-compatible envelopes) ───────
+//
+// Stable envelope metadata emitted alongside (or preceding) business events so
+// analytics pipelines can reconstruct causal ordering across ledger replays,
+// node restarts, or cross-ledger archival dumps.
+//
+// # Fields
+//
+#[contracttype]
+pub enum ReplayStorageKey {
+    NextEnvelopeId,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayEnvelope {
+    pub schema_version: u32,
+    pub envelope_id: u64,
+    pub ledger_sequence: u32,
+    pub timestamp: u64,
+}
+
+/// Return the next monotonically-increasing envelope id and bump the counter.
+pub fn next_envelope_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&ReplayStorageKey::NextEnvelopeId)
+        .unwrap_or(0);
+    let next = id + 1;
+    env.storage()
+        .instance()
+        .set(&ReplayStorageKey::NextEnvelopeId, &next);
+    next
+}
+
+pub fn emit_replay_envelope(env: &Env) {
+    let envelope = ReplayEnvelope {
+        schema_version: 1,
+        envelope_id: next_envelope_id(env),
+        ledger_sequence: env.ledger().sequence(),
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(
+        (Symbol::new(env, "replay"), Symbol::new(env, "envelope")),
+        envelope,
+    );
+}
+
+/// Convenience: emit an envelope immediately followed by a business event.
+/// This helps analytics pipelines pair the envelope metadata with the actual
+/// payload while preserving stable ordering.
+pub fn emit_with_replay<E: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    topic: (Symbol, Symbol),
+    event: E,
+) {
+    emit_replay_envelope(env);
+    env.events().publish(topic, event);
+}
+
+// ── Replay envelope tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use soroban_sdk::{contract, testutils::Address as _, Env, FromVal};
+
+    #[contract]
+    struct TestContract;
+
+    fn setup() -> (Env, Address) {
+        let env = Env::default();
+        let id = env.register(TestContract, ());
+        (env, id)
+    }
+
+    #[test]
+    fn envelope_id_is_monotonically_increasing() {
+        let (env, contract_id) = setup();
+
+        env.as_contract(&contract_id, || {
+            let id1 = next_envelope_id(&env);
+            let id2 = next_envelope_id(&env);
+            let id3 = next_envelope_id(&env);
+            assert!(id1 < id2);
+            assert!(id2 < id3);
+        });
+    }
+
+    #[test]
+    fn envelope_survives_replay_of_same_ledger() {
+        use soroban_sdk::testutils::Events;
+        let (env, contract_id) = setup();
+
+        env.as_contract(&contract_id, || {
+            emit_replay_envelope(&env);
+            let first_len = env.events().all().len();
+            emit_replay_envelope(&env);
+            let second_len = env.events().all().len();
+            assert_eq!(first_len, 1);
+            assert_eq!(second_len, 2);
+        });
+    }
+
+    #[test]
+    fn emit_with_replay_publishes_envelope_then_event() {
+        use soroban_sdk::testutils::Events;
+        let (env, contract_id) = setup();
+
+        env.as_contract(&contract_id, || {
+            emit_with_replay(
+                &env,
+                (Symbol::new(&env, "trade"), Symbol::new(&env, "executed")),
+                42u64,
+            );
+
+            let events = env.events().all();
+            assert_eq!(events.len(), 2);
+            // First event must be the replay envelope
+            let envelope_topics = &events.get(0).unwrap().1;
+            assert_eq!(
+                Symbol::from_val(&env, &envelope_topics.get(0).unwrap()),
+                Symbol::new(&env, "replay")
+            );
+            assert_eq!(
+                Symbol::from_val(&env, &envelope_topics.get(1).unwrap()),
+                Symbol::new(&env, "envelope")
+            );
         });
     }
 }

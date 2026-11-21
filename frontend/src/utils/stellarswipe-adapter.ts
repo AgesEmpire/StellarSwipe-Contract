@@ -1,93 +1,120 @@
-// Integration utility for StellarSwipe contract data
+import {
+  getRpcCandidates,
+  getRpcEndpointConfig,
+  type RpcEndpointConfig,
+} from "../config/rpc-endpoints";
+
 export interface StellarSwipeStats {
   cash: number;
   incomeRate: number;
   boosts: number;
 }
 
-export type FetchErrorKind = 'network' | 'server';
+export type FetchErrorKind = "network" | "server";
 
 export class FetchError extends Error {
   constructor(public kind: FetchErrorKind, message: string) {
     super(message);
-    this.name = 'FetchError';
+    this.name = "FetchError";
   }
 }
 
 export class StellarSwipeHUDAdapter {
   private contractAddress: string;
-  private networkUrl: string;
+  private network: RpcEndpointConfig;
 
-  constructor(contractAddress: string, networkUrl: string = 'https://soroban-testnet.stellar.org') {
+  constructor(contractAddress: string, network: RpcEndpointConfig = getRpcEndpointConfig()) {
     this.contractAddress = contractAddress;
-    this.networkUrl = networkUrl;
+    this.network = network;
+  }
+
+  get rpcUrl(): string {
+    return this.network.primary_rpc;
+  }
+
+  get fallbackRpcUrl(): string {
+    return this.network.fallback_rpc;
+  }
+
+  get horizonUrl(): string {
+    return this.network.horizon_url;
+  }
+
+  get networkPassphrase(): string {
+    return this.network.network_passphrase;
+  }
+
+  private get rpcCandidates(): string[] {
+    return getRpcCandidates(
+      this.network.network_passphrase === getRpcEndpointConfig("mainnet").network_passphrase
+        ? "mainnet"
+        : "testnet"
+    );
   }
 
   async fetchTycoonStats(): Promise<StellarSwipeStats> {
-    let response: Response;
-    try {
-      response = await fetch(`${this.networkUrl}/contracts/${this.contractAddress}/stats`);
-    } catch {
-      throw new FetchError('network', 'Unable to reach the server. Check your connection.');
-    }
-    if (!response.ok) {
-      throw new FetchError('server', `Server error ${response.status}: ${response.statusText}`);
-      const response = await fetch(`${this.networkUrl}/contracts/${this.contractAddress}/stats`);
-      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      const data = await response.json();
-      // Mock implementation - replace with actual Soroban contract calls
-      const response = await fetch(`${this.networkUrl}/contracts/${this.contractAddress}/stats`);
-      
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
+    const errors: string[] = [];
 
-      const data = await response.json();
-      
-      return {
-        cash: data.cash || 0,
-        incomeRate: data.income_rate || 0,
-        boosts: data.active_boosts || 0,
-      };
-    } catch (error) {
-      console.error('Failed to fetch stats from StellarSwipe contract:', error);
-      // Return empty state on error
-      return { cash: 0, incomeRate: 0, boosts: 0 };
+    for (const baseUrl of this.rpcCandidates) {
+      try {
+        const response = await fetch(
+          `${baseUrl.replace(/\/+$/, "")}/contracts/${this.contractAddress}/stats`
+        );
+        if (!response.ok) {
+          errors.push(`HTTP ${response.status}: ${response.statusText}`);
+          continue;
+        }
+
+        const data = (await response.json()) as Partial<StellarSwipeStats> & {
+          income_rate?: number;
+          active_boosts?: number;
+        };
+
+        return {
+          cash: data.cash ?? 0,
+          incomeRate: data.incomeRate ?? data.income_rate ?? 0,
+          boosts: data.boosts ?? data.active_boosts ?? 0,
+        };
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+      }
     }
-    const data = await response.json();
-    return {
-      cash: data.cash || 0,
-      incomeRate: data.income_rate || 0,
-      boosts: data.active_boosts || 0,
-    };
+
+    throw new FetchError(
+      "network",
+      errors.length > 0
+        ? `Unable to reach the selected RPC endpoints: ${errors.join(" | ")}`
+        : "Unable to reach the selected RPC endpoint."
+    );
   }
 
-  // Batch multiple stat requests to reduce network calls
   async batchFetchStats(requests: string[]): Promise<StellarSwipeStats[]> {
-    let batchResponse: Response;
-    try {
-      batchResponse = await fetch(`${this.networkUrl}/batch`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ requests }),
-      });
-    } catch {
-      throw new FetchError('network', 'Unable to reach the server. Check your connection.');
-    }
-    if (!batchResponse.ok) {
-      throw new FetchError('server', `Batch request failed: ${batchResponse.status}`);
-      if (!batchResponse.ok) throw new Error(`Batch request failed: ${batchResponse.status}`);
+    const errors: string[] = [];
 
-      if (!batchResponse.ok) {
-        throw new Error(`Batch request failed: ${batchResponse.status}`);
+    for (const baseUrl of this.rpcCandidates) {
+      try {
+        const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/batch`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ requests }),
+        });
+
+        if (!response.ok) {
+          errors.push(`HTTP ${response.status}: ${response.statusText}`);
+          continue;
+        }
+
+        return (await response.json()) as StellarSwipeStats[];
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
       }
-
-      return await batchResponse.json();
-    } catch (error) {
-      console.error('Batch fetch failed:', error);
-      return requests.map(() => ({ cash: 0, incomeRate: 0, boosts: 0 }));
     }
-    return batchResponse.json();
+
+    throw new FetchError(
+      "network",
+      errors.length > 0
+        ? `Unable to reach the selected RPC endpoints: ${errors.join(" | ")}`
+        : "Unable to reach the selected RPC endpoint."
+    );
   }
-}
 }

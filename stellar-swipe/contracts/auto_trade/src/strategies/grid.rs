@@ -88,6 +88,23 @@ pub struct GridPerformance {
 pub enum GridDataKey {
     Strategy(u64),
     NextId,
+    /// Issue #1444: append-only revision history for a strategy's
+    /// `GridConfig`. Keyed by (strategy_id, revision_epoch).
+    ConfigRevision(u64, u32),
+    /// Next revision epoch to assign for a strategy (0 = the config set at
+    /// `initialize_grid_strategy` time, never itself stored as a revision).
+    ConfigRevisionEpoch(u64),
+}
+
+/// A single historical revision of a strategy's `GridConfig` (Issue #1444).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GridConfigRevision {
+    /// Monotonic per-strategy revision number (0 = first update away from
+    /// the initial config).
+    pub epoch: u32,
+    pub config: GridConfig,
+    pub updated_at: u64,
 }
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
@@ -258,6 +275,98 @@ pub fn place_grid_orders(env: &Env, strategy_id: u64) -> Result<(), AutoTradeErr
     Ok(())
 }
 
+// ── #1444 Strategy config revision history ───────────────────────────────────
+
+/// Update a grid strategy's configuration, retaining the prior config as an
+/// append-only revision rather than silently overwriting it.
+///
+/// Only fields that make sense to tune post-launch are accepted here
+/// (`order_size_per_grid` and `rebalance_on_fill`); grid geometry
+/// (`upper_price`/`lower_price`/`num_grids`/`grid_spacing`) requires
+/// re-initializing the strategy. The config in effect *before* this call is
+/// archived under the next revision epoch, retrievable via
+/// `get_grid_config_history` / `get_grid_config_revision`.
+pub fn update_grid_config(
+    env: &Env,
+    caller: &Address,
+    strategy_id: u64,
+    order_size_per_grid: i128,
+    rebalance_on_fill: bool,
+) -> Result<u32, AutoTradeError> {
+    caller.require_auth();
+    let mut strategy = load(env, strategy_id)?;
+    if &strategy.user != caller {
+        return Err(AutoTradeError::Unauthorized);
+    }
+    if order_size_per_grid <= 0 {
+        return Err(AutoTradeError::InvalidAmount);
+    }
+
+    // Archive the config as it stood before this update.
+    let epoch: u32 = env
+        .storage()
+        .persistent()
+        .get(&GridDataKey::ConfigRevisionEpoch(strategy_id))
+        .unwrap_or(0u32);
+    let revision = GridConfigRevision {
+        epoch,
+        config: strategy.grid_config.clone(),
+        updated_at: env.ledger().timestamp(),
+    };
+    env.storage()
+        .persistent()
+        .set(&GridDataKey::ConfigRevision(strategy_id, epoch), &revision);
+    env.storage()
+        .persistent()
+        .set(&GridDataKey::ConfigRevisionEpoch(strategy_id), &(epoch + 1));
+
+    strategy.grid_config.order_size_per_grid = order_size_per_grid;
+    strategy.grid_config.rebalance_on_fill = rebalance_on_fill;
+    save(env, strategy_id, &strategy);
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (Symbol::new(env, "grid_cfg_upd"), strategy_id),
+        (epoch, order_size_per_grid, rebalance_on_fill),
+    );
+
+    Ok(epoch)
+}
+
+/// Returns the number of archived config revisions for a strategy (i.e. how
+/// many times `update_grid_config` has been called).
+pub fn get_grid_config_revision_count(env: &Env, strategy_id: u64) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&GridDataKey::ConfigRevisionEpoch(strategy_id))
+        .unwrap_or(0u32)
+}
+
+/// Fetch a single archived config revision by epoch.
+pub fn get_grid_config_revision(
+    env: &Env,
+    strategy_id: u64,
+    epoch: u32,
+) -> Option<GridConfigRevision> {
+    env.storage()
+        .persistent()
+        .get(&GridDataKey::ConfigRevision(strategy_id, epoch))
+}
+
+/// Fetch the full archived config revision history for a strategy, oldest
+/// first. Does not include the currently active config — use
+/// `get_grid_strategy`/`load` for that.
+pub fn get_grid_config_history(env: &Env, strategy_id: u64) -> Vec<GridConfigRevision> {
+    let count = get_grid_config_revision_count(env, strategy_id);
+    let mut out = Vec::new(env);
+    for epoch in 0..count {
+        if let Some(rev) = get_grid_config_revision(env, strategy_id, epoch) {
+            out.push_back(rev);
+        }
+    }
+    out
+}
+
 /// Called when an order at a grid level is filled.
 pub fn on_grid_order_filled(
     env: &Env,
@@ -426,11 +535,10 @@ pub fn calculate_grid_performance(
     };
 
     let expected_fills = strategy.grid_config.num_grids * 2;
-    let fill_rate = if expected_fills > 0 {
-        ((total_fills * 10_000) / expected_fills) as u32
-    } else {
-        0
-    };
+    let fill_rate = total_fills
+        .checked_mul(10_000)
+        .and_then(|v| v.checked_div(expected_fills))
+        .unwrap_or(0) as u32;
 
     let avg_profit_per_fill = if total_fills > 0 {
         strategy.total_profit / total_fills as i128

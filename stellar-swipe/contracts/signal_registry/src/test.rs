@@ -6,11 +6,7 @@ use super::*;
 use crate::categories::{RiskLevel, SignalCategory};
 use crate::errors::AdminError;
 use crate::migration::test_seed_v1_signals;
-use soroban_sdk::{
-    testutils::Address as _,
-    testutils::Ledger,
-    vec, Env, Map, String,
-};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, vec, Env, Map, String};
 
 #[test]
 fn test_initialize_and_admin() {
@@ -75,6 +71,53 @@ fn create_and_read_signal() {
     let signal = client.get_signal(&signal_id).unwrap();
     assert_eq!(signal.id, signal_id);
     assert_eq!(signal.status, SignalStatus::Active);
+}
+
+#[test]
+fn test_submit_signal_from_template() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    client.initialize(&admin);
+
+    let template_id = client.save_signal_template(
+        &provider,
+        &SignalTemplatePreset {
+            asset_pair: String::from_str(&env, "XLM/USDC"),
+            action: SignalAction::Buy,
+            risk_rating: 3,
+            category: String::from_str(&env, "momentum"),
+            default_expiry_hours: 24,
+        },
+    );
+
+    let signal_id = client.submit_signal_from_template(
+        &provider,
+        &template_id,
+        &SignalTemplateOverrides {
+            asset_pair: None,
+            action: None,
+            risk_rating: None,
+            category: None,
+            expiry_hours: None,
+            price: Some(100_000),
+            rationale: Some(String::from_str(&env, "Template rationale")),
+        },
+    );
+
+    let signal = client.get_signal(&signal_id).unwrap();
+    assert_eq!(signal.asset_pair, String::from_str(&env, "XLM/USDC"));
+    assert_eq!(signal.price, 100_000);
+    assert_eq!(
+        signal.rationale,
+        String::from_str(&env, "Template rationale")
+    );
 }
 
 #[test]
@@ -421,18 +464,14 @@ fn test_multisig_enable_and_use() {
     signers.push_back(signer2.clone());
     signers.push_back(signer3.clone());
 
-    // Enable multi-sig with 2-of-3 threshold
     client.enable_multisig(&admin, &signers, &2);
 
     assert!(client.is_multisig_enabled());
     assert_eq!(client.get_multisig_threshold(), 2);
 
-    let returned_signers = client.get_multisig_signers();
-    assert_eq!(returned_signers.len(), 3);
-
-    // Any signer should be able to pause
-    client.pause_trading(&signer1);
-    assert!(client.is_paused());
+    // Direct pause by signer is blocked; use approval workflow instead
+    let result = client.try_pause_trading(&signer1);
+    assert_eq!(result, Err(Ok(AdminError::RequiresMultisigApproval)));
 }
 
 #[test]
@@ -689,11 +728,11 @@ fn test_cleanup_batch_limit() {
     use soroban_sdk::testutils::Ledger;
     env.ledger().set_timestamp(10000);
 
-    let provider = Address::generate(&env);
+    // Create 150 expired signals (unique providers avoid signal-submission rate limits)
     let current_time = env.ledger().timestamp();
-
-    // Create 150 expired signals
-    for _ in 0..150 {
+    for _i in 0..150 {
+        let provider = Address::generate(&env);
+        client.stake_tokens(&provider, &1_000_000_000i128);
         client.create_signal(
             &provider,
             &String::from_str(&env, "XLM/USDC"),
@@ -1169,4 +1208,39 @@ fn migration_v1_to_v2_batches() {
         let s = client.get_signal(&sid).expect("still v2");
         assert_eq!(s.id, sid);
     }
+}
+
+// ── Instruction-budget regression snapshots (Issue #budget) ───────────────────
+
+use stellar_swipe_common::budget_regression::measure_and_emit;
+
+#[test]
+fn submit_signal_budget_regression() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let provider = Address::generate(&env);
+    let expiry = env.ledger().timestamp() + 60;
+
+    env.budget().reset_tracker();
+    let _ = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Breakout confirmed"),
+        &expiry,
+        &SignalCategory::SWING,
+        &vec![&env, String::from_str(&env, "test")],
+        &RiskLevel::Medium,
+    );
+    let instructions = env.budget().cpu_instruction_cost();
+    measure_and_emit("signal_registry.submit_signal", 15_000_000, instructions);
 }

@@ -1,0 +1,39 @@
+{
+  "_comment": "TEMPLATE — copy to deployments/mainnet.manifest.json and replace every REPLACE_WITH_* placeholder with real values before a mainnet release. Named *.example.json (not *.manifest.json) so it is never auto-discovered or auto-validated by scripts/validate_deployment_manifest.py, scripts/deploy_testnet.sh, or CI — the placeholders below are intentionally invalid StrKeys so a copy that was never filled in fails validation loudly instead of silently deploying with garbage addresses.",
+  "network": "mainnet",
+  "admin": "REPLACE_WITH_MAINNET_ADMIN_ADDRESS",
+  "contracts": {
+    "stake_vault": {
+      "package": "stake_vault",
+      "address": null,
+      "version": 2,
+      "depends_on": {}
+    },
+    "signal_registry": {
+      "package": "signal_registry",
+      "address": null,
+      "version": 2,
+      "depends_on": {}
+    },
+    "fee_collector": {
+      "package": "fee_collector",
+      "address": null,
+      "version": 2,
+      "depends_on": {}
+    },
+    "user_portfolio": {
+      "package": "auto_trade",
+      "address": null,
+      "version": 2,
+      "depends_on": {}
+    },
+    "trade_executor": {
+      "package": "bridge",
+      "address": null,
+      "version": 1,
+      "depends_on": {
+        "user_portfolio": { "min_version": 2 }
+      }
+    }
+  }
+}

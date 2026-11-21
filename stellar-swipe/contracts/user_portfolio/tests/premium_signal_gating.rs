@@ -3,7 +3,9 @@
 use soroban_sdk::token::StellarAssetClient;
 use soroban_sdk::{testutils::Address as _, Address, Env, String, Vec};
 
-use signal_registry::{RiskLevel, SignalAction, SignalCategory, SignalRegistry, SignalRegistryClient};
+use signal_registry::{
+    RiskLevel, SignalAction, SignalCategory, SignalRegistry, SignalRegistryClient,
+};
 use user_portfolio::{UserPortfolio, UserPortfolioClient};
 
 #[test]
@@ -23,7 +25,9 @@ fn premium_signal_visible_only_to_subscriber_or_provider() {
     portfolio.initialize(&admin, &oracle);
 
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     StellarAssetClient::new(&env, &token).mint(&subscriber, &50_000_000i128);
 
     portfolio

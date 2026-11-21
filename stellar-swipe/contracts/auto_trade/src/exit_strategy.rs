@@ -132,8 +132,7 @@ pub fn check_and_execute_exits(
     for i in 0..tp_len {
         let tp = strategy.take_profit_tiers.get(i).unwrap();
         if !tp.executed && current_price >= tp.price && strategy.current_position_size > 0 {
-            let close_amount =
-                (strategy.current_position_size * tp.position_pct as i128) / 10_000;
+            let close_amount = (strategy.current_position_size * tp.position_pct as i128) / 10_000;
             let close_amount = close_amount.max(1);
 
             let trade_id = execute_sell(
@@ -154,11 +153,7 @@ pub fn check_and_execute_exits(
 
             #[allow(deprecated)]
             env.events().publish(
-                (
-                    Symbol::new(env, "tp_hit"),
-                    strategy_id,
-                    tp.price,
-                ),
+                (Symbol::new(env, "tp_hit"), strategy_id, tp.price),
                 (close_amount, strategy.current_position_size),
             );
         }
@@ -196,7 +191,7 @@ pub fn check_and_execute_exits(
 
         if let Some(trail_pct) = tightest_trail {
             let stop_price = calculate_trailing_stop(strategy.highest_price, trail_pct);
-            if current_price <= stop_price && strategy.current_position_size > 0 {
+            if current_price < stop_price && strategy.current_position_size > 0 {
                 let trade_id = execute_sell(
                     env,
                     &strategy.user,
@@ -513,7 +508,7 @@ mod tests {
 
             // Price rises to 1100 (no TP hit), then drops 10% → stop at 990
             check_and_execute_exits(&env, id, 1_100).unwrap();
-            let trades = check_and_execute_exits(&env, id, 990).unwrap();
+            let trades = check_and_execute_exits(&env, id, 989).unwrap();
             assert_eq!(trades.len(), 1);
 
             let s = get_exit_strategy(&env, id).unwrap();

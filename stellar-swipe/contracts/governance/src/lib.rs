@@ -3,36 +3,71 @@
 
 mod committees;
 mod conviction_voting;
+mod delegation_expiry;
+pub mod dependencies;
 mod distribution;
-mod errors;
+pub mod errors;
+pub use errors::GovernanceError;
+mod proposal_deposit;
 mod proposals;
 mod quadratic_voting;
 mod reputation;
+pub mod snapshot_pruning;
+mod shadow_mode;
+mod spend_window;
 mod timelock;
 mod token;
 mod treasury;
+/// Stash-account isolation for treasury funds (Issue #1044).
+mod treasury_stash;
 mod voting;
 
 #[cfg(test)]
 mod test;
 #[cfg(test)]
+#[allow(non_snake_case)]
+mod test_TomikeDS;
+#[cfg(test)]
+mod test_admin_timelock;
+#[cfg(test)]
+mod test_committee_elections;
+#[cfg(test)]
+mod test_duplicate_actions;
+#[cfg(test)]
 mod test_health;
+#[cfg(test)]
+mod test_pause_propagation;
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod test_portableDD;
+#[cfg(test)]
+mod test_simulation;
+#[cfg(test)]
+mod test_transition_events;
+#[cfg(test)]
+mod test_veto_window;
+#[cfg(test)]
+mod test_vote_deadline;
 
 use committees::{
     list_committees as list_registered_committees, CommitteeAction, CommitteeElection,
-    CommitteeReport, CommitteesState, CrossCommitteeRequest, VoteType,
+    CommitteeReport, CommitteesState, CrossCommitteeRequest, ElectionResult, ElectionStatus,
+    VoteType,
 };
 pub use committees::{
     Authority, Committee, CommitteeDecision, CrossCommitteeStatus, DecisionStatus,
+    ElectionResult as CommitteeElectionResult, ElectionStatus as CommitteeElectionStatus,
     EmergencyActionAuthority, EmergencyActionPayload, GrantApprovalAction, GrantApprovalAuthority,
     ParameterAdjustmentAuthority, PerformanceMetrics, RewardConfigUpdateAction,
     TreasurySpendAction, TreasurySpendAuthority, VetoAuthority, VetoPayload,
 };
 use conviction_voting::{
     analyze_conviction_proposal, change_conviction_vote, create_conviction_pool,
-    create_conviction_proposal, execute_conviction_funding, get_conviction_growth_curve,
-    refill_conviction_pool, update_proposal_conviction, vote_conviction, withdraw_conviction_vote,
-    ConvictionAnalytics, ConvictionStatus, ConvictionVotingPool,
+    create_conviction_proposal, execute_conviction_funding, get_conviction_calibration,
+    get_conviction_growth_curve, put_conviction_calibration, refill_conviction_pool,
+    set_conviction_decay_rate, update_proposal_conviction, vote_conviction,
+    withdraw_conviction_vote, ConvictionAnalytics, ConvictionCalibration, ConvictionStatus,
+    ConvictionVotingPool, MAX_DECAY_RATE, MIN_DECAY_RATE,
 };
 use distribution::{
     circulating_supply as calculate_circulating_supply, create_vesting_schedule as create_schedule,
@@ -40,44 +75,77 @@ use distribution::{
     releasable_amount, release_vested_tokens as release_schedule_tokens, update_reward_config,
     DistributionRecipients, DistributionState, VestingCategory, VestingSchedule,
 };
-pub use errors::GovernanceError;
-pub use proposals::GovernanceConfig;
 use proposals::{
     calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
-    default_governance_config, execute_proposal, finalize_proposal, get_all_proposals,
-    get_governance_config, get_proposal, Proposal, ProposalStatistics, ProposalStatus,
-    ProposalType, Vote, VoteDelegation, VoteType as GovernanceVoteType,
+    default_governance_config, effective_status, execute_proposal, expire_proposal,
+    finalize_proposal, get_active_proposals, get_all_proposals, get_category_threshold,
+    get_governance_config, get_proposal, get_proposal_status_report, reclaim_expired_proposal,
+    set_category_thresholds, simulate_proposal,
+    withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalStatusReport, ProposalType,
+    SimulationEffect, SimulationResult, Vote, VoteDelegation, VoteType as GovernanceVoteType,
+};
+pub use proposals::{
+    action_identity, validate_no_duplicate_actions, CategoryThreshold, GovernanceConfig,
+    ProposalCategory, ProposalTransitionEvent,
+};
+use quadratic_voting::{
+    allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
+    get_quadratic_vote, get_quadratic_voting_config, get_vote_credits, reallocate_quadratic_votes,
+    refund_credits_on_failure, set_quadratic_voting_config, verify_identity, QuadraticVote,
+    QuadraticVotingConfig, VerificationMethod, VoteCredits, VotingComparison,
 };
 use reputation::{
-    calculate_reputation_score, cast_reputation_weighted_vote, distribute_reputation_rewards,
-    get_governance_reputation, get_reputation_leaderboard, record_proposal_creation,
-    record_proposal_outcome, record_vote, Badge, GovernanceReputation,
+    calculate_reputation_score, cast_reputation_weighted_vote, detect_staleness,
+    distribute_reputation_rewards, get_governance_reputation, get_reputation_config,
+    get_reputation_leaderboard, put_reputation_config, record_proposal_creation,
+    record_proposal_outcome, record_vote, refresh_stale_reputation, resolve_staleness, Badge,
+    GovernanceReputation, ReputationConfig, ReputationTier, StalenessLevel,
 };
+pub use shadow_mode::{ShadowModeResult, ShadowModeState};
+use shared::capabilities::{self, Capability, CapabilityError};
+use shared::pausable;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Map, String, Symbol,
     Vec,
 };
 use stellar_swipe_common::Asset;
 use timelock::{
-    cancel_queued_action, emergency_execute, execute_multiple_actions, execute_queued_action,
-    extend_execution_window, generate_timelock_analytics, initialize_timelock, queue_action,
-    update_timelock_delay, ActionType, Timelock, TimelockAnalytics,
+    cancel_admin_action, cancel_queued_action, emergency_execute, emergency_unblock_action,
+    execute_admin_action, execute_multiple_actions, execute_queued_action, extend_execution_window,
+    generate_timelock_analytics, get_admin_pending_actions, get_queued_action, initialize_timelock,
+    queue_action, queue_admin_action, update_timelock_delay, ActionType, AdminTimelockEntry,
+    QueuedAction, Timelock, TimelockAnalytics,
 };
 pub use token::{HolderAnalytics, HolderBalance, TokenMetadata};
 pub use treasury::{
-    Budget, BudgetReport, RebalanceAction, RecurringPayment, Treasury, TreasuryReport,
-    TreasurySpend,
-};
-use quadratic_voting::{
-    allocate_vote_credits, cast_quadratic_vote, compare_voting_systems, reallocate_quadratic_votes,
-    refund_credits_on_failure, verify_identity, get_vote_credits, get_quadratic_vote,
-    get_quadratic_voting_config, set_quadratic_voting_config, calculate_marginal_cost,
-    QuadraticVotingConfig, VoteCredits, QuadraticVote, VerificationMethod,
-    VotingComparison,
+    AssetAllocation, Budget, BudgetApproval, BudgetReport, RebalanceAction, RecurringPayment,
+    Treasury, TreasuryDiversification, TreasuryReport, TreasurySpend,
 };
 
 const DEFAULT_LIQUIDITY_REWARD_BPS: u32 = 100;
 const DEFAULT_MIN_CLAIM_THRESHOLD: i128 = 100;
+
+// ── Issue #666: Proposal execution simulation ─────────────────────────────────
+
+/// Result of a `simulate_execution` dry-run.
+///
+/// `old_value` and `new_value` encode the projected state change:
+/// - `ParameterChange`: current and proposed parameter values.
+/// - `TreasurySpend`: current treasury asset balance and post-spend balance.
+/// - `FeatureToggle`: current flag (0/1) and proposed flag (0/1).
+/// - `ContractUpgrade`/`SignalProposal`/`Custom`: both 0 (no numeric diff).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ExecutionSimulationResult {
+    pub proposal_id: u64,
+    pub simulation_timestamp: u64,
+    pub would_succeed: bool,
+    pub old_value: i128,
+    pub new_value: i128,
+}
+
+soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
+soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
 
 #[contract]
 pub struct GovernanceContract;
@@ -108,8 +176,35 @@ pub enum StorageKey {
     ReputationState,
     VoteRecords,
     ConvictionState,
-    /// Global pause flag surfaced by `health_check` (admin-controlled).
-    ContractPaused,
+    /// Voting-power snapshot taken at proposal creation: Map<Address, i128>.
+    VoteSnapshots(u64),
+    /// Reputation decay and stale-score configuration.
+    ReputationConfig,
+    /// Conviction calibration configuration (penalty, reward, cap parameters).
+    ConvictionCalibration,
+    /// Issue #884: Pending admin for key rotation flow. Set by current admin
+    /// via `propose_key_rotation`; cleared when new admin accepts or rotation
+    /// is cancelled.
+    PendingAdmin,
+    /// Spam-deposit configuration for proposal creation.
+    DepositConfig,
+    /// Address of the treasury wallet for forfeited deposits.
+    TreasuryAddress,
+    /// Shadow-mode canary upgrade trial state (issue #589).
+    ShadowMode,
+    /// #693: Per-category quorum and supermajority thresholds (Map<u32, CategoryThreshold>).
+    CategoryThresholds,
+    /// Issue #865: downstream contract addresses that receive governance pause propagation.
+    PausePropagationTargets,
+    /// Pending admin timelock action entries.
+    AdminPendingActions,
+    StorageVersion,
+    MigrationInProgress,
+    /// Issue #942: when set to `true`, every category (b) admin entry point
+    /// (see `docs/governance-timelock-audit.md`) rejects direct calls and the
+    /// action must be routed through its `queue_*` + `*_timelocked` pair. This
+    /// is a one-way latch — see `enforce_admin_timelock`.
+    EnforceAdminTimelock,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -243,16 +338,41 @@ impl GovernanceContract {
             .set(&StorageKey::Initialized, &true);
         env.storage()
             .instance()
-            .set(&StorageKey::ContractPaused, &false);
+            .set(&StorageKey::StorageVersion, &1u32);
+        // Initialize pause state via shared::pausable (no event on init).
+        env.storage()
+            .instance()
+            .set(&pausable::PausableKey::Paused, &false);
         track_holder(&env, &recipients.team);
         track_holder(&env, &recipients.early_investors);
         track_holder(&env, &recipients.community_rewards);
         track_holder(&env, &recipients.treasury);
         track_holder(&env, &recipients.public_sale);
+        // Record treasury address for deposit settlement
+        env.storage()
+            .instance()
+            .set(&StorageKey::TreasuryAddress, &recipients.treasury);
 
         emit_initialized(&env, &admin, &name, &symbol, total_supply);
         emit_distribution_initialized(&env, &distribution);
         Ok(())
+    }
+
+    pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
+        let mut m = soroban_sdk::Map::new(&env);
+        m.set(
+            soroban_sdk::String::from_str(&env, "version"),
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "source_hash"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_SOURCE_HASH")),
+        );
+        m.set(
+            soroban_sdk::String::from_str(&env, "git_commit"),
+            soroban_sdk::String::from_str(&env, env!("STELLAR_GIT_COMMIT")),
+        );
+        m
     }
 
     /// Read-only health probe for monitoring and front-ends (no auth).
@@ -266,26 +386,157 @@ impl GovernanceContract {
             .instance()
             .get(&StorageKey::Admin)
             .unwrap_or_else(|| stellar_swipe_common::placeholder_admin(&env));
-        let is_paused = env
-            .storage()
-            .instance()
-            .get(&StorageKey::ContractPaused)
-            .unwrap_or(false);
-        stellar_swipe_common::HealthStatus {
+        let is_paused = pausable::is_paused(&env);
+        let status = stellar_swipe_common::HealthStatus {
             is_initialized: true,
             is_paused,
             version,
             admin,
-        }
+            initialized_at: env.ledger().timestamp(),
+        };
+        stellar_swipe_common::emit_health_event(&env, &status);
+        status
     }
 
-    /// Sets the global pause flag read by `health_check` (admin only).
-    pub fn set_contract_paused(env: Env, admin: Address, paused: bool) -> Result<(), GovernanceError> {
+    /// Admin-only: propose a key rotation to a new admin address.
+    /// The current admin must authorize. The rotation must be accepted
+    /// by the proposed new admin within the governance-configured delay.
+    pub fn propose_key_rotation(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+    ) -> Result<(), GovernanceError> {
         require_admin(&env, &admin)?;
+        if new_admin == admin {
+            return Err(GovernanceError::InvalidMetadata);
+        }
         env.storage()
             .instance()
-            .set(&StorageKey::ContractPaused, &paused);
+            .set(&StorageKey::PendingAdmin, &new_admin);
         Ok(())
+    }
+
+    /// Accept a pending key rotation. The caller becomes the new admin.
+    /// Only the address currently stored as PendingAdmin can call this.
+    pub fn accept_key_rotation(env: Env, new_admin: Address) -> Result<(), GovernanceError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingAdmin)
+            .ok_or(GovernanceError::Unauthorized)?;
+        if pending != new_admin {
+            return Err(GovernanceError::Unauthorized);
+        }
+        env.storage().instance().set(&StorageKey::Admin, &new_admin);
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
+        Ok(())
+    }
+
+    /// Admin-only: cancel a pending key rotation.
+    pub fn cancel_key_rotation(env: Env, admin: Address) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
+        Ok(())
+    }
+
+    /// Guardian-only: emergency revocation of the current admin.
+    /// Removes admin access and clears any pending rotation.
+    /// The guardian must authorize.
+    pub fn emergency_revoke_admin(env: Env, guardian: Address) -> Result<(), GovernanceError> {
+        let stored_guardian: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardian)
+            .ok_or(GovernanceError::Unauthorized)?;
+        if stored_guardian != guardian {
+            return Err(GovernanceError::Unauthorized);
+        }
+        guardian.require_auth();
+        env.storage().instance().remove(&StorageKey::Admin);
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
+        // Brick the contract until a trusted party re-initializes it with a
+        // fresh admin — an emergency revocation implies the admin key may be
+        // compromised, so other governance state should not stay reachable.
+        env.storage().instance().remove(&StorageKey::Initialized);
+        Ok(())
+    }
+
+    /// Admin-only: set the guardian address for emergency recovery.
+    pub fn set_guardian(
+        env: Env,
+        admin: Address,
+        guardian: Address,
+    ) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::Guardian, &guardian);
+        Ok(())
+    }
+
+    /// Sets the global pause flag (admin only) and propagates the change to
+    /// every registered downstream contract (Issue #865).
+    ///
+    /// Uses the shared [`pausable`] module so pause behavior and event shape
+    /// are consistent across all contracts that adopt it (Issue #561).
+    pub fn set_contract_paused(
+        env: Env,
+        admin: Address,
+        paused: bool,
+    ) -> Result<(), GovernanceError> {
+        // Issue #860: Capability-based authorization for pause actions.
+        require_capability(&env, &admin, Capability::Pause)?;
+        pausable::set_paused(&env, paused);
+        propagate_pause_to_downstream(&env, paused);
+        Ok(())
+    }
+
+    // ── Issue #865: governance pause propagation ───────────────────────────────
+
+    /// Register a downstream contract to receive pause/unpause propagation the
+    /// next time `set_contract_paused` is called. Admin only. Idempotent.
+    pub fn register_pause_target(
+        env: Env,
+        admin: Address,
+        target: Address,
+    ) -> Result<(), GovernanceError> {
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::Pause)?;
+        let mut targets = pause_targets(&env);
+        if !targets.contains(&target) {
+            targets.push_back(target);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PausePropagationTargets, &targets);
+        }
+        Ok(())
+    }
+
+    /// Unregister a downstream contract from pause propagation. Admin only.
+    pub fn unregister_pause_target(
+        env: Env,
+        admin: Address,
+        target: Address,
+    ) -> Result<(), GovernanceError> {
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::Pause)?;
+        let targets = pause_targets(&env);
+        let mut filtered = Vec::new(&env);
+        for t in targets.iter() {
+            if t != target {
+                filtered.push_back(t);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::PausePropagationTargets, &filtered);
+        Ok(())
+    }
+
+    /// Read-only: the downstream contracts currently registered for pause propagation.
+    pub fn get_pause_targets(env: Env) -> Vec<Address> {
+        pause_targets(&env)
     }
 
     pub fn get_metadata(env: Env) -> Result<TokenMetadata, GovernanceError> {
@@ -328,7 +579,61 @@ impl GovernanceContract {
         config: GovernanceConfig,
     ) -> Result<GovernanceConfig, GovernanceError> {
         require_initialized(&env)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
+        // Issue #942: direct call is blocked once timelock enforcement is on.
+        require_no_timelock_bypass(&env)?;
         proposals::configure_governance(&env, &admin, config)
+    }
+
+    // ── Issue #693: Category-specific quorum thresholds ───────────────────────
+
+    /// Admin: set per-category quorum and supermajority thresholds.
+    ///
+    /// A value of 0 in either field means "inherit from global GovernanceConfig".
+    /// Thresholds are validated to be ≤ 10 000 bps (100 %).
+    pub fn set_category_thresholds(
+        env: Env,
+        admin: Address,
+        category: ProposalCategory,
+        threshold: CategoryThreshold,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
+        // Issue #942: direct call is blocked once timelock enforcement is on.
+        require_no_timelock_bypass(&env)?;
+        set_category_thresholds(&env, &admin, category, threshold)
+    }
+
+    /// Returns the per-category threshold overrides for `category`, or `None`
+    /// if no override has been configured (global thresholds apply).
+    pub fn get_category_thresholds(
+        env: Env,
+        category: ProposalCategory,
+    ) -> Option<CategoryThreshold> {
+        get_category_threshold(&env, &category)
+    }
+
+    /// Configure the spam-deposit requirement for proposal creation.
+    ///
+    /// `config.amount` is the token amount locked from the proposer. Set to 0
+    /// to disable deposits. `config.min_participation_bps` is the minimum
+    /// participation (total_votes / total_supply, in bps) needed for a refund.
+    pub fn set_deposit_config(
+        env: Env,
+        admin: Address,
+        config: proposal_deposit::DepositConfig,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        // Issue #860: Capability-based authorization.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
+        proposal_deposit::set_deposit_config(&env, &admin, config)
+    }
+
+    /// Return the current proposal spam-deposit configuration.
+    pub fn get_deposit_config(env: Env) -> proposal_deposit::DepositConfig {
+        proposal_deposit::get_deposit_config(&env)
     }
 
     /// # Summary
@@ -342,6 +647,8 @@ impl GovernanceContract {
     /// - `title`: Short human-readable title.
     /// - `description`: Full proposal description.
     /// - `execution_payload`: Arbitrary bytes attached to the proposal (e.g. migration notes hash).
+    /// - `category`: Proposal category used to select per-category quorum/supermajority thresholds.
+    /// - `use_quadratic_voting`: When `true`, votes are weighted by sqrt(staked_balance).
     ///
     /// # Returns
     /// The new proposal ID.
@@ -358,8 +665,11 @@ impl GovernanceContract {
         title: String,
         description: String,
         execution_payload: Bytes,
+        category: ProposalCategory,
+        use_quadratic_voting: bool,
     ) -> Result<u64, GovernanceError> {
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         let proposal_id = proposals::create_proposal(
             &env,
             proposer.clone(),
@@ -367,19 +677,56 @@ impl GovernanceContract {
             title,
             description,
             execution_payload,
+            category,
+            use_quadratic_voting,
         )?;
+        proposal_deposit::lock_proposal_deposit(&env, proposal_id, &proposer)?;
         let _ = record_proposal_creation(&env, proposer);
         Ok(proposal_id)
     }
 
+    /// #1286: validate an action list for duplicate canonical identities without
+    /// creating a proposal. Rejected lists never reserve IDs, bonds or power.
+    pub fn validate_proposal_actions(
+        env: Env,
+        actions: Vec<ProposalType>,
+    ) -> Result<(), GovernanceError> {
+        proposals::validate_no_duplicate_actions(&env, &actions)
+    }
+
     pub fn proposal(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
         require_initialized(&env)?;
-        get_proposal(&env, proposal_id)
+        let mut proposal = get_proposal(&env, proposal_id)?;
+        proposal.status = effective_status(&env, &proposal);
+        Ok(proposal)
+    }
+
+    /// # Summary
+    /// Read-only proposal status and tally query (Issue #1292). Returns the
+    /// effective lifecycle state, current/final vote totals, resolved quorum
+    /// and approval thresholds, and all relevant deadlines in one call.
+    /// Unknown proposal IDs return `exists: false` with zeroed fields instead
+    /// of trapping.
+    pub fn proposal_status(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ProposalStatusReport, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(get_proposal_status_report(&env, proposal_id))
     }
 
     pub fn proposals(env: Env) -> Result<Vec<Proposal>, GovernanceError> {
         require_initialized(&env)?;
-        Ok(get_all_proposals(&env))
+        let all = get_all_proposals(&env);
+        let mut out = Vec::new(&env);
+        let mut i = 0;
+        while i < all.len() {
+            let mut proposal = all.get(i).unwrap();
+            proposal.status = effective_status(&env, &proposal);
+            out.push_back(proposal);
+            i += 1;
+        }
+        Ok(out)
     }
 
     /// # Summary
@@ -409,6 +756,7 @@ impl GovernanceContract {
         vote_type: GovernanceVoteType,
     ) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         voting::cast_vote(&env, proposal_id, voter.clone(), vote_type.clone())?;
         let _ = record_vote(&env, voter, proposal_id, vote_type);
         Ok(())
@@ -419,8 +767,29 @@ impl GovernanceContract {
         proposal_id: u64,
     ) -> Result<ProposalStatus, GovernanceError> {
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         let status = proposals::finalize_proposal(&env, proposal_id)?;
         let _ = record_proposal_outcome(&env, proposal_id);
+        // Settle spam-deposit: refund or forfeit based on participation.
+        let proposal = proposals::get_proposal(&env, proposal_id)
+            .unwrap_or_else(|_| panic!("proposal missing after finalize"));
+        let total_votes = proposal
+            .votes_for
+            .saturating_add(proposal.votes_against)
+            .saturating_add(proposal.votes_abstain);
+        let total_supply = get_total_supply(&env).unwrap_or(0);
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TreasuryAddress)
+            .unwrap_or_else(|| proposal.proposer.clone());
+        let _ = proposal_deposit::settle_proposal_deposit(
+            &env,
+            proposal_id,
+            total_votes,
+            total_supply,
+            &treasury,
+        );
         Ok(status)
     }
 
@@ -430,7 +799,90 @@ impl GovernanceContract {
         executor: Address,
     ) -> Result<ProposalStatus, GovernanceError> {
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         proposals::execute_proposal(&env, proposal_id, executor)
+    }
+
+    /// #1287: veto a passed proposal during its explicit veto window.
+    /// Only the configured guardian (which must authorize) may call this.
+    pub fn veto_proposal(
+        env: Env,
+        proposal_id: u64,
+        guardian: Address,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        require_not_paused(&env)?;
+        proposals::veto_proposal(&env, proposal_id, guardian)
+    }
+
+    pub fn migrate_storage(env: Env, admin: Address, from: u32) -> Result<u32, GovernanceError> {
+        require_admin(&env, &admin)?;
+        let current: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StorageVersion)
+            .unwrap_or(0);
+        if current == 1 {
+            return Ok(1);
+        }
+        if from != 0 || current != from {
+            return Err(GovernanceError::InvalidGovernanceConfig);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::MigrationInProgress, &true);
+        let state = proposals::get_proposals_state(&env);
+        if state.next_proposal_id == 0 {
+            return Err(GovernanceError::InvalidProposal);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::StorageVersion, &1u32);
+        env.storage()
+            .instance()
+            .remove(&StorageKey::MigrationInProgress);
+        Ok(1)
+    }
+
+    pub fn storage_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::StorageVersion)
+            .unwrap_or(0)
+    }
+
+    pub fn cleanup_proposals(env: Env, cursor: u32, limit: u32) -> Result<u32, GovernanceError> {
+        require_initialized(&env)?;
+        proposals::cleanup_terminal_proposals(&env, cursor, limit)
+    }
+
+    /// # Summary
+    /// Simulate execution of a governance proposal **without mutating state**.
+    ///
+    /// Runs the same logic as `execute_proposal` but returns a [`SimulationResult`]
+    /// describing every storage effect the proposal would cause, allowing
+    /// maintainers to validate proposal effects before executing on-chain.
+    ///
+    /// No authentication is required - the simulation is read-only and safe
+    /// to call via `simulateTransaction` RPC.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `proposal_id`: ID of the proposal to simulate.
+    ///
+    /// # Returns
+    /// `Ok(SimulationResult)` describing whether the execution would succeed,
+    /// an error message if it would fail, and the list of effects.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::NotInitialized`] - contract not initialized.
+    /// - [`GovernanceError::ProposalNotFound`] - `proposal_id` does not exist.
+    pub fn simulate_proposal(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<SimulationResult, GovernanceError> {
+        require_initialized(&env)?;
+        proposals::simulate_proposal(&env, proposal_id)
     }
 
     pub fn cancel_proposal(
@@ -440,6 +892,159 @@ impl GovernanceContract {
     ) -> Result<ProposalStatus, GovernanceError> {
         require_initialized(&env)?;
         proposals::cancel_proposal(&env, proposal_id, canceller)
+    }
+
+    /// # Summary
+    /// List proposals still eligible for voting or execution — i.e. not
+    /// `Cancelled`/`Failed`/`Executed`/`Withdrawn`/`Expired`, and not past
+    /// their `execution_deadline` even if their stored status hasn't caught
+    /// up yet (Issue #796).
+    pub fn get_active_proposals(env: Env) -> Result<Vec<Proposal>, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(proposals::get_active_proposals(&env))
+    }
+
+    /// # Summary
+    /// Persist the terminal `Expired` state for a passed proposal whose
+    /// execution deadline has passed (Issue #1291). Idempotent: repeated calls
+    /// succeed without changing state or settling any bond twice.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::InvalidDuration`] — deadline has not passed yet
+    ///   (`now == execution_deadline` is still executable).
+    /// - [`GovernanceError::ProposalNotApproved`] — proposal never succeeded.
+    pub fn expire_proposal(env: Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        expire_proposal(&env, proposal_id)
+    }
+
+    /// # Summary
+    /// Reclaim a `Succeeded` treasury spend proposal that was never executed
+    /// before its `execution_deadline` elapsed. Callable by **any** address —
+    /// not admin-gated — so DAO members can free up stale spend
+    /// authorisations without waiting on an admin. Removes the proposal and
+    /// emits a `TreasuryProposalExpired` event.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::NotInitialized`] — contract not initialized.
+    /// - [`GovernanceError::ProposalNotFound`] — `proposal_id` does not exist.
+    /// - [`GovernanceError::ProposalNotApproved`] — proposal never succeeded.
+    /// - [`GovernanceError::InvalidDuration`] — execution window hasn't closed yet.
+    pub fn reclaim_expired_proposal(
+        env: Env,
+        proposal_id: u64,
+        caller: Address,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        require_not_paused(&env)?;
+        proposals::reclaim_expired_proposal(&env, proposal_id, caller)
+    }
+
+    /// # Summary
+    /// Voluntarily withdraw a proposal before voting opens.  Only callable by
+    /// the original proposer while the proposal is still in `Pending` status.
+    ///
+    /// # Behaviour
+    /// - Authorization: only the original `proposer` may call this.
+    /// - State guard: proposal must be `Pending` (pre-vote).  Rejected if
+    ///   voting has already started (`Active`) or any terminal state is reached.
+    /// - Deposit: the spam-deposit is **refunded** to the proposer (unlike
+    ///   failed proposals which forfeit the deposit).  See inline docs in
+    ///   `proposals::withdraw_proposal` for the rationale.
+    /// - Event: a `propwdr` event is emitted on success.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `proposal_id`: ID of the proposal to withdraw.
+    /// - `proposer`: Address of the original proposer (must authorize).
+    ///
+    /// # Returns
+    /// `Ok(ProposalStatus::Withdrawn)` on success.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::NotInitialized`] — contract not initialized.
+    /// - [`GovernanceError::Unauthorized`] — caller is not the original proposer.
+    /// - [`GovernanceError::ProposalNotFound`] — proposal_id does not exist.
+    /// - [`GovernanceError::ProposalNotActive`] — proposal is not in Pending status.
+    pub fn withdraw_proposal(
+        env: Env,
+        proposal_id: u64,
+        proposer: Address,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        require_not_paused(&env)?;
+        proposals::withdraw_proposal(&env, proposal_id, proposer)
+    }
+
+    // ── Issue #666: Proposal execution payload simulation (dry-run) ───────────
+
+    /// Read-only dry-run of a proposal's execution payload.
+    ///
+    /// Applies the payload against a read-only view of current contract state and
+    /// returns the projected diff without writing to persistent storage. Emits a
+    /// `simulation_complete` event for off-chain/UI consumption.
+    ///
+    /// Returns `ExecutionSimulationResult::would_succeed = true` only when the proposal
+    /// is in `Succeeded` status and the payload would execute without error.
+    pub fn simulate_execution(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ExecutionSimulationResult, GovernanceError> {
+        require_initialized(&env)?;
+        let proposal = get_proposal(&env, proposal_id)?;
+
+        let executable = matches!(proposal.status, ProposalStatus::Succeeded);
+
+        let (old_value, new_value) = match &proposal.proposal_type {
+            ProposalType::ParameterChange(key, _old_expected, new_val) => {
+                let params: Map<String, i128> = env
+                    .storage()
+                    .instance()
+                    .get(&StorageKey::GovernanceParameters)
+                    .unwrap_or_else(|| Map::new(&env));
+                let current = params.get(key.clone()).unwrap_or(0);
+                (current, *new_val)
+            }
+            ProposalType::TreasurySpend(_recipient, amount, asset, _category) => {
+                let treasury = get_treasury(&env);
+                let current_balance = treasury.assets.get(asset.clone()).unwrap_or(0);
+                (current_balance, current_balance.saturating_sub(*amount))
+            }
+            ProposalType::FeatureToggle(name, enabled) => {
+                let features: Map<String, bool> = env
+                    .storage()
+                    .instance()
+                    .get(&StorageKey::GovernanceFeatures)
+                    .unwrap_or_else(|| Map::new(&env));
+                let current_flag = features.get(name.clone()).unwrap_or(false);
+                (current_flag as i128, *enabled as i128)
+            }
+            ProposalType::ContractUpgrade(_name, _wasm) => (0, 1),
+            ProposalType::SignalProposal(_text) => (0, 0),
+            ProposalType::Custom(_addr) => (0, 0),
+        };
+
+        let result = ExecutionSimulationResult {
+            proposal_id,
+            simulation_timestamp: env.ledger().timestamp(),
+            would_succeed: executable,
+            old_value,
+            new_value,
+        };
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("gov"), symbol_short!("sim_done")),
+            (
+                proposal_id,
+                executable,
+                old_value,
+                new_value,
+                env.ledger().timestamp(),
+            ),
+        );
+
+        Ok(result)
     }
 
     pub fn proposal_statistics(env: Env) -> Result<ProposalStatistics, GovernanceError> {
@@ -454,6 +1059,57 @@ impl GovernanceContract {
     ) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
         voting::delegate_voting_power(&env, delegator, delegate)
+    }
+
+    /// Delegate voting power until `expiry_ledger`; afterwards the delegation
+    /// is ignored automatically (Issue #1131).
+    pub fn delegate_voting_power_until(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+        expiry_ledger: u32,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        delegation_expiry::delegate_until(&env, delegator, delegate, expiry_ledger)
+    }
+
+    /// Extend a live delegation's expiry ledger.
+    pub fn renew_delegation(
+        env: Env,
+        delegator: Address,
+        new_expiry_ledger: u32,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        delegation_expiry::renew(&env, delegator, new_expiry_ledger)
+    }
+
+    pub fn get_delegation_expiry(env: Env, delegator: Address) -> Option<u32> {
+        delegation_expiry::get_expiry(&env, &delegator)
+    }
+
+    /// Permissionless, bounded and idempotent sweep of expired delegations.
+    pub fn cleanup_expired_delegations(env: Env, start: u32, limit: u32) -> u32 {
+        delegation_expiry::cleanup_expired(&env, start, limit)
+    }
+
+    /// Configure the rolling treasury spend window (Issue #1130).
+    pub fn set_treasury_spend_window(
+        env: Env,
+        admin: Address,
+        window_secs: u64,
+        cap: i128,
+    ) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        spend_window::configure(&env, window_secs, cap)
+    }
+
+    pub fn get_treasury_spend_window(env: Env) -> Option<spend_window::SpendWindowConfig> {
+        spend_window::get_config(&env)
+    }
+
+    /// Remaining spend capacity in the current window (`i128::MAX` if unset).
+    pub fn get_treasury_window_remaining(env: Env) -> i128 {
+        spend_window::remaining(&env)
     }
 
     pub fn undelegate_voting_power(env: Env, delegator: Address) -> Result<(), GovernanceError> {
@@ -473,12 +1129,14 @@ impl GovernanceContract {
         max_delay: u64,
         guardian: Address,
     ) -> Result<Timelock, GovernanceError> {
-        require_admin(&env, &admin)?;
+        // Issue #860: Capability-based authorization for parameter changes.
+        require_capability(&env, &admin, Capability::ParameterChange)?;
         initialize_timelock(&env, min_delay, max_delay, guardian)
     }
 
     pub fn queue_action(env: Env, proposal_id: u64) -> Result<u64, GovernanceError> {
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         timelock::queue_action(&env, proposal_id)
     }
 
@@ -488,6 +1146,7 @@ impl GovernanceContract {
         executor: Address,
     ) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         timelock::execute_queued_action(&env, action_id, executor)
     }
 
@@ -507,6 +1166,7 @@ impl GovernanceContract {
         new_delay: u64,
     ) -> Result<(), GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         timelock::update_timelock_delay(&env, action_type, new_delay)
     }
 
@@ -517,6 +1177,22 @@ impl GovernanceContract {
     ) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
         timelock::emergency_execute(&env, action_id, guardian)
+    }
+
+    /// Guardian-only recovery path that retries a queued action which is stuck
+    /// past its execution window due to ledger timing or contract state issues.
+    pub fn emergency_unblock_action(
+        env: Env,
+        action_id: u64,
+        guardian: Address,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        timelock::emergency_unblock_action(&env, action_id, guardian)
+    }
+
+    pub fn queued_action(env: Env, action_id: u64) -> Result<QueuedAction, GovernanceError> {
+        require_initialized(&env)?;
+        get_queued_action(&env, action_id)
     }
 
     pub fn timelock_analytics(env: Env) -> Result<TimelockAnalytics, GovernanceError> {
@@ -540,6 +1216,7 @@ impl GovernanceContract {
         executor: Address,
     ) -> Result<Vec<u64>, GovernanceError> {
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         timelock::execute_multiple_actions(&env, action_ids, executor)
     }
 
@@ -548,7 +1225,9 @@ impl GovernanceContract {
         user: Address,
     ) -> Result<GovernanceReputation, GovernanceError> {
         require_initialized(&env)?;
-        Ok(get_governance_reputation(&env, user))
+        let mut rep = get_governance_reputation(&env, user.clone());
+        rep.reputation_score = reputation::calculate_reputation_score(&env, user)?;
+        Ok(rep)
     }
 
     pub fn calculate_reputation_score(env: Env, user: Address) -> Result<u32, GovernanceError> {
@@ -571,7 +1250,7 @@ impl GovernanceContract {
         limit: u32,
     ) -> Result<Vec<(Address, u32)>, GovernanceError> {
         require_initialized(&env)?;
-        Ok(get_reputation_leaderboard(&env, limit))
+        get_reputation_leaderboard(&env, limit)
     }
 
     pub fn distribute_reputation_rewards(
@@ -581,6 +1260,39 @@ impl GovernanceContract {
     ) -> Result<Vec<(Address, i128)>, GovernanceError> {
         require_admin(&env, &admin)?;
         reputation::distribute_reputation_rewards(&env, reward_pool)
+    }
+
+    /// # Summary
+    /// Get the current reputation configuration (decay schedule, stale penalty settings).
+    pub fn reputation_config(env: Env) -> ReputationConfig {
+        get_reputation_config(&env)
+    }
+
+    /// # Summary
+    /// Admin-only: update the reputation configuration.
+    pub fn update_reputation_config(
+        env: Env,
+        admin: Address,
+        config: ReputationConfig,
+    ) -> Result<ReputationConfig, GovernanceError> {
+        require_admin(&env, &admin)?;
+        put_reputation_config(&env, &config);
+        Ok(config)
+    }
+
+    /// # Summary
+    /// Check the current staleness level for a user.
+    pub fn check_reputation_staleness(env: Env, user: Address) -> StalenessLevel {
+        let rep = get_governance_reputation(&env, user);
+        resolve_staleness(&env, &rep)
+    }
+
+    /// # Summary
+    /// Force-refresh a user's reputation score with current decay and staleness adjustments.
+    /// Can be called by anyone to update a stale score on-chain.
+    pub fn refresh_reputation(env: Env, user: Address) -> Result<u32, GovernanceError> {
+        require_initialized(&env)?;
+        refresh_stale_reputation(&env, user)
     }
 
     pub fn create_conviction_pool(
@@ -698,6 +1410,43 @@ impl GovernanceContract {
         conviction_voting::get_conviction_growth_curve(&env, pool_id, proposal_id, days)
     }
 
+    /// # Summary
+    /// Get the current conviction calibration configuration.
+    pub fn conviction_calibration(env: Env) -> ConvictionCalibration {
+        require_initialized(&env).unwrap_or(());
+        conviction_voting::get_conviction_calibration(&env)
+    }
+
+    /// # Summary
+    /// Admin-only: set the conviction calibration parameters (penalty threshold,
+    /// penalty multiplier, reward bonus percentage, and max conviction cap).
+    pub fn set_conviction_calibration(
+        env: Env,
+        admin: Address,
+        config: ConvictionCalibration,
+    ) -> Result<ConvictionCalibration, GovernanceError> {
+        require_admin(&env, &admin)?;
+        if config.penalty_multiplier == 0 || config.reward_bonus_pct > 100 {
+            return Err(GovernanceError::InvalidCalibrationConfig);
+        }
+        conviction_voting::put_conviction_calibration(&env, &config)?;
+        Ok(config)
+    }
+
+    /// # Summary
+    /// Admin-only: set the conviction decay rate (in basis points, 1-999).
+    /// A decay rate of 0 would disable decay (unbounded accumulation).
+    /// A decay rate of 1000 would cause instant full decay (votes always zero).
+    /// Returns Error::InvalidDecayRate if rate is outside MIN_DECAY_RATE..=MAX_DECAY_RATE.
+    pub fn set_conviction_decay_rate(
+        env: Env,
+        admin: Address,
+        rate: u64,
+    ) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        conviction_voting::set_conviction_decay_rate(&env, rate)
+    }
+
     pub fn distribution(env: Env) -> Result<DistributionState, GovernanceError> {
         require_initialized(&env)?;
         load_distribution_state(&env)
@@ -713,6 +1462,7 @@ impl GovernanceContract {
         duration_seconds: u64,
     ) -> Result<(), GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         create_schedule(
             &env,
             beneficiary.clone(),
@@ -757,8 +1507,56 @@ impl GovernanceContract {
         Ok(amount)
     }
 
+    // ── Shadow-mode canary upgrade (#589) ─────────────────────────────────────
+
+    /// Admin-only: begin a shadow-mode trial for a new WASM upgrade.
+    ///
+    /// During `trial_duration_seconds` read-only paths may call
+    /// `shadow_compare` to detect divergence between old and new logic.
+    pub fn enter_shadow_mode(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: Bytes,
+        trial_duration_seconds: u64,
+    ) -> Result<ShadowModeState, GovernanceError> {
+        require_initialized(&env)?;
+        require_no_timelock_bypass(&env)?;
+        shadow_mode::enter_shadow_mode(&env, &admin, new_wasm_hash, trial_duration_seconds)
+    }
+
+    /// Compare two output hashes for a read-only entrypoint during shadow mode.
+    ///
+    /// Emits a `shadow/discrep` event when they differ. Returns `true` on match.
+    pub fn shadow_compare(
+        env: Env,
+        entrypoint_id: u32,
+        old_output_hash: Bytes,
+        new_output_hash: Bytes,
+    ) -> bool {
+        shadow_mode::compare_shadow_results(&env, entrypoint_id, old_output_hash, new_output_hash)
+    }
+
+    /// Return whether the contract is currently in an active shadow-mode trial.
+    pub fn is_in_shadow_mode(env: Env) -> bool {
+        shadow_mode::is_in_shadow_mode(&env)
+    }
+
+    /// Admin-only: promote the new logic and end the shadow trial.
+    pub fn promote_from_shadow_mode(env: Env, admin: Address) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        require_no_timelock_bypass(&env)?;
+        shadow_mode::promote_from_shadow_mode(&env, &admin)
+    }
+
+    /// Admin-only: cancel the shadow trial without promoting.
+    pub fn cancel_shadow_mode(env: Env, admin: Address) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        shadow_mode::cancel_shadow_mode(&env, &admin)
+    }
+
     pub fn stake(env: Env, user: Address, amount: i128) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         user.require_auth();
         token::stake(&env, &user, amount)?;
         emit_stake_changed(&env, &user, amount, true);
@@ -767,6 +1565,7 @@ impl GovernanceContract {
 
     pub fn unstake(env: Env, user: Address, amount: i128) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         user.require_auth();
         token::unstake(&env, &user, amount)?;
         emit_stake_changed(&env, &user, amount, false);
@@ -846,6 +1645,7 @@ impl GovernanceContract {
         amount: i128,
     ) -> Result<Treasury, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut treasury = get_treasury(&env);
         treasury::set_asset_balance(&env, &mut treasury, asset, amount)?;
         put_treasury(&env, &treasury);
@@ -865,6 +1665,7 @@ impl GovernanceContract {
         auto_renew: bool,
     ) -> Result<Budget, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut treasury = get_treasury(&env);
         let budget = treasury::upsert_budget(
             &env,
@@ -881,6 +1682,49 @@ impl GovernanceContract {
         Ok(budget)
     }
 
+    /// Attach a governance-approved spending cap to an existing budget category.
+    ///
+    /// This **must** be called before any `execute_treasury_spend` for that
+    /// category.  Re-approving a category (e.g. each fiscal period) replaces
+    /// the previous cap and resets the drawn-down counter.
+    ///
+    /// # Parameters
+    /// - `admin`: Admin address (must authorize).
+    /// - `category`: Budget category that already exists via `create_budget`.
+    /// - `proposal_id`: The governance proposal ID that authorised this cap.
+    /// - `approved_cap`: Maximum cumulative spend allowed under this approval.
+    ///
+    /// # Returns
+    /// The recorded [`BudgetApproval`] on success.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::Unauthorized`] — caller is not the admin.
+    /// - [`GovernanceError::BudgetNotFound`] — `category` has no budget.
+    /// - [`GovernanceError::InvalidAmount`] — `approved_cap` ≤ 0.
+    /// - [`GovernanceError::BudgetExceeded`] — cap exceeds budget's `allocated`.
+    pub fn approve_treasury_budget(
+        env: Env,
+        admin: Address,
+        category: String,
+        proposal_id: u64,
+        approved_cap: i128,
+    ) -> Result<BudgetApproval, GovernanceError> {
+        require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
+        let mut treasury = get_treasury(&env);
+        let approval = treasury::approve_budget(
+            &env,
+            &mut treasury,
+            category,
+            proposal_id,
+            approved_cap,
+            env.ledger().timestamp(),
+        )?;
+        put_treasury(&env, &treasury);
+        emit_admin_action(&env, symbol_short!("budgapprv"), &admin, approved_cap);
+        Ok(approval)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn execute_treasury_spend(
         env: Env,
@@ -893,8 +1737,11 @@ impl GovernanceContract {
         approved_by_proposal: Option<u64>,
     ) -> Result<TreasurySpend, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
+        spend_window::consume(&env, amount)?;
         let mut treasury = get_treasury(&env);
         let spend = treasury::execute_spend(
+            &env,
             &mut treasury,
             recipient,
             amount,
@@ -923,6 +1770,7 @@ impl GovernanceContract {
         end_date: Option<u64>,
     ) -> Result<RecurringPayment, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut treasury = get_treasury(&env);
         let payment = treasury::schedule_recurring_payment(
             &env,
@@ -945,7 +1793,7 @@ impl GovernanceContract {
         require_admin(&env, &admin)?;
         let mut treasury = get_treasury(&env);
         let processed =
-            treasury::process_recurring_payments(&mut treasury, env.ledger().timestamp())?;
+            treasury::process_recurring_payments(&env, &mut treasury, env.ledger().timestamp())?;
         put_treasury(&env, &treasury);
         emit_admin_action(&env, symbol_short!("payrun"), &admin, processed as i128);
         Ok(processed)
@@ -954,6 +1802,20 @@ impl GovernanceContract {
     pub fn treasury_report(env: Env) -> Result<TreasuryReport, GovernanceError> {
         require_initialized(&env)?;
         treasury::build_report(&env, &get_treasury(&env))
+    }
+
+    /// Return a live diversification snapshot of the treasury's holdings.
+    ///
+    /// `prices` must map each held asset to its current USD-equivalent price.
+    /// Assets with a zero balance or no price entry are excluded from the result.
+    /// Concentration metrics (basis points) use oracle-price-weighted values so
+    /// cross-asset comparisons are meaningful.
+    pub fn get_treasury_diversification(
+        env: Env,
+        prices: Map<Asset, i128>,
+    ) -> Result<TreasuryDiversification, GovernanceError> {
+        require_initialized(&env)?;
+        treasury::get_diversification(&env, &get_treasury(&env), &prices)
     }
 
     pub fn committees(env: Env) -> Result<Vec<Committee>, GovernanceError> {
@@ -981,6 +1843,7 @@ impl GovernanceContract {
         term_duration_days: Option<u32>,
     ) -> Result<Committee, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut committees_state = get_committees_state(&env);
         let committee = committees::create_committee(
             &env,
@@ -1067,6 +1930,8 @@ impl GovernanceContract {
         committee_id: u64,
         positions_available: u32,
         duration_days: u32,
+        min_participation: u32,
+        quorum_stake_threshold: i128,
     ) -> Result<CommitteeElection, GovernanceError> {
         require_admin(&env, &admin)?;
         let mut committees_state = get_committees_state(&env);
@@ -1076,6 +1941,8 @@ impl GovernanceContract {
             committee_id,
             positions_available,
             duration_days,
+            min_participation,
+            quorum_stake_threshold,
         )?;
         put_committees_state(&env, &committees_state);
         emit_admin_action(
@@ -1140,10 +2007,10 @@ impl GovernanceContract {
         env: Env,
         admin: Address,
         committee_id: u64,
-    ) -> Result<Vec<Address>, GovernanceError> {
+    ) -> Result<CommitteeElectionResult, GovernanceError> {
         require_admin(&env, &admin)?;
         let mut committees_state = get_committees_state(&env);
-        let winners = committees::finalize_election(&env, &mut committees_state, committee_id)?;
+        let result = committees::finalize_election(&env, &mut committees_state, committee_id)?;
         put_committees_state(&env, &committees_state);
         emit_admin_action(
             &env,
@@ -1151,7 +2018,7 @@ impl GovernanceContract {
             &admin,
             committee_id as i128,
         );
-        Ok(winners)
+        Ok(result)
     }
 
     pub fn set_committee_approval_rating(
@@ -1192,6 +2059,7 @@ impl GovernanceContract {
         decision_id: u64,
     ) -> Result<CommitteeDecision, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut committees_state = get_committees_state(&env);
         let decision =
             committees::override_decision(&mut committees_state, committee_id, decision_id)?;
@@ -1206,6 +2074,7 @@ impl GovernanceContract {
         committee_id: u64,
     ) -> Result<Committee, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut committees_state = get_committees_state(&env);
         let committee = committees::dissolve_committee(&env, &mut committees_state, committee_id)?;
         put_committees_state(&env, &committees_state);
@@ -1271,6 +2140,7 @@ impl GovernanceContract {
         target_bps: i128,
     ) -> Result<Treasury, GovernanceError> {
         require_admin(&env, &admin)?;
+        require_no_timelock_bypass(&env)?;
         let mut treasury = get_treasury(&env);
         treasury::set_rebalance_target(&env, &mut treasury, asset, target_bps)?;
         put_treasury(&env, &treasury);
@@ -1295,6 +2165,627 @@ impl GovernanceContract {
         );
         Ok(actions)
     }
+
+    // ── Issue #860: Capability management ──────────────────────────────────────
+
+    /// Grant `capability` to `target` address. Only SuperAdmin may call this.
+    pub fn grant_capability(
+        env: Env,
+        caller: Address,
+        target: Address,
+        capability: Capability,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        require_capability(&env, &caller, Capability::SuperAdmin)?;
+        require_no_timelock_bypass(&env)?;
+        capabilities::grant_capability(&env, &caller, &target, capability);
+        Ok(())
+    }
+
+    /// Revoke `capability` from `target` address. Only SuperAdmin may call this.
+    pub fn revoke_capability(
+        env: Env,
+        caller: Address,
+        target: Address,
+        capability: Capability,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        require_capability(&env, &caller, Capability::SuperAdmin)?;
+        require_no_timelock_bypass(&env)?;
+        capabilities::revoke_capability(&env, &caller, &target, capability);
+        Ok(())
+    }
+
+    /// Check whether `target` holds `capability`.
+    pub fn has_capability(
+        env: Env,
+        target: Address,
+        capability: Capability,
+    ) -> Result<bool, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(capabilities::has_capability(&env, &target, capability))
+    }
+
+    /// List all capabilities granted to `target`.
+    pub fn list_capabilities(
+        env: Env,
+        target: Address,
+    ) -> Result<Vec<Capability>, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(capabilities::list_capabilities(&env, &target))
+    }
+
+    // ── Admin timelock queue/execute pairs ─────────────────────────────────────
+    //
+    // Category (b) functions that modify critical state must be routed through
+    // the admin timelock.  The flow is:
+    //   1. Call `queue_<action>(admin, ...)` → returns `action_id`
+    //   2. Wait for the timelock delay to elapse
+    //   3. Call `<action>(admin, action_id, ...)` → verifies delay, executes
+
+    pub fn queue_set_treasury_asset(
+        env: Env,
+        admin: Address,
+        _asset: Asset,
+        _amount: i128,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("trasset"))
+    }
+
+    pub fn set_treasury_asset_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        asset: Asset,
+        amount: i128,
+    ) -> Result<Treasury, GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        let mut treasury = get_treasury(&env);
+        treasury::set_asset_balance(&env, &mut treasury, asset, amount)?;
+        put_treasury(&env, &treasury);
+        emit_admin_action(&env, symbol_short!("trsasset"), &admin, amount);
+        Ok(treasury)
+    }
+
+    pub fn queue_execute_treasury_spend(
+        env: Env,
+        admin: Address,
+        _recipient: Address,
+        _amount: i128,
+        _asset: Asset,
+        _category: String,
+        _purpose: String,
+        _approved_by_proposal: Option<u64>,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("tspspend"))
+    }
+
+    pub fn treasury_spend_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        recipient: Address,
+        amount: i128,
+        asset: Asset,
+        category: String,
+        purpose: String,
+        approved_by_proposal: Option<u64>,
+    ) -> Result<TreasurySpend, GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        spend_window::consume(&env, amount)?;
+        let mut treasury = get_treasury(&env);
+        let spend = treasury::execute_spend(
+            &env,
+            &mut treasury,
+            recipient,
+            amount,
+            asset,
+            category,
+            purpose,
+            approved_by_proposal,
+            env.ledger().timestamp(),
+        )?;
+        put_treasury(&env, &treasury);
+        emit_admin_action(&env, symbol_short!("spend"), &admin, spend.amount);
+        Ok(spend)
+    }
+
+    pub fn queue_configure_governance(
+        env: Env,
+        admin: Address,
+        _config: GovernanceConfig,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("govcfg"))
+    }
+
+    pub fn configure_governance_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        config: GovernanceConfig,
+    ) -> Result<GovernanceConfig, GovernanceError> {
+        require_initialized(&env)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        proposals::configure_governance(&env, &admin, config)
+    }
+
+    pub fn queue_set_category_thresholds(
+        env: Env,
+        admin: Address,
+        _category: ProposalCategory,
+        _threshold: CategoryThreshold,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("catthresh"))
+    }
+
+    pub fn category_thresholds_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        category: ProposalCategory,
+        threshold: CategoryThreshold,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        set_category_thresholds(&env, &admin, category, threshold)
+    }
+
+    pub fn queue_create_committee(
+        env: Env,
+        admin: Address,
+        _name: String,
+        _description: String,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("cmtadd"))
+    }
+
+    pub fn create_committee_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        name: String,
+        description: String,
+        initial_members: Vec<Address>,
+        chair: Address,
+        max_members: u32,
+        authorities: Vec<Authority>,
+        term_duration_days: Option<u32>,
+    ) -> Result<Committee, GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        let mut committees_state = get_committees_state(&env);
+        let committee = committees::create_committee(
+            &env,
+            &mut committees_state,
+            name,
+            description,
+            initial_members,
+            chair,
+            max_members,
+            authorities,
+            term_duration_days,
+        )?;
+        put_committees_state(&env, &committees_state);
+        emit_admin_action(&env, symbol_short!("cmtadd"), &admin, committee.id as i128);
+        Ok(committee)
+    }
+
+    pub fn queue_dissolve_committee(
+        env: Env,
+        admin: Address,
+        _committee_id: u64,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("cmtdrop"))
+    }
+
+    pub fn dissolve_committee_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        committee_id: u64,
+    ) -> Result<Committee, GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        let mut committees_state = get_committees_state(&env);
+        let committee = committees::dissolve_committee(&env, &mut committees_state, committee_id)?;
+        put_committees_state(&env, &committees_state);
+        emit_admin_action(&env, symbol_short!("cmtdrop"), &admin, committee_id as i128);
+        Ok(committee)
+    }
+
+    pub fn queue_committee_override(
+        env: Env,
+        admin: Address,
+        _committee_id: u64,
+        _decision_id: u64,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("cmtover"))
+    }
+
+    pub fn committee_override_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        committee_id: u64,
+        decision_id: u64,
+    ) -> Result<CommitteeDecision, GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        let mut committees_state = get_committees_state(&env);
+        let decision =
+            committees::override_decision(&mut committees_state, committee_id, decision_id)?;
+        put_committees_state(&env, &committees_state);
+        emit_admin_action(&env, symbol_short!("cmtover"), &admin, decision_id as i128);
+        Ok(decision)
+    }
+
+    pub fn queue_set_guardian(
+        env: Env,
+        admin: Address,
+        _guardian: Address,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("setguard"))
+    }
+
+    pub fn set_guardian_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        guardian: Address,
+    ) -> Result<(), GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::Guardian, &guardian);
+        Ok(())
+    }
+
+    pub fn queue_grant_capability(
+        env: Env,
+        caller: Address,
+        _target: Address,
+        _capability: Capability,
+    ) -> Result<u64, GovernanceError> {
+        require_initialized(&env)?;
+        queue_admin_action(&env, caller, symbol_short!("capgrant"))
+    }
+
+    pub fn grant_capability_timelocked(
+        env: Env,
+        caller: Address,
+        action_id: u64,
+        target: Address,
+        capability: Capability,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        execute_admin_action(&env, action_id, &caller)?;
+        capabilities::grant_capability(&env, &caller, &target, capability);
+        Ok(())
+    }
+
+    pub fn queue_revoke_capability(
+        env: Env,
+        caller: Address,
+        _target: Address,
+        _capability: Capability,
+    ) -> Result<u64, GovernanceError> {
+        require_initialized(&env)?;
+        queue_admin_action(&env, caller, symbol_short!("caprevk"))
+    }
+
+    pub fn revoke_capability_timelocked(
+        env: Env,
+        caller: Address,
+        action_id: u64,
+        target: Address,
+        capability: Capability,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        execute_admin_action(&env, action_id, &caller)?;
+        capabilities::revoke_capability(&env, &caller, &target, capability);
+        Ok(())
+    }
+
+    pub fn queue_create_budget(
+        env: Env,
+        admin: Address,
+        _category: String,
+        _allocated: i128,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("budget"))
+    }
+
+    pub fn create_budget_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        category: String,
+        allocated: i128,
+        spend_limit: i128,
+        period_start: u64,
+        period_end: u64,
+        auto_renew: bool,
+    ) -> Result<Budget, GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        let mut treasury = get_treasury(&env);
+        let budget = treasury::upsert_budget(
+            &env,
+            &mut treasury,
+            category,
+            allocated,
+            spend_limit,
+            period_start,
+            period_end,
+            auto_renew,
+        )?;
+        put_treasury(&env, &treasury);
+        emit_admin_action(&env, symbol_short!("budget"), &admin, allocated);
+        Ok(budget)
+    }
+
+    pub fn queue_approve_treasury_budget(
+        env: Env,
+        admin: Address,
+        _category: String,
+        _proposal_id: u64,
+        _approved_cap: i128,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("budgapprv"))
+    }
+
+    pub fn treasury_budget_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        category: String,
+        proposal_id: u64,
+        approved_cap: i128,
+    ) -> Result<BudgetApproval, GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        let mut treasury = get_treasury(&env);
+        let approval = treasury::approve_budget(
+            &env,
+            &mut treasury,
+            category,
+            proposal_id,
+            approved_cap,
+            env.ledger().timestamp(),
+        )?;
+        put_treasury(&env, &treasury);
+        emit_admin_action(&env, symbol_short!("budgapprv"), &admin, approved_cap);
+        Ok(approval)
+    }
+
+    pub fn queue_create_recurring_payment(
+        env: Env,
+        admin: Address,
+        _recipient: Address,
+        _amount: i128,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("recur"))
+    }
+
+    pub fn recurring_payment_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        recipient: Address,
+        amount: i128,
+        asset: Asset,
+        frequency: u64,
+        category: String,
+        purpose: String,
+        approved_by_proposal: Option<u64>,
+        end_date: Option<u64>,
+    ) -> Result<RecurringPayment, GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        let mut treasury = get_treasury(&env);
+        let payment = treasury::schedule_recurring_payment(
+            &env,
+            &mut treasury,
+            recipient,
+            amount,
+            asset,
+            frequency,
+            category,
+            purpose,
+            approved_by_proposal,
+            end_date,
+        )?;
+        put_treasury(&env, &treasury);
+        emit_admin_action(&env, symbol_short!("recur"), &admin, amount);
+        Ok(payment)
+    }
+
+    pub fn queue_enter_shadow_mode(
+        env: Env,
+        admin: Address,
+        _new_wasm_hash: Bytes,
+        _trial_duration_seconds: u64,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("shadow"))
+    }
+
+    pub fn enter_shadow_mode_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        new_wasm_hash: Bytes,
+        trial_duration_seconds: u64,
+    ) -> Result<ShadowModeState, GovernanceError> {
+        require_initialized(&env)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        shadow_mode::enter_shadow_mode(&env, &admin, new_wasm_hash, trial_duration_seconds)
+    }
+
+    pub fn queue_promote_from_shadow_mode(
+        env: Env,
+        admin: Address,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("shpromt"))
+    }
+
+    pub fn shadow_mode_promote_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        shadow_mode::promote_from_shadow_mode(&env, &admin)
+    }
+
+    pub fn queue_update_timelock_delay(
+        env: Env,
+        admin: Address,
+        _action_type: ActionType,
+        _new_delay: u64,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("tlupdate"))
+    }
+
+    pub fn update_timelock_delay_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        action_type: ActionType,
+        new_delay: u64,
+    ) -> Result<(), GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        timelock::update_timelock_delay(&env, action_type, new_delay)
+    }
+
+    pub fn queue_create_vesting_schedule(
+        env: Env,
+        admin: Address,
+        _beneficiary: Address,
+        _total_amount: i128,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("vestadd"))
+    }
+
+    pub fn vesting_schedule_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        beneficiary: Address,
+        total_amount: i128,
+        start_time: u64,
+        cliff_seconds: u64,
+        duration_seconds: u64,
+    ) -> Result<(), GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        create_schedule(
+            &env,
+            beneficiary.clone(),
+            VestingCategory::Custom,
+            total_amount,
+            start_time,
+            cliff_seconds,
+            duration_seconds,
+        )?;
+        track_holder(&env, &beneficiary);
+        emit_vesting_created(
+            &env,
+            &beneficiary,
+            total_amount,
+            cliff_seconds,
+            duration_seconds,
+        );
+        Ok(())
+    }
+
+    pub fn queue_set_rebalance_target(
+        env: Env,
+        admin: Address,
+        _asset: Asset,
+        _target_bps: i128,
+    ) -> Result<u64, GovernanceError> {
+        require_admin(&env, &admin)?;
+        queue_admin_action(&env, admin, symbol_short!("target"))
+    }
+
+    pub fn set_rebalance_target_timelocked(
+        env: Env,
+        admin: Address,
+        action_id: u64,
+        asset: Asset,
+        target_bps: i128,
+    ) -> Result<Treasury, GovernanceError> {
+        require_admin_identity(&env, &admin)?;
+        execute_admin_action(&env, action_id, &admin)?;
+        let mut treasury = get_treasury(&env);
+        treasury::set_rebalance_target(&env, &mut treasury, asset, target_bps)?;
+        put_treasury(&env, &treasury);
+        emit_admin_action(&env, symbol_short!("target"), &admin, target_bps);
+        Ok(treasury)
+    }
+
+    /// Issue #942: irreversibly enable admin-timelock enforcement.
+    ///
+    /// Once enabled, every category (b) admin entry point (the ones with a
+    /// `queue_*` / `*_timelocked` counterpart — see
+    /// `docs/governance-timelock-audit.md`) rejects direct calls with
+    /// [`GovernanceError::TimelockBypassBlocked`]; the action must be routed
+    /// through its queue + timelocked-execute pair so the mandatory delay
+    /// applies. Category (c) functions (emergency pause, key rotation, and the
+    /// low-risk operational setters documented in `SECURITY.md`) are
+    /// unaffected.
+    ///
+    /// Intended to be switched on before a DAO token launch. This latch is
+    /// **one-way** — there is deliberately no disable function, so a
+    /// compromised admin cannot re-open the bypass.
+    pub fn enforce_admin_timelock(env: Env, admin: Address) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&StorageKey::EnforceAdminTimelock, &true);
+        emit_admin_action(&env, symbol_short!("tlenforce"), &admin, 1);
+        Ok(())
+    }
+
+    /// Issue #942: whether admin-timelock enforcement has been latched on via
+    /// [`Self::enforce_admin_timelock`].
+    pub fn is_admin_timelock_enforced(env: Env) -> bool {
+        admin_timelock_enforced(&env)
+    }
+
+    pub fn admin_pending_actions(env: Env) -> Result<Vec<AdminTimelockEntry>, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(get_admin_pending_actions(&env))
+    }
+
+    pub fn cancel_admin_action(
+        env: Env,
+        action_id: u64,
+        canceller: Address,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        timelock::cancel_admin_action(&env, action_id, &canceller)
+    }
 }
 
 fn is_initialized(env: &Env) -> bool {
@@ -1302,6 +2793,17 @@ fn is_initialized(env: &Env) -> bool {
         .instance()
         .get(&StorageKey::Initialized)
         .unwrap_or(false)
+}
+
+/// Returns `Err(GovernanceError::ContractPaused)` when the governance contract
+/// is administratively paused.  Call this at the top of every state-mutating
+/// entry-point that should be blocked during a pause.
+///
+/// Delegates to [`shared::pausable::require_not_paused`] so the pause check
+/// is consistent with all other contracts that adopt the shared module
+/// (Issue #561).
+pub(crate) fn require_not_paused(env: &Env) -> Result<(), GovernanceError> {
+    pausable::require_not_paused(env).map_err(|_| GovernanceError::ContractPaused)
 }
 
 fn metadata(env: &Env) -> Result<TokenMetadata, GovernanceError> {
@@ -1326,6 +2828,16 @@ pub(crate) fn require_initialized(env: &Env) -> Result<(), GovernanceError> {
 fn require_admin(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
     require_initialized(env)?;
     caller.require_auth();
+    require_admin_identity(env, caller)
+}
+
+/// Same admin-identity check as [`require_admin`] but without the
+/// `require_auth()` call. Use this immediately before `execute_admin_action`,
+/// which performs its own `require_auth()` for the same caller — invoking
+/// `require_auth()` twice for the same address within one top-level
+/// invocation is rejected by the host with "frame is already authorized".
+fn require_admin_identity(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
+    require_initialized(env)?;
     let admin: Address = env
         .storage()
         .instance()
@@ -1335,6 +2847,83 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
         return Err(GovernanceError::Unauthorized);
     }
     Ok(())
+}
+
+/// Issue #942: `true` once `enforce_admin_timelock` has latched
+/// admin-timelock enforcement on. Defaults to `false` for backward
+/// compatibility (pre-DAO-launch deployments and the existing test suite).
+pub(crate) fn admin_timelock_enforced(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&StorageKey::EnforceAdminTimelock)
+        .unwrap_or(false)
+}
+
+/// Issue #942: reject a direct call to a category (b) admin entry point while
+/// admin-timelock enforcement is active. Such actions must instead be routed
+/// through their `queue_*` + `*_timelocked` pair so the mandatory delay
+/// applies. A no-op (returns `Ok`) while enforcement is disabled.
+fn require_no_timelock_bypass(env: &Env) -> Result<(), GovernanceError> {
+    if admin_timelock_enforced(env) {
+        return Err(GovernanceError::TimelockBypassBlocked);
+    }
+    Ok(())
+}
+
+/// Issue #860: Require that `caller` has a specific capability.
+/// Falls back to legacy admin check for backward compatibility.
+fn require_capability(
+    env: &Env,
+    caller: &Address,
+    capability: Capability,
+) -> Result<(), GovernanceError> {
+    require_initialized(env)?;
+    caller.require_auth();
+    // Check capability system first; fall back to legacy admin check.
+    if capabilities::has_capability(env, caller, capability) {
+        return Ok(());
+    }
+    // Legacy fallback: caller must be the stored admin address.
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&StorageKey::Admin)
+        .ok_or(GovernanceError::NotInitialized)?;
+    if admin == *caller {
+        return Ok(());
+    }
+    Err(GovernanceError::Unauthorized)
+}
+
+/// Crate-visible alias used by sub-modules (e.g. proposal_deposit).
+pub(crate) fn require_admin_pub(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
+    require_admin(env, caller)
+}
+
+/// Issue #865: downstream contracts registered for pause propagation.
+fn pause_targets(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::PausePropagationTargets)
+        .unwrap_or(Vec::new(env))
+}
+
+/// Best-effort propagation of a governance pause/unpause to every registered
+/// downstream contract (Issue #865). A single unreachable or incompatible
+/// downstream contract does not block the local pause or propagation to the
+/// remaining targets; failures are surfaced via a `pause_propagation_failed`
+/// event so operators can reconcile drift manually.
+fn propagate_pause_to_downstream(env: &Env, paused: bool) {
+    let targets = pause_targets(env);
+    for target in targets.iter() {
+        let client = pausable::PausableClient::new(env, &target);
+        if client.try_apply_governance_pause(&paused).is_err() {
+            env.events().publish(
+                (Symbol::new(env, "pause_propagation_failed"),),
+                (target, paused),
+            );
+        }
+    }
 }
 
 fn balances(env: &Env) -> Map<Address, i128> {
@@ -1442,28 +3031,35 @@ pub(crate) fn subtract_staked_balance(
 }
 
 pub(crate) fn get_pending_rewards(env: &Env) -> Map<Address, i128> {
+    // Migrated to persistent storage (#592): per-user data should not occupy
+    // the size-limited instance storage slot. Fall back to instance for any
+    // data written before this migration.
     env.storage()
-        .instance()
+        .persistent()
         .get(&StorageKey::PendingRewards)
+        .or_else(|| env.storage().instance().get(&StorageKey::PendingRewards))
         .unwrap_or(Map::new(env))
 }
 
 pub(crate) fn put_pending_rewards(env: &Env, rewards: &Map<Address, i128>) {
     env.storage()
-        .instance()
+        .persistent()
         .set(&StorageKey::PendingRewards, rewards);
 }
 
 pub(crate) fn get_vesting_schedules(env: &Env) -> Map<Address, VestingSchedule> {
+    // Migrated to persistent storage (#592): vesting schedules are long-lived
+    // per-user data that should not occupy instance storage.
     env.storage()
-        .instance()
+        .persistent()
         .get(&StorageKey::VestingSchedules)
+        .or_else(|| env.storage().instance().get(&StorageKey::VestingSchedules))
         .unwrap_or(Map::new(env))
 }
 
 pub(crate) fn put_vesting_schedules(env: &Env, schedules: &Map<Address, VestingSchedule>) {
     env.storage()
-        .instance()
+        .persistent()
         .set(&StorageKey::VestingSchedules, schedules);
 }
 
@@ -1481,9 +3077,12 @@ pub(crate) fn put_distribution_state(env: &Env, state: &DistributionState) {
 }
 
 pub(crate) fn get_vote_locks(env: &Env) -> Map<Address, u32> {
+    // Migrated to persistent storage (#592): vote-lock data is per-user and
+    // should not compete for the shared instance storage budget.
     env.storage()
-        .instance()
+        .persistent()
         .get(&StorageKey::VoteLocks)
+        .or_else(|| env.storage().instance().get(&StorageKey::VoteLocks))
         .unwrap_or(Map::new(env))
 }
 
@@ -1514,7 +3113,9 @@ pub(crate) fn put_committees_state(env: &Env, committees_state: &CommitteesState
 }
 
 pub(crate) fn put_vote_locks(env: &Env, locks: &Map<Address, u32>) {
-    env.storage().instance().set(&StorageKey::VoteLocks, locks);
+    env.storage()
+        .persistent()
+        .set(&StorageKey::VoteLocks, locks);
 }
 
 pub(crate) fn get_holders(env: &Env) -> Vec<Address> {
@@ -1539,6 +3140,21 @@ pub(crate) fn track_holder(env: &Env, holder: &Address) {
     }
     holders.push_back(holder.clone());
     put_holders(env, &holders);
+}
+
+pub(crate) fn get_vote_snapshot(env: &Env, proposal_id: u64, voter: &Address) -> Option<i128> {
+    let map: Map<Address, i128> = env
+        .storage()
+        .instance()
+        .get(&StorageKey::VoteSnapshots(proposal_id))
+        .unwrap_or(Map::new(env));
+    map.get(voter.clone())
+}
+
+pub(crate) fn put_vote_snapshots(env: &Env, proposal_id: u64, snapshots: &Map<Address, i128>) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::VoteSnapshots(proposal_id), snapshots);
 }
 
 pub(crate) fn checked_add(left: i128, right: i128) -> Result<i128, GovernanceError> {

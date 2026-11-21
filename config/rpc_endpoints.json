@@ -1,0 +1,14 @@
+{
+  "testnet": {
+    "primary_rpc": "https://soroban-testnet.stellar.org",
+    "fallback_rpc": "https://stellar-soroban-testnet-public.nodies.app",
+    "horizon_url": "https://horizon-testnet.stellar.org",
+    "network_passphrase": "Test SDF Network ; September 2015"
+  },
+  "mainnet": {
+    "primary_rpc": "https://mainnet.sorobanrpc.com",
+    "fallback_rpc": "https://soroban-rpc.mainnet.stellar.gateway.fm",
+    "horizon_url": "https://horizon.stellar.org",
+    "network_passphrase": "Public Global Stellar Network ; September 2015"
+  }
+}

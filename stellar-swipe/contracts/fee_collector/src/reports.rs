@@ -6,10 +6,8 @@
 //! expected to be merged by an off-chain aggregator (or a future cross-contract
 //! implementation).
 
-use crate::storage::{
-    get_provider_daily_fee_shares, get_provider_earnings_first_day,
-};
-use soroban_sdk::{contracttype, Address, Env};
+use crate::storage::{get_provider_daily_fee_shares, get_provider_earnings_first_day};
+use soroban_sdk::{contracttype, Address, Env, Vec};
 use stellar_swipe_common::SECONDS_PER_DAY;
 
 // ── Period enum ───────────────────────────────────────────────────────────────
@@ -37,7 +35,14 @@ pub struct EarningsReport {
     pub period_start: u64,
     pub period_end: u64,
 }
-
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EarningsLeaderboardEntry {
+    pub rank: u32,
+    pub provider: Address,
+    pub total_earned: i128,
+    pub first_earned_day: u64,
+}
 // ── Core logic ────────────────────────────────────────────────────────────────
 
 fn current_day(env: &Env) -> u64 {
@@ -100,6 +105,50 @@ pub fn get_provider_earnings_report(
         period_start: start_ts,
         period_end: now_ts,
     }
+}
+
+pub fn get_provider_earnings_leaderboard(env: &Env, limit: u32) -> Vec<EarningsLeaderboardEntry> {
+    let limit = if limit == 0 { 10 } else { limit.min(50) };
+    let mut entries = Vec::new(env);
+    let index = crate::storage::get_provider_earnings_index(env);
+    for i in 0..index.len() {
+        if let Some(provider_addr) = index.get(i) {
+            let amount = crate::storage::get_provider_total_earnings(env, &provider_addr);
+            if amount <= 0 {
+                continue;
+            }
+            let first_day =
+                crate::storage::get_provider_earnings_first_day(env, &provider_addr).unwrap_or(0);
+            entries.push_back(EarningsLeaderboardEntry {
+                rank: 0,
+                provider: provider_addr.clone(),
+                total_earned: amount,
+                first_earned_day: first_day,
+            });
+        }
+    }
+
+    let len = entries.len();
+    for i in 0..len {
+        for j in 0..(len - i - 1) {
+            let curr = entries.get(j).unwrap();
+            let next = entries.get(j + 1).unwrap();
+            if curr.total_earned < next.total_earned {
+                entries.set(j, next);
+                entries.set(j + 1, curr);
+            }
+        }
+    }
+
+    let mut result = Vec::new(env);
+    let take = limit.min(entries.len());
+    for i in 0..take {
+        let mut entry = entries.get(i).unwrap();
+        entry.rank = i + 1;
+        result.push_back(entry);
+    }
+
+    result
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

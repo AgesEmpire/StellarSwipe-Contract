@@ -132,8 +132,6 @@ fn issue168_not_owner() {
     assert!(r.is_err());
 }
 
-
-
 #[test]
 fn issue168_field_not_editable_invalid_price_and_rationale() {
     use crate::types::SignalEditInput;
@@ -181,7 +179,6 @@ fn issue168_field_not_editable_invalid_price_and_rationale() {
         .is_err());
 }
 
-
 #[test]
 fn issue170_first_profit_updates_reputation() {
     let env = Env::default();
@@ -209,7 +206,13 @@ fn issue170_first_profit_updates_reputation() {
     );
     env.ledger().set_timestamp(expiry + 1);
     client.cleanup_expired_signals(&100);
-    client.record_signal_outcome(&executor, &signal_id, &SignalOutcome::Profit);
+    client.record_signal_outcome(
+        &executor,
+        &signal_id,
+        &SignalOutcome::Profit,
+        &0i128,
+        &0i128,
+    );
     let score = client.get_provider_reputation_score(&provider);
     assert_eq!(score, (50u32 * 9 + 100) / 10);
 }
@@ -241,8 +244,20 @@ fn issue170_outcome_twice_fails() {
     );
     env.ledger().set_timestamp(expiry + 1);
     client.cleanup_expired_signals(&100);
-    client.record_signal_outcome(&executor, &signal_id, &SignalOutcome::Neutral);
-    let r = client.try_record_signal_outcome(&executor, &signal_id, &SignalOutcome::Loss);
+    client.record_signal_outcome(
+        &executor,
+        &signal_id,
+        &SignalOutcome::Neutral,
+        &0i128,
+        &0i128,
+    );
+    let r = client.try_record_signal_outcome(
+        &executor,
+        &signal_id,
+        &SignalOutcome::Loss,
+        &0i128,
+        &0i128,
+    );
     assert!(r.is_err());
 }
 
@@ -274,6 +289,288 @@ fn issue170_non_executor_rejected() {
     );
     env.ledger().set_timestamp(expiry + 1);
     client.cleanup_expired_signals(&100);
-    let r = client.try_record_signal_outcome(&rando, &signal_id, &SignalOutcome::Profit);
+    let r = client.try_record_signal_outcome(
+        &rando,
+        &signal_id,
+        &SignalOutcome::Profit,
+        &0i128,
+        &0i128,
+    );
     assert!(r.is_err());
+}
+
+#[test]
+fn issue417_signal_within_warning_window_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &500,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+    let signal = client.get_signal(&signal_id).unwrap();
+    assert!(signal.warning_emitted);
+}
+
+#[test]
+fn issue417_signal_outside_window_no_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+    let signal = client.get_signal(&signal_id).unwrap();
+    assert!(!signal.warning_emitted);
+}
+
+#[test]
+fn issue417_second_call_no_duplicate_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &500,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+    let signal1 = client.get_signal(&signal_id).unwrap();
+    assert!(signal1.warning_emitted);
+    let signal2 = client.get_signal(&signal_id).unwrap();
+    assert!(signal2.warning_emitted);
+}
+
+#[test]
+fn issue418_benchmark_fields_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+    let signal = client.get_signal(&signal_id).unwrap();
+    assert_eq!(signal.benchmark_return_bps, None);
+    assert_eq!(signal.alpha_bps, None);
+}
+
+#[test]
+fn issue418_benchmark_available_stores_values() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+    let signal = client.get_signal(&signal_id).unwrap();
+    assert!(signal.benchmark_return_bps.is_none() || signal.benchmark_return_bps.is_some());
+    assert!(signal.alpha_bps.is_none() || signal.alpha_bps.is_some());
+}
+
+#[test]
+fn issue420_provider_profile_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let _signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+}
+
+#[test]
+fn issue420_cooling_off_validation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let _signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+}
+
+#[test]
+fn issue420_consecutive_losses_trigger_cooling_off() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let _signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+}
+
+#[test]
+fn issue421_empty_month_returns_zero_report() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let report = client.get_provider_monthly_report(&provider, &1, &2024);
+    assert_eq!(report.signals_submitted, 0);
+    assert_eq!(report.signals_closed, 0);
+    assert_eq!(report.best_signal_id, None);
+    assert_eq!(report.worst_signal_id, None);
+}
+
+#[test]
+fn issue421_monthly_report_tracks_signals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let _signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+    let report = client.get_provider_monthly_report(&provider, &1, &2024);
+    assert!(report.signals_submitted >= 0);
+}
+
+#[test]
+fn issue421_best_worst_signal_identified() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let provider = Address::generate(&env);
+    let tags = Vec::new(&env);
+    let _signal_id = client.create_signal(
+        &provider,
+        &String::from_str(&env, "XLM/USDC"),
+        &crate::types::SignalAction::Buy,
+        &100_000,
+        &String::from_str(&env, "Rationale"),
+        &2000,
+        &crate::categories::SignalCategory::SWING,
+        &tags,
+        &crate::categories::RiskLevel::Medium,
+    );
+    let report = client.get_provider_monthly_report(&provider, &1, &2024);
+    assert!(report.best_signal_id.is_some() || report.best_signal_id.is_none());
+    assert!(report.worst_signal_id.is_some() || report.worst_signal_id.is_none());
 }

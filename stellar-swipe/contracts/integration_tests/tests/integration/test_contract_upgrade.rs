@@ -156,9 +156,7 @@ impl ContractV1 {
     // ── Auth / stakes ─────────────────────────────────────────────────────────
 
     pub fn set_auth(env: Env, user: Address, cfg: AuthConfig) {
-        env.storage()
-            .persistent()
-            .set(&AuthKey::Auth(user), &cfg);
+        env.storage().persistent().set(&AuthKey::Auth(user), &cfg);
     }
 
     pub fn get_auth(env: Env, user: Address) -> Option<AuthConfig> {
@@ -167,12 +165,7 @@ impl ContractV1 {
 
     // ── Positions ─────────────────────────────────────────────────────────────
 
-    pub fn open_position(
-        env: Env,
-        user: Address,
-        amount: i128,
-        entry_price: i128,
-    ) -> BytesN<32> {
+    pub fn open_position(env: Env, user: Address, amount: i128, entry_price: i128) -> BytesN<32> {
         let nonce: u64 = env
             .storage()
             .persistent()
@@ -333,7 +326,9 @@ fn positions_preserved_after_upgrade() {
     env.register_at(&cid, ContractV2, ());
     let v2 = ContractV2Client::new(&env, &cid);
 
-    let pos = v2.get_position_v2(&tid).expect("position must survive upgrade");
+    let pos = v2
+        .get_position_v2(&tid)
+        .expect("position must survive upgrade");
     assert_eq!(pos.user, user);
     assert_eq!(pos.amount, 1_000);
     assert_eq!(pos.entry_price, 500);
@@ -349,12 +344,18 @@ fn signals_preserved_after_upgrade() {
     let (env, cid, _admin) = setup();
     let v1 = ContractV1Client::new(&env, &cid);
 
-    v1.set_signal(&Signal { id: 42, price: 99_000, asset: 7 });
+    v1.set_signal(&Signal {
+        id: 42,
+        price: 99_000,
+        asset: 7,
+    });
 
     env.register_at(&cid, ContractV2, ());
     let v2 = ContractV2Client::new(&env, &cid);
 
-    let sig = v2.get_signal_v2(&42u64).expect("signal must survive upgrade");
+    let sig = v2
+        .get_signal_v2(&42u64)
+        .expect("signal must survive upgrade");
     assert_eq!(sig.id, 42);
     assert_eq!(sig.price, 99_000);
     assert_eq!(sig.asset, 7);
@@ -370,7 +371,13 @@ fn stakes_preserved_after_upgrade() {
     let user = Address::generate(&env);
     let v1 = ContractV1Client::new(&env, &cid);
 
-    v1.set_auth(&user, &AuthConfig { authorized: true, max_amount: 5_000_000 });
+    v1.set_auth(
+        &user,
+        &AuthConfig {
+            authorized: true,
+            max_amount: 5_000_000,
+        },
+    );
 
     env.register_at(&cid, ContractV2, ());
     let v2 = ContractV2Client::new(&env, &cid);
@@ -390,8 +397,16 @@ fn v2_new_function_works() {
     let v1 = ContractV1Client::new(&env, &cid);
 
     // Seed some signals.
-    v1.set_signal(&Signal { id: 1, price: 100, asset: 1 });
-    v1.set_signal(&Signal { id: 2, price: 200, asset: 2 });
+    v1.set_signal(&Signal {
+        id: 1,
+        price: 100,
+        asset: 1,
+    });
+    v1.set_signal(&Signal {
+        id: 2,
+        price: 200,
+        asset: 2,
+    });
 
     env.register_at(&cid, ContractV2, ());
     let v2 = ContractV2Client::new(&env, &cid);
@@ -423,7 +438,10 @@ fn upgrade_only_callable_by_admin() {
     let non_admin = Address::generate(&env);
     env.set_auths(&[]);
     let result = v2.try_admin_action(&non_admin);
-    assert!(result.is_err(), "non-admin must be rejected by admin_action");
+    assert!(
+        result.is_err(),
+        "non-admin must be rejected by admin_action"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -436,8 +454,18 @@ fn migrated_state_values_exact() {
     let user = Address::generate(&env);
     let v1 = ContractV1Client::new(&env, &cid);
 
-    v1.set_signal(&Signal { id: 99, price: 42_000, asset: 3 });
-    v1.set_auth(&user, &AuthConfig { authorized: true, max_amount: 999_999 });
+    v1.set_signal(&Signal {
+        id: 99,
+        price: 42_000,
+        asset: 3,
+    });
+    v1.set_auth(
+        &user,
+        &AuthConfig {
+            authorized: true,
+            max_amount: 999_999,
+        },
+    );
     let tid = v1.open_position(&user, &1_234i128, &567i128);
 
     env.register_at(&cid, ContractV2, ());
@@ -469,9 +497,23 @@ fn all_v1_state_accessible_simultaneously() {
     let user = Address::generate(&env);
     let v1 = ContractV1Client::new(&env, &cid);
 
-    v1.set_signal(&Signal { id: 1, price: 100, asset: 1 });
-    v1.set_signal(&Signal { id: 2, price: 200, asset: 2 });
-    v1.set_auth(&user, &AuthConfig { authorized: true, max_amount: 1_000 });
+    v1.set_signal(&Signal {
+        id: 1,
+        price: 100,
+        asset: 1,
+    });
+    v1.set_signal(&Signal {
+        id: 2,
+        price: 200,
+        asset: 2,
+    });
+    v1.set_auth(
+        &user,
+        &AuthConfig {
+            authorized: true,
+            max_amount: 1_000,
+        },
+    );
     let tid1 = v1.open_position(&user, &100i128, &50i128);
     let tid2 = v1.open_position(&user, &200i128, &75i128);
 
@@ -517,8 +559,7 @@ fn stake_vault_migration_preserves_balances() {
         }
         seed_v1_stakes(&env, v1);
 
-        let result: MigrationBatchResult =
-            migrate_stakes_v1_to_v2(&env, &admin, 10).unwrap();
+        let result: MigrationBatchResult = migrate_stakes_v1_to_v2(&env, &admin, 10).unwrap();
         assert_eq!(result.migrated_this_batch, 10);
         assert!(result.complete);
 
@@ -629,4 +670,58 @@ fn multiple_users_state_preserved() {
         assert_eq!(pos.amount, (i as i128 + 1) * 100);
         assert_eq!(pos.entry_price, (i as i128 + 1) * 50);
     }
+}
+
+#[test]
+fn upgrade_rollback_simulation_preserves_state() {
+    let (env, cid, _admin) = setup();
+    let user = Address::generate(&env);
+    let v1 = ContractV1Client::new(&env, &cid);
+
+    let tid = v1.open_position(&user, &250i128, &125i128);
+    v1.set_signal(&Signal {
+        id: 77,
+        price: 135_000,
+        asset: 9,
+    });
+
+    env.register_at(&cid, ContractV2, ());
+    let v2 = ContractV2Client::new(&env, &cid);
+    assert_eq!(v2.get_version(), String::from_str(&env, "2.0.0"));
+
+    // Simulate an upgrade rollback by returning to V1 implementation at the same address.
+    env.register_at(&cid, ContractV1, ());
+    let v1_again = ContractV1Client::new(&env, &cid);
+
+    let pos = v1_again.get_position(&tid).unwrap();
+    assert_eq!(pos.user, user);
+    assert_eq!(pos.entry_price, 125);
+    assert_eq!(v1_again.get_signal(&77u64).unwrap().price, 135_000);
+}
+
+#[test]
+fn pre_upgrade_validation_checks_state_before_upgrade() {
+    let (env, cid, _admin) = setup();
+    let user = Address::generate(&env);
+    let v1 = ContractV1Client::new(&env, &cid);
+
+    let tid = v1.open_position(&user, &500i128, &300i128);
+    v1.set_auth(
+        &user,
+        &AuthConfig {
+            authorized: true,
+            max_amount: 2_000,
+        },
+    );
+
+    // Validate pre-upgrade state before re-registering V2.
+    assert!(v1.get_position(&tid).is_some());
+    assert!(v1.get_auth(&user).unwrap().authorized);
+
+    env.register_at(&cid, ContractV2, ());
+    let v2 = ContractV2Client::new(&env, &cid);
+
+    // Ensure pre-upgrade state remains intact after upgrade.
+    assert_eq!(v2.get_position_v2(&tid).unwrap().entry_price, 300);
+    assert_eq!(v2.get_auth_v2(&user).unwrap().max_amount, 2_000);
 }

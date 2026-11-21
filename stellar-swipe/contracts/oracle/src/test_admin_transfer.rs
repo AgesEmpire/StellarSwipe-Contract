@@ -54,7 +54,10 @@ fn test_accept_admin_transfer_oracle() {
     client.accept_admin_transfer(&new_admin);
 
     // Unpause should work (new_admin is now admin)
-    client.unpause_category(&new_admin, &soroban_sdk::String::from_str(&env, "test_category"));
+    client.unpause_category(
+        &new_admin,
+        &soroban_sdk::String::from_str(&env, "test_category"),
+    );
 }
 
 #[test]

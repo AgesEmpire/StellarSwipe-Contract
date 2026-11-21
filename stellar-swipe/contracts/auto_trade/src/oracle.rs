@@ -9,10 +9,11 @@
 
 use soroban_sdk::{contracttype, Address, Env, String, Symbol};
 use stellar_swipe_common::oracle::{
-    IOracleClient, MockOracleClient, OnChainOracleClient, OracleError, OraclePrice,
+    validate_price_bounds, IOracleClient, MockOracleClient, OnChainOracleClient, OracleError,
+    OraclePrice,
 };
 
-use crate::admin::{AdminStorageKey, require_admin};
+use crate::admin::{require_admin, AdminStorageKey};
 use crate::errors::AutoTradeError;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -68,14 +69,11 @@ pub fn set_oracle_address(
     oracle: Address,
 ) -> Result<(), AutoTradeError> {
     require_admin(env, caller)?;
-    caller.require_auth();
     env.storage()
         .instance()
         .set(&AdminStorageKey::OracleAddress, &oracle);
-    env.events().publish(
-        (Symbol::new(env, "oracle_set"), caller.clone()),
-        oracle,
-    );
+    env.events()
+        .publish((Symbol::new(env, "oracle_set"), caller.clone()), oracle);
     Ok(())
 }
 
@@ -94,7 +92,6 @@ pub fn override_oracle_circuit_breaker(
     enabled: bool,
 ) -> Result<(), AutoTradeError> {
     require_admin(env, caller)?;
-    caller.require_auth();
     let mut state = get_cb_state(env);
     state.admin_override = enabled;
     set_cb_state(env, &state);
@@ -116,6 +113,7 @@ pub fn get_oracle_price(env: &Env, asset_pair: u32) -> Result<OraclePrice, Oracl
     let client = OnChainOracleClient { address };
     let price = client.get_price(env, asset_pair)?;
     validate_freshness(env, &price)?;
+    validate_price_bounds(&price)?;
     Ok(price)
 }
 
@@ -132,10 +130,7 @@ pub fn get_mock_oracle_price(env: &Env, asset_pair: u32) -> Result<OraclePrice, 
 ///
 /// - On success: resets any previously tripped circuit breaker (auto-recovery).
 /// - On failure: trips the circuit breaker and emits `OracleCircuitBreakerTriggered`.
-pub fn get_aggregated_price(
-    env: &Env,
-    asset_pair: u32,
-) -> Result<OraclePrice, AutoTradeError> {
+pub fn get_aggregated_price(env: &Env, asset_pair: u32) -> Result<OraclePrice, AutoTradeError> {
     match get_oracle_price(env, asset_pair) {
         Ok(price) => {
             // Oracle is healthy — auto-reset the circuit breaker if it was tripped
@@ -143,10 +138,8 @@ pub fn get_aggregated_price(
             if state.triggered {
                 state.triggered = false;
                 set_cb_state(env, &state);
-                env.events().publish(
-                    (Symbol::new(env, "oracle_cb_reset"),),
-                    asset_pair,
-                );
+                env.events()
+                    .publish((Symbol::new(env, "oracle_cb_reset"),), asset_pair);
             }
             Ok(price)
         }
@@ -161,13 +154,13 @@ pub fn get_aggregated_price(
             let reason = match err {
                 OracleError::NotConfigured => String::from_str(env, "oracle_not_configured"),
                 OracleError::PriceNotFound => String::from_str(env, "price_not_found"),
-                OracleError::PriceStale    => String::from_str(env, "price_stale"),
-                OracleError::CallFailed    => String::from_str(env, "call_failed"),
+                OracleError::PriceStale => String::from_str(env, "price_stale"),
+                OracleError::CallFailed => String::from_str(env, "call_failed"),
+                OracleError::PriceBelowMin => String::from_str(env, "price_below_min"),
+                OracleError::PriceAboveMax => String::from_str(env, "price_above_max"),
             };
-            env.events().publish(
-                (Symbol::new(env, "oracle_cb_triggered"),),
-                reason,
-            );
+            env.events()
+                .publish((Symbol::new(env, "oracle_cb_triggered"),), reason);
             Err(AutoTradeError::OracleUnavailable)
         }
     }
@@ -180,10 +173,7 @@ pub fn get_aggregated_price(
 ///
 /// Also attempts auto-recovery: if the oracle is now healthy, the breaker is
 /// reset and trading proceeds.
-pub fn check_oracle_circuit_breaker(
-    env: &Env,
-    asset_pair: u32,
-) -> Result<(), AutoTradeError> {
+pub fn check_oracle_circuit_breaker(env: &Env, asset_pair: u32) -> Result<(), AutoTradeError> {
     let state = get_cb_state(env);
 
     // Admin override bypasses the circuit breaker entirely
@@ -197,31 +187,78 @@ pub fn check_oracle_circuit_breaker(
     }
 
     // Breaker is tripped — attempt auto-recovery by probing the oracle
-    match get_oracle_price(env, asset_pair) {
+    let price_result = match get_oracle_price(env, asset_pair) {
+        Ok(price) => Ok(price),
+        Err(OracleError::NotConfigured) => get_mock_oracle_price(env, asset_pair),
+        Err(err) => Err(err),
+    };
+    match price_result {
         Ok(_) => {
             // Oracle recovered — reset breaker
             let mut new_state = state;
             new_state.triggered = false;
             set_cb_state(env, &new_state);
-            env.events().publish(
-                (Symbol::new(env, "oracle_cb_reset"),),
-                asset_pair,
-            );
+            env.events()
+                .publish((Symbol::new(env, "oracle_cb_reset"),), asset_pair);
             Ok(())
         }
         Err(_) => Err(AutoTradeError::OracleUnavailable),
     }
 }
 
-/// Return the oracle price scaled to a plain i128 (same unit as SDEX prices).
+/// Target decimal precision for every price used in settlement math
+/// (signal.price, risk thresholds, conditional-order trigger prices, …).
+/// Matches `multi_asset::STELLAR_DECIMALS` — Stellar assets are always
+/// 7-decimal, so every price flowing into settlement must land on the same
+/// scale rather than being silently collapsed to whole units.
+pub const PRICE_SCALE_DECIMALS: u32 = 7;
+
+/// Decimal counts beyond this cannot be normalized with checked i128
+/// arithmetic (10^op.decimals would overflow before we even get to
+/// rescaling), so they are rejected outright rather than producing a
+/// garbage value.
+const MAX_SUPPORTED_ORACLE_DECIMALS: u32 = 30;
+
+/// Normalize an oracle price (reported at `op.decimals` precision) onto the
+/// shared `PRICE_SCALE_DECIMALS` scale used throughout settlement, using
+/// checked arithmetic.
 ///
-/// Divides by 10^decimals so callers don't need to know the oracle's scale.
-pub fn oracle_price_to_i128(op: &OraclePrice) -> i128 {
-    let scale = 10i128.pow(op.decimals);
-    if scale == 0 {
+/// Rounding policy: when the oracle reports *more* precision than the target
+/// scale, the extra digits are truncated (rounded toward zero) via integer
+/// division — the same policy Stellar/Soroban integer math uses everywhere
+/// else in this contract. When the oracle reports *less* precision, the
+/// value is scaled up exactly (no rounding needed).
+///
+/// Errors:
+/// - Unsupported scale (`op.decimals` too large to exponentiate, or the
+///   up-scale multiplication overflows i128) is rejected before the caller
+///   can combine this price with a differently-scaled token amount.
+pub fn oracle_price_to_i128(op: &OraclePrice) -> Result<i128, AutoTradeError> {
+    if op.decimals > MAX_SUPPORTED_ORACLE_DECIMALS {
+        return Err(AutoTradeError::UnsupportedDecimalScale);
+    }
+
+    if op.decimals == PRICE_SCALE_DECIMALS {
+        return Ok(op.price);
+    }
+
+    if op.decimals < PRICE_SCALE_DECIMALS {
+        let diff = PRICE_SCALE_DECIMALS - op.decimals;
+        let factor = 10i128
+            .checked_pow(diff)
+            .ok_or(AutoTradeError::UnsupportedDecimalScale)?;
         op.price
+            .checked_mul(factor)
+            .ok_or(AutoTradeError::UnsupportedDecimalScale)
     } else {
-        op.price / scale
+        let diff = op.decimals - PRICE_SCALE_DECIMALS;
+        let factor = 10i128
+            .checked_pow(diff)
+            .ok_or(AutoTradeError::UnsupportedDecimalScale)?;
+        if factor == 0 {
+            return Err(AutoTradeError::UnsupportedDecimalScale);
+        }
+        Ok(op.price / factor)
     }
 }
 
@@ -261,7 +298,6 @@ pub fn add_oracle(
     oracle_addr: Address,
 ) -> Result<(), AutoTradeError> {
     require_admin(env, caller)?;
-    caller.require_auth();
 
     let mut list = get_oracle_whitelist(env, asset_pair);
     // Idempotency: skip if already present
@@ -273,10 +309,8 @@ pub fn add_oracle(
     list.push_back(oracle_addr.clone());
     set_oracle_whitelist(env, asset_pair, &list);
 
-    env.events().publish(
-        (Symbol::new(env, "oracle_added"), asset_pair),
-        oracle_addr,
-    );
+    env.events()
+        .publish((Symbol::new(env, "oracle_added"), asset_pair), oracle_addr);
     Ok(())
 }
 
@@ -290,7 +324,6 @@ pub fn remove_oracle(
     oracle_addr: Address,
 ) -> Result<(), AutoTradeError> {
     require_admin(env, caller)?;
-    caller.require_auth();
 
     let list = get_oracle_whitelist(env, asset_pair);
 
@@ -346,14 +379,13 @@ pub fn push_price_update(
     caller.require_auth();
     require_whitelisted_oracle(env, caller, asset_pair)?;
     validate_freshness(env, &price).map_err(|_| AutoTradeError::OracleUnavailable)?;
+    validate_price_bounds(&price).map_err(|_| AutoTradeError::OracleUnavailable)?;
 
-    let scaled = oracle_price_to_i128(&price);
+    let scaled = oracle_price_to_i128(&price)?;
     crate::risk::set_asset_price(env, asset_pair, scaled);
     crate::risk::record_price(env, asset_pair, scaled);
 
-    env.events().publish(
-        (Symbol::new(env, "oracle_price_upd"), asset_pair),
-        scaled,
-    );
+    env.events()
+        .publish((Symbol::new(env, "oracle_price_upd"), asset_pair), scaled);
     Ok(())
 }

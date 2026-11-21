@@ -118,7 +118,11 @@ pub fn subscribe_to_provider(
 
     let now = env.ledger().timestamp();
     let sub_key = StorageKey::Subscription(user.clone(), provider.clone());
-    let base = match env.storage().persistent().get::<_, SubscriptionRecord>(&sub_key) {
+    let base = match env
+        .storage()
+        .persistent()
+        .get::<_, SubscriptionRecord>(&sub_key)
+    {
         Some(rec) if rec.expires_at > now => rec.expires_at,
         _ => now,
     };
@@ -176,7 +180,15 @@ mod tests {
         sac.address()
     }
 
-    fn setup() -> (Env, Address, Address, Address, Address, Address, UserPortfolioClient<'static>) {
+    fn setup() -> (
+        Env,
+        Address,
+        Address,
+        Address,
+        Address,
+        Address,
+        UserPortfolioClient<'static>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -195,15 +207,7 @@ mod tests {
         StellarAssetClient::new(&env, &token).mint(&subscriber, &1_000_000_000i128);
         StellarAssetClient::new(&env, &token).mint(&other, &1_000_000_000i128);
 
-        (
-            env,
-            admin,
-            provider,
-            subscriber,
-            other,
-            token,
-            client,
-        )
+        (env, admin, provider, subscriber, other, token, client)
     }
 
     #[test]

@@ -1,0 +1,11 @@
+{
+  "_comment": "Baseline error codes for the stellar_swipe_common crate. Generated from contracts/common/src/cross_contract.rs. Do not renumber existing codes; add new variants with unused numbers only.",
+  "crate": "stellar_swipe_common",
+  "source": "contracts/common/src/cross_contract.rs",
+  "enums": {
+    "CrossContractError": {
+      "InterfaceVersionMismatch": 1,
+      "InterfaceVersionUnavailable": 2
+    }
+  }
+}

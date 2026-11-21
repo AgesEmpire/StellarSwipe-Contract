@@ -1,0 +1,66 @@
+
+
+## Handsoff notes
+
+<!-- handsoff-issue-1101 -->
+- #1101: Invalidate cached token metadata after asset configuration changes
+<!-- handsoff-issue-1088 -->
+- #1088: Add Soroban contract reentrancy fixture harness
+<!-- handsoff-issue-1074 -->
+- #1074: Add storage footprint growth regression tests
+<!-- handsoff-issue-949 -->
+- #949: Add provider churn risk score integration test covering all risk factors in analytics
+
+<!-- handsoff-issue-956 -->
+- #956: Add slash cooldown window to prevent repeated slashing of same provider in stake_vault
+
+<!-- handsoff-issue-1169 -->
+- #1169: Create cross-contract upgrade compatibility fixtures
+
+<!-- handsoff-issue-1170 -->
+- #1170: Add Soroban authorization payload size regression tests
+
+<!-- handsoff-issue-1186 -->
+- #1186: Verify persistent storage schema checksum during upgrades
+
+<!-- handsoff-issue-1114 -->
+- #1114: Implement overflow-safe oracle median aggregation
+
+<!-- handsoff-issue-1192 -->
+- #1192: Benchmark host function costs for critical contract entrypoints
+
+<!-- handsoff-issue-1185 -->
+- #1185: Add resumable cursor-based lazy storage migration
+
+<!-- handsoff-issue-1187 -->
+- #1187: Authenticate pagination cursors against contract and query scope
+
+<!-- handsoff-issue-1188 -->
+- #1188: Reject stale pagination cursors after relevant state changes
+
+<!-- handsoff-issue-1197 -->
+- #1197: Reject unsupported fee-on-transfer tokens during asset registration
+
+<!-- handsoff-issue-1198 -->
+- #1198: Update contract accounting state before invoking token callbacks
+
+<!-- handsoff-issue-1216 -->
+- #1216: Bind bridge message signatures to source and destination domains
+
+<!-- handsoff-issue-1220 -->
+- #1220: Require provider authorization for signal revision updates
+
+<!-- handsoff-issue-1151 -->
+- #1151: Implement auto trade portfolio valuation confidence threshold
+
+<!-- handsoff-issue-1244 -->
+- #1244: Prevent fee collector reinitialization from resetting accounting
+
+<!-- handsoff-issue-1283 -->
+- #1283: Validate governance quorum and approval thresholds at initialization
+
+<!-- handsoff-issue-1284 -->
+- #1284: Add proposer bond settlement for governance proposals
+
+<!-- handsoff-issue-1285 -->
+- #1285: Canonicalize governance action payloads before proposal hashing

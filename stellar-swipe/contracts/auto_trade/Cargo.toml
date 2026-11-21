@@ -14,6 +14,7 @@ testutils = []
 [dependencies]
 soroban-sdk = { workspace = true }
 stellar_swipe_common = { path = "../common" }
+shared = { path = "../shared" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
@@ -24,7 +25,20 @@ path = "tests/load/test_high_volume.rs"
 required-features = ["testutils"]
 
 [[test]]
+name = "test_perf_regression"
+path = "tests/load/test_perf_regression.rs"
+required-features = ["testutils"]
+
+[[test]]
 name = "test_contract_upgrade"
 path = "tests/integration/test_contract_upgrade.rs"
 required-features = ["testutils"]
 
+[[test]]
+name = "test_amm_bridge"
+path = "tests/integration/test_amm_bridge.rs"
+required-features = ["testutils"]
+
+
+[lints]
+workspace = true

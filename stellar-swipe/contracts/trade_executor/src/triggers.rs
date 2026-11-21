@@ -38,6 +38,103 @@ pub fn get_stop_loss(env: &Env, user: &Address, trade_id: u64) -> Option<i128> {
         .get(&(Symbol::new(env, "StopLoss"), user.clone(), trade_id))
 }
 
+// ── Trailing stop (Issue #528) ──────────────────────────────────────────────
+
+/// Register a trailing stop for `(user, trade_id)`.
+/// `trail_bps`: distance from peak in basis points (e.g. 500 = 5%).
+/// `initial_price`: the entry price used to seed the peak tracker.
+pub fn set_trailing_stop(
+    env: &Env,
+    user: &Address,
+    trade_id: u64,
+    trail_bps: u32,
+    initial_price: i128,
+) {
+    env.storage().persistent().set(
+        &(Symbol::new(env, "TrailBps"), user.clone(), trade_id),
+        &trail_bps,
+    );
+    env.storage().persistent().set(
+        &(Symbol::new(env, "TrailPeak"), user.clone(), trade_id),
+        &initial_price,
+    );
+}
+
+pub fn get_trailing_stop(env: &Env, user: &Address, trade_id: u64) -> Option<(u32, i128)> {
+    let trail_bps: Option<u32> =
+        env.storage()
+            .persistent()
+            .get(&(Symbol::new(env, "TrailBps"), user.clone(), trade_id));
+    let peak: Option<i128> =
+        env.storage()
+            .persistent()
+            .get(&(Symbol::new(env, "TrailPeak"), user.clone(), trade_id));
+    match (trail_bps, peak) {
+        (Some(bps), Some(p)) => Some((bps, p)),
+        _ => None,
+    }
+}
+
+/// Update the peak price for a trailing stop. Call this whenever a new price is observed.
+/// Returns the updated peak (unchanged if `current_price` is not a new high).
+pub fn update_trailing_peak(env: &Env, user: &Address, trade_id: u64, current_price: i128) -> i128 {
+    let peak_key = (Symbol::new(env, "TrailPeak"), user.clone(), trade_id);
+    let peak: i128 = env.storage().persistent().get(&peak_key).unwrap_or(0);
+    if current_price > peak {
+        env.storage().persistent().set(&peak_key, &current_price);
+        current_price
+    } else {
+        peak
+    }
+}
+
+/// Check oracle price, update trailing peak, and trigger if price has dropped
+/// `trail_bps` below the peak. Returns `true` when triggered.
+///
+/// ## Auth
+/// Keeper-callable (no user auth required).
+pub fn check_and_trigger_trailing_stop(
+    env: &Env,
+    user: Address,
+    trade_id: u64,
+    asset_pair: u32,
+) -> Result<bool, ContractError> {
+    if is_trigger_settled(env, &user, trade_id) {
+        return Ok(false);
+    }
+
+    let (oracle, portfolio) = fetch_oracle_and_portfolio(env)?;
+    let (trail_bps, _) =
+        get_trailing_stop(env, &user, trade_id).ok_or(ContractError::NotInitialized)?;
+    let current_price = fetch_current_price(env, &oracle, asset_pair)?;
+
+    // Update peak
+    let peak = update_trailing_peak(env, &user, trade_id, current_price);
+
+    // Trigger price = peak * (10000 - trail_bps) / 10000
+    let trigger_price = peak.saturating_mul(10_000 - trail_bps as i128) / 10_000;
+
+    if current_price <= trigger_price {
+        // Claim settlement before closing/paying out: if another keeper's
+        // call already claimed it (race within the same ledger), bail out
+        // without closing the position or triggering a duplicate reward.
+        if !claim_trigger_settlement(env, &user, trade_id) {
+            return Ok(false);
+        }
+        close_position_keeper(env, &portfolio, &user, trade_id, asset_pair);
+        env.events().publish(
+            (
+                Symbol::new(env, "trade_executor"),
+                Symbol::new(env, "trailing_stop_triggered"),
+            ),
+            (user, trade_id, peak, trigger_price, current_price),
+        );
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// Register a take-profit price for `(user, trade_id)`.
 pub fn set_take_profit(env: &Env, user: &Address, trade_id: u64, take_profit_price: i128) {
     env.storage().persistent().set(
@@ -50,6 +147,34 @@ pub fn get_take_profit(env: &Env, user: &Address, trade_id: u64) -> Option<i128>
     env.storage()
         .persistent()
         .get(&(Symbol::new(env, "TakeProfit"), user.clone(), trade_id))
+}
+
+/// Issue #1440: per-(user, trade_id) guard recording that a trigger (stop-loss,
+/// take-profit, or trailing-stop) has already been settled for this position.
+/// Multiple keepers racing to call the same trigger entrypoint for a stale or
+/// already-closed position must not be able to close it — and pay out a
+/// keeper reward — more than once.
+fn settled_key(env: &Env, user: &Address, trade_id: u64) -> (Symbol, Address, u64) {
+    (Symbol::new(env, "TrigSettled"), user.clone(), trade_id)
+}
+
+fn is_trigger_settled(env: &Env, user: &Address, trade_id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .get(&settled_key(env, user, trade_id))
+        .unwrap_or(false)
+}
+
+/// Atomically claim the settlement slot for `(user, trade_id)`. Returns
+/// `true` if this call is the one that claimed it (first to settle), `false`
+/// if it was already settled by a prior (possibly concurrent) call.
+fn claim_trigger_settlement(env: &Env, user: &Address, trade_id: u64) -> bool {
+    let key = settled_key(env, user, trade_id);
+    if env.storage().persistent().get(&key).unwrap_or(false) {
+        return false;
+    }
+    env.storage().persistent().set(&key, &true);
+    true
 }
 
 fn fetch_oracle_and_portfolio(env: &Env) -> Result<(Address, Address), ContractError> {
@@ -136,6 +261,7 @@ fn close_position_keeper(
     args.push_back(trade_id.into_val(env));
     args.push_back(asset_pair.into_val(env));
     env.invoke_contract::<()>(portfolio, &sym, args);
+    crate::decrement_user_position_count(env, user);
 }
 
 /// If `current_price <= stop_loss_price`, closes the position and emits `StopLossTriggered`.
@@ -149,12 +275,19 @@ pub fn check_and_trigger_stop_loss(
     trade_id: u64,
     asset_pair: u32,
 ) -> Result<bool, ContractError> {
+    if is_trigger_settled(env, &user, trade_id) {
+        return Ok(false);
+    }
+
     let (oracle, portfolio) = fetch_oracle_and_portfolio(env)?;
     let stop_loss_price =
         get_stop_loss(env, &user, trade_id).ok_or(ContractError::NotInitialized)?;
     let current_price = fetch_current_price(env, &oracle, asset_pair)?;
 
     if current_price <= stop_loss_price {
+        if !claim_trigger_settlement(env, &user, trade_id) {
+            return Ok(false);
+        }
         close_position_keeper(env, &portfolio, &user, trade_id, asset_pair);
         shared::events::emit_stop_loss_triggered(
             env,
@@ -189,6 +322,10 @@ pub fn check_and_trigger_take_profit(
     trade_id: u64,
     asset_pair: u32,
 ) -> Result<bool, ContractError> {
+    if is_trigger_settled(env, &user, trade_id) {
+        return Ok(false);
+    }
+
     let (oracle, portfolio) = fetch_oracle_and_portfolio(env)?;
     let take_profit_price =
         get_take_profit(env, &user, trade_id).ok_or(ContractError::NotInitialized)?;
@@ -202,6 +339,9 @@ pub fn check_and_trigger_take_profit(
     }
 
     if current_price >= take_profit_price {
+        if !claim_trigger_settlement(env, &user, trade_id) {
+            return Ok(false);
+        }
         close_position_keeper(env, &portfolio, &user, trade_id, asset_pair);
         shared::events::emit_take_profit_triggered(
             env,
@@ -294,10 +434,23 @@ mod tests {
             env.storage()
                 .instance()
                 .set(&symbol_short!("closed"), &trade_id);
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("ccount"))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("ccount"), &(count + 1));
         }
 
         pub fn last_closed(env: Env) -> Option<u64> {
             env.storage().instance().get(&symbol_short!("closed"))
+        }
+
+        /// Number of times `close_position_keeper` has actually been invoked.
+        pub fn close_count(env: Env) -> u32 {
+            env.storage().instance().get(&symbol_short!("ccount")).unwrap_or(0)
         }
     }
 
@@ -333,6 +486,29 @@ mod tests {
         assert!(MockPortfolioClient::new(&env, &portfolio_id)
             .last_closed()
             .is_none());
+    }
+
+    /// Issue #1440: two competing keepers both calling the stop-loss trigger
+    /// for the same stale/expired position must not both succeed in closing
+    /// it (and thus must not both earn a keeper reward for the same intent).
+    #[test]
+    fn duplicate_keeper_trigger_settles_only_once() {
+        let (env, exec_id, oracle_id, portfolio_id) = setup();
+        let user = Address::generate(&env);
+        MockOracleClient::new(&env, &oracle_id).set_price(&100);
+        let exec = TradeExecutorContractClient::new(&env, &exec_id);
+        exec.set_stop_loss_price(&user, &1u64, &100);
+
+        // First keeper triggers successfully.
+        assert!(exec.check_and_trigger_stop_loss(&user, &1u64, &0u32));
+        // A second, competing keeper calling the same entrypoint for the same
+        // position must be a no-op: no second close, no second reward.
+        assert!(!exec.check_and_trigger_stop_loss(&user, &1u64, &0u32));
+
+        assert_eq!(
+            MockPortfolioClient::new(&env, &portfolio_id).close_count(),
+            1
+        );
     }
 
     #[test]
@@ -372,12 +548,9 @@ mod tests {
         exec.set_stop_loss_price(&user, &3u64, &100);
         exec.check_and_trigger_stop_loss(&user, &3u64, &0u32);
         // Just verify the call succeeded and position was closed (event format tested below).
-        assert_eq!(
-            MockPortfolioClient::new(&env, &portfolio_id)
-                .last_closed()
-                .is_none(),
-            false
-        );
+        assert!(MockPortfolioClient::new(&env, &portfolio_id)
+            .last_closed()
+            .is_some());
         let _ = env.events();
     }
 

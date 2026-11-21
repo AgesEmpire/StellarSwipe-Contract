@@ -20,6 +20,24 @@ pub const DEFAULT_ESTIMATED_COPY_TRADE_FEE: i128 = 500_000;
 /// Maximum number of trades allowed in a single `batch_execute` call.
 pub const MAX_BATCH_SIZE: u32 = 10;
 
+/// Sensible default minimum trade size (token smallest units, 7 decimals) applied to any
+/// asset without an explicit admin-configured override. Chosen as a conservative dust
+/// floor — well below realistic trade sizes but high enough to block griefing via
+/// near-zero-amount trades/copy-trades that cost more in storage/processing than they're
+/// worth, or that round to zero in fee calculations.
+pub const DEFAULT_MIN_TRADE_SIZE: i128 = 1_000;
+
+/// Reject `amount` if it falls below `minimum` for the asset being traded.
+/// Callers resolve `minimum` via the per-asset override (falling back to
+/// [`DEFAULT_MIN_TRADE_SIZE`]) before any state changes occur.
+pub fn validate_min_trade_size(amount: i128, minimum: i128) -> Result<(), ContractError> {
+    if amount < minimum {
+        Err(ContractError::BelowMinimumTradeSize)
+    } else {
+        Ok(())
+    }
+}
+
 /// Batched portfolio entrypoint: atomically validates the position cap and records the
 /// copy position in one cross-contract call, replacing the old two-call pattern
 /// (`get_open_position_count` + `record_copy_position`).
@@ -108,7 +126,7 @@ pub fn resolve_trade_amount(
 /// Replaces the previous two-call pattern:
 ///   - call A: `get_open_position_count(user) -> u32`
 ///   - call B: `record_copy_position(user)`
-/// with a single batched call:
+///     with a single batched call:
 ///   - call A: `validate_and_record(user, max_positions) -> u32`
 ///
 /// Cross-contract call count in `execute_copy_trade`: **3 → 2** (−1 call, ≥33% reduction).

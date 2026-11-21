@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::reputation::{
-        calculate_trust_score, calculate_stake_component, calculate_tenure_component,
+        calculate_stake_component, calculate_tenure_component, calculate_trust_score,
         calculate_weighted_score, get_first_signal_time, get_trust_score, get_trust_score_tier,
         record_first_signal, store_trust_score, update_median_values, ReputationDataKey,
         TrustScoreComponents, TrustScoreDetails, TrustScoreTier,
@@ -44,6 +44,7 @@ mod tests {
             success_rate,
             avg_return: 500,
             total_volume: 1000000,
+            follower_count: 0,
         }
     }
 
@@ -64,9 +65,10 @@ mod tests {
             let provider = create_test_provider(env);
             update_median_values(env, 100_000_000, 50);
             let first_signal_time = env.ledger().timestamp() - (200 * 24 * 60 * 60);
-            env.storage()
-                .persistent()
-                .set(&ReputationDataKey::FirstSignalTime(provider.clone()), &first_signal_time);
+            env.storage().persistent().set(
+                &ReputationDataKey::FirstSignalTime(provider.clone()),
+                &first_signal_time,
+            );
             let performance = create_test_performance(20, 18, 9000);
             let stake_info = Some(StakeInfo {
                 amount: 300_000_000,
@@ -102,9 +104,10 @@ mod tests {
             let provider = create_test_provider(env);
             update_median_values(env, 100_000_000, 50);
             let first_signal_time = env.ledger().timestamp() - (100 * 24 * 60 * 60);
-            env.storage()
-                .persistent()
-                .set(&ReputationDataKey::FirstSignalTime(provider.clone()), &first_signal_time);
+            env.storage().persistent().set(
+                &ReputationDataKey::FirstSignalTime(provider.clone()),
+                &first_signal_time,
+            );
             let performance = create_test_performance(10, 7, 7000);
             let stake_info = Some(StakeInfo {
                 amount: 150_000_000,
@@ -155,21 +158,24 @@ mod tests {
             let recent_provider = env.ledger().timestamp() - (10 * 24 * 60 * 60);
             let established_provider = env.ledger().timestamp() - (200 * 24 * 60 * 60);
             let veteran_provider = env.ledger().timestamp() - (400 * 24 * 60 * 60);
-            env.storage()
-                .persistent()
-                .set(&ReputationDataKey::FirstSignalTime(provider.clone()), &recent_provider);
+            env.storage().persistent().set(
+                &ReputationDataKey::FirstSignalTime(provider.clone()),
+                &recent_provider,
+            );
             let component_recent =
                 calculate_tenure_component(env, &provider, env.ledger().timestamp());
             assert!(component_recent < 1000);
-            env.storage()
-                .persistent()
-                .set(&ReputationDataKey::FirstSignalTime(provider.clone()), &established_provider);
+            env.storage().persistent().set(
+                &ReputationDataKey::FirstSignalTime(provider.clone()),
+                &established_provider,
+            );
             let component_established =
                 calculate_tenure_component(env, &provider, env.ledger().timestamp());
             assert!(component_established > 5000);
-            env.storage()
-                .persistent()
-                .set(&ReputationDataKey::FirstSignalTime(provider.clone()), &veteran_provider);
+            env.storage().persistent().set(
+                &ReputationDataKey::FirstSignalTime(provider.clone()),
+                &veteran_provider,
+            );
             let component_veteran =
                 calculate_tenure_component(env, &provider, env.ledger().timestamp());
             assert_eq!(component_veteran, 10000);
@@ -178,7 +184,10 @@ mod tests {
 
     #[test]
     fn test_weighted_score_calculation() {
-        assert_eq!(calculate_weighted_score(10000, 10000, 10000, 10000, 10000), 100);
+        assert_eq!(
+            calculate_weighted_score(10000, 10000, 10000, 10000, 10000),
+            100
+        );
         assert_eq!(calculate_weighted_score(5000, 5000, 5000, 5000, 5000), 50);
         assert_eq!(calculate_weighted_score(0, 0, 0, 0, 0), 0);
     }

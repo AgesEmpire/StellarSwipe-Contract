@@ -1,3 +1,4 @@
+use crate::migration::MigrationSnapshot;
 use crate::types::{Asset, MigrationProgress};
 use soroban_sdk::{contracttype, Address, Env, String, Symbol, Vec};
 
@@ -16,13 +17,11 @@ pub fn emit_admin_transfer_proposed(
 }
 
 pub fn emit_admin_transfer_completed(env: &Env, old_admin: Address, new_admin: Address) {
-    let topics = (Symbol::new(env, "admin_transfer_completed"),);
-    env.events().publish(topics, (old_admin, new_admin));
+    stellar_swipe_common::emit_event!(env, "admin_transfer_completed", (old_admin, new_admin));
 }
 
 pub fn emit_admin_transferred(env: &Env, old_admin: Address, new_admin: Address) {
-    let topics = (Symbol::new(env, "admin_transferred"),);
-    env.events().publish(topics, (old_admin, new_admin));
+    stellar_swipe_common::emit_event!(env, "admin_transferred", (old_admin, new_admin));
 }
 
 pub fn emit_parameter_updated(env: &Env, parameter: Symbol, old_value: i128, new_value: i128) {
@@ -106,6 +105,22 @@ pub fn emit_signal_expired(env: &Env, signal_id: u64, provider: Address, expired
         .publish(topics, (signal_id, provider, expired_at_ledger));
 }
 
+/// Emitted when expired signals are permanently removed from storage
+/// (issue #779). `ledger` is the ledger sequence at prune time so off-chain
+/// indexers can track storage health over time.
+pub fn emit_signals_pruned(env: &Env, count: u32, ledger: u32) {
+    let topics = (Symbol::new(env, "signals_pruned"),);
+    env.events().publish(topics, (count, ledger));
+}
+
+/// Emitted once per `archive_old_signals` call that removes at least one
+/// expired signal from storage (issue #1219). `archived_at` is the ledger
+/// timestamp of the sweep.
+pub fn emit_signals_archived(env: &Env, count: u32, archived_at: u64) {
+    let topics = (Symbol::new(env, "signals_archived"),);
+    env.events().publish(topics, (count, archived_at));
+}
+
 pub fn emit_trade_executed(env: &Env, signal_id: u64, executor: Address, roi: i128, volume: i128) {
     let topics = (Symbol::new(env, "trade_executed"),);
     env.events()
@@ -136,16 +151,22 @@ pub fn emit_provider_stats_updated(
         .publish(topics, (provider, success_rate, avg_return, total_volume));
 }
 
+pub fn emit_verification_eligibility_checked(env: &Env, provider: Address, eligible: bool) {
+    let topics = (
+        Symbol::new(env, "verification_eligibility_checked"),
+        provider,
+    );
+    env.events().publish(topics, eligible);
+}
+
 pub fn emit_follow_gained(env: &Env, user: Address, provider: Address, new_count: u32) {
     let topics = (Symbol::new(env, "follow_gained"),);
-    env.events()
-        .publish(topics, (user, provider, new_count));
+    env.events().publish(topics, (user, provider, new_count));
 }
 
 pub fn emit_follow_lost(env: &Env, user: Address, provider: Address, new_count: u32) {
     let topics = (Symbol::new(env, "follow_lost"),);
-    env.events()
-        .publish(topics, (user, provider, new_count));
+    env.events().publish(topics, (user, provider, new_count));
 }
 
 pub fn emit_tags_added(env: &Env, signal_id: u64, provider: Address, tag_count: u32) {
@@ -161,8 +182,7 @@ pub fn emit_collaborative_signal_created(env: &Env, signal_id: u64, authors: Vec
 
 pub fn emit_collaborative_signal_approved(env: &Env, signal_id: u64, approver: Address) {
     let topics = (Symbol::new(env, "collab_signal_approved"),);
-    env.events()
-        .publish(topics, (signal_id, approver));
+    env.events().publish(topics, (signal_id, approver));
 }
 
 pub fn emit_collaborative_signal_published(env: &Env, signal_id: u64) {
@@ -195,8 +215,7 @@ pub fn emit_combo_cancelled(env: &Env, combo_id: u64, provider: Address) {
 
 pub fn emit_signal_updated(env: &Env, signal_id: u64, version: u32, updater: Address) {
     let topics = (Symbol::new(env, "signal_updated"),);
-    env.events()
-        .publish(topics, (signal_id, version, updater));
+    env.events().publish(topics, (signal_id, version, updater));
 }
 
 #[contracttype]
@@ -232,8 +251,7 @@ pub fn emit_signal_edited(
 
 pub fn emit_copy_recorded(env: &Env, user: Address, signal_id: u64, version: u32) {
     let topics = (Symbol::new(env, "copy_recorded"),);
-    env.events()
-        .publish(topics, (user, signal_id, version));
+    env.events().publish(topics, (user, signal_id, version));
 }
 
 pub fn emit_cross_chain_signal_requested(
@@ -294,14 +312,12 @@ pub fn emit_emergency_paused(
 
 pub fn emit_emergency_unpaused(env: &Env, category: String, unpaused_by: Address) {
     let topics = (Symbol::new(env, "emergency_unpaused"),);
-    env.events()
-        .publish(topics, (category, unpaused_by));
+    env.events().publish(topics, (category, unpaused_by));
 }
 
 pub fn emit_circuit_breaker_triggered(env: &Env, category: String, reason: String) {
     let topics = (Symbol::new(env, "circuit_breaker_triggered"),);
-    env.events()
-        .publish(topics, (category, reason));
+    env.events().publish(topics, (category, reason));
 }
 
 pub fn emit_guardian_set(env: &Env, guardian: Address) {
@@ -332,4 +348,90 @@ pub fn emit_reputation_updated(env: &Env, provider: Address, old_score: u32, new
             new_score,
         },
     );
+}
+
+/// Emitted when a storage type exceeds 80% of its capacity limit.
+/// `storage_type`: 0 = instance, 1 = persistent, 2 = temporary
+/// `entry_count`: current number of entries
+/// `capacity_limit`: the configured limit
+pub fn emit_storage_capacity_warning(
+    env: &Env,
+    storage_type: u32,
+    entry_count: u32,
+    capacity_limit: u32,
+) {
+    let topics = (Symbol::new(env, "storage_cap_warn"),);
+    env.events()
+        .publish(topics, (storage_type, entry_count, capacity_limit));
+}
+
+pub fn emit_signal_expiry_warning(
+    env: &Env,
+    signal_id: u64,
+    provider: Address,
+    expires_at: u64,
+    time_remaining_ledgers: u64,
+) {
+    let topics = (Symbol::new(env, "signal_expiry_warning"),);
+    env.events().publish(
+        topics,
+        (signal_id, provider, expires_at, time_remaining_ledgers),
+    );
+}
+
+pub fn emit_provider_cooling_off_started(env: &Env, provider: Address, ends_at: u64) {
+    let topics = (Symbol::new(env, "provider_cooling_off"),);
+    env.events().publish(topics, (provider, ends_at));
+}
+
+pub fn emit_migration_progress(env: &Env, progress: MigrationProgress) {
+    let topics = (Symbol::new(env, "migration_progress"),);
+    env.events().publish(topics, progress);
+}
+
+/// Post-migration invariants reconciled successfully (issue #597).
+pub fn emit_migration_verified(env: &Env, post: MigrationSnapshot) {
+    let topics = (Symbol::new(env, "migration_verified"),);
+    env.events().publish(topics, post);
+}
+
+/// Post-migration invariants did NOT reconcile (issue #597): the migrated
+/// data's record count / total_volume sum differs from the pre-migration
+/// snapshot taken over the same id scope. Flags the migration as requiring
+/// manual review/rollback.
+pub fn emit_migration_verification_failed(
+    env: &Env,
+    verification: crate::migration::MigrationVerification,
+) {
+    let topics = (Symbol::new(env, "migration_verify_failed"),);
+    env.events()
+        .publish(topics, (verification.pre, verification.post));
+}
+
+/// Issue #812: a migration was rejected before any migration logic ran
+/// because the on-chain storage schema version did not match what the
+/// migration code expects as a precondition. Emitted for auditability —
+/// no state is mutated when this fires.
+pub fn emit_migration_layout_rejected(env: &Env, found_schema_version: u32) {
+    let topics = (Symbol::new(env, "migration_layout_rejected"),);
+    env.events().publish(topics, found_schema_version);
+}
+
+pub fn emit_signal_orphaned(env: &Env, signal_id: u64, reason: String) {
+    let topics = (Symbol::new(env, "signal_orphaned"),);
+    env.events().publish(topics, (signal_id, reason));
+}
+
+/// Issue #948: emitted when a caller invokes an entry point kept only for
+/// backward compatibility, so indexers/integrators can see legacy usage and
+/// migrate to `replacement` before the shim is ever removed.
+pub fn emit_deprecated_entry_point_used(env: &Env, entry_point: Symbol, replacement: Symbol) {
+    let topics = (Symbol::new(env, "deprecated_entry_point_used"),);
+    env.events().publish(topics, (entry_point, replacement));
+}
+
+/// Emitted when a provider cancels a signal after the minimum lifetime has elapsed (issue #687).
+pub fn emit_signal_cancelled(env: &Env, signal_id: u64, provider: Address) {
+    let topics = (Symbol::new(env, "signal_cancelled"),);
+    env.events().publish(topics, (signal_id, provider));
 }
