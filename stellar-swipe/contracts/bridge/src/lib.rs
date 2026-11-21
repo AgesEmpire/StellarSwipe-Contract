@@ -12,6 +12,10 @@ use stellar_swipe_common::SECONDS_PER_DAY;
 mod validators;
 
 pub mod asset_amount;
+pub mod movement_limits;
+pub mod recovery;
+pub mod reservations;
+pub mod validator_accounting;
 pub use validators::{ValidatorApproval, ValidatorApprovalKind, ValidatorSet};
 
 #[contracterror]
@@ -112,6 +116,29 @@ pub enum BridgeError {
     /// A swap would move the pool price beyond the configured maximum impact
     /// bound, independently of the caller's minimum-output limit (Issue #1317).
     MaxPriceImpactExceeded = 40,
+    /// Bridge movement would push the asset's aggregate volume for the
+    /// current ledger-time window past its configured limit (Issue #1417).
+    AssetMovementLimitExceeded = 41,
+    /// The bounded delivery recovery queue is full; no further transient
+    /// failures can be queued until it is drained (Issue #1415).
+    RecoveryQueueFull = 42,
+    /// A recovery batch size is zero or above `recovery::MAX_RECOVERY_BATCH`
+    /// (Issue #1415).
+    RecoveryBatchLimitExceeded = 43,
+    /// Not enough unreserved bridge liquidity for the asset to cover the
+    /// requested reservation (Issue #1416).
+    InsufficientBridgeLiquidity = 44,
+    /// No liquidity reservation exists for the given transfer (Issue #1416).
+    ReservationNotFound = 45,
+    /// The active-reservation set is at `reservations::MAX_ACTIVE_RESERVATIONS`
+    /// (Issue #1416).
+    ReservationCapacityReached = 46,
+    /// A slash would debit more than the validator's accounted balance
+    /// (Issue #1418).
+    InsufficientValidatorBalance = 47,
+    /// Reward/slash epoch is in the future relative to the ledger epoch
+    /// (Issue #1418).
+    InvalidValidatorEpoch = 48,
 }
 
 impl BridgeError {
@@ -231,6 +258,30 @@ impl BridgeError {
             }
             BridgeError::MaxPriceImpactExceeded => {
                 "swap would exceed the pool's configured maximum price impact bound"
+            }
+            BridgeError::AssetMovementLimitExceeded => {
+                "bridge movement would exceed the asset's aggregate limit for the current window"
+            }
+            BridgeError::RecoveryQueueFull => {
+                "delivery recovery queue is full; drain it before queueing more failures"
+            }
+            BridgeError::RecoveryBatchLimitExceeded => {
+                "recovery batch size must be between one and the protocol maximum"
+            }
+            BridgeError::InsufficientBridgeLiquidity => {
+                "not enough unreserved bridge liquidity for this asset"
+            }
+            BridgeError::ReservationNotFound => {
+                "no liquidity reservation exists for this transfer"
+            }
+            BridgeError::ReservationCapacityReached => {
+                "maximum number of active liquidity reservations reached"
+            }
+            BridgeError::InsufficientValidatorBalance => {
+                "slash amount exceeds the validator's accounted balance"
+            }
+            BridgeError::InvalidValidatorEpoch => {
+                "validator accounting epoch is in the future"
             }
         }
     }
@@ -818,6 +869,9 @@ impl BridgeContract {
         // or downstream settlement effect. On error the whole transaction
         // rolls back, including this flag.
         consume_message_for_execution(&env, &transfer)?;
+        // #1416: a delivered message uses its reserved liquidity, so expiry
+        // processing can never release it afterwards.
+        reservations::consume_for_transfer(&env, transfer_id)?;
 
         let balance_key =
             DataKey::WrappedBalance(transfer.user.clone(), transfer.wrapped_asset.clone());
@@ -1621,6 +1675,14 @@ impl BridgeContract {
             return Err(BridgeError::TransferPermanentlyFailed);
         }
 
+        // #1415: a transfer that has used up its retry attempts can no longer
+        // be marked retryable.
+        let retryable = retryable
+            && recovery::get_attempts(&env, transfer_id) < recovery::get_max_attempts(&env);
+        if !retryable {
+            recovery::dequeue(&env, transfer_id);
+        }
+
         transfer.status = TransferStatus::Failed;
         transfer.failure_reason = Some(reason.clone());
         transfer.retryable = retryable;
@@ -1660,9 +1722,9 @@ impl BridgeContract {
             return Err(BridgeError::TransferPermanentlyFailed);
         }
 
-        transfer.status = TransferStatus::ReadyToExecute;
-        transfer.failure_reason = None;
-        transfer.retryable = false;
+        // #1415: counts against the attempt policy and leaves the recovery
+        // queue, so a manual retry and the queue cannot both re-arm it.
+        recovery::begin_retry(&env, &mut transfer);
         store_transfer(&env, &transfer);
 
         #[allow(deprecated)]
@@ -1671,6 +1733,259 @@ impl BridgeContract {
             env.ledger().timestamp(),
         );
         Ok(())
+    }
+
+    // ── #1415: Bounded recovery queue for failed deliveries ──────────────────
+
+    /// Record a classified delivery failure.
+    ///
+    /// A [`recovery::FailureClass::Transient`] failure enters the bounded
+    /// recovery queue while the transfer still has retry attempts left; once
+    /// the attempt policy is used up it is recorded as permanent instead. A
+    /// [`recovery::FailureClass::Permanent`] failure never enters the queue.
+    /// Returns whether the transfer is now queued for retry.
+    pub fn report_delivery_failure(
+        env: Env,
+        admin: Address,
+        transfer_id: u64,
+        reason: String,
+        class: recovery::FailureClass,
+    ) -> Result<bool, BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        let mut transfer = get_transfer(&env, transfer_id)?;
+        if transfer.status == TransferStatus::Completed
+            || transfer.status == TransferStatus::Cancelled
+        {
+            return Err(BridgeError::InvalidOperation);
+        }
+        if transfer.status == TransferStatus::Failed && !transfer.retryable {
+            return Err(BridgeError::TransferPermanentlyFailed);
+        }
+        let queued = recovery::record_failure(&env, &mut transfer, reason, class)?;
+        store_transfer(&env, &transfer);
+        Ok(queued)
+    }
+
+    /// Re-arm up to `max_items` queued transfers (oldest first) for
+    /// execution. `max_items` must be within `1..=recovery::MAX_RECOVERY_BATCH`.
+    /// No external call is made; each re-armed transfer is executed by a
+    /// separate `execute_*` call. Expired transfers are dropped as permanent.
+    /// Returns the number of transfers re-armed.
+    pub fn process_recovery_queue(
+        env: Env,
+        admin: Address,
+        max_items: u32,
+    ) -> Result<u32, BridgeError> {
+        if is_paused(&env) {
+            return Err(BridgeError::ContractPaused);
+        }
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        recovery::process_queue(
+            &env,
+            max_items,
+            |env, id| get_transfer(env, id).ok(),
+            store_transfer,
+            |env, t| ensure_not_expired(env, t).is_err(),
+        )
+    }
+
+    /// Admin: set how many retry attempts a transfer may use
+    /// (`1..=recovery::MAX_DELIVERY_ATTEMPTS_CAP`).
+    pub fn set_max_delivery_attempts(
+        env: Env,
+        admin: Address,
+        max_attempts: u32,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        recovery::set_max_attempts(&env, max_attempts)
+    }
+
+    pub fn get_max_delivery_attempts(env: Env) -> u32 {
+        recovery::get_max_attempts(&env)
+    }
+
+    pub fn get_delivery_attempts(env: Env, transfer_id: u64) -> u32 {
+        recovery::get_attempts(&env, transfer_id)
+    }
+
+    /// Transfer ids currently waiting in the recovery queue, oldest first.
+    pub fn get_recovery_queue(env: Env) -> Vec<u64> {
+        recovery::get_queue(&env)
+    }
+
+    // ── #1416: Liquidity reservations released on expiry ─────────────────────
+
+    /// Admin: set the total bridge liquidity tracked for `asset`. Cannot be
+    /// set below the amount currently reserved.
+    pub fn set_bridge_asset_liquidity(
+        env: Env,
+        admin: Address,
+        asset: String,
+        total: i128,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        reservations::set_asset_liquidity(&env, asset, total)
+    }
+
+    pub fn get_bridge_asset_liquidity(env: Env, asset: String) -> reservations::AssetLiquidity {
+        reservations::get_asset_liquidity(&env, &asset)
+    }
+
+    /// Liquidity for `asset` not held by any active reservation.
+    pub fn get_available_bridge_liquidity(env: Env, asset: String) -> i128 {
+        reservations::available_liquidity(&env, &asset)
+    }
+
+    /// Admin: reserve liquidity for a live lock/mint transfer. The
+    /// reservation inherits the transfer's `expires_at`.
+    pub fn reserve_transfer_liquidity(
+        env: Env,
+        admin: Address,
+        transfer_id: u64,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        let transfer = get_transfer(&env, transfer_id)?;
+        reservations::reserve(&env, &transfer)
+    }
+
+    pub fn get_liquidity_reservation(
+        env: Env,
+        transfer_id: u64,
+    ) -> Option<reservations::LiquidityReservation> {
+        reservations::get_reservation(&env, transfer_id)
+    }
+
+    /// Release the reservation of one transfer that can no longer be
+    /// delivered. Permissionless: eligibility depends only on ledger time and
+    /// transfer state. Returns `false` (and changes nothing) when the
+    /// reservation was already settled or the transfer is still deliverable.
+    pub fn release_expired_reservation(env: Env, transfer_id: u64) -> Result<bool, BridgeError> {
+        let transfer = get_transfer(&env, transfer_id).ok();
+        reservations::release_if_expired(&env, transfer_id, transfer.as_ref())
+    }
+
+    /// Release up to `max_items` (`1..=reservations::MAX_EXPIRY_BATCH`)
+    /// eligible reservations. Permissionless and idempotent: a repeated call
+    /// releases nothing that was already released. Returns the count released.
+    pub fn release_expired_reservations(env: Env, max_items: u32) -> Result<u32, BridgeError> {
+        reservations::release_expired(&env, max_items, |env, id| get_transfer(env, id).ok())
+    }
+
+    // ── #1417: Per-asset bridge movement limits ──────────────────────────────
+
+    /// Admin: cap the aggregate amount of `asset` that may move through the
+    /// bridge per `window_seconds` ledger-time window. Updating only the
+    /// limit keeps the current window's volume; changing the window length
+    /// starts a fresh window.
+    pub fn set_asset_movement_limit(
+        env: Env,
+        admin: Address,
+        asset: String,
+        limit: i128,
+        window_seconds: u64,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        movement_limits::set_limit(&env, asset, limit, window_seconds)
+    }
+
+    /// Admin: remove the movement limit for `asset`.
+    pub fn remove_asset_movement_limit(
+        env: Env,
+        admin: Address,
+        asset: String,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        movement_limits::remove_limit(&env, asset);
+        Ok(())
+    }
+
+    pub fn get_asset_movement_limit(
+        env: Env,
+        asset: String,
+    ) -> Option<movement_limits::AssetMovementLimit> {
+        movement_limits::get_limit(&env, &asset)
+    }
+
+    /// Volume moved for `asset` in the current window (zero after rollover).
+    pub fn get_asset_movement_usage(
+        env: Env,
+        asset: String,
+    ) -> movement_limits::AssetMovementWindow {
+        movement_limits::get_usage(&env, &asset)
+    }
+
+    // ── #1418: Validator reward / slash accounting ───────────────────────────
+
+    /// Admin: credit a reward to an active validator for `epoch`. Emits
+    /// `validator_reward_credited` after the balance is updated.
+    pub fn credit_validator_reward(
+        env: Env,
+        admin: Address,
+        validator: Address,
+        amount: i128,
+        reason: validator_accounting::ValidatorRewardReason,
+        epoch: u64,
+    ) -> Result<validator_accounting::ValidatorAccount, BridgeError> {
+        let config = require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        if !config.validator_set.validators.contains(&validator) {
+            return Err(BridgeError::UnauthorizedValidator);
+        }
+        validator_accounting::credit_reward(&env, validator, amount, reason, epoch)
+    }
+
+    /// Admin: slash an active validator for `epoch`. Emits
+    /// `validator_slashed` after the balance is updated.
+    pub fn slash_validator(
+        env: Env,
+        admin: Address,
+        validator: Address,
+        amount: i128,
+        reason: validator_accounting::ValidatorSlashReason,
+        epoch: u64,
+    ) -> Result<validator_accounting::ValidatorAccount, BridgeError> {
+        let config = require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        if !config.validator_set.validators.contains(&validator) {
+            return Err(BridgeError::UnauthorizedValidator);
+        }
+        validator_accounting::slash(&env, validator, amount, reason, epoch)
+    }
+
+    pub fn get_validator_account(
+        env: Env,
+        validator: Address,
+    ) -> validator_accounting::ValidatorAccount {
+        validator_accounting::get_account(&env, &validator)
+    }
+
+    pub fn get_validator_epoch(env: Env) -> u64 {
+        validator_accounting::current_epoch(&env)
     }
 }
 
@@ -1937,6 +2252,11 @@ fn validate_amount_and_limits(
         return Err(BridgeError::MaxTransferExceeded);
     }
 
+    // ── #1417: per-asset aggregate movement limit ─────────────────────────
+    // Checked before any limit accounting is written; the updated window is
+    // only persisted once every other check below has passed.
+    let asset_window = movement_limits::check_movement(env, &wrapped_asset, amount)?;
+
     // ── #989: Per-message route limit ──────────────────────────────────────
     if let Some(route_cfg) = env.storage().persistent().get::<_, WithdrawalRouteConfig>(
         &DataKey::WithdrawalRouteConfig(source_chain, destination_chain, wrapped_asset.clone()),
@@ -2015,6 +2335,9 @@ fn validate_amount_and_limits(
     env.storage()
         .persistent()
         .set(&DataKey::DailyVolume, &volume);
+    if let Some(window) = asset_window {
+        movement_limits::commit_movement(env, &wrapped_asset, &window);
+    }
     Ok(())
 }
 
@@ -3098,3 +3421,12 @@ mod test_message_expiry;
 
 #[cfg(test)]
 mod test_validator_activation;
+
+#[cfg(test)]
+mod test_liquidity_reservations;
+
+#[cfg(test)]
+mod test_asset_movement_limits;
+
+#[cfg(test)]
+mod test_validator_accounting;
