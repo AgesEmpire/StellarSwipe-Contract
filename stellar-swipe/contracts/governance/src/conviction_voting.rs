@@ -429,6 +429,13 @@ pub fn change_conviction_vote(
 ) -> Result<(), GovernanceError> {
     voter.require_auth();
 
+    // #1289: a vote replacement is a vote submission and obeys exactly the
+    // same deadline rule on both the source and destination proposals.
+    let source_proposal = crate::proposals::get_proposal(env, from_proposal)?;
+    let target_proposal = crate::proposals::get_proposal(env, to_proposal)?;
+    crate::voting::require_voting_open(env, &source_proposal)?;
+    crate::voting::require_voting_open(env, &target_proposal)?;
+
     let mut state = get_conviction_state(env);
     let mut pool = state
         .pools

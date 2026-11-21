@@ -231,6 +231,51 @@ pub enum ProposalStatus {
     /// voting opened.  This status is immutable once set — the proposal is
     /// permanently excluded from future voting-eligible listings.
     Withdrawn,
+    /// #1287: proposal was vetoed by the guardian during the veto window.
+    Vetoed,
+    /// #1288: synthetic "prior" state for a newly created proposal.
+    Uninitialized,
+}
+
+/// #1288: structured proposal lifecycle transition event.
+///
+/// Emitted for every valid state change. `previous_status` is
+/// `ProposalStatus::Uninitialized` only for creation. `kind` names the transition ("created", "voting_started",
+/// "voting_completed", "queued", "vetoed", "cancelled", "executed",
+/// "expired"), so an off-chain consumer can replay the event stream and
+/// reconstruct a proposal's state without reading contract storage.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalTransitionEvent {
+    pub proposal_id: u64,
+    pub previous_status: ProposalStatus,
+    pub new_status: ProposalStatus,
+    pub actor: Address,
+    pub ledger_time: u64,
+    pub kind: String,
+}
+
+/// Publish a documented proposal state transition (Issue #1288).
+pub fn publish_transition(
+    env: &Env,
+    proposal_id: u64,
+    previous_status: ProposalStatus,
+    new_status: ProposalStatus,
+    actor: &Address,
+    kind: &str,
+) {
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("pstate")),
+        ProposalTransitionEvent {
+            proposal_id,
+            previous_status,
+            new_status,
+            actor: actor.clone(),
+            ledger_time: env.ledger().timestamp(),
+            kind: String::from_str(env, kind),
+        },
+    );
 }
 
 #[contracttype]
@@ -282,6 +327,12 @@ pub struct Proposal {
     /// Used as the quadratic-adjusted total supply for quorum checks.
     pub quadratic_total_supply: i128,
     // ── #796: Treasury spend proposal execution expiry ───────────────────────
+    /// #1287: end of the guardian veto window. Set at creation as
+    /// `voting_ends + GovernanceConfig::veto_window`. A proposal cannot be
+    /// executed while `now < veto_ends_at`.
+    pub veto_ends_at: u64,
+    /// #1287: address of the guardian that vetoed this proposal, if any.
+    pub vetoed_by: Option<Address>,
     /// Ledger timestamp after which a `Succeeded` proposal can no longer be
     /// executed. Set at creation as `voting_ends + EXECUTION_WINDOW`. Prevents
     /// approved-but-unexecuted spend authorisations from locking treasury
@@ -308,6 +359,9 @@ pub struct GovernanceConfig {
     /// Mandatory discussion window (seconds) before votes can be cast (Issue #667).
     /// A value of 0 disables the discussion period.
     pub discussion_duration: u64,
+    /// #1287: seconds after `voting_ends` during which the guardian may veto
+    /// a passed proposal. Zero disables the veto window (legacy behaviour).
+    pub veto_window: u64,
 }
 
 #[contracttype]
@@ -320,6 +374,69 @@ pub struct ProposalStatistics {
     pub executed_proposals: u32,
     pub avg_participation_rate: u32,
     pub avg_approval_rate: u32,
+}
+
+/// Read-only, self-contained governance proposal status report (Issue #1292).
+///
+/// One call returns lifecycle state, current/final tally, effective thresholds
+/// and every relevant deadline, so clients never have to reconstruct state
+/// from separate `proposal`, `governance_config` and threshold calls.
+/// An unknown `proposal_id` returns `exists: false` with `state: Pending` and
+/// all numeric fields zeroed rather than trapping. `exists` is authoritative
+/// in that case; the `Pending` state is only a non-optional placeholder.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalStatusReport {
+    pub proposal_id: u64,
+    pub exists: bool,
+    pub state: ProposalStatus,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    pub votes_abstain: i128,
+    pub quorum_bps: u32,
+    pub approval_bps: u32,
+    pub voting_starts: u64,
+    pub voting_ends: u64,
+    pub discussion_ends_at: u64,
+    pub execution_deadline: u64,
+}
+
+/// Build a [`ProposalStatusReport`] without mutating storage.
+pub fn get_proposal_status_report(env: &Env, proposal_id: u64) -> ProposalStatusReport {
+    let empty = ProposalStatusReport {
+        proposal_id,
+        exists: false,
+        state: ProposalStatus::Pending,
+        votes_for: 0,
+        votes_against: 0,
+        votes_abstain: 0,
+        quorum_bps: 0,
+        approval_bps: 0,
+        voting_starts: 0,
+        voting_ends: 0,
+        discussion_ends_at: 0,
+        execution_deadline: 0,
+    };
+    let proposal = match get_proposals_state(env).proposals.get(proposal_id) {
+        Some(p) => p,
+        None => return empty,
+    };
+    let cfg = get_governance_config(env);
+    let (quorum_bps, approval_bps) = resolve_category_thresholds(env, &proposal.category, &cfg);
+    ProposalStatusReport {
+        proposal_id,
+        exists: true,
+        state: effective_status(env, &proposal),
+        votes_for: proposal.votes_for,
+        votes_against: proposal.votes_against,
+        votes_abstain: proposal.votes_abstain,
+        quorum_bps,
+        approval_bps,
+        voting_starts: proposal.voting_starts,
+        voting_ends: proposal.voting_ends,
+        discussion_ends_at: proposal.discussion_ends_at,
+        execution_deadline: proposal.execution_deadline,
+    }
 }
 
 #[contracttype]
@@ -357,6 +474,7 @@ pub fn default_governance_config() -> GovernanceConfig {
         approval_threshold: 5_000,
         execution_delay: 0,
         discussion_duration: 0,
+        veto_window: 0,
     }
 }
 
@@ -455,6 +573,9 @@ pub fn create_proposal(
 
     validate_proposal(env, &proposal_type)?;
     validate_execution_payload(&proposal_type, &execution_payload)?;
+    // #1286: duplicate detection runs before any ID / deposit / snapshot work.
+    let actions: Vec<ProposalType> = Vec::from_slice(env, &[proposal_type.clone()]);
+    validate_no_duplicate_actions(env, &actions)?;
 
     let mut state = get_proposals_state(env);
     let id = state.next_proposal_id;
@@ -506,6 +627,8 @@ pub fn create_proposal(
         voters: Map::new(env),
         voter_list: Vec::new(env),
         executed_at: None,
+        veto_ends_at: voting_ends.saturating_add(config.veto_window),
+        vetoed_by: None,
         discussion_ends_at,
         category,
         use_quadratic_voting,
@@ -517,6 +640,14 @@ pub fn create_proposal(
     state.proposal_ids.push_back(id);
     state.next_proposal_id = id.saturating_add(1);
     put_proposals_state(env, &state);
+    publish_transition(
+        env,
+        id,
+        ProposalStatus::Uninitialized,
+        ProposalStatus::Pending,
+        &proposer,
+        "created",
+    );
 
     #[allow(deprecated)]
     env.events().publish(
@@ -592,12 +723,8 @@ pub fn cast_vote(
         );
     }
 
-    if now < proposal.voting_starts {
-        return Err(GovernanceError::VotingNotStarted);
-    }
-    if now >= proposal.voting_ends {
-        return Err(GovernanceError::VotingEnded);
-    }
+    // #1289: one explicit deadline rule for both submission and replacement.
+    crate::voting::require_voting_open(env, &proposal)?;
     if proposal.status != ProposalStatus::Pending && proposal.status != ProposalStatus::Active {
         return Err(GovernanceError::ProposalNotActive);
     }
@@ -639,6 +766,14 @@ pub fn cast_vote(
 
     if proposal.status == ProposalStatus::Pending {
         proposal.status = ProposalStatus::Active;
+        publish_transition(
+            env,
+            proposal_id,
+            ProposalStatus::Pending,
+            ProposalStatus::Active,
+            &voter,
+            "voting_started",
+        );
     }
     put_proposal(env, &proposal)
 }
@@ -785,6 +920,7 @@ pub fn simulate_proposal(env: &Env, proposal_id: u64) -> Result<SimulationResult
 
 pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
     let mut proposal = get_proposal(env, proposal_id)?;
+    let previous_status = proposal.status.clone();
     if env.ledger().timestamp() < proposal.voting_ends {
         return Err(GovernanceError::InvalidDuration);
     }
@@ -819,6 +955,14 @@ pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, 
 
     if !quorum_met {
         proposal.status = ProposalStatus::Failed;
+        publish_transition(
+            env,
+            proposal_id,
+            previous_status,
+            ProposalStatus::Failed,
+            &proposal.proposer,
+            "voting_completed",
+        );
         put_proposal(env, &proposal)?;
         return Ok(ProposalStatus::Failed);
     }
@@ -851,6 +995,19 @@ pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, 
         }
     }
 
+    let kind = if status == ProposalStatus::Succeeded && cfg.execution_delay > 0 {
+        "queued"
+    } else {
+        "voting_completed"
+    };
+    publish_transition(
+        env,
+        proposal_id,
+        previous_status,
+        status.clone(),
+        &proposal.proposer,
+        kind,
+    );
     put_proposal(env, &proposal)?;
 
     if status == ProposalStatus::Succeeded && cfg.execution_delay == 0 {
@@ -867,8 +1024,18 @@ pub fn execute_proposal(
 ) -> Result<ProposalStatus, GovernanceError> {
     executor.require_auth();
     let mut proposal = get_proposal(env, proposal_id)?;
+    if proposal.status == ProposalStatus::Vetoed || proposal.vetoed_by.is_some() {
+        return Err(GovernanceError::ProposalVetoed);
+    }
     if proposal.status != ProposalStatus::Succeeded {
         return Err(GovernanceError::ProposalNotApproved);
+    }
+
+    let now_check = env.ledger().timestamp();
+    // #1287: execution is blocked for the whole explicit veto window,
+    // including its final ledger (interval: [voting_ends, veto_ends_at)).
+    if now_check < proposal.veto_ends_at {
+        return Err(GovernanceError::VetoWindowOpen);
     }
 
     let ready = proposal
@@ -896,6 +1063,14 @@ pub fn execute_proposal(
     execute_proposal_action(env, &proposal)?;
     proposal.status = ProposalStatus::Executed;
     proposal.executed_at = Some(env.ledger().timestamp());
+    publish_transition(
+        env,
+        proposal_id,
+        ProposalStatus::Succeeded,
+        ProposalStatus::Executed,
+        &executor,
+        "executed",
+    );
     put_proposal(env, &proposal)?;
     Ok(ProposalStatus::Executed)
 }
@@ -965,6 +1140,49 @@ pub fn mark_proposal_executed(env: &Env, proposal_id: u64) -> Result<(), Governa
     put_proposal(env, &proposal)
 }
 
+/// #1287: guardian veto of a passed proposal during its explicit veto window.
+///
+/// The window is `[voting_ends, veto_ends_at)`; at or after `veto_ends_at` the
+/// proposal is executable and can no longer be vetoed. Only the address in
+/// `StorageKey::Guardian` may call this, and it must authorize.
+pub fn veto_proposal(
+    env: &Env,
+    proposal_id: u64,
+    guardian: Address,
+) -> Result<ProposalStatus, GovernanceError> {
+    guardian.require_auth();
+    let configured: Address = env
+        .storage()
+        .instance()
+        .get(&StorageKey::Guardian)
+        .ok_or(GovernanceError::GuardianNotSet)?;
+    if configured != guardian {
+        return Err(GovernanceError::NotGuardian);
+    }
+
+    let mut proposal = get_proposal(env, proposal_id)?;
+    if proposal.status != ProposalStatus::Succeeded {
+        return Err(GovernanceError::ProposalNotApproved);
+    }
+    let now = env.ledger().timestamp();
+    if now < proposal.voting_ends || now >= proposal.veto_ends_at {
+        return Err(GovernanceError::VetoWindowOpen);
+    }
+
+    proposal.status = ProposalStatus::Vetoed;
+    publish_transition(
+        env,
+        proposal_id,
+        ProposalStatus::Succeeded,
+        ProposalStatus::Vetoed,
+        &guardian,
+        "vetoed",
+    );
+    proposal.vetoed_by = Some(guardian);
+    put_proposal(env, &proposal)?;
+    Ok(ProposalStatus::Vetoed)
+}
+
 pub fn cancel_proposal(
     env: &Env,
     proposal_id: u64,
@@ -992,7 +1210,16 @@ pub fn cancel_proposal(
         return Err(GovernanceError::InvalidCommitteeAction);
     }
 
+    let previous_status = proposal.status.clone();
     proposal.status = ProposalStatus::Cancelled;
+    publish_transition(
+        env,
+        proposal_id,
+        previous_status,
+        ProposalStatus::Cancelled,
+        &canceller,
+        "cancelled",
+    );
     put_proposal(env, &proposal)?;
     Ok(ProposalStatus::Cancelled)
 }
@@ -1052,6 +1279,14 @@ pub fn withdraw_proposal(
     }
 
     proposal.status = ProposalStatus::Withdrawn;
+    publish_transition(
+        env,
+        proposal_id,
+        ProposalStatus::Pending,
+        ProposalStatus::Withdrawn,
+        &proposer,
+        "cancelled",
+    );
     put_proposal(env, &proposal)?;
 
     // Refund the spam-deposit to the proposer (see deposit handling policy above).
@@ -1177,6 +1412,66 @@ pub fn get_all_proposals(env: &Env) -> Vec<Proposal> {
 
 // ── #796: Treasury spend proposal execution expiry ───────────────────────────
 
+/// Persist the terminal `Expired` state for a passed proposal that missed its
+/// execution deadline (Issue #1291).
+///
+/// Settlement rule: the proposal bond is settled exactly once. Finalization
+/// normally settles it already; calling `settle_proposal_deposit` here is
+/// idempotent because it removes the `LockedDeposit` record on settlement, so
+/// an expiry (or a repeated expiry call) can never refund/forfeit twice.
+///
+/// Returns `Ok(Expired)` unchanged for an already-expired proposal, making
+/// repeated expiry processing safe and idempotent.
+pub fn expire_proposal(
+    env: &Env,
+    proposal_id: u64,
+) -> Result<ProposalStatus, GovernanceError> {
+    let mut proposal = get_proposal(env, proposal_id)?;
+    if proposal.status == ProposalStatus::Expired {
+        return Ok(ProposalStatus::Expired);
+    }
+    if proposal.status != ProposalStatus::Succeeded {
+        return Err(GovernanceError::ProposalNotApproved);
+    }
+    if env.ledger().timestamp() <= proposal.execution_deadline {
+        return Err(GovernanceError::InvalidDuration);
+    }
+
+    proposal.status = ProposalStatus::Expired;
+    put_proposal(env, &proposal)?;
+
+    // The deadline is now definitive: no reserved bond stays locked.
+    let total_votes = proposal
+        .votes_for
+        .saturating_add(proposal.votes_against)
+        .saturating_add(proposal.votes_abstain);
+    let total_supply = get_total_supply(env).unwrap_or(0);
+    let treasury: Address = env
+        .storage()
+        .instance()
+        .get(&StorageKey::TreasuryAddress)
+        .unwrap_or_else(|| proposal.proposer.clone());
+    let _ = crate::proposal_deposit::settle_proposal_deposit(
+        env,
+        proposal_id,
+        total_votes,
+        total_supply,
+        &treasury,
+    );
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("treasury"), symbol_short!("propexp")),
+        (
+            proposal_id,
+            proposal.proposer.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+
+    Ok(ProposalStatus::Expired)
+}
+
 /// Reclaim a `Succeeded` proposal whose execution window has closed without
 /// ever being executed. Callable by **any** address (not admin-only) — any
 /// DAO member can clear a stale authorisation once it has expired. Removes
@@ -1195,6 +1490,11 @@ pub fn reclaim_expired_proposal(
 ) -> Result<(), GovernanceError> {
     caller.require_auth();
 
+    // Persist the terminal state (and settle any still-locked bond) before
+    // removing the entry, so expiry processing is never skipped on the reclaim
+    // path. This is idempotent for an already-expired proposal.
+    expire_proposal(env, proposal_id)?;
+
     let mut state = get_proposals_state(env);
     let proposal = state
         .proposals
@@ -1211,6 +1511,14 @@ pub fn reclaim_expired_proposal(
         return Err(GovernanceError::InvalidDuration);
     }
 
+    publish_transition(
+        env,
+        proposal_id,
+        proposal.status.clone(),
+        ProposalStatus::Expired,
+        &caller,
+        "expired",
+    );
     state.proposals.remove(proposal_id);
     remove_proposal_id(&mut state.proposal_ids, proposal_id);
     put_proposals_state(env, &state);
@@ -1319,17 +1627,23 @@ pub fn delegate_voting_power(
     if state
         .delegations
         .get(delegator.clone())
-        .map(|d| d.active)
+        .map(|d| crate::delegation_expiry::is_live(env, &d))
         .unwrap_or(false)
     {
         return Err(GovernanceError::InvalidCommitteeAction);
     }
+    crate::delegation_expiry::clear_expiry(env, &delegator);
 
     let power = get_staked_balance(env, &delegator);
     if power <= 0 {
         return Err(GovernanceError::NoVotingPower);
     }
 
+    // #1290: a delegate may hold no stake of their own but still be eligible
+    // to vote at proposal creation. Track them as a holder now so the
+    // eligibility snapshot includes their delegated power; changes made after
+    // a proposal opens cannot add or remove that eligibility retroactively.
+    crate::track_holder(env, &delegate);
     state.delegations.set(
         delegator.clone(),
         VoteDelegation {
@@ -1354,6 +1668,7 @@ pub fn undelegate_voting_power(env: &Env, delegator: Address) -> Result<(), Gove
         .get(delegator.clone())
         .ok_or(GovernanceError::CrossCommitteeRequestNotFound)?;
     d.active = false;
+    crate::delegation_expiry::clear_expiry(env, &delegator);
     state.delegations.set(delegator, d);
     put_delegation_state(env, &state);
     Ok(())
@@ -1364,7 +1679,7 @@ pub fn get_effective_voting_power(env: &Env, user: &Address) -> i128 {
     let own = if state
         .delegations
         .get(user.clone())
-        .map(|d| d.active)
+        .map(|d| crate::delegation_expiry::is_live(env, &d))
         .unwrap_or(false)
     {
         0
@@ -1377,7 +1692,7 @@ pub fn get_effective_voting_power(env: &Env, user: &Address) -> i128 {
     while i < state.delegators.len() {
         let delegator = state.delegators.get(i).unwrap();
         if let Some(d) = state.delegations.get(delegator) {
-            if d.active && d.delegate == *user {
+            if d.delegate == *user && crate::delegation_expiry::is_live(env, &d) {
                 delegated = delegated.saturating_add(d.delegated_power);
             }
         }
@@ -1385,6 +1700,101 @@ pub fn get_effective_voting_power(env: &Env, user: &Address) -> i128 {
     }
 
     own.saturating_add(delegated)
+}
+
+/// #1286: canonical action identity.
+///
+/// Every action is rendered into a single deterministic string containing its
+/// variant tag and *all* of its parameters. Two actions have the same identity
+/// exactly when they would perform the same on-chain operation, regardless of
+/// the order in which they appear in a proposal's action list.
+pub fn action_identity(env: &Env, action: &ProposalType) -> String {
+    match action {
+        ProposalType::ParameterChange(name, current, proposed) => concat_parts(
+            env,
+            &[
+                Part::Static("ParameterChange|"),
+                Part::Dynamic(name),
+                Part::Static("|"),
+                Part::Dynamic(&i128_to_string(env, *current)),
+                Part::Static("|"),
+                Part::Dynamic(&i128_to_string(env, *proposed)),
+            ],
+        ),
+        ProposalType::TreasurySpend(recipient, amount, asset, purpose) => {
+            let issuer = match &asset.issuer {
+                Some(address) => address.to_string(),
+                None => String::from_str(env, "native"),
+            };
+            concat_parts(
+                env,
+                &[
+                    Part::Static("TreasurySpend|"),
+                    Part::Dynamic(&recipient.to_string()),
+                    Part::Static("|"),
+                    Part::Dynamic(&i128_to_string(env, *amount)),
+                    Part::Static("|"),
+                    Part::Dynamic(&asset.code),
+                    Part::Static("|"),
+                    Part::Dynamic(&issuer),
+                    Part::Static("|"),
+                    Part::Dynamic(purpose),
+                ],
+            )
+        }
+        ProposalType::FeatureToggle(feature, enabled) => concat_parts(
+            env,
+            &[
+                Part::Static("FeatureToggle|"),
+                Part::Dynamic(feature),
+                Part::Static("|"),
+                Part::Dynamic(&bool_to_string(env, *enabled)),
+            ],
+        ),
+        ProposalType::ContractUpgrade(name, hash) => concat_parts(
+            env,
+            &[
+                Part::Static("ContractUpgrade|"),
+                Part::Dynamic(name),
+                Part::Static("|"),
+                Part::Dynamic(&hash.to_string()),
+            ],
+        ),
+        ProposalType::SignalProposal(text) => concat_parts(
+            env,
+            &[
+                Part::Static("SignalProposal|"),
+                Part::Dynamic(text),
+            ],
+        ),
+        ProposalType::Custom(executor) => concat_parts(
+            env,
+            &[
+                Part::Static("Custom|"),
+                Part::Dynamic(&executor.to_string()),
+            ],
+        ),
+    }
+}
+
+/// #1286: reject a proposal whose action list contains a repeated canonical
+/// action identity. Callers must invoke this *before* reserving a proposal ID,
+/// snapshotting voting power or locking a deposit.
+pub fn validate_no_duplicate_actions(
+    env: &Env,
+    actions: &Vec<ProposalType>,
+) -> Result<(), GovernanceError> {
+    let mut seen: Vec<String> = Vec::new(env);
+    let mut i = 0u32;
+    while i < actions.len() {
+        let identity = action_identity(env, &actions.get(i).unwrap());
+        if seen.contains(&identity) {
+            return Err(GovernanceError::DuplicateProposalAction);
+        }
+        seen.push_back(identity);
+        i += 1;
+    }
+    Ok(())
 }
 
 /// Validate a proposal's action and its embedded parameters against the

@@ -151,6 +151,43 @@ const BITCOIN_BLOCK_TIME: u64 = 600; // seconds
 
 const MONITORING_TIMEOUT: u64 = 3600; // 1 hour in seconds
 
+/// Stable errors returned by inbound message finality verification (Issue #1296).
+pub const FINALITY_METADATA_MISSING: &str = "Source finality metadata unavailable";
+pub const FINALITY_INSUFFICIENT: &str = "Insufficient source-chain finality";
+
+/// Documented per-source finality threshold.
+///
+/// * `BlockConfirmations` (Polygon, BNB): `required_confirmations`.
+/// * `EpochFinality` (Ethereum): `required_confirmations`.
+/// * `Probabilistic` (Bitcoin): `2 × required_confirmations`, providing an
+///   extra safety margin against reorgs.
+/// * Stellar has no external finality configuration and fails closed.
+pub fn source_finality_threshold(config: &ChainFinalityConfig) -> u32 {
+    match config.verification_method {
+        VerificationMethod::Probabilistic => config.required_confirmations.saturating_mul(2),
+        VerificationMethod::BlockConfirmations | VerificationMethod::EpochFinality => {
+            config.required_confirmations
+        }
+    }
+}
+
+/// Verify that an inbound message's source observation satisfies the
+/// configured finality threshold before it may be executed.
+///
+/// This function is read-only: on missing or insufficient finality metadata it
+/// returns a stable error without touching replay or transfer state.
+pub fn verify_source_finality(env: &Env, transfer_id: u64) -> Result<(), String> {
+    let monitored = get_monitored_tx(env, transfer_id)
+        .ok_or_else(|| String::from_str(env, FINALITY_METADATA_MISSING))?;
+    let config = get_chain_finality_config(env, monitored.source_chain)
+        .map_err(|_| String::from_str(env, FINALITY_METADATA_MISSING))?;
+    let required = source_finality_threshold(&config);
+    if monitored.confirmations < required {
+        return Err(String::from_str(env, FINALITY_INSUFFICIENT));
+    }
+    Ok(())
+}
+
 // ==========================
 // Chain Configuration
 // ==========================
@@ -726,6 +763,10 @@ pub fn approve_transfer_for_minting(env: &Env, transfer_id: u64) -> Result<(), S
         return Err(String::from_str(env, "Transfer not approved by validators"));
     }
 
+    // #1296: never execute an inbound message until its source-chain
+    // observation is final. Verification happens before any state write.
+    verify_source_finality(env, transfer_id)?;
+
     transfer.status = TransferStatus::Minting;
     transfer.status_updated_at = env.ledger().timestamp();
     store_bridge_transfer(env, &transfer);
@@ -1049,6 +1090,39 @@ mod tests {
     }
 
     #[test]
+    fn source_finality_threshold_is_explicit_and_fails_closed() {
+        let (env, contract_id) = setup_env();
+        env.as_contract(&contract_id, || {
+            // Missing finality metadata is a stable error.
+            assert_eq!(
+                verify_source_finality(&env, 99),
+                Err(String::from_str(&env, FINALITY_METADATA_MISSING))
+            );
+
+            // Bitcoin requires 12 confirmations (6 × 2, probabilistic mode).
+            monitor_source_transaction(
+                &env,
+                1,
+                String::from_str(&env, "btc-tx"),
+                ChainId::Bitcoin,
+                100,
+            )
+            .unwrap();
+            assert_eq!(
+                verify_source_finality(&env, 1),
+                Err(String::from_str(&env, FINALITY_INSUFFICIENT))
+            );
+            update_transaction_confirmation_count(&env, 1, 111).unwrap();
+            assert_eq!(
+                verify_source_finality(&env, 1),
+                Err(String::from_str(&env, FINALITY_INSUFFICIENT))
+            );
+            update_transaction_confirmation_count(&env, 1, 112).unwrap();
+            assert!(verify_source_finality(&env, 1).is_ok());
+        });
+    }
+
+    #[test]
     fn test_approve_transfer_for_minting() {
         let (env, contract_id) = setup_env();
         env.as_contract(&contract_id, || {
@@ -1071,6 +1145,16 @@ mod tests {
         )
         .unwrap();
 
+        // Source observation is required before execution can proceed.
+        monitor_source_transaction(
+            &env,
+            1,
+            String::from_str(&env, "finality-src"),
+            ChainId::Polygon,
+            100,
+        )
+        .unwrap();
+
         // Try to approve without validator signatures - should fail
         let result = approve_transfer_for_minting(&env, 1);
         assert!(result.is_err());
@@ -1082,6 +1166,9 @@ mod tests {
         let val2 = Address::generate(&env);
         add_validator_signature(&env, 1, val1, sig1).unwrap();
         add_validator_signature(&env, 1, val2, sig2).unwrap();
+
+        // Reach Polygon's source-specific threshold (128 confirmations).
+        update_transaction_confirmation_count(&env, 1, 228).unwrap();
 
         // Now approve should succeed
         let result = approve_transfer_for_minting(&env, 1);
@@ -1314,6 +1401,9 @@ mod tests {
             get_transfer_status(&env, 1).unwrap().status,
             TransferStatus::Pending
         );
+
+        // Source finality must be reached before minting (Ethereum: 32).
+        update_transaction_confirmation_count(&env, 1, 132).unwrap();
 
         // Step 3: ValidatorApproved
         let val1 = Address::generate(&env);

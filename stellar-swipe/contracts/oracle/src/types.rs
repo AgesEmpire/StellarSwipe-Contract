@@ -34,6 +34,10 @@ pub struct PriceData {
     /// Ledger sequence the observation was recorded at. Together with
     /// `source` it uniquely identifies the observation (Issue #1212).
     pub ledger_sequence: u32,
+    /// Feed-local round this observation belongs to (Issue #1308). Strictly
+    /// increasing for a given `asset_pair`, independently of other feeds and
+    /// of the observation timestamp.
+    pub round_id: u64,
 }
 
 #[contracttype]

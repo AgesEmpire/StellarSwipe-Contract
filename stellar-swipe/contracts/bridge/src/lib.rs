@@ -11,6 +11,7 @@ use stellar_swipe_common::SECONDS_PER_DAY;
 
 mod validators;
 
+pub mod asset_amount;
 pub use validators::{ValidatorApproval, ValidatorApprovalKind, ValidatorSet};
 
 #[contracterror]
@@ -95,6 +96,25 @@ pub enum BridgeError {
     /// The number of stored (undelivered) bridge messages reached
     /// `MAX_PENDING_MESSAGES` (Issue #1302).
     PendingMessageLimitReached = 35,
+    /// A liquidity withdrawal targeted a recipient that is neither the
+    /// liquidity provider nor an address the provider explicitly approved
+    /// (Issue #1319).
+    UnauthorizedRecipient = 35,
+    /// A pool operation's resulting reserves or LP-share supply would be
+    /// negative or internally inconsistent (Issue #1318).
+    PoolInvariantViolation = 36,
+    /// The pool's trading is currently paused by its operator; swaps are
+    /// rejected until it is resumed (Issue #1320).
+    PoolTradingPaused = 37,
+    /// A proof, validator set, or approval vector exceeds the documented
+    /// bounded-work limit; rejected before any iteration (Issue #1298).
+    ProofLimitExceeded = 38,
+    /// Asset decimal scales differ by more than the supported maximum, or the
+    /// converted amount cannot be represented (Issue #1299).
+    AmountConversionFailed = 39,
+    /// A swap would move the pool price beyond the configured maximum impact
+    /// bound, independently of the caller's minimum-output limit (Issue #1317).
+    MaxPriceImpactExceeded = 40,
 }
 
 impl BridgeError {
@@ -197,6 +217,24 @@ impl BridgeError {
             BridgeError::PoolAlreadyExists => {
                 "a liquidity pool already exists for this asset pair, in either order"
             }
+            BridgeError::UnauthorizedRecipient => {
+                "withdrawal recipient is neither the liquidity provider nor an approved delegate"
+            }
+            BridgeError::PoolInvariantViolation => {
+                "pool operation would leave reserves or LP-share supply negative or inconsistent"
+            }
+            BridgeError::PoolTradingPaused => {
+                "pool trading is paused by its operator; swaps are rejected until resumed"
+            }
+            BridgeError::ProofLimitExceeded => {
+                "validator, approval, or proof input exceeds its documented maximum size"
+            }
+            BridgeError::AmountConversionFailed => {
+                "asset amount cannot be converted between the given decimal scales"
+            }
+            BridgeError::MaxPriceImpactExceeded => {
+                "swap would exceed the pool's configured maximum price impact bound"
+            }
         }
     }
 }
@@ -293,6 +331,122 @@ pub struct DailyVolume {
     pub total_amount: i128,
 }
 
+#[contracttype]
+pub enum DataKey {
+    Config,
+    WrappedAsset(String),
+    Transfer(u64),
+    ReplayLock(ChainId, String, u64),
+    UsedSignature(Address, u64, ValidatorApprovalKind, String),
+    WrappedBalance(Address, String),
+    DailyVolume,
+}
+
+feat/bridge-liquidity-pools-96
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+
+use soroban_sdk::{contract, contractimpl, Env};
+use stellar_swipe_common::HealthStatus;
+
+pub mod monitoring;
+pub mod governance;
+pub mod analytics;
+pub mod fees;
+pub mod messaging;
+pub mod fee_escrow;
+
+pub use monitoring::{
+    ChainFinalityConfig, ChainId, MonitoredTransaction, MonitoringStatus, VerificationMethod,
+    BridgeTransfer, TransferStatus,
+    monitor_source_transaction, get_monitored_tx, check_for_reorg, handle_reorg,
+    update_transaction_confirmation_count, mark_transaction_failed, create_bridge_transfer,
+    add_validator_signature, approve_transfer_for_minting, complete_transfer,
+    get_chain_finality_config, set_chain_finality_config,
+main
+};
+
+mod liquidity;
+mod validators;
+
+pub use liquidity::{LiquidityPool, LiquidityPosition, PoolHealth, PoolType, SwapResult};
+pub use validators::{ValidatorApproval, ValidatorApprovalKind, ValidatorSet};
+
+const DAY_SECONDS: u64 = 86_400;
+
+feat/bridge-liquidity-pools-96
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum BridgeError {
+    AlreadyInitialized = 1,
+    InvalidAmount = 2,
+    InvalidValidatorSet = 3,
+    UnauthorizedValidator = 4,
+    TransferNotFound = 5,
+    TransferAlreadyExecuted = 6,
+    ReplayDetected = 7,
+    SignatureAlreadyUsed = 8,
+    NotEnoughValidatorApprovals = 9,
+    DailyLimitExceeded = 10,
+    MaxTransferExceeded = 11,
+    InsufficientWrappedBalance = 12,
+    WithdrawalNotReady = 13,
+    InvalidOperation = 14,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChainId {
+    Ethereum,
+    Polygon,
+    Bnb,
+    Bitcoin,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferKind {
+    LockMint,
+    BurnUnlock,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferStatus {
+    PendingValidators,
+    ReadyToExecute,
+    Completed,
+    Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityConfig {
+    pub max_transfer_amount: i128,
+    pub daily_transfer_limit: i128,
+    pub required_validator_signatures: u32,
+    pub withdraw_delay_seconds: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WrappedAsset {
+    pub source_chain: ChainId,
+    pub source_asset: String,
+    pub wrapped_asset: String,
+    pub decimals: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeConfig {
+    pub admin: Address,
+    pub validator_set: ValidatorSet,
+    pub security: SecurityConfig,
+    pub next_transfer_id: u64,
+}
+
 /// Per-route withdrawal configuration (Issue #989).
 /// Each route is identified by (source_chain, destination_chain, wrapped_asset).
 #[contracttype]
@@ -365,9 +519,10 @@ pub use liquidity::{LiquidityPool, LiquidityPosition, PoolHealth, PoolType, Swap
 
 pub use messaging::{
     confirm_message_delivery, expire_timed_out_message, get_cross_chain_message,
-    mark_message_failed, message_size, receive_message_callback, register_bridge_for_chain,
-    relay_message_to_target_chain, retry_failed_message, send_cross_chain_message,
-    CrossChainMessage, MessageStatus, MAX_MESSAGE_SIZE, MESSAGE_TIMEOUT,
+    get_message_status, mark_message_failed, message_size, receive_message_callback,
+    register_bridge_for_chain, relay_message_to_target_chain, retry_failed_message,
+    send_cross_chain_message, CrossChainMessage, LifecycleStatus, MessageStatus, MessageStatusView,
+    MAX_MESSAGE_SIZE, MESSAGE_TIMEOUT,
 };
 
 soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
@@ -546,6 +701,42 @@ impl BridgeContract {
         )
     }
 
+    /// Register an inbound message after converting the source-chain amount
+    /// into the wrapped asset's decimal scale (Issue #1299). Conversion is
+    /// exact and checked, so dust or overflow fails before any mint can run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initiate_lock_mint_with_decimals(
+        env: Env,
+        user: Address,
+        source_chain: ChainId,
+        destination_chain: ChainId,
+        source_asset: String,
+        wrapped_asset: String,
+        amount: i128,
+        source_decimals: u32,
+        wrapped_decimals: u32,
+        source_tx_hash: String,
+        source_nonce: u64,
+        destination_recipient: String,
+        expires_at: u64,
+    ) -> Result<u64, BridgeError> {
+        let converted =
+            asset_amount::convert_asset_amount(&env, amount, source_decimals, wrapped_decimals)?;
+        initiate_lock_mint_inner(
+            env,
+            user,
+            source_chain,
+            destination_chain,
+            source_asset,
+            wrapped_asset,
+            converted,
+            source_tx_hash,
+            source_nonce,
+            destination_recipient,
+            expires_at,
+        )
+    }
+
     /// Canonical digest of a bridge message that validators sign off-chain.
     /// Covers the deployment id, route, source tx hash/nonce, user, asset,
     /// amount, recipient and `expires_at`, so an approval cannot be reused
@@ -626,6 +817,10 @@ impl BridgeContract {
         }
         // #1217: an expired message must not mint or touch any accounting.
         ensure_not_expired(&env, &transfer)?;
+        // #1297: persist consumption in this transaction before any minting
+        // or downstream settlement effect. On error the whole transaction
+        // rolls back, including this flag.
+        consume_message_for_execution(&env, &transfer)?;
 
         let balance_key =
             DataKey::WrappedBalance(transfer.user.clone(), transfer.wrapped_asset.clone());
@@ -646,25 +841,6 @@ impl BridgeContract {
         transfer.status = TransferStatus::Completed;
         transfer.executed_at = Some(env.ledger().timestamp());
         store_transfer(&env, &transfer);
-
-        // ── #988: mark message as consumed so it cannot be replayed ────────
-        let deployment_id: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::DeploymentId)
-            .expect("deployment id not set");
-        if !transfer.source_tx_hash.is_empty() {
-            let msg_key = build_consumed_message_key(
-                &env,
-                &deployment_id,
-                transfer.source_chain,
-                &transfer.source_tx_hash,
-                transfer.source_nonce,
-            );
-            env.storage()
-                .persistent()
-                .set(&DataKey::ConsumedMessage(msg_key), &true);
-        }
 
         #[allow(deprecated)]
         env.events().publish(
@@ -818,6 +994,8 @@ impl BridgeContract {
         if env.ledger().timestamp() < ready_at {
             return Err(BridgeError::WithdrawalNotReady);
         }
+        // #1297: same one-time guard as lock/mint, written before settlement.
+        consume_message_for_execution(&env, &transfer)?;
 
         transfer.status = TransferStatus::Completed;
         transfer.executed_at = Some(env.ledger().timestamp());
@@ -834,6 +1012,18 @@ impl BridgeContract {
 
     pub fn get_transfer(env: Env, transfer_id: u64) -> Result<BridgeTransfer, BridgeError> {
         get_transfer(&env, transfer_id)
+    }
+
+    /// Convert an amount between decimal scales before minting or releasing.
+    /// Exact conversion only: overflow, unsupported gaps, and dust fail
+    /// before any balance or transfer state is written (Issue #1299).
+    pub fn convert_asset_amount(
+        env: Env,
+        amount: i128,
+        from_decimals: u32,
+        to_decimals: u32,
+    ) -> Result<i128, BridgeError> {
+        asset_amount::convert_asset_amount(&env, amount, from_decimals, to_decimals)
     }
 
     pub fn get_bridge_config(env: Env) -> Result<BridgeConfig, BridgeError> {
@@ -949,16 +1139,115 @@ impl BridgeContract {
         liquidity::add_liquidity(&env, provider, pool_id, amount_a, amount_b)
     }
 
+    /// Withdraws `lp_amount` of `provider`'s liquidity, crediting proceeds to
+    /// `recipient` (Issue #1319). `recipient` must be `provider` itself or an
+    /// address `provider` previously approved via
+    /// [`BridgeContract::approve_withdrawal_recipient`]; any other recipient
+    /// is rejected with `BridgeError::UnauthorizedRecipient` and leaves
+    /// shares and reserves unchanged.
     pub fn remove_bridge_liquidity(
         env: Env,
         provider: Address,
+        recipient: Address,
         pool_id: u64,
         lp_amount: i128,
     ) -> Result<(i128, i128, i128), BridgeError> {
         if !cfg!(test) {
             provider.require_auth();
         }
-        liquidity::remove_liquidity(&env, provider, pool_id, lp_amount)
+        liquidity::remove_liquidity(&env, provider, recipient, pool_id, lp_amount)
+    }
+
+    /// Authorizes `recipient` to receive future withdrawal proceeds on
+    /// behalf of `provider` (Issue #1319). Only `provider` can grant this.
+    pub fn approve_withdrawal_recipient(
+        env: Env,
+        provider: Address,
+        recipient: Address,
+    ) {
+        if !cfg!(test) {
+            provider.require_auth();
+        }
+        liquidity::approve_withdrawal_recipient(&env, &provider, &recipient);
+    }
+
+    /// Revokes a previously granted withdrawal-recipient approval
+    /// (Issue #1319). Only `provider` can revoke their own approval.
+    pub fn revoke_withdrawal_recipient(
+        env: Env,
+        provider: Address,
+        recipient: Address,
+    ) {
+        if !cfg!(test) {
+            provider.require_auth();
+        }
+        liquidity::revoke_withdrawal_recipient(&env, &provider, &recipient);
+    }
+
+    /// Admin: set the maximum allowed swap price impact, in basis points
+    /// (Issue #1317). Applies to every pool, independently of the caller's
+    /// `min_amount_out` slippage limit.
+    pub fn set_max_price_impact_bps(
+        env: Env,
+        admin: Address,
+        max_price_impact_bps: u32,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        liquidity::set_max_price_impact_bps(&env, max_price_impact_bps)
+    }
+
+    pub fn get_max_price_impact_bps(env: Env) -> u32 {
+        liquidity::get_max_price_impact_bps(&env)
+    }
+
+    /// Designates `operator` as the account authorized to pause/resume
+    /// trading on `pool_id` (Issue #1320). Only the bridge admin may set
+    /// this; until set, the admin itself is the implicit operator.
+    pub fn set_pool_operator(
+        env: Env,
+        admin: Address,
+        pool_id: u64,
+        operator: Address,
+    ) -> Result<(), BridgeError> {
+        require_admin(&env, &admin)?;
+        if !cfg!(test) {
+            admin.require_auth();
+        }
+        liquidity::set_pool_operator(&env, pool_id, &operator);
+        Ok(())
+    }
+
+    /// Pauses new swaps on `pool_id` (Issue #1320). Callable by the pool's
+    /// designated operator (see [`BridgeContract::set_pool_operator`]) or,
+    /// if none was set, the bridge admin. Withdrawals remain available
+    /// while paused — the documented safe-exit policy for an incident.
+    pub fn pause_pool_trading(
+        env: Env,
+        caller: Address,
+        pool_id: u64,
+    ) -> Result<(), BridgeError> {
+        require_pool_operator(&env, &caller, pool_id)?;
+        if !cfg!(test) {
+            caller.require_auth();
+        }
+        liquidity::pause_trading(&env, caller, pool_id)
+    }
+
+    /// Resumes swaps on `pool_id` after a pause (Issue #1320). Same
+    /// authorization as [`BridgeContract::pause_pool_trading`].
+    pub fn resume_pool_trading(
+        env: Env,
+        caller: Address,
+        pool_id: u64,
+    ) -> Result<(), BridgeError> {
+        require_pool_operator(&env, &caller, pool_id)?;
+        if !cfg!(test) {
+            caller.require_auth();
+        }
+        liquidity::resume_trading(&env, caller, pool_id)
     }
 
     pub fn swap_bridge_assets(
@@ -1178,6 +1467,12 @@ impl BridgeContract {
     }
 
     // ── #668: Message nonce read-only entrypoint ───────────────────────────────
+
+    /// Compact lifecycle view for a message id (Issue #1300). Unknown ids
+    /// return `LifecycleStatus::Unknown`; the query never traps or writes.
+    pub fn get_message_status(env: Env, message_id: u64) -> MessageStatusView {
+        messaging::get_message_status(&env, message_id)
+    }
 
     /// Return the next expected delivery-confirmation nonce for `source_chain_id`.
     /// `source_chain_id` is the numeric value of `monitoring::ChainId`
@@ -1555,6 +1850,24 @@ fn require_admin(env: &Env, admin: &Address) -> Result<BridgeConfig, BridgeError
     Ok(config)
 }
 
+/// Issue #1320: `caller` must be the pool's designated operator (set via
+/// [`BridgeContract::set_pool_operator`]) or, if none was set, the bridge
+/// admin. Used to gate pause/resume trading calls.
+fn require_pool_operator(env: &Env, caller: &Address, pool_id: u64) -> Result<(), BridgeError> {
+    match liquidity::get_pool_operator(env, pool_id) {
+        Some(operator) if operator == *caller => Ok(()),
+        Some(_) => Err(BridgeError::UnauthorizedValidator),
+        None => {
+            let config = get_config(env)?;
+            if config.admin == *caller {
+                Ok(())
+            } else {
+                Err(BridgeError::UnauthorizedValidator)
+            }
+        }
+    }
+}
+
 /// Issue #865: true when a governance-driven emergency pause is active.
 fn is_paused(env: &Env) -> bool {
     env.storage()
@@ -1705,6 +2018,35 @@ fn validate_amount_and_limits(
     env.storage()
         .persistent()
         .set(&DataKey::DailyVolume, &volume);
+    Ok(())
+}
+
+/// The single consumed-message guard shared by every bridge execution path
+/// (Issue #1297). The flag is written before any mint, unlock, transfer, or
+/// downstream settlement call so a duplicate invocation cannot repeat effects.
+/// A failed transaction rolls the flag back atomically with the rest of the
+/// storage changes.
+fn consume_message_for_execution(
+    env: &Env,
+    transfer: &BridgeTransfer,
+) -> Result<(), BridgeError> {
+    let deployment_id: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::DeploymentId)
+        .expect("deployment id not set");
+    let msg_key = build_consumed_message_key(
+        env,
+        &deployment_id,
+        transfer.source_chain,
+        &transfer.source_tx_hash,
+        transfer.source_nonce,
+    );
+    let key = DataKey::ConsumedMessage(msg_key);
+    if env.storage().persistent().has(&key) {
+        return Err(BridgeError::MessageAlreadyConsumed);
+    }
+    env.storage().persistent().set(&key, &true);
     Ok(())
 }
 
@@ -1899,6 +2241,80 @@ mod test {
                     String::from_str(&env, "wETH")
                 ),
                 500
+            );
+        });
+    }
+
+    #[test]
+    fn consumed_guard_blocks_repeat_execution_and_rolls_back_on_early_failure() {
+        let (env, contract_id, admin, validators) = setup();
+        env.as_contract(&contract_id, || {
+            init(&env, &admin, &validators);
+            let user = Address::generate(&env);
+            let tid = BridgeContract::initiate_lock_mint(
+                env.clone(),
+                user.clone(),
+                ChainId::Ethereum,
+                ChainId::Polygon,
+                String::from_str(&env, "ETH"),
+                String::from_str(&env, "wETH"),
+                100,
+                String::from_str(&env, "src-tx-1297"),
+                7,
+                String::from_str(&env, "recipient"),
+            )
+            .unwrap();
+            BridgeContract::approve_lock_mint(
+                env.clone(),
+                validators.get(0).unwrap(),
+                tid,
+                String::from_str(&env, "sig-a"),
+            )
+            .unwrap();
+            BridgeContract::approve_lock_mint(
+                env.clone(),
+                validators.get(1).unwrap(),
+                tid,
+                String::from_str(&env, "sig-b"),
+            )
+            .unwrap();
+
+            let deployment_id: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::DeploymentId)
+                .unwrap();
+            let key = DataKey::ConsumedMessage(build_consumed_message_key(
+                &env,
+                &deployment_id,
+                ChainId::Ethereum,
+                &String::from_str(&env, "src-tx-1297"),
+                7,
+            ));
+
+            // A failed call (unauthorized admin) happens before settlement and
+            // leaves the consumed flag untouched.
+            let rogue = Address::generate(&env);
+            assert!(BridgeContract::execute_lock_mint(env.clone(), rogue, tid).is_err());
+            assert!(!env.storage().persistent().has(&key));
+
+            // Successful execution persists the guard before settlement.
+            BridgeContract::execute_lock_mint(env.clone(), admin.clone(), tid).unwrap();
+            assert!(env.storage().persistent().has(&key));
+            assert_eq!(BridgeContract::get_wrapped_balance(env.clone(), user, String::from_str(&env, "wETH")), 100);
+
+            // Repeated invocation cannot repeat mint effects.
+            assert_eq!(
+                BridgeContract::execute_lock_mint(env.clone(), admin.clone(), tid),
+                Err(BridgeError::TransferAlreadyExecuted)
+            );
+            // Even if a status is reset, the shared guard still blocks it.
+            let mut transfer = get_transfer(&env, tid).unwrap();
+            transfer.status = TransferStatus::ReadyToExecute;
+            store_transfer(&env, &transfer);
+            assert_eq!(
+                BridgeContract::execute_lock_mint(env.clone(), admin, tid),
+                Err(BridgeError::MessageAlreadyConsumed)
             );
         });
     }

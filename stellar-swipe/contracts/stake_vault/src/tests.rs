@@ -2830,6 +2830,10 @@ mod reward_campaign_contract {
         let funder = Address::generate(&env);
         StellarAssetClient::new(&env, &reward).mint(&funder, &budget);
         let id = client.create_reward_campaign(&funder, &reward, &budget, &MIN_CLAIM_WINDOW_SECS);
+        // Issue #1323: a campaign is `Pending` (not claimable) until it is
+        // fully funded and explicitly activated.
+        client.fund_reward_campaign(&id, &reward, &budget);
+        client.activate_reward_campaign(&id, &1u64);
         (env, client, reward, funder, id)
     }
 
@@ -2921,6 +2925,153 @@ mod reward_campaign_contract {
         assert_eq!(
             client.try_create_reward_campaign(&funder, &unregistered, &100, &MIN_CLAIM_WINDOW_SECS),
             Err(Ok(StakeVaultError::Unauthorized))
+        );
+    }
+
+    // ── Issues #1323–#1325: funding handshake, cancellation, epoch binding ────
+
+    fn fresh_campaign(budget: i128) -> (Env, StakeVaultContractClient<'static>, Address, Address, u64) {
+        let (env, vault_id, _stake_token, admin, _) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let reward = sac_token(&env, &admin);
+        client.add_reward_asset(&reward);
+        let funder = Address::generate(&env);
+        StellarAssetClient::new(&env, &reward).mint(&funder, &(budget * 2));
+        let id = client.create_reward_campaign(&funder, &reward, &budget, &MIN_CLAIM_WINDOW_SECS);
+        (env, client, reward, funder, id)
+    }
+
+    #[test]
+    fn new_campaign_starts_pending_and_not_claimable() {
+        let (_, client, _, _, id) = fresh_campaign(1_000);
+        assert_eq!(
+            client.get_reward_campaign(&id).unwrap().status,
+            CampaignStatus::Pending
+        );
+        // Not claimable: cannot distribute or close yet.
+        assert_eq!(
+            client.try_close_reward_campaign(&id),
+            Err(Ok(StakeVaultError::CampaignNotOpen))
+        );
+    }
+
+    #[test]
+    fn activation_fails_and_leaves_state_unchanged_when_underfunded() {
+        let (env, client, reward, _, id) = fresh_campaign(1_000);
+        client.fund_reward_campaign(&id, &reward, &600); // short funding
+        let before = client.get_reward_campaign(&id).unwrap();
+
+        assert_eq!(
+            client.try_activate_reward_campaign(&id, &1u64),
+            Err(Ok(StakeVaultError::InvalidAmount))
+        );
+        assert_eq!(client.get_reward_campaign(&id).unwrap(), before);
+        assert_eq!(TokenClient::new(&env, &reward).balance(&client.address), 600);
+    }
+
+    #[test]
+    fn activation_fails_when_funded_in_the_wrong_asset() {
+        let (env, vault_id, _stake_token, admin, _) = setup();
+        let client = StakeVaultContractClient::new(&env, &vault_id);
+        let reward = sac_token(&env, &admin);
+        let wrong_asset = sac_token(&env, &admin);
+        client.add_reward_asset(&reward);
+        client.add_reward_asset(&wrong_asset);
+        let funder = Address::generate(&env);
+        StellarAssetClient::new(&env, &wrong_asset).mint(&funder, &1_000);
+        let id = client.create_reward_campaign(&funder, &reward, &1_000, &MIN_CLAIM_WINDOW_SECS);
+
+        assert_eq!(
+            client.try_fund_reward_campaign(&id, &wrong_asset, &1_000),
+            Err(Ok(StakeVaultError::InvalidAmount))
+        );
+        assert_eq!(
+            client.get_reward_campaign(&id).unwrap().status,
+            CampaignStatus::Pending
+        );
+        assert_eq!(client.get_reward_campaign(&id).unwrap().funded, 0);
+    }
+
+    #[test]
+    fn activation_succeeds_with_exact_funding() {
+        let (env, client, reward, _, id) = fresh_campaign(1_000);
+        client.fund_reward_campaign(&id, &reward, &1_000);
+        client.activate_reward_campaign(&id, &7u64);
+        let campaign = client.get_reward_campaign(&id).unwrap();
+        assert_eq!(campaign.status, CampaignStatus::Open);
+        assert_eq!(campaign.epoch_id, 7);
+        let _ = env;
+    }
+
+    #[test]
+    fn sponsor_can_cancel_unfunded_pending_campaign_and_is_refunded() {
+        let (env, client, reward, funder, id) = fresh_campaign(1_000);
+        client.fund_reward_campaign(&id, &reward, &400); // partial funding only
+        let refund = client.cancel_reward_campaign(&id);
+        assert_eq!(refund, 400);
+        assert_eq!(TokenClient::new(&env, &reward).balance(&funder), 1_600); // 2_000 minted - 400 funded
+        assert_eq!(
+            client.get_reward_campaign(&id).unwrap().status,
+            CampaignStatus::Canceled
+        );
+    }
+
+    #[test]
+    fn canceled_campaign_cannot_be_activated_and_cancellation_is_not_repeatable() {
+        let (_, client, reward, _, id) = fresh_campaign(1_000);
+        client.fund_reward_campaign(&id, &reward, &1_000);
+        client.cancel_reward_campaign(&id);
+
+        assert_eq!(
+            client.try_activate_reward_campaign(&id, &1u64),
+            Err(Ok(StakeVaultError::CampaignNotOpen))
+        );
+        assert_eq!(
+            client.try_cancel_reward_campaign(&id),
+            Err(Ok(StakeVaultError::CampaignNotOpen))
+        );
+    }
+
+    #[test]
+    fn active_campaign_cannot_be_cancelled() {
+        let (_, client, reward, _, id) = fresh_campaign(1_000);
+        client.fund_reward_campaign(&id, &reward, &1_000);
+        client.activate_reward_campaign(&id, &1u64);
+
+        assert_eq!(
+            client.try_cancel_reward_campaign(&id),
+            Err(Ok(StakeVaultError::CampaignNotOpen))
+        );
+    }
+
+    /// Issue #1325: the campaign's epoch snapshot is bound at activation and
+    /// stamped onto every allocation. Changing an account's stake/activity
+    /// after that snapshot (modelled here as later campaign activity) never
+    /// retroactively alters an allocation created under the original epoch.
+    #[test]
+    fn claims_remain_bound_to_the_activation_epoch_snapshot() {
+        let (env, client, reward, _, id) = fresh_campaign(1_000);
+        client.fund_reward_campaign(&id, &reward, &1_000);
+        client.activate_reward_campaign(&id, &42u64);
+
+        let recipient = Address::generate(&env);
+        let created = client.distribute_campaign_rewards(
+            &id,
+            &500,
+            &vec![&env, (recipient.clone(), 1u32)],
+        );
+        let (_, alloc_id, amount) = created.get(0).unwrap();
+
+        let allocation = client.get_campaign_allocation(&id, &alloc_id).unwrap();
+        assert_eq!(allocation.epoch_id, 42);
+
+        // The campaign's epoch_id is immutable post-activation (no setter
+        // exists), so later reads of the campaign still agree with the
+        // allocation's stamped snapshot, and the claim succeeds normally.
+        assert_eq!(client.get_reward_campaign(&id).unwrap().epoch_id, 42);
+        assert_eq!(
+            client.claim_campaign_rewards(&recipient, &id, &vec![&env, alloc_id]),
+            amount
         );
     }
 }

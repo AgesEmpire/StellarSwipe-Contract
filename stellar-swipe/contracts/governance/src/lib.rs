@@ -3,6 +3,8 @@
 
 mod committees;
 mod conviction_voting;
+mod delegation_expiry;
+pub mod dependencies;
 mod distribution;
 pub mod errors;
 pub use errors::GovernanceError;
@@ -10,7 +12,9 @@ mod proposal_deposit;
 mod proposals;
 mod quadratic_voting;
 mod reputation;
+pub mod snapshot_pruning;
 mod shadow_mode;
+mod spend_window;
 mod timelock;
 mod token;
 mod treasury;
@@ -28,6 +32,8 @@ mod test_admin_timelock;
 #[cfg(test)]
 mod test_committee_elections;
 #[cfg(test)]
+mod test_duplicate_actions;
+#[cfg(test)]
 mod test_health;
 #[cfg(test)]
 mod test_pause_propagation;
@@ -36,6 +42,12 @@ mod test_pause_propagation;
 mod test_portableDD;
 #[cfg(test)]
 mod test_simulation;
+#[cfg(test)]
+mod test_transition_events;
+#[cfg(test)]
+mod test_veto_window;
+#[cfg(test)]
+mod test_vote_deadline;
 
 use committees::{
     list_committees as list_registered_committees, CommitteeAction, CommitteeElection,
@@ -65,13 +77,17 @@ use distribution::{
 };
 use proposals::{
     calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
-    default_governance_config, effective_status, execute_proposal, finalize_proposal,
-    get_active_proposals, get_all_proposals, get_category_threshold, get_governance_config,
-    get_proposal, reclaim_expired_proposal, set_category_thresholds, simulate_proposal,
-    withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalType,
+    default_governance_config, effective_status, execute_proposal, expire_proposal,
+    finalize_proposal, get_active_proposals, get_all_proposals, get_category_threshold,
+    get_governance_config, get_proposal, get_proposal_status_report, reclaim_expired_proposal,
+    set_category_thresholds, simulate_proposal,
+    withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalStatusReport, ProposalType,
     SimulationEffect, SimulationResult, Vote, VoteDelegation, VoteType as GovernanceVoteType,
 };
-pub use proposals::{CategoryThreshold, GovernanceConfig, ProposalCategory};
+pub use proposals::{
+    action_identity, validate_no_duplicate_actions, CategoryThreshold, GovernanceConfig,
+    ProposalCategory, ProposalTransitionEvent,
+};
 use quadratic_voting::{
     allocate_vote_credits, calculate_marginal_cost, cast_quadratic_vote, compare_voting_systems,
     get_quadratic_vote, get_quadratic_voting_config, get_vote_credits, reallocate_quadratic_votes,
@@ -669,11 +685,34 @@ impl GovernanceContract {
         Ok(proposal_id)
     }
 
+    /// #1286: validate an action list for duplicate canonical identities without
+    /// creating a proposal. Rejected lists never reserve IDs, bonds or power.
+    pub fn validate_proposal_actions(
+        env: Env,
+        actions: Vec<ProposalType>,
+    ) -> Result<(), GovernanceError> {
+        proposals::validate_no_duplicate_actions(&env, &actions)
+    }
+
     pub fn proposal(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
         require_initialized(&env)?;
         let mut proposal = get_proposal(&env, proposal_id)?;
         proposal.status = effective_status(&env, &proposal);
         Ok(proposal)
+    }
+
+    /// # Summary
+    /// Read-only proposal status and tally query (Issue #1292). Returns the
+    /// effective lifecycle state, current/final vote totals, resolved quorum
+    /// and approval thresholds, and all relevant deadlines in one call.
+    /// Unknown proposal IDs return `exists: false` with zeroed fields instead
+    /// of trapping.
+    pub fn proposal_status(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ProposalStatusReport, GovernanceError> {
+        require_initialized(&env)?;
+        Ok(get_proposal_status_report(&env, proposal_id))
     }
 
     pub fn proposals(env: Env) -> Result<Vec<Proposal>, GovernanceError> {
@@ -764,6 +803,18 @@ impl GovernanceContract {
         proposals::execute_proposal(&env, proposal_id, executor)
     }
 
+    /// #1287: veto a passed proposal during its explicit veto window.
+    /// Only the configured guardian (which must authorize) may call this.
+    pub fn veto_proposal(
+        env: Env,
+        proposal_id: u64,
+        guardian: Address,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        require_not_paused(&env)?;
+        proposals::veto_proposal(&env, proposal_id, guardian)
+    }
+
     pub fn migrate_storage(env: Env, admin: Address, from: u32) -> Result<u32, GovernanceError> {
         require_admin(&env, &admin)?;
         let current: u32 = env
@@ -851,6 +902,20 @@ impl GovernanceContract {
     pub fn get_active_proposals(env: Env) -> Result<Vec<Proposal>, GovernanceError> {
         require_initialized(&env)?;
         Ok(proposals::get_active_proposals(&env))
+    }
+
+    /// # Summary
+    /// Persist the terminal `Expired` state for a passed proposal whose
+    /// execution deadline has passed (Issue #1291). Idempotent: repeated calls
+    /// succeed without changing state or settling any bond twice.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::InvalidDuration`] — deadline has not passed yet
+    ///   (`now == execution_deadline` is still executable).
+    /// - [`GovernanceError::ProposalNotApproved`] — proposal never succeeded.
+    pub fn expire_proposal(env: Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
+        require_initialized(&env)?;
+        expire_proposal(&env, proposal_id)
     }
 
     /// # Summary
@@ -994,6 +1059,57 @@ impl GovernanceContract {
     ) -> Result<(), GovernanceError> {
         require_initialized(&env)?;
         voting::delegate_voting_power(&env, delegator, delegate)
+    }
+
+    /// Delegate voting power until `expiry_ledger`; afterwards the delegation
+    /// is ignored automatically (Issue #1131).
+    pub fn delegate_voting_power_until(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+        expiry_ledger: u32,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        delegation_expiry::delegate_until(&env, delegator, delegate, expiry_ledger)
+    }
+
+    /// Extend a live delegation's expiry ledger.
+    pub fn renew_delegation(
+        env: Env,
+        delegator: Address,
+        new_expiry_ledger: u32,
+    ) -> Result<(), GovernanceError> {
+        require_initialized(&env)?;
+        delegation_expiry::renew(&env, delegator, new_expiry_ledger)
+    }
+
+    pub fn get_delegation_expiry(env: Env, delegator: Address) -> Option<u32> {
+        delegation_expiry::get_expiry(&env, &delegator)
+    }
+
+    /// Permissionless, bounded and idempotent sweep of expired delegations.
+    pub fn cleanup_expired_delegations(env: Env, start: u32, limit: u32) -> u32 {
+        delegation_expiry::cleanup_expired(&env, start, limit)
+    }
+
+    /// Configure the rolling treasury spend window (Issue #1130).
+    pub fn set_treasury_spend_window(
+        env: Env,
+        admin: Address,
+        window_secs: u64,
+        cap: i128,
+    ) -> Result<(), GovernanceError> {
+        require_admin(&env, &admin)?;
+        spend_window::configure(&env, window_secs, cap)
+    }
+
+    pub fn get_treasury_spend_window(env: Env) -> Option<spend_window::SpendWindowConfig> {
+        spend_window::get_config(&env)
+    }
+
+    /// Remaining spend capacity in the current window (`i128::MAX` if unset).
+    pub fn get_treasury_window_remaining(env: Env) -> i128 {
+        spend_window::remaining(&env)
     }
 
     pub fn undelegate_voting_power(env: Env, delegator: Address) -> Result<(), GovernanceError> {
@@ -1622,6 +1738,7 @@ impl GovernanceContract {
     ) -> Result<TreasurySpend, GovernanceError> {
         require_admin(&env, &admin)?;
         require_no_timelock_bypass(&env)?;
+        spend_window::consume(&env, amount)?;
         let mut treasury = get_treasury(&env);
         let spend = treasury::execute_spend(
             &env,
@@ -2159,6 +2276,7 @@ impl GovernanceContract {
     ) -> Result<TreasurySpend, GovernanceError> {
         require_admin_identity(&env, &admin)?;
         execute_admin_action(&env, action_id, &admin)?;
+        spend_window::consume(&env, amount)?;
         let mut treasury = get_treasury(&env);
         let spend = treasury::execute_spend(
             &env,

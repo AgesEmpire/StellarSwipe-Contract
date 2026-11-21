@@ -99,6 +99,10 @@ pub fn check_and_trigger_trailing_stop(
     trade_id: u64,
     asset_pair: u32,
 ) -> Result<bool, ContractError> {
+    if is_trigger_settled(env, &user, trade_id) {
+        return Ok(false);
+    }
+
     let (oracle, portfolio) = fetch_oracle_and_portfolio(env)?;
     let (trail_bps, _) =
         get_trailing_stop(env, &user, trade_id).ok_or(ContractError::NotInitialized)?;
@@ -111,6 +115,12 @@ pub fn check_and_trigger_trailing_stop(
     let trigger_price = peak.saturating_mul(10_000 - trail_bps as i128) / 10_000;
 
     if current_price <= trigger_price {
+        // Claim settlement before closing/paying out: if another keeper's
+        // call already claimed it (race within the same ledger), bail out
+        // without closing the position or triggering a duplicate reward.
+        if !claim_trigger_settlement(env, &user, trade_id) {
+            return Ok(false);
+        }
         close_position_keeper(env, &portfolio, &user, trade_id, asset_pair);
         env.events().publish(
             (
@@ -137,6 +147,34 @@ pub fn get_take_profit(env: &Env, user: &Address, trade_id: u64) -> Option<i128>
     env.storage()
         .persistent()
         .get(&(Symbol::new(env, "TakeProfit"), user.clone(), trade_id))
+}
+
+/// Issue #1440: per-(user, trade_id) guard recording that a trigger (stop-loss,
+/// take-profit, or trailing-stop) has already been settled for this position.
+/// Multiple keepers racing to call the same trigger entrypoint for a stale or
+/// already-closed position must not be able to close it — and pay out a
+/// keeper reward — more than once.
+fn settled_key(env: &Env, user: &Address, trade_id: u64) -> (Symbol, Address, u64) {
+    (Symbol::new(env, "TrigSettled"), user.clone(), trade_id)
+}
+
+fn is_trigger_settled(env: &Env, user: &Address, trade_id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .get(&settled_key(env, user, trade_id))
+        .unwrap_or(false)
+}
+
+/// Atomically claim the settlement slot for `(user, trade_id)`. Returns
+/// `true` if this call is the one that claimed it (first to settle), `false`
+/// if it was already settled by a prior (possibly concurrent) call.
+fn claim_trigger_settlement(env: &Env, user: &Address, trade_id: u64) -> bool {
+    let key = settled_key(env, user, trade_id);
+    if env.storage().persistent().get(&key).unwrap_or(false) {
+        return false;
+    }
+    env.storage().persistent().set(&key, &true);
+    true
 }
 
 fn fetch_oracle_and_portfolio(env: &Env) -> Result<(Address, Address), ContractError> {
@@ -237,12 +275,19 @@ pub fn check_and_trigger_stop_loss(
     trade_id: u64,
     asset_pair: u32,
 ) -> Result<bool, ContractError> {
+    if is_trigger_settled(env, &user, trade_id) {
+        return Ok(false);
+    }
+
     let (oracle, portfolio) = fetch_oracle_and_portfolio(env)?;
     let stop_loss_price =
         get_stop_loss(env, &user, trade_id).ok_or(ContractError::NotInitialized)?;
     let current_price = fetch_current_price(env, &oracle, asset_pair)?;
 
     if current_price <= stop_loss_price {
+        if !claim_trigger_settlement(env, &user, trade_id) {
+            return Ok(false);
+        }
         close_position_keeper(env, &portfolio, &user, trade_id, asset_pair);
         shared::events::emit_stop_loss_triggered(
             env,
@@ -277,6 +322,10 @@ pub fn check_and_trigger_take_profit(
     trade_id: u64,
     asset_pair: u32,
 ) -> Result<bool, ContractError> {
+    if is_trigger_settled(env, &user, trade_id) {
+        return Ok(false);
+    }
+
     let (oracle, portfolio) = fetch_oracle_and_portfolio(env)?;
     let take_profit_price =
         get_take_profit(env, &user, trade_id).ok_or(ContractError::NotInitialized)?;
@@ -290,6 +339,9 @@ pub fn check_and_trigger_take_profit(
     }
 
     if current_price >= take_profit_price {
+        if !claim_trigger_settlement(env, &user, trade_id) {
+            return Ok(false);
+        }
         close_position_keeper(env, &portfolio, &user, trade_id, asset_pair);
         shared::events::emit_take_profit_triggered(
             env,
@@ -382,10 +434,23 @@ mod tests {
             env.storage()
                 .instance()
                 .set(&symbol_short!("closed"), &trade_id);
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("ccount"))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("ccount"), &(count + 1));
         }
 
         pub fn last_closed(env: Env) -> Option<u64> {
             env.storage().instance().get(&symbol_short!("closed"))
+        }
+
+        /// Number of times `close_position_keeper` has actually been invoked.
+        pub fn close_count(env: Env) -> u32 {
+            env.storage().instance().get(&symbol_short!("ccount")).unwrap_or(0)
         }
     }
 
@@ -421,6 +486,29 @@ mod tests {
         assert!(MockPortfolioClient::new(&env, &portfolio_id)
             .last_closed()
             .is_none());
+    }
+
+    /// Issue #1440: two competing keepers both calling the stop-loss trigger
+    /// for the same stale/expired position must not both succeed in closing
+    /// it (and thus must not both earn a keeper reward for the same intent).
+    #[test]
+    fn duplicate_keeper_trigger_settles_only_once() {
+        let (env, exec_id, oracle_id, portfolio_id) = setup();
+        let user = Address::generate(&env);
+        MockOracleClient::new(&env, &oracle_id).set_price(&100);
+        let exec = TradeExecutorContractClient::new(&env, &exec_id);
+        exec.set_stop_loss_price(&user, &1u64, &100);
+
+        // First keeper triggers successfully.
+        assert!(exec.check_and_trigger_stop_loss(&user, &1u64, &0u32));
+        // A second, competing keeper calling the same entrypoint for the same
+        // position must be a no-op: no second close, no second reward.
+        assert!(!exec.check_and_trigger_stop_loss(&user, &1u64, &0u32));
+
+        assert_eq!(
+            MockPortfolioClient::new(&env, &portfolio_id).close_count(),
+            1
+        );
     }
 
     #[test]

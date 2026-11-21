@@ -294,6 +294,33 @@ jobs:
           fi
           echo "Embedded SourceHash: $STELLAR_SOURCE_HASH"
 
+      # Reproducible release fixture (issue #1341): deploy the exact
+      # optimized WASM artifact just built to the local Soroban test
+      # environment and exercise representative entrypoints against it,
+      # catching behavior differences between native `cargo test` and the
+      # artifact actually shipped to a network. Records the artifact hash
+      # alongside the pass/fail result in release-fixture-results/latest.json.
+      - name: Run release fixture against optimized WASM
+        run: |
+          set -euo pipefail
+          cd stellar-swipe
+          result="pass"
+          cargo test -p integration_tests --test test_release_fixture -- --nocapture \
+            2>&1 | tee /tmp/release-fixture.log || result="fail"
+          hash="$(grep -o 'RELEASE_FIXTURE_ARTIFACT_HASH: signal_registry.wasm sha256=[0-9a-f]*' \
+            /tmp/release-fixture.log | tail -n1 | awk -F'sha256=' '{print $2}')"
+          hash="${hash:-unknown}"
+          commit="$(git rev-parse HEAD)"
+          recorded_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cat > release-fixture-results/latest.json <<EOF
+          {"artifact":"signal_registry.wasm","sha256":"$hash","result":"$result","commit":"$commit","recorded_at":"$recorded_at"}
+          EOF
+          cat release-fixture-results/latest.json
+          if [ "$result" = "fail" ]; then
+            echo "ERROR: release fixture failed against the optimized WASM artifact." >&2
+            exit 1
+          fi
+
       # Reproducibility check (issue #1083): rebuild the same source a second
       # time under the identical toolchain/target/lock state and assert the
       # optimized WASM hashes match.  Non-reproducible output fails CI with

@@ -14,6 +14,10 @@ pub mod amm_bridge;
 pub mod apy_math;
 pub mod assets;
 pub mod budget_regression;
+/// Shared test helper asserting a query entrypoint is read-only: no events
+/// published and (optionally) a stable result across repeated calls
+/// (Issue #1336).
+pub mod read_only_check;
 /// Checked-arithmetic wrapper for financial amounts (issue #599).
 pub mod checked_amount;
 /// Oracle price-freshness gating for collateral / health checks (Issue #1031).

@@ -31,6 +31,7 @@ mod logging;
 mod loss_streak;
 mod multi_asset;
 mod oracle;
+pub mod plan_lifecycle;
 mod portfolio;
 mod portfolio_insurance;
 #[cfg(not(feature = "testutils"))]
@@ -699,6 +700,17 @@ impl AutoTradeContract {
             return Err(AutoTradeError::InsufficientBalance);
         }
 
+        // Issue #1438: this intent (user, signal) may already be partially
+        // filled from a previous `execute_trade` call. Only attempt to fill
+        // the remaining unfilled amount so repeated calls top up the fill
+        // instead of silently losing track of (or double-filling) the
+        // original request.
+        let remaining_amount = storage::remaining_intent_amount(&env, &user, signal_id, amount);
+        if remaining_amount <= 0 {
+            return Err(AutoTradeError::InvalidAmount);
+        }
+        let amount = remaining_amount;
+
         let is_sell = false;
 
         risk::set_asset_price(&env, signal.base_asset, signal.price);
@@ -707,7 +719,7 @@ impl AutoTradeContract {
         // Falls back to None (SDEX spot) when no oracle is configured.
         let oracle_price: Option<i128> = oracle::get_oracle_price(&env, signal.base_asset)
             .ok()
-            .map(|op| oracle::oracle_price_to_i128(&op));
+            .and_then(|op| oracle::oracle_price_to_i128(&op).ok());
 
         // Perform risk checks
         let stop_loss_triggered = risk::validate_trade(
@@ -739,9 +751,21 @@ impl AutoTradeContract {
             OrderType::Limit => sdex::execute_limit_order(&env, &user, &signal, amount)?,
         };
 
+        // Issue #1438: record this call's contribution toward the intent's
+        // cumulative fill, then derive status from the intent's total
+        // filled-vs-requested, not just this single call's amount.
+        if execution.executed_amount > 0 {
+            storage::record_intent_fill(&env, &user, signal_id, amount, execution.executed_amount);
+        }
+        let intent_fill = storage::get_intent_fill(&env, &user, signal_id);
+        let (total_requested, total_filled) = match &intent_fill {
+            Some(f) => (f.total_requested, f.total_filled),
+            None => (amount, execution.executed_amount),
+        };
+
         let status = if execution.executed_amount == 0 {
             TradeStatus::Failed
-        } else if execution.executed_amount < amount {
+        } else if total_filled < total_requested {
             TradeStatus::PartiallyFilled
         } else {
             TradeStatus::Filled
@@ -1012,6 +1036,20 @@ impl AutoTradeContract {
         limit: u32,
     ) -> soroban_sdk::Vec<history::HistoryTrade> {
         history::get_trade_history(&env, &user, offset, limit)
+    }
+
+    /// Get paginated trade history (newest first) using stable cursor
+    /// pagination keyed by trade id (Issue #1446). Pass `after_id = None`
+    /// for the first page, then feed back the returned cursor to continue.
+    /// Unlike `get_trade_history`'s offset parameter, this is stable under
+    /// concurrent trade recording between page fetches.
+    pub fn get_trade_history_cursor(
+        env: Env,
+        user: Address,
+        after_id: Option<u64>,
+        limit: u32,
+    ) -> (soroban_sdk::Vec<history::HistoryTrade>, Option<u64>) {
+        history::get_trade_history_by_cursor(&env, &user, after_id, limit)
     }
 
     /// Get user portfolio with holdings and P&L
@@ -1918,6 +1956,34 @@ impl AutoTradeContract {
         strategies::grid::calculate_grid_performance(&env, strategy_id)
     }
 
+    /// Update a grid strategy's tunable config (order size, rebalance-on-fill),
+    /// retaining the previous config as a revision (Issue #1444). Returns the
+    /// epoch under which the prior config was archived.
+    pub fn update_grid_config(
+        env: Env,
+        caller: Address,
+        strategy_id: u64,
+        order_size_per_grid: i128,
+        rebalance_on_fill: bool,
+    ) -> Result<u32, AutoTradeError> {
+        strategies::grid::update_grid_config(
+            &env,
+            &caller,
+            strategy_id,
+            order_size_per_grid,
+            rebalance_on_fill,
+        )
+    }
+
+    /// Return the full archived config-revision history for a grid strategy,
+    /// oldest first (Issue #1444).
+    pub fn get_grid_config_history(
+        env: Env,
+        strategy_id: u64,
+    ) -> soroban_sdk::Vec<strategies::grid::GridConfigRevision> {
+        strategies::grid::get_grid_config_history(&env, strategy_id)
+    }
+
     // ── Pairs Trading Strategy (Issue #106) ───────────────────────────────────
 
     pub fn configure_pairs_strategy(
@@ -2109,6 +2175,15 @@ impl AutoTradeContract {
         conditional::cancel_conditional_order(&env, id, user)
     }
 
+    /// Issue #1441: permissionless, deterministic cancellation of a
+    /// conditional order (auto-trade intent) once its `expires_at` deadline
+    /// has passed. Any address may call this — it requires no owner auth —
+    /// since it is gated purely by ledger time and only ever releases a
+    /// `Pending` order exactly once.
+    pub fn cancel_expired_order(env: Env, id: u64) -> Result<(), AutoTradeError> {
+        conditional::cancel_expired_order(&env, id)
+    }
+
     /// Get a conditional order by id.
     pub fn get_conditional_order(
         env: Env,
@@ -2144,6 +2219,106 @@ impl AutoTradeContract {
     /// List all registered keeper addresses.
     pub fn list_keepers(env: Env) -> Vec<Address> {
         keeper::list_keepers(&env)
+    }
+
+    // ── Auto-trade plan lifecycle (#1145/#1147/#1148/#1150) ──────────────────
+
+    pub fn create_plan(
+        env: Env,
+        owner: Address,
+        asset_pair: u32,
+        funding_token: Address,
+        budget: i128,
+        position_pct: u32,
+        dca_interval: u64,
+    ) -> Result<u64, AutoTradeError> {
+        plan_lifecycle::create_plan(&env, owner, asset_pair, funding_token, budget, position_pct, dca_interval)
+    }
+
+    pub fn get_plan(env: Env, plan_id: u64) -> Result<plan_lifecycle::AutoTradePlan, AutoTradeError> {
+        plan_lifecycle::get_plan(&env, plan_id)
+    }
+
+    pub fn set_plan_asset(env: Env, admin: Address, asset_pair: u32, supported: bool) -> Result<(), AutoTradeError> {
+        plan_lifecycle::set_supported_asset(&env, &admin, asset_pair, supported)
+    }
+
+    pub fn set_recovery_cooldown(env: Env, admin: Address, ledgers: u32) -> Result<(), AutoTradeError> {
+        plan_lifecycle::set_recovery_cooldown(&env, &admin, ledgers)
+    }
+
+    /// Draft/Tripped → Active after asset, oracle, risk and funding checks.
+    pub fn activate_plan(env: Env, caller: Address, plan_id: u64) -> Result<(), AutoTradeError> {
+        plan_lifecycle::activate_plan(&env, &caller, plan_id)
+    }
+
+    pub fn check_plan_drawdown(env: Env, plan_id: u64, current_value: i128) -> Result<bool, AutoTradeError> {
+        plan_lifecycle::check_plan_drawdown(&env, plan_id, current_value)
+    }
+
+    pub fn emergency_disable_plan(env: Env, caller: Address, plan_id: u64) -> Result<(), AutoTradeError> {
+        plan_lifecycle::emergency_disable(&env, &caller, plan_id)
+    }
+
+    pub fn clear_plan_disable(env: Env, admin: Address, plan_id: u64) -> Result<(), AutoTradeError> {
+        plan_lifecycle::clear_emergency_disable(&env, &admin, plan_id)
+    }
+
+    pub fn acquire_plan_lease(env: Env, keeper: Address, plan_id: u64, duration_ledgers: u32) -> Result<u64, AutoTradeError> {
+        plan_lifecycle::acquire_lease(&env, &keeper, plan_id, duration_ledgers)
+    }
+
+    pub fn renew_plan_lease(
+        env: Env,
+        keeper: Address,
+        plan_id: u64,
+        epoch: u64,
+        duration_ledgers: u32,
+    ) -> Result<u32, AutoTradeError> {
+        plan_lifecycle::renew_lease(&env, &keeper, plan_id, epoch, duration_ledgers)
+    }
+
+    pub fn finalize_plan_lease(env: Env, keeper: Address, plan_id: u64, epoch: u64) -> Result<(), AutoTradeError> {
+        plan_lifecycle::finalize_with_lease(&env, &keeper, plan_id, epoch)
+    }
+
+    pub fn set_dca_catch_up_policy(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+        policy: plan_lifecycle::CatchUpPolicy,
+    ) -> Result<(), AutoTradeError> {
+        plan_lifecycle::set_catch_up_policy(&env, &caller, plan_id, policy)
+    }
+
+    pub fn process_dca_tick(
+        env: Env,
+        keeper: Address,
+        plan_id: u64,
+        epoch: u64,
+    ) -> Result<Option<plan_lifecycle::DriftDecision>, AutoTradeError> {
+        plan_lifecycle::process_dca_tick(&env, &keeper, plan_id, epoch)
+    }
+
+    /// Owner: set the maximum number of executions that may be in flight at
+    /// once for this plan (Issue #1443).
+    pub fn set_plan_max_concurrent_executions(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+        max_concurrent: u32,
+    ) -> Result<(), AutoTradeError> {
+        plan_lifecycle::set_max_concurrent_executions(&env, &caller, plan_id, max_concurrent)
+    }
+
+    /// Read-only: the configured concurrent-execution cap for a plan.
+    pub fn get_plan_max_concurrent_executions(env: Env, plan_id: u64) -> u32 {
+        plan_lifecycle::get_max_concurrent_executions(&env, plan_id)
+    }
+
+    /// Read-only: how many executions are currently in flight for a plan.
+    pub fn get_plan_in_flight_executions(env: Env, plan_id: u64) -> u32 {
+        plan_lifecycle::get_in_flight_executions(&env, plan_id)
     }
 
     /// Mark a triggered conditional order as executed (call after trade fill).
@@ -2398,7 +2573,8 @@ mod oracle_tests {
         });
     }
 
-    /// oracle_price_to_i128 correctly scales by decimals.
+    /// oracle_price_to_i128 normalizes onto the shared 7-decimal settlement
+    /// scale (Issue #1442) rather than collapsing to whole units.
     #[test]
     fn test_oracle_price_scaling() {
         let env = Env::default();
@@ -2408,8 +2584,61 @@ mod oracle_tests {
             timestamp: 1_000,
             source: Symbol::new(&env, "mock"),
         };
-        // 1_000_000 / 10^4 = 100
-        assert_eq!(oracle::oracle_price_to_i128(&op), 100);
+        // Oracle reports 4 decimals; target is 7, so scale up by 10^3:
+        // 1_000_000 * 10^3 = 1_000_000_000.
+        assert_eq!(oracle::oracle_price_to_i128(&op).unwrap(), 1_000_000_000);
+    }
+
+    /// A low-decimal price (e.g. a whole-dollar feed, decimals = 0) is
+    /// scaled up to the 7-decimal settlement precision exactly.
+    #[test]
+    fn test_oracle_price_scaling_low_decimals() {
+        let env = Env::default();
+        let op = OraclePrice {
+            price: 5,
+            decimals: 0,
+            timestamp: 1_000,
+            source: Symbol::new(&env, "mock"),
+        };
+        assert_eq!(
+            oracle::oracle_price_to_i128(&op).unwrap(),
+            5 * 10_000_000
+        );
+    }
+
+    /// A high-decimal price (more precise than settlement scale) is
+    /// truncated down to it, not collapsed to whole units.
+    #[test]
+    fn test_oracle_price_scaling_high_decimals() {
+        let env = Env::default();
+        let op = OraclePrice {
+            price: 123_456_789_012,
+            decimals: 10,
+            timestamp: 1_000,
+            source: Symbol::new(&env, "mock"),
+        };
+        // decimals=10, target=7: divide by 10^3.
+        assert_eq!(
+            oracle::oracle_price_to_i128(&op).unwrap(),
+            123_456_789_012 / 1_000
+        );
+    }
+
+    /// An oracle reporting an unsupported (absurdly large) decimal count is
+    /// rejected rather than silently producing a garbage scaled value.
+    #[test]
+    fn test_oracle_price_scaling_rejects_unsupported_decimals() {
+        let env = Env::default();
+        let op = OraclePrice {
+            price: 100,
+            decimals: 40,
+            timestamp: 1_000,
+            source: Symbol::new(&env, "mock"),
+        };
+        assert_eq!(
+            oracle::oracle_price_to_i128(&op),
+            Err(AutoTradeError::UnsupportedDecimalScale)
+        );
     }
 }
 

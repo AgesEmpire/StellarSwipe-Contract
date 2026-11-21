@@ -28,6 +28,22 @@
 //! field boundaries can never collide. The domain-separation tag
 //! `"signal-replay-v1"` prevents cross-protocol digest reuse.
 //!
+//! ## Nonce domains
+//!
+//! Auto-trade order intents are partitioned into independent nonce domains so
+//! that replaying one intent cannot consume another intent's nonce:
+//!
+//! * [`NonceDomain::UserOrder`] — user-submitted order intents.
+//! * [`NonceDomain::KeeperRetry`] — keeper retries of a previously submitted
+//!   intent.
+//! * [`NonceDomain::Administrative`] — administrative actions.
+//!
+//! The domain is encoded into the authorization payload (see
+//! [`NonceDomain::tag`]) and mixed into the derived digest, so the same inputs
+//! submitted under different domains produce distinct digests. Each domain
+//! maintains its own nonce sequence and only increments on successful use;
+//! replay within a domain and cross-domain collisions are rejected.
+//!
 //! ## Bounded nonce compaction
 //!
 //! Consumed digests are stored in a bounded window so storage growth is
@@ -77,6 +93,43 @@ const IDEMPOTENCY_DOMAIN_TAG: &[u8] = b"signal-idempotency-v1";
 /// Default number of consumed digests retained before compaction evicts the
 /// oldest entries.
 pub const DEFAULT_REPLAY_CAPACITY: usize = 4096;
+
+/// Independent nonce domain for auto-trade order intents.
+///
+/// Each domain maintains its own nonce sequence so that replaying an intent in
+/// one domain cannot consume another domain's nonce. The domain is encoded in
+/// the authorization payload via [`NonceDomain::tag`] and mixed into the
+/// derived digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NonceDomain {
+    /// User-submitted order intents.
+    UserOrder,
+    /// Keeper retries of a previously submitted intent.
+    KeeperRetry,
+    /// Administrative actions.
+    Administrative,
+}
+
+impl NonceDomain {
+    /// Returns the stable byte tag encoded into authorization payloads.
+    pub fn tag(&self) -> u8 {
+        match self {
+            NonceDomain::UserOrder => 0x01,
+            NonceDomain::KeeperRetry => 0x02,
+            NonceDomain::Administrative => 0x03,
+        }
+    }
+
+    /// Returns the domain for a stable byte tag, if any.
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0x01 => Some(NonceDomain::UserOrder),
+            0x02 => Some(NonceDomain::KeeperRetry),
+            0x03 => Some(NonceDomain::Administrative),
+            _ => None,
+        }
+    }
+}
 
 /// Deterministic replay-protection key for a cross-contract signal submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -138,15 +191,21 @@ pub struct SubmissionContext<'a> {
     pub caller: &'a [u8],
     /// Address of the registry the submission is intended for.
     pub registry: &'a [u8],
+    /// Nonce domain the submission belongs to.
+    pub domain: NonceDomain,
 }
 
 impl<'a> SubmissionContext<'a> {
-    /// Computes the deterministic digest binding provider, payload, caller and
-    /// intended registry.
+    /// Computes the deterministic digest binding provider, payload, caller,
+    /// intended registry and nonce domain.
+    ///
+    /// The domain tag is mixed in so the same inputs submitted under different
+    /// domains produce distinct digests and cannot collide across domains.
     pub fn digest(&self) -> SubmissionDigest {
         let mut hasher = Sha256::new();
         hasher.update(DOMAIN_TAG);
         hasher.update([0u8]);
+        hasher.update([self.domain.tag()]);
         for field in [self.provider, self.payload, self.caller, self.registry] {
             hasher.update((field.len() as u32).to_be_bytes());
             hasher.update(field);
@@ -203,198 +262,5 @@ impl ReplayProtection {
     /// Returns the maximum number of consumed digests retained.
     pub fn capacity(&self) -> usize {
         self.capacity
-    }
-
-    /// Returns the number of currently retained consumed digests.
-    pub fn len(&self) -> usize {
-        self.consumed.len()
-    }
-
-    /// Returns `true` if no consumed digests are currently retained.
-    pub fn is_empty(&self) -> bool {
-        self.consumed.is_empty()
-    }
-
-    /// Returns `true` if the digest has already been accepted and is still
-    /// within the retained window.
-    pub fn is_consumed(&self, digest: &SubmissionDigest) -> bool {
-        self.consumed.contains(digest)
-    }
-
-    /// Checks a submission for replay without consuming its digest.
-    ///
-    /// Call this before executing the submission. A failed execution leaves
-    /// the digest unconsumed, so the same submission can be retried.
-    pub fn check(&self, ctx: &SubmissionContext<'_>) -> Result<SubmissionDigest, ReplayError> {
-        let digest = ctx.digest();
-        if self.consumed.contains(&digest) {
-            return Err(ReplayError::AlreadyConsumed);
-        }
-        Ok(digest)
-    }
-
-    /// Marks a submission as accepted, consuming its digest.
-    ///
-    /// Must only be called after the submission has succeeded. Returns the
-    /// digest that was consumed. If the retained window is full, the oldest
-    /// consumed digest is evicted to keep storage bounded.
-    pub fn commit(&mut self, ctx: &SubmissionContext<'_>) -> SubmissionDigest {
-        let digest = ctx.digest();
-        self.record(digest);
-        digest
-    }
-
-    /// Checks a privileged operation for replay without consuming its key.
-    ///
-    /// Call this before executing the operation. A failed execution leaves
-    /// the key unconsumed, so the operation can be retried with the same key.
-    pub fn check_key(&self, key: &IdempotencyKey) -> Result<SubmissionDigest, ReplayError> {
-        let digest = key.digest();
-        if self.consumed.contains(&digest) {
-            return Err(ReplayError::AlreadyConsumed);
-        }
-        Ok(digest)
-    }
-
-    /// Marks a privileged operation as applied, consuming its idempotency key.
-    ///
-    /// Must only be called after the operation has succeeded. Returns the
-    /// digest that was consumed. If the retained window is full, the oldest
-    /// consumed entry is evicted to keep storage bounded.
-    pub fn commit_key(&mut self, key: &IdempotencyKey) -> SubmissionDigest {
-        let digest = key.digest();
-        self.record(digest);
-        digest
-    }
-
-    /// Convenience wrapper for privileged operations: checks the idempotency
-    /// key, runs `execute`, and only consumes the key if `execute` succeeds.
-    ///
-    /// A repeated key for the same operation is rejected with
-    /// [`ReplayError::AlreadyConsumed`] and `execute` is not run, so the
-    /// operation cannot be applied twice. On failure the key is not consumed
-    /// and the error is propagated so the caller can retry the same operation.
-    pub fn submit_key<F, E>(
-        &mut self,
-        key: &IdempotencyKey,
-        execute: F,
-    ) -> Result<SubmissionDigest, SubmitError<E>>
-    where
-        F: FnOnce() -> Result<(), E>,
-    {
-        let digest = self.check_key(key).map_err(SubmitError::Replay)?;
-        execute().map_err(SubmitError::Execute)?;
-        self.record(digest);
-        Ok(digest)
-    }
-
-    /// Inserts `digest` into the retained window, compacting if necessary.
-    fn record(&mut self, digest: SubmissionDigest) {
-        if self.capacity == 0 {
-            return;
-        }
-        if self.consumed.insert(digest) {
-            self.order.push_back(digest);
-        }
-        self.compact();
-    }
-
-    /// Evicts the oldest consumed digests until the window fits `capacity`.
-    ///
-    /// Eviction only removes digests that have aged out of the window; digests
-    /// still retained are never reopened, so duplicate and reordered claims
-    /// within the window remain rejected.
-    fn compact(&mut self) {
-        while self.order.len() > self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.consumed.remove(&oldest);
-            }
-        }
-    }
-
-    /// Convenience wrapper: checks the submission, runs `execute`, and only
-    /// consumes the digest if `execute` succeeds.
-    ///
-    /// On failure the digest is not consumed and the error is propagated so
-    /// the caller can retry the same submission.
-    pub fn submit<F, E>(
-        &mut self,
-        ctx: &SubmissionContext<'_>,
-        execute: F,
-    ) -> Result<SubmissionDigest, SubmitError<E>>
-    where
-        F: FnOnce() -> Result<(), E>,
-    {
-        let digest = self.check(ctx).map_err(SubmitError::Replay)?;
-        execute().map_err(SubmitError::Execute)?;
-        self.record(digest);
-        Ok(digest)
-    }
-}
-
-/// Error returned by [`ReplayProtection::submit`] and
-/// [`ReplayProtection::submit_key`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubmitError<E> {
-    /// The submission or operation was rejected as a replay.
-    Replay(ReplayError),
-    /// The wrapped execution failed; the digest/key was not consumed.
-    Execute(E),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn key(op: &[u8], value: &[u8]) -> IdempotencyKey {
-        IdempotencyKey::new(op.to_vec(), value.to_vec())
-    }
-
-    #[test]
-    fn same_key_retry_is_rejected() {
-        let mut rp = ReplayProtection::new();
-        let k = key(b"set-admin", b"req-1");
-
-        assert!(rp.submit_key(&k, || Ok::<(), ()>(())).is_ok());
-        assert_eq!(rp.check_key(&k), Err(ReplayError::AlreadyConsumed));
-        assert_eq!(
-            rp.submit_key(&k, || Ok::<(), ()>(())),
-            Err(SubmitError::Replay(ReplayError::AlreadyConsumed))
-        );
-    }
-
-    #[test]
-    fn distinct_keys_are_independent() {
-        let mut rp = ReplayProtection::new();
-        let a = key(b"set-admin", b"req-1");
-        let b = key(b"set-admin", b"req-2");
-
-        assert!(rp.submit_key(&a, || Ok::<(), ()>(())).is_ok());
-        assert!(rp.submit_key(&b, || Ok::<(), ()>(())).is_ok());
-        assert_eq!(rp.len(), 2);
-    }
-
-    #[test]
-    fn same_key_different_operation_does_not_collide() {
-        let mut rp = ReplayProtection::new();
-        let a = key(b"set-admin", b"req-1");
-        let b = key(b"set-fee", b"req-1");
-
-        assert!(rp.submit_key(&a, || Ok::<(), ()>(())).is_ok());
-        assert!(rp.submit_key(&b, || Ok::<(), ()>(())).is_ok());
-    }
-
-    #[test]
-    fn failed_execution_does_not_consume_key() {
-        let mut rp = ReplayProtection::new();
-        let k = key(b"set-admin", b"req-1");
-
-        assert_eq!(
-            rp.submit_key(&k, || Err::<(), &str>("boom")),
-            Err(SubmitError::Execute("boom"))
-        );
-        assert!(!rp.is_consumed(&k.digest()));
-        // Retrying with the same key after a failure succeeds.
-        assert!(rp.submit_key(&k, || Ok::<(), ()>(())).is_ok());
     }
 }

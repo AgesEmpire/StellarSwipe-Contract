@@ -318,6 +318,28 @@ impl AutoTradeError {
 // These keep all existing call-sites compiling without modification.
 #[allow(non_upper_case_globals)]
 impl AutoTradeError {
+    // ── Auto-trade plan lifecycle (#1145/#1147/#1148/#1150) ──────────────────
+    /// No auto-trade plan exists for the given id.
+    pub const PlanNotFound: AutoTradeError = AutoTradeError::StrategyNotFound;
+    /// Plan is not in a state that permits the requested transition.
+    pub const InvalidPlanState: AutoTradeError = AutoTradeError::InvalidExitConfig;
+    /// Plan was manually emergency-disabled; activation is overridden.
+    pub const PlanDisabled: AutoTradeError = AutoTradeError::TradingPaused;
+    /// Activation rejected; see the `act_rej` event for the typed reason.
+    pub const ActivationPrerequisiteFailed: AutoTradeError = AutoTradeError::InvalidExitConfig;
+    /// Plan is still inside its drawdown recovery cooldown window.
+    pub const RecoveryCooldownActive: AutoTradeError = AutoTradeError::RateLimited;
+    /// Another keeper holds a live execution lease for the plan.
+    pub const LeaseHeld: AutoTradeError = AutoTradeError::RateLimited;
+    /// Keeper lease is missing or expired; stale keepers cannot finalize.
+    pub const LeaseExpired: AutoTradeError = AutoTradeError::Unauthorized;
+    /// A DCA catch-up policy is already set for the plan.
+    pub const CatchUpPolicyAlreadySet: AutoTradeError = AutoTradeError::InvalidExitConfig;
+    /// Issue #1443: plan already has its configured maximum number of
+    /// executions in flight; caller must wait for one to finish.
+    pub const ConcurrencyLimitExceeded: AutoTradeError = AutoTradeError::RateLimited;
+    /// Checked schedule/ledger arithmetic overflowed.
+    pub const ScheduleOverflow: AutoTradeError = AutoTradeError::InvalidAmount;
     pub const SelfReferral: AutoTradeError = AutoTradeError::ReferralError;
     pub const ReferralAlreadySet: AutoTradeError = AutoTradeError::ReferralError;
     pub const CircularReferral: AutoTradeError = AutoTradeError::ReferralError;
@@ -331,6 +353,15 @@ impl AutoTradeError {
     pub const ConditionalOrderNotFound: AutoTradeError = AutoTradeError::ConditionalOrderError;
     pub const ConditionalOrderNotPending: AutoTradeError = AutoTradeError::ConditionalOrderError;
     pub const ConditionalOrderNotTriggered: AutoTradeError = AutoTradeError::ConditionalOrderError;
+    /// Issue #1441: `cancel_expired_order` was called before the order's
+    /// `expires_at` deadline has actually passed.
+    pub const ConditionalOrderNotExpired: AutoTradeError = AutoTradeError::ConditionalOrderError;
+
+    // ── Issue #1442: decimal normalization in trade settlement ──────────────
+    /// A price/amount scale could not be normalized onto the shared
+    /// settlement precision with checked arithmetic (decimals too large, or
+    /// rescaling would overflow i128). Rejected before any token transfer.
+    pub const UnsupportedDecimalScale: AutoTradeError = AutoTradeError::SystemError;
 
     pub const RateLimitPenalty: AutoTradeError = AutoTradeError::RateLimitExceeded;
     pub const BelowMinTransfer: AutoTradeError = AutoTradeError::RateLimitExceeded;
