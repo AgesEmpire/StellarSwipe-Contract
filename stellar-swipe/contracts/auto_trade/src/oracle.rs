@@ -206,15 +206,59 @@ pub fn check_oracle_circuit_breaker(env: &Env, asset_pair: u32) -> Result<(), Au
     }
 }
 
-/// Return the oracle price scaled to a plain i128 (same unit as SDEX prices).
+/// Target decimal precision for every price used in settlement math
+/// (signal.price, risk thresholds, conditional-order trigger prices, …).
+/// Matches `multi_asset::STELLAR_DECIMALS` — Stellar assets are always
+/// 7-decimal, so every price flowing into settlement must land on the same
+/// scale rather than being silently collapsed to whole units.
+pub const PRICE_SCALE_DECIMALS: u32 = 7;
+
+/// Decimal counts beyond this cannot be normalized with checked i128
+/// arithmetic (10^op.decimals would overflow before we even get to
+/// rescaling), so they are rejected outright rather than producing a
+/// garbage value.
+const MAX_SUPPORTED_ORACLE_DECIMALS: u32 = 30;
+
+/// Normalize an oracle price (reported at `op.decimals` precision) onto the
+/// shared `PRICE_SCALE_DECIMALS` scale used throughout settlement, using
+/// checked arithmetic.
 ///
-/// Divides by 10^decimals so callers don't need to know the oracle's scale.
-pub fn oracle_price_to_i128(op: &OraclePrice) -> i128 {
-    let scale = 10i128.pow(op.decimals);
-    if scale == 0 {
+/// Rounding policy: when the oracle reports *more* precision than the target
+/// scale, the extra digits are truncated (rounded toward zero) via integer
+/// division — the same policy Stellar/Soroban integer math uses everywhere
+/// else in this contract. When the oracle reports *less* precision, the
+/// value is scaled up exactly (no rounding needed).
+///
+/// Errors:
+/// - Unsupported scale (`op.decimals` too large to exponentiate, or the
+///   up-scale multiplication overflows i128) is rejected before the caller
+///   can combine this price with a differently-scaled token amount.
+pub fn oracle_price_to_i128(op: &OraclePrice) -> Result<i128, AutoTradeError> {
+    if op.decimals > MAX_SUPPORTED_ORACLE_DECIMALS {
+        return Err(AutoTradeError::UnsupportedDecimalScale);
+    }
+
+    if op.decimals == PRICE_SCALE_DECIMALS {
+        return Ok(op.price);
+    }
+
+    if op.decimals < PRICE_SCALE_DECIMALS {
+        let diff = PRICE_SCALE_DECIMALS - op.decimals;
+        let factor = 10i128
+            .checked_pow(diff)
+            .ok_or(AutoTradeError::UnsupportedDecimalScale)?;
         op.price
+            .checked_mul(factor)
+            .ok_or(AutoTradeError::UnsupportedDecimalScale)
     } else {
-        op.price / scale
+        let diff = op.decimals - PRICE_SCALE_DECIMALS;
+        let factor = 10i128
+            .checked_pow(diff)
+            .ok_or(AutoTradeError::UnsupportedDecimalScale)?;
+        if factor == 0 {
+            return Err(AutoTradeError::UnsupportedDecimalScale);
+        }
+        Ok(op.price / factor)
     }
 }
 
@@ -337,7 +381,7 @@ pub fn push_price_update(
     validate_freshness(env, &price).map_err(|_| AutoTradeError::OracleUnavailable)?;
     validate_price_bounds(&price).map_err(|_| AutoTradeError::OracleUnavailable)?;
 
-    let scaled = oracle_price_to_i128(&price);
+    let scaled = oracle_price_to_i128(&price)?;
     crate::risk::set_asset_price(env, asset_pair, scaled);
     crate::risk::record_price(env, asset_pair, scaled);
 

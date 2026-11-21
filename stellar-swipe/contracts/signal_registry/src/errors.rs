@@ -904,6 +904,19 @@ impl ProviderOnboardingError {
 // This asserts every discriminant across every `#[contracterror]` enum in
 // the crate — including `DisputeError`, defined in `community_voting.rs` —
 // is unique, at compile time.
+/// Provider lifecycle transition failures (Issue #1137).
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ProviderStatusError {
+    /// Caller may not perform this transition.
+    Unauthorized = 1800,
+    /// The transition is not in the allowed transition table.
+    InvalidTransition = 1801,
+    /// Requested status equals the current status.
+    NoChange = 1802,
+}
+
 const ALL_ERROR_CODES: &[u32] = &[
     // AdminError
     AdminError::Unauthorized as u32,
@@ -1093,6 +1106,10 @@ const ALL_ERROR_CODES: &[u32] = &[
     ProviderOnboardingError::ArithmeticError as u32,
     ProviderOnboardingError::Unauthorized as u32,
     ProviderOnboardingError::InvalidConfig as u32,
+    // ProviderStatusError
+    ProviderStatusError::Unauthorized as u32,
+    ProviderStatusError::InvalidTransition as u32,
+    ProviderStatusError::NoChange as u32,
 ];
 
 const fn has_duplicate(codes: &[u32]) -> bool {

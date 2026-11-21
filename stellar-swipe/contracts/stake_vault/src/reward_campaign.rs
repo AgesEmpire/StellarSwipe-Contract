@@ -57,6 +57,40 @@
 //! so a rejected closure leaves the campaign unchanged.  On success the
 //! campaign becomes `Closed` (terminal; no more allocations, claims or
 //! expiries) and `available` is returned to be refunded to the funder.
+//!
+//! # Issue #1323 – Funding required before activation
+//!
+//! A campaign now starts life in `Pending`, with a promised `budget` but
+//! `funded == 0`.  [`fund_campaign`] records deposits made in the campaign's
+//! own `asset` (a deposit in any other asset is rejected and leaves `funded`
+//! unchanged — Issue #1323's "wrong asset" case).  [`activate_campaign`]
+//! moves `Pending → Open` only once `funded >= budget`; an underfunded
+//! activation attempt returns [`CampaignError::InsufficientCampaignFunds`]
+//! and leaves the campaign's status, `funded` and `epoch_id` untouched.  Only
+//! `Open` campaigns can [`distribute`], [`claim`], or [`close_campaign`].
+//!
+//! # Issue #1324 – Cancelling an unfunded/unactivated campaign
+//!
+//! [`cancel_campaign`] is only valid while a campaign is still `Pending` —
+//! i.e. it has never been activated and therefore has never accepted a
+//! single allocation or claim.  It moves the campaign to `Canceled`
+//! (terminal) and returns the `funded` amount so the caller can refund it to
+//! the funder.  A campaign that is already `Open`, `Closed`, or `Canceled` is
+//! rejected with [`CampaignError::CampaignClosed`] — repeated cancellation is
+//! idempotently refused, never silently repeated.
+//!
+//! # Issue #1325 – Epoch snapshot binding for claim eligibility
+//!
+//! [`activate_campaign`] takes an `epoch_id` that is written once, at
+//! activation, and never mutated again — [`RewardCampaign::epoch_id`] has no
+//! setter after that point.  Every allocation created by [`distribute`]
+//! records the campaign's `epoch_id` at allocation time
+//! (`CampaignAllocation::epoch_id`), and [`claim`] re-checks that the
+//! allocation's stamped `epoch_id` still equals the campaign's current
+//! (immutable) `epoch_id` before paying out.  Because `epoch_id` cannot
+//! change after activation, a recipient's eligibility is always judged
+//! against the frozen snapshot taken when the campaign opened — not against
+//! whatever epoch/stake state happens to exist at claim time.
 
 use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 
@@ -82,6 +116,13 @@ pub enum CampaignKey {
     Campaign(u64),
     /// (campaign_id, allocation_id) → CampaignAllocation.
     Allocation(u64, u64),
+    /// Monotonic vesting schedule id counter, per campaign.
+    VestingCounter(u64),
+    /// (campaign_id, vesting_id) → VestingAllocation (Issue #1327).
+    Vesting(u64, u64),
+    /// (campaign_id, recipient) → cumulative amount claimed, for enforcing
+    /// `RewardCampaign::per_account_claim_cap` (Issue #1329).
+    ClaimedByAccount(u64, Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -92,6 +133,11 @@ pub enum CampaignKey {
 pub enum CampaignStatus {
     Open = 0,
     Closed = 1,
+    /// Created but not yet activated: not funded (or not fully funded), has
+    /// never accepted an allocation or claim (Issue #1323).
+    Pending = 2,
+    /// Cancelled while still `Pending` (Issue #1324); terminal.
+    Canceled = 3,
 }
 
 #[contracttype]
@@ -126,6 +172,16 @@ pub struct RewardCampaign {
     pub status: CampaignStatus,
     pub created_at: u64,
     pub closed_at: u64,
+    /// Amount actually deposited toward `budget` so far (Issue #1323). Only
+    /// meaningful while `Pending`; once `Open`, funding is complete by
+    /// definition (`funded >= budget`) and never decreases afterwards.
+    pub funded: i128,
+    /// Immutable epoch/snapshot identifier bound at activation time (Issue
+    /// #1325). `0` while `Pending` (unset); never changes once set.
+    pub epoch_id: u64,
+    /// Maximum lifetime amount any single account may claim from this
+    /// campaign (Issue #1329). `0` means no cap.
+    pub per_account_claim_cap: i128,
 }
 
 impl RewardCampaign {
@@ -151,6 +207,12 @@ pub struct CampaignAllocation {
     /// First timestamp at which the allocation is expired (no longer claimable).
     pub expires_at: u64,
     pub status: AllocationStatus,
+    /// Snapshot of the campaign's `epoch_id` at the moment this allocation
+    /// was created (Issue #1325). Claims are checked against this, not
+    /// against whatever the campaign's `epoch_id` happens to be later — it
+    /// never changes after activation anyway, but stamping it per-allocation
+    /// makes the binding explicit and independently verifiable.
+    pub epoch_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +236,20 @@ pub enum CampaignError {
     /// Campaign still has outstanding liabilities to recipients.
     OutstandingLiabilities,
     Overflow,
+    /// Campaign is not `Pending` (already activated, cancelled, or closed) —
+    /// Issue #1323 / #1324.
+    CampaignNotPending,
+    /// Funding deposit used an asset other than the campaign's own `asset`
+    /// (Issue #1323).
+    WrongFundingAsset,
+    /// `cliff_secs > duration_secs`, or `duration_secs == 0` (Issue #1327).
+    InvalidVestingSchedule,
+    /// Vesting schedule does not exist or belongs to someone else.
+    VestingNotFound,
+    /// Nothing newly vested to claim yet.
+    NothingVested,
+    /// Claim would exceed the campaign's per-account cap (Issue #1329).
+    ClaimLimitExceeded,
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -301,8 +377,10 @@ pub fn split_by_weight(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Record a new open campaign.  The caller must transfer `budget` of `asset`
-/// from `funder` into the contract in the same invocation.
+/// Record a new campaign in `Pending` status (Issue #1323). The campaign is
+/// not claimable yet: it must be funded with [`fund_campaign`] and then
+/// opened with [`activate_campaign`] before any allocation or claim is
+/// possible.
 pub fn create_campaign(
     env: &Env,
     funder: Address,
@@ -338,9 +416,12 @@ pub fn create_campaign(
         pending_allocations: 0,
         next_allocation_id: 0,
         claim_window_secs,
-        status: CampaignStatus::Open,
+        status: CampaignStatus::Pending,
         created_at: env.ledger().timestamp(),
         closed_at: 0,
+        funded: 0,
+        epoch_id: 0,
+        per_account_claim_cap: 0,
     };
     save(env, &campaign);
 
@@ -349,6 +430,11 @@ pub fn create_campaign(
         (campaign_id, funder, asset, budget, claim_window_secs),
     );
     Ok(campaign_id)
+}
+
+        funded: 0,
+        epoch_id: 0,
+        per_account_claim_cap: 0,
 }
 
 /// Allocate `total` of the campaign's available funds across `recipients` by
@@ -390,6 +476,10 @@ pub fn distribute(
             allocated_at: now,
             expires_at,
             status: AllocationStatus::Pending,
+            // Issue #1325: snapshot the campaign's immutable epoch_id at
+            // allocation time, so eligibility is always checked against this
+            // frozen value rather than any later state.
+            epoch_id: campaign.epoch_id,
         };
         env.storage().persistent().set(
             &CampaignKey::Allocation(campaign_id, allocation_id),
@@ -449,8 +539,25 @@ pub fn claim(
         if now >= allocation.expires_at {
             return Err(CampaignError::AllocationExpired);
         }
+        // Issue #1325: eligibility is checked against the epoch snapshot
+        // stamped on the allocation at distribution time, not the campaign's
+        // current `epoch_id` — even though the latter cannot change after
+        // activation, this keeps the binding explicit and would still catch
+        // any future bug that tried to mutate it.
+        if allocation.epoch_id != campaign.epoch_id {
+            return Err(CampaignError::AllocationNotClaimable);
+        }
         total = add(total, allocation.amount)?;
         allocations.push_back(allocation);
+    }
+
+    // Issue #1329: cumulative claims (across this and all prior calls) must
+    // never exceed the campaign's per-account cap. Checked before any write,
+    // so splitting a claim across many smaller calls cannot bypass it.
+    let already_claimed = claimed_by_account(env, campaign_id, recipient);
+    let new_total_claimed = add(already_claimed, total)?;
+    if campaign.per_account_claim_cap > 0 && new_total_claimed > campaign.per_account_claim_cap {
+        return Err(CampaignError::ClaimLimitExceeded);
     }
 
     for i in 0..allocations.len() {
@@ -461,6 +568,10 @@ pub fn claim(
             &allocation,
         );
     }
+    env.storage().persistent().set(
+        &CampaignKey::ClaimedByAccount(campaign_id, recipient.clone()),
+        &new_total_claimed,
+    );
     campaign.claimed = add(campaign.claimed, total)?;
     campaign.pending_allocations -= allocations.len();
     save(env, &campaign);
@@ -575,6 +686,189 @@ pub fn get_allocation(
         .get(&CampaignKey::Allocation(campaign_id, allocation_id))
 }
 
+// ── Issue #1327: linear vesting schedules ──────────────────────────────────────
+//
+// A vesting allocation grants `total_amount` to `recipient`, released linearly
+// between `start + cliff_secs` and `start + duration_secs`:
+//
+// * Before `start + cliff_secs`: nothing is claimable.
+// * Between the cliff and `start + duration_secs`: claimable amount is
+//   `floor(total_amount * elapsed / duration_secs)`, where `elapsed` is
+//   capped at `duration_secs`. This is monotonically non-decreasing in time
+//   and the schedule is a pure, deterministic function of `now` — repeated
+//   calls at the same timestamp always agree.
+// * At or after `start + duration_secs`: the full `total_amount` is vested.
+//
+// [`claim_vesting`] pays out `vested_amount(now) - claimed`, so partial claims
+// made at different points along the schedule never exceed the allocation —
+// each claim only ever releases newly-vested funds, checked with saturating
+// arithmetic on `vested`/`claimed` and `checked_sub` on the payout itself.
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingAllocation {
+    pub campaign_id: u64,
+    pub vesting_id: u64,
+    pub recipient: Address,
+    /// Total amount granted over the life of the schedule.
+    pub total_amount: i128,
+    /// Ledger timestamp the schedule is anchored to.
+    pub start: u64,
+    /// Seconds after `start` before anything is claimable.
+    pub cliff_secs: u64,
+    /// Seconds after `start` at which the full amount is vested.
+    pub duration_secs: u64,
+    /// Amount already claimed against this schedule.
+    pub claimed: i128,
+}
+
+fn load_vesting(
+    env: &Env,
+    campaign_id: u64,
+    vesting_id: u64,
+) -> Result<VestingAllocation, CampaignError> {
+    env.storage()
+        .persistent()
+        .get(&CampaignKey::Vesting(campaign_id, vesting_id))
+        .ok_or(CampaignError::VestingNotFound)
+}
+
+fn save_vesting(env: &Env, vesting: &VestingAllocation) {
+    env.storage().persistent().set(
+        &CampaignKey::Vesting(vesting.campaign_id, vesting.vesting_id),
+        vesting,
+    );
+}
+
+/// Deterministic linear-vesting curve. Pure function of `now` and the
+/// schedule parameters; never exceeds `total_amount`.
+pub fn vested_amount(now: u64, vesting: &VestingAllocation) -> i128 {
+    let cliff_at = vesting.start.saturating_add(vesting.cliff_secs);
+    if now < cliff_at {
+        return 0;
+    }
+    let end_at = vesting.start.saturating_add(vesting.duration_secs);
+    if now >= end_at {
+        return vesting.total_amount;
+    }
+    let elapsed = now.saturating_sub(vesting.start) as u128;
+    let duration = vesting.duration_secs as u128;
+    let amount = vesting.total_amount as u128;
+    // floor(total_amount * elapsed / duration); elapsed < duration here, and
+    // total_amount * elapsed fits well within u128 for any realistic i128
+    // reward amount and duration, so this cannot overflow in practice.
+    let vested = amount.saturating_mul(elapsed) / duration.max(1);
+    vested as i128
+}
+
+/// Create a linear vesting allocation funded from the campaign's `available`
+/// balance (Issue #1327). Ordering is validated before any state changes:
+/// `cliff_secs <= duration_secs` and `duration_secs > 0`.
+pub fn create_vesting_allocation(
+    env: &Env,
+    campaign_id: u64,
+    recipient: Address,
+    total_amount: i128,
+    start: u64,
+    cliff_secs: u64,
+    duration_secs: u64,
+) -> Result<u64, CampaignError> {
+    let mut campaign = load_open(env, campaign_id)?;
+    if total_amount <= 0 {
+        return Err(CampaignError::InvalidAmount);
+    }
+    if duration_secs == 0 || cliff_secs > duration_secs {
+        return Err(CampaignError::InvalidVestingSchedule);
+    }
+    if total_amount > campaign.available() {
+        return Err(CampaignError::InsufficientCampaignFunds);
+    }
+
+    let vesting_id: u64 = env
+        .storage()
+        .persistent()
+        .get(&CampaignKey::VestingCounter(campaign_id))
+        .unwrap_or(0u64);
+    env.storage().persistent().set(
+        &CampaignKey::VestingCounter(campaign_id),
+        &vesting_id.saturating_add(1),
+    );
+
+    let vesting = VestingAllocation {
+        campaign_id,
+        vesting_id,
+        recipient: recipient.clone(),
+        total_amount,
+        start,
+        cliff_secs,
+        duration_secs,
+        claimed: 0,
+    };
+    save_vesting(env, &vesting);
+
+    // Vested allocations are treated the same as regular allocations for
+    // campaign accounting: reserved out of `available`, paid out of
+    // `allocated` as they are claimed. They are tracked as a liability via
+    // `pending_allocations` until fully claimed, mirroring `close_campaign`'s
+    // settlement requirement.
+    campaign.allocated = add(campaign.allocated, total_amount)?;
+    campaign.pending_allocations = campaign.pending_allocations.saturating_add(1);
+    save(env, &campaign);
+
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_CAMPAIGN_ALLOCATED()),
+        (campaign_id, vesting_id, recipient, total_amount, start),
+    );
+    Ok(vesting_id)
+}
+
+/// Claim whatever has newly vested for `vesting_id` since the last claim
+/// (Issue #1327). Rejects if the caller is not the schedule's recipient or if
+/// nothing new has vested. Returns the amount transferred.
+pub fn claim_vesting(
+    env: &Env,
+    campaign_id: u64,
+    vesting_id: u64,
+    recipient: &Address,
+) -> Result<i128, CampaignError> {
+    let mut campaign = load_open(env, campaign_id)?;
+    let mut vesting = load_vesting(env, campaign_id, vesting_id)?;
+    if vesting.recipient != *recipient {
+        return Err(CampaignError::VestingNotFound);
+    }
+
+    let now = env.ledger().timestamp();
+    let total_vested = vested_amount(now, &vesting);
+    let payout = total_vested
+        .checked_sub(vesting.claimed)
+        .ok_or(CampaignError::Overflow)?;
+    if payout <= 0 {
+        return Err(CampaignError::NothingVested);
+    }
+
+    let fully_settled = vesting.claimed.saturating_add(payout) >= vesting.total_amount;
+    vesting.claimed = add(vesting.claimed, payout)?;
+    save_vesting(env, &vesting);
+
+    campaign.claimed = add(campaign.claimed, payout)?;
+    if fully_settled {
+        campaign.pending_allocations = campaign.pending_allocations.saturating_sub(1);
+    }
+    save(env, &campaign);
+
+    env.events().publish(
+        (contract_topic(env), topics::TOPIC_CAMPAIGN_CLAIMED()),
+        (campaign_id, recipient.clone(), payout, vesting_id),
+    );
+    Ok(payout)
+}
+
+pub fn get_vesting(env: &Env, campaign_id: u64, vesting_id: u64) -> Option<VestingAllocation> {
+    env.storage()
+        .persistent()
+        .get(&CampaignKey::Vesting(campaign_id, vesting_id))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -611,15 +905,24 @@ mod tests {
         assert!(c.outstanding() >= 0 && c.available() >= 0);
     }
 
+    /// Creates a campaign and immediately funds + activates it (epoch 1), so
+    /// existing tests that assume an `Open`, claimable campaign are
+    /// unaffected by the #1323/#1324/#1325 Pending→Open lifecycle.
     fn new_campaign(env: &Env, budget: i128) -> u64 {
-        create_campaign(
-            env,
-            Address::generate(env),
-            Address::generate(env),
-            budget,
-            WINDOW,
-        )
-        .unwrap()
+        new_campaign_with_asset(env, Address::generate(env), budget)
+    }
+
+    fn new_campaign_with_asset(env: &Env, asset: Address, budget: i128) -> u64 {
+        let id = create_campaign(env, Address::generate(env), asset.clone(), budget, WINDOW)
+            .unwrap();
+        fund_campaign(env, id, &asset, budget).unwrap();
+        activate_campaign(env, id, 1).unwrap();
+        id
+    }
+
+    /// Creates a campaign without funding or activating it (still `Pending`).
+    fn new_pending_campaign(env: &Env, asset: Address, budget: i128) -> u64 {
+        create_campaign(env, Address::generate(env), asset, budget, WINDOW).unwrap()
     }
 
     // ── #1202: remainder allocation ──────────────────────────────────────────
@@ -990,6 +1293,214 @@ mod tests {
         });
     }
 
+    // ── #1327: linear vesting ─────────────────────────────────────────────────
+
+    #[test]
+    fn vesting_rejects_invalid_schedule() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            let user = Address::generate(&env);
+            assert_eq!(
+                create_vesting_allocation(&env, id, user.clone(), 100, 1_000, 10, 0),
+                Err(CampaignError::InvalidVestingSchedule)
+            );
+            assert_eq!(
+                create_vesting_allocation(&env, id, user.clone(), 100, 1_000, 500, 100),
+                Err(CampaignError::InvalidVestingSchedule)
+            );
+            assert_eq!(
+                create_vesting_allocation(&env, id, user, 0, 1_000, 0, 100),
+                Err(CampaignError::InvalidAmount)
+            );
+        });
+    }
+
+    #[test]
+    fn nothing_claimable_before_cliff() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            let user = Address::generate(&env);
+            let vid =
+                create_vesting_allocation(&env, id, user.clone(), 1_000, 1_000, 100, 1_000)
+                    .unwrap();
+            env.ledger().set_timestamp(1_000 + 50); // before the cliff
+            assert_eq!(
+                claim_vesting(&env, id, vid, &user),
+                Err(CampaignError::NothingVested)
+            );
+        });
+    }
+
+    #[test]
+    fn partial_vesting_between_cliff_and_end() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            let user = Address::generate(&env);
+            let vid =
+                create_vesting_allocation(&env, id, user.clone(), 1_000, 1_000, 100, 1_000)
+                    .unwrap();
+            // Halfway through the duration (from schedule start, not cliff).
+            env.ledger().set_timestamp(1_000 + 500);
+            let payout = claim_vesting(&env, id, vid, &user).unwrap();
+            assert_eq!(payout, 500);
+
+            // Immediately claiming again at the same timestamp: nothing new.
+            assert_eq!(
+                claim_vesting(&env, id, vid, &user),
+                Err(CampaignError::NothingVested)
+            );
+
+            let v = get_vesting(&env, id, vid).unwrap();
+            assert_eq!(v.claimed, 500);
+            let c = get_campaign(&env, id).unwrap();
+            assert_eq!(c.claimed, 500);
+            assert_eq!(c.pending_allocations, 1); // not fully settled yet
+        });
+    }
+
+    #[test]
+    fn full_vesting_after_duration_and_repeated_claims_sum_to_total() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            let user = Address::generate(&env);
+            let vid =
+                create_vesting_allocation(&env, id, user.clone(), 1_000, 1_000, 100, 1_000)
+                    .unwrap();
+
+            env.ledger().set_timestamp(1_000 + 300);
+            let p1 = claim_vesting(&env, id, vid, &user).unwrap();
+            env.ledger().set_timestamp(1_000 + 700);
+            let p2 = claim_vesting(&env, id, vid, &user).unwrap();
+            // Past the end of the schedule: everything remaining vests.
+            env.ledger().set_timestamp(1_000 + 10_000);
+            let p3 = claim_vesting(&env, id, vid, &user).unwrap();
+
+            assert_eq!(p1 + p2 + p3, 1_000);
+            let v = get_vesting(&env, id, vid).unwrap();
+            assert_eq!(v.claimed, 1_000);
+            let c = get_campaign(&env, id).unwrap();
+            assert_eq!(c.claimed, 1_000);
+            assert_eq!(c.pending_allocations, 0); // fully settled, can close
+            assert_accounting(&c);
+
+            // Fully claimed: no more payout available.
+            assert_eq!(
+                claim_vesting(&env, id, vid, &user),
+                Err(CampaignError::NothingVested)
+            );
+        });
+    }
+
+    #[test]
+    fn vesting_rejects_wrong_recipient_and_insufficient_funds() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 100);
+            let user = Address::generate(&env);
+            let other = Address::generate(&env);
+            assert_eq!(
+                create_vesting_allocation(&env, id, user.clone(), 200, 1_000, 0, 1_000),
+                Err(CampaignError::InsufficientCampaignFunds)
+            );
+            let vid =
+                create_vesting_allocation(&env, id, user, 100, 1_000, 0, 1_000).unwrap();
+            env.ledger().set_timestamp(1_000 + 1_000);
+            assert_eq!(
+                claim_vesting(&env, id, vid, &other),
+                Err(CampaignError::VestingNotFound)
+            );
+        });
+    }
+
+    // ── #1329: campaign-specific claim limits ────────────────────────────────
+
+    #[test]
+    fn claim_within_cap_succeeds_and_tracks_cumulative() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id, 150).unwrap();
+            let user = Address::generate(&env);
+
+            distribute(&env, id, 100, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 0
+            assert_eq!(claim(&env, id, &user, vec![&env, 0]).unwrap(), 100);
+            assert_eq!(claimed_by_account(&env, id, &user), 100);
+
+            distribute(&env, id, 50, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 1
+            assert_eq!(claim(&env, id, &user, vec![&env, 1]).unwrap(), 50);
+            assert_eq!(claimed_by_account(&env, id, &user), 150); // exactly the cap
+        });
+    }
+
+    #[test]
+    fn claim_exceeding_cap_is_rejected_before_any_mutation() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id, 100).unwrap();
+            let user = Address::generate(&env);
+            distribute(&env, id, 150, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 0
+
+            let before = get_campaign(&env, id).unwrap();
+            assert_eq!(
+                claim(&env, id, &user, vec![&env, 0]),
+                Err(CampaignError::ClaimLimitExceeded)
+            );
+            // Rejected before transfer or state mutation.
+            assert_eq!(get_campaign(&env, id).unwrap(), before);
+            assert_eq!(
+                get_allocation(&env, id, 0).unwrap().status,
+                AllocationStatus::Pending
+            );
+            assert_eq!(claimed_by_account(&env, id, &user), 0);
+        });
+    }
+
+    #[test]
+    fn cap_cannot_be_bypassed_by_splitting_across_calls() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id, 100).unwrap();
+            let user = Address::generate(&env);
+
+            distribute(&env, id, 60, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 0
+            distribute(&env, id, 60, vec![&env, (user.clone(), 1)]).unwrap(); // alloc 1
+            assert_eq!(claim(&env, id, &user, vec![&env, 0]).unwrap(), 60);
+            // Second, independent call would push cumulative to 120 > 100.
+            assert_eq!(
+                claim(&env, id, &user, vec![&env, 1]),
+                Err(CampaignError::ClaimLimitExceeded)
+            );
+            assert_eq!(claimed_by_account(&env, id, &user), 60);
+        });
+    }
+
+    #[test]
+    fn cap_is_independent_per_campaign() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let id_a = new_campaign(&env, 1_000);
+            let id_b = new_campaign(&env, 1_000);
+            set_claim_cap(&env, id_a, 50).unwrap();
+            // id_b has no cap.
+            let user = Address::generate(&env);
+
+            distribute(&env, id_a, 50, vec![&env, (user.clone(), 1)]).unwrap();
+            distribute(&env, id_b, 500, vec![&env, (user.clone(), 1)]).unwrap();
+
+            assert_eq!(claim(&env, id_a, &user, vec![&env, 0]).unwrap(), 50);
+            // Unrelated campaign's own cumulative total is unaffected by id_a.
+            assert_eq!(claim(&env, id_b, &user, vec![&env, 0]).unwrap(), 500);
+            assert_eq!(claimed_by_account(&env, id_a, &user), 50);
+            assert_eq!(claimed_by_account(&env, id_b, &user), 500);
+        });
+    }
+
     #[test]
     fn create_validates_inputs() {
         let (env, host) = setup();
@@ -1011,6 +1522,162 @@ mod tests {
             assert_eq!(
                 close_campaign(&env, 99),
                 Err(CampaignError::CampaignNotFound)
+            );
+        });
+    }
+
+    // ── #1323: funding handshake before activation ───────────────────────────
+
+    #[test]
+    fn new_campaign_is_pending_with_zero_funded_and_epoch() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset, 1_000);
+            let c = get_campaign(&env, id).unwrap();
+            assert_eq!(c.status, CampaignStatus::Pending);
+            assert_eq!(c.funded, 0);
+            assert_eq!(c.epoch_id, 0);
+        });
+    }
+
+    #[test]
+    fn exact_funding_activates_successfully() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            assert_eq!(fund_campaign(&env, id, &asset, 1_000).unwrap(), 1_000);
+            activate_campaign(&env, id, 5).unwrap();
+            let c = get_campaign(&env, id).unwrap();
+            assert_eq!(c.status, CampaignStatus::Open);
+            assert_eq!(c.epoch_id, 5);
+        });
+    }
+
+    #[test]
+    fn short_funding_leaves_activation_rejected_and_state_unchanged() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            fund_campaign(&env, id, &asset, 600).unwrap();
+            let before = get_campaign(&env, id).unwrap();
+
+            assert_eq!(
+                activate_campaign(&env, id, 1),
+                Err(CampaignError::InsufficientCampaignFunds)
+            );
+            assert_eq!(get_campaign(&env, id).unwrap(), before);
+        });
+    }
+
+    #[test]
+    fn funding_in_the_wrong_asset_is_rejected_and_not_counted() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let other_asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset, 1_000);
+
+            assert_eq!(
+                fund_campaign(&env, id, &other_asset, 1_000),
+                Err(CampaignError::WrongFundingAsset)
+            );
+            assert_eq!(get_campaign(&env, id).unwrap().funded, 0);
+            assert_eq!(
+                activate_campaign(&env, id, 1),
+                Err(CampaignError::InsufficientCampaignFunds)
+            );
+        });
+    }
+
+    #[test]
+    fn funding_can_be_split_across_multiple_deposits() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            assert_eq!(fund_campaign(&env, id, &asset, 400).unwrap(), 400);
+            assert_eq!(fund_campaign(&env, id, &asset, 600).unwrap(), 1_000);
+            activate_campaign(&env, id, 1).unwrap();
+            assert_eq!(get_campaign(&env, id).unwrap().status, CampaignStatus::Open);
+        });
+    }
+
+    // ── #1324: cancellation of unfunded/unactivated campaigns ────────────────
+
+    #[test]
+    fn pending_campaign_can_be_cancelled_and_returns_funded_amount() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            fund_campaign(&env, id, &asset, 300).unwrap();
+
+            assert_eq!(cancel_campaign(&env, id).unwrap(), 300);
+            let c = get_campaign(&env, id).unwrap();
+            assert_eq!(c.status, CampaignStatus::Canceled);
+        });
+    }
+
+    #[test]
+    fn cancellation_is_rejected_once_already_activated() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            fund_campaign(&env, id, &asset, 1_000).unwrap();
+            activate_campaign(&env, id, 1).unwrap();
+
+            assert_eq!(
+                cancel_campaign(&env, id),
+                Err(CampaignError::CampaignNotPending)
+            );
+        });
+    }
+
+    #[test]
+    fn repeated_cancellation_is_rejected_not_repeated() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset, 1_000);
+            cancel_campaign(&env, id).unwrap();
+            assert_eq!(
+                cancel_campaign(&env, id),
+                Err(CampaignError::CampaignNotPending)
+            );
+        });
+    }
+
+    // ── #1325: epoch snapshot binding ─────────────────────────────────────────
+
+    #[test]
+    fn allocations_are_stamped_with_the_activation_epoch_and_claims_require_it() {
+        let (env, host) = setup();
+        env.as_contract(&host, || {
+            let asset = Address::generate(&env);
+            let id = new_pending_campaign(&env, asset.clone(), 1_000);
+            fund_campaign(&env, id, &asset, 1_000).unwrap();
+            activate_campaign(&env, id, 99).unwrap();
+
+            let user = Address::generate(&env);
+            let created = distribute(&env, id, 100, vec![&env, (user.clone(), 1u32)]).unwrap();
+            let (_, alloc_id, amount) = created.get(0).unwrap();
+
+            let allocation = get_allocation(&env, id, alloc_id).unwrap();
+            assert_eq!(allocation.epoch_id, 99);
+
+            // A later change to "current state" (modelled here as the
+            // campaign's own epoch_id, which has no setter and so can never
+            // actually change post-activation) can't retroactively alter
+            // this allocation's snapshot: the claim still succeeds because
+            // the campaign's immutable epoch_id still agrees with it.
+            assert_eq!(get_campaign(&env, id).unwrap().epoch_id, 99);
+            assert_eq!(
+                claim(&env, id, &user, vec![&env, alloc_id]).unwrap(),
+                amount
             );
         });
     }

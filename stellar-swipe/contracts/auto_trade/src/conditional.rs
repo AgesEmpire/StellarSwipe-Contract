@@ -315,6 +315,47 @@ pub fn cancel_conditional_order(env: &Env, id: u64, user: Address) -> Result<(),
     Ok(())
 }
 
+/// Issue #1441: deterministic, permissionless cancellation of an expired
+/// conditional order (auto-trade intent).
+///
+/// Unlike `cancel_conditional_order`, this requires no auth from the owner —
+/// anyone may call it — because the only thing it does is apply a pure,
+/// deterministic check (`now >= expires_at`) against on-chain ledger time and
+/// release the order from the active set exactly once. It can never execute
+/// the underlying trade: it only ever transitions `Pending -> Expired`.
+///
+/// Calling this repeatedly for the same id is safe: the first call flips the
+/// status to `Expired` and removes it from the active set; every subsequent
+/// call observes a non-`Pending` status and returns
+/// `ConditionalOrderNotPending` without emitting a second event or touching
+/// storage again.
+pub fn cancel_expired_order(env: &Env, id: u64) -> Result<(), AutoTradeError> {
+    let mut order = load(env, id)?;
+    if order.status != ConditionalStatus::Pending {
+        return Err(AutoTradeError::ConditionalOrderNotPending);
+    }
+    let now = env.ledger().timestamp();
+    if now < order.expires_at {
+        return Err(AutoTradeError::ConditionalOrderNotExpired);
+    }
+
+    order.status = ConditionalStatus::Expired;
+    save(env, &order);
+    remove_active(env, id);
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (
+            Symbol::new(env, "cond_order_expired"),
+            order.user.clone(),
+            id,
+        ),
+        (),
+    );
+
+    Ok(())
+}
+
 /// Get a conditional order by id.
 pub fn get_conditional_order(env: &Env, id: u64) -> Result<ConditionalOrder, AutoTradeError> {
     load(env, id)
@@ -506,6 +547,43 @@ mod tests {
         client.cancel_conditional_order(&id, &user);
         let order = client.get_conditional_order(&id);
         assert_eq!(order.status, ConditionalStatus::Cancelled);
+    }
+
+    /// Issue #1441: anyone (no auth) can deterministically cancel an order
+    /// once ledger time has passed its `expires_at` deadline.
+    #[test]
+    fn test_cancel_expired_order_is_permissionless() {
+        use soroban_sdk::testutils::Ledger as _;
+
+        let (env, contract, client) = setup();
+        let user = Address::generate(&env);
+        seed_price(&env, &contract, 1, 100_000);
+        let conditions = simple_price_condition(&env, 1, PriceDirection::Above, 110_000);
+        let id = client.create_conditional_order(
+            &user,
+            &1,
+            &ConditionalSide::Buy,
+            &1_000,
+            &0,
+            &conditions,
+            &LogicOp::And,
+            &3_600,
+        );
+
+        // Not yet expired: deterministic check rejects it.
+        let result = env.as_contract(&contract, || cancel_expired_order(&env, id));
+        assert_eq!(result, Err(AutoTradeError::ConditionalOrderNotExpired));
+
+        env.ledger().with_mut(|l| l.timestamp += 3_601);
+
+        // Past the deadline: succeeds with no owner signature at all.
+        env.as_contract(&contract, || cancel_expired_order(&env, id)).unwrap();
+        let order = client.get_conditional_order(&id);
+        assert_eq!(order.status, ConditionalStatus::Expired);
+
+        // Calling it again must be a no-op, not a double release.
+        let second = env.as_contract(&contract, || cancel_expired_order(&env, id));
+        assert_eq!(second, Err(AutoTradeError::ConditionalOrderNotPending));
     }
 
     #[test]

@@ -828,6 +828,7 @@ fn timelock_queue_execute_and_cancel_flow() {
         approval_threshold: 5_000,
         execution_delay: 60,
         discussion_duration: 0,
+        veto_window: 0,
     };
     client.configure_governance(&admin, &cfg);
     client.initialize_timelock(&admin, &3_600u64, &(7 * 86_400u64), &admin);
@@ -886,6 +887,7 @@ fn queue_underfunded_treasury_spend_action(
         approval_threshold: 5_000,
         execution_delay: 60,
         discussion_duration: 0,
+        veto_window: 0,
     };
     client.configure_governance(admin, &cfg);
     client.initialize_timelock(admin, &3_600u64, &(7 * 86_400u64), admin);
@@ -2416,6 +2418,54 @@ fn voting_power_uses_snapshot_not_live_balance() {
 }
 
 #[test]
+fn snapshot_survives_exit_and_stake_changes_after_proposal_opens() {
+    // #1290: eligibility is frozen at proposal creation. Unstaking (exit),
+    // increasing stake, or partially reducing stake afterwards must not change
+    // the weight this proposal counts for the voter.
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let voter = recipients.community_rewards.clone();
+    client.stake(&voter, &120_000_000i128);
+    let proposal_id = client.create_proposal(
+        &voter,
+        &ProposalType::SignalProposal(String::from_str(&env, "Snapshot exit")),
+        &String::from_str(&env, "Exit/change"),
+        &String::from_str(&env, "Eligibility must be immutable after opening"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+
+    // Exit: unstake everything after the proposal opened.
+    client.unstake(&voter, &120_000_000i128);
+    assert_eq!(client.staked_balance(&voter), 0);
+    env.ledger().set_timestamp(70);
+    client.cast_vote(&proposal_id, &voter, &GovernanceVoteType::For);
+    assert_eq!(client.proposal(&proposal_id).votes_for, 120_000_000);
+
+    // Stake changes (increase and decrease) on a second proposal still use
+    // the value captured when that proposal opened.
+    client.stake(&voter, &200_000_000i128);
+    let second = client.create_proposal(
+        &voter,
+        &ProposalType::SignalProposal(String::from_str(&env, "Snapshot change")),
+        &String::from_str(&env, "Change"),
+        &String::from_str(&env, "Changing stake after opening is ignored"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    client.stake(&voter, &50_000_000i128);
+    client.unstake(&voter, &80_000_000i128);
+    assert_eq!(client.staked_balance(&voter), 170_000_000);
+    env.ledger().set_timestamp(140);
+    client.cast_vote(&second, &voter, &GovernanceVoteType::For);
+    assert_eq!(client.proposal(&second).votes_for, 200_000_000);
+}
+
+#[test]
 fn test_reputation_leaderboard_limit() {
     let (env, contract_id, admin, recipients) = setup();
     let client = client(&env, &contract_id);
@@ -2894,6 +2944,7 @@ fn setup_succeeded_treasury_spend_proposal(
         approval_threshold: 5_000,
         execution_delay: 60,
         discussion_duration: 0,
+        veto_window: 0,
     };
     client.configure_governance(admin, &cfg);
 
@@ -2980,6 +3031,72 @@ fn treasury_spend_proposal_execution_past_deadline_is_rejected() {
 }
 
 #[test]
+fn execution_deadline_boundary_is_inclusive() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let (proposal_id, payout_recipient, _spend_asset) =
+        setup_succeeded_treasury_spend_proposal(&env, &client, &admin, &recipients);
+
+    let deadline = client.proposal(&proposal_id).execution_deadline;
+    assert_eq!(deadline, 1_209_660);
+
+    // Exactly at the deadline execution is still allowed; one second later it
+    // is not. This pins the boundary of the bounded execution lifetime.
+    env.ledger().set_timestamp(deadline);
+    assert_eq!(
+        client.execute_proposal(&proposal_id, &recipients.community_rewards),
+        ProposalStatus::Executed
+    );
+    assert_eq!(client.balance(&payout_recipient), 500);
+}
+
+#[test]
+fn expired_proposal_becomes_terminal_and_expiry_is_idempotent() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let (proposal_id, payout_recipient, _spend_asset) =
+        setup_succeeded_treasury_spend_proposal(&env, &client, &admin, &recipients);
+    let deadline = client.proposal(&proposal_id).execution_deadline;
+
+    // Before the deadline there is nothing to expire yet.
+    env.ledger().set_timestamp(deadline);
+    assert_eq!(
+        client.try_expire_proposal(&proposal_id),
+        Err(Ok(GovernanceError::InvalidDuration))
+    );
+
+    env.ledger().set_timestamp(deadline + 1);
+    assert_eq!(
+        client.expire_proposal(&proposal_id),
+        ProposalStatus::Expired
+    );
+    // Terminal state is persisted (not merely computed by a query).
+    assert_eq!(
+        client.try_execute_proposal(&proposal_id, &recipients.community_rewards),
+        Err(Ok(GovernanceError::ProposalNotApproved))
+    );
+
+    let proposer_balance = client.balance(&recipients.community_rewards);
+    // Repeated expiry processing is a no-op: no double bond settlement and no
+    // re-execution of the spend.
+    assert_eq!(
+        client.expire_proposal(&proposal_id),
+        ProposalStatus::Expired
+    );
+    assert_eq!(
+        client.expire_proposal(&proposal_id),
+        ProposalStatus::Expired
+    );
+    assert_eq!(client.balance(&recipients.community_rewards), proposer_balance);
+    assert_eq!(client.balance(&payout_recipient), 0);
+    assert_eq!(client.proposal(&proposal_id).status, ProposalStatus::Expired);
+}
+
+#[test]
 fn reclaim_expired_proposal_removes_entry_and_is_callable_by_anyone() {
     let (env, contract_id, admin, recipients) = setup();
     let client = client(&env, &contract_id);
@@ -3013,6 +3130,80 @@ fn reclaim_expired_proposal_removes_entry_and_is_callable_by_anyone() {
         i += 1;
     }
     assert!(!found);
+}
+
+#[test]
+fn proposal_status_query_reports_unknown_without_trapping() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let report = client.proposal_status(&999);
+    assert!(!report.exists);
+    assert_eq!(report.state, ProposalStatus::Pending);
+    assert_eq!(report.votes_for, 0);
+    assert_eq!(report.quorum_bps, 0);
+    assert_eq!(report.execution_deadline, 0);
+}
+
+#[test]
+fn proposal_status_query_tracks_voting_and_terminal_transitions() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+
+    let (proposal_id, _payout, _asset) =
+        setup_succeeded_treasury_spend_proposal(&env, &client, &admin, &recipients);
+
+    // Final state after voting and finalization: Succeeded with a full tally,
+    // resolved thresholds and the stored execution deadline.
+    let report = client.proposal_status(&proposal_id);
+    assert!(report.exists);
+    assert_eq!(report.state, ProposalStatus::Succeeded);
+    assert_eq!(report.votes_for, 160_000_000);
+    assert_eq!(report.votes_against, 0);
+    assert_eq!(report.votes_abstain, 0);
+    assert_eq!(report.quorum_bps, 1_000);
+    assert_eq!(report.approval_bps, 5_000);
+    assert_eq!(report.execution_deadline, 1_209_660);
+
+    // Terminal transition: expiry is reflected by the same query.
+    env.ledger().set_timestamp(report.execution_deadline + 1);
+    client.expire_proposal(&proposal_id);
+    let expired = client.proposal_status(&proposal_id);
+    assert_eq!(expired.state, ProposalStatus::Expired);
+    assert_eq!(expired.votes_for, report.votes_for);
+    assert_eq!(expired.execution_deadline, report.execution_deadline);
+}
+
+#[test]
+fn proposal_status_query_before_voting_has_zero_tally() {
+    let (env, contract_id, admin, recipients) = setup();
+    let client = client(&env, &contract_id);
+    initialize(&client, &env, &admin, &recipients);
+    client.stake(&recipients.community_rewards, &120_000_000i128);
+
+    let proposal_id = client.create_proposal(
+        &recipients.community_rewards,
+        &ProposalType::SignalProposal(String::from_str(&env, "Status query")),
+        &String::from_str(&env, "Status"),
+        &String::from_str(&env, "Read-only status query"),
+        &Bytes::new(&env),
+        &ProposalCategory::General,
+        &false,
+    );
+    let before = client.proposal_status(&proposal_id);
+    assert!(before.exists);
+    assert_eq!(before.state, ProposalStatus::Pending);
+    assert_eq!(before.votes_for, 0);
+    assert!(before.execution_deadline > before.voting_ends);
+
+    env.ledger().set_timestamp(70);
+    client.cast_vote(&proposal_id, &recipients.community_rewards, &GovernanceVoteType::For);
+    let after = client.proposal_status(&proposal_id);
+    assert_eq!(after.state, ProposalStatus::Active);
+    assert_eq!(after.votes_for, 120_000_000);
+    assert_eq!(after.execution_deadline, before.execution_deadline);
 }
 
 #[test]

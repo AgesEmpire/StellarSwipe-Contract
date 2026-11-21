@@ -23,6 +23,27 @@
 //!
 //! The module is intentionally free of cross-contract calls so it can be unit-
 //! tested in isolation and reused by any contract that needs settlement logic.
+//!
+//! # Expiration and cancellation (Issue #1322)
+//!
+//! A settlement order can carry an optional `deadline_ledger` (0 = no
+//! deadline), set once at creation via
+//! [`create_settlement_order_with_deadline`] and never changed afterwards.
+//!
+//! * **Expiration** is checked lazily at the start of [`settle_batch`]: once
+//!   `env.ledger().sequence() > deadline_ledger`, the order is marked
+//!   `Expired` (if not already closed) and the fill is rejected with
+//!   [`SettlementError::OrderExpired`] — the deadline boundary itself
+//!   (`sequence == deadline_ledger`) still allows a fill. An expired order can
+//!   never execute again: `is_closed()` includes `Expired`, so any later
+//!   `settle_batch` call returns `OrderAlreadyClosed` and leaves the already
+//!   "consumed" `settled_amount` and fill records exactly as they were — an
+//!   expired or cancelled order can never be replayed into executing again.
+//! * **Cancellation** via [`cancel_settlement_order`] is restricted to the
+//!   order's own `user` (the only authorized party). It is rejected once the
+//!   order is already closed (fully settled, failed, cancelled, or expired),
+//!   and — like expiration — never discards previously recorded fills or
+//!   `settled_amount`; it only prevents any *further* fills.
 
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Vec};
 
@@ -41,6 +62,11 @@ pub enum SettlementStatus {
     FullySettled = 2,
     /// The order was closed with a failure before full settlement.
     Failed = 3,
+    /// Cancelled by the order's owner before it was fully settled (Issue #1322).
+    Cancelled = 4,
+    /// Deadline (`deadline_ledger`) passed before the order was fully settled
+    /// (Issue #1322).
+    Expired = 5,
 }
 
 /// A single fill event recorded against a settlement order.
@@ -100,6 +126,9 @@ pub struct SettlementOrder {
     pub min_output: i128,
     /// Maximum input a single fill may consume (`i128::MAX` = no cap). Issue #991.
     pub max_input: i128,
+    /// Ledger sequence after which the order can no longer execute (Issue
+    /// #1322). `0` means no deadline. Immutable once the order is created.
+    pub deadline_ledger: u32,
 }
 
 impl SettlementOrder {
@@ -114,8 +143,17 @@ impl SettlementOrder {
     pub fn is_closed(&self) -> bool {
         matches!(
             self.status,
-            SettlementStatus::FullySettled | SettlementStatus::Failed
+            SettlementStatus::FullySettled
+                | SettlementStatus::Failed
+                | SettlementStatus::Cancelled
+                | SettlementStatus::Expired
         )
+    }
+
+    /// True once `deadline_ledger` (if set) has passed as of `now`. A
+    /// deadline of `0` means the order never expires on its own.
+    pub fn is_past_deadline(&self, now: u32) -> bool {
+        self.deadline_ledger != 0 && now > self.deadline_ledger
     }
 }
 
@@ -157,6 +195,14 @@ pub enum SettlementError {
     /// (output below `min_output`, or input above `max_input`). No accounting
     /// update is made — the order and its fills are left untouched.
     SlippageBoundsViolated,
+    /// `deadline_ledger` is set but not strictly in the future of the
+    /// creating ledger (Issue #1322).
+    InvalidDeadline,
+    /// The order's deadline has passed; it is now `Expired` and can never
+    /// execute again (Issue #1322).
+    OrderExpired,
+    /// Only the order's own `user` may cancel it (Issue #1322).
+    Unauthorized,
 }
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -283,6 +329,36 @@ pub fn create_settlement_order(
     requested_amount: i128,
     slippage: SlippageBounds,
 ) -> Result<u64, SettlementError> {
+    create_order_internal(env, user, requested_amount, slippage, 0)
+}
+
+/// Like [`create_settlement_order`], but the order automatically becomes
+/// `Expired` (and can never execute) once `env.ledger().sequence()` passes
+/// `deadline_ledger` (Issue #1322). `deadline_ledger == 0` means no deadline.
+///
+/// # Errors
+/// - [`SettlementError::InvalidDeadline`] — `deadline_ledger` is set but is
+///   not strictly greater than the current ledger sequence.
+pub fn create_settlement_order_with_deadline(
+    env: &Env,
+    user: Address,
+    requested_amount: i128,
+    slippage: SlippageBounds,
+    deadline_ledger: u32,
+) -> Result<u64, SettlementError> {
+    if deadline_ledger != 0 && deadline_ledger <= env.ledger().sequence() {
+        return Err(SettlementError::InvalidDeadline);
+    }
+    create_order_internal(env, user, requested_amount, slippage, deadline_ledger)
+}
+
+fn create_order_internal(
+    env: &Env,
+    user: Address,
+    requested_amount: i128,
+    slippage: SlippageBounds,
+    deadline_ledger: u32,
+) -> Result<u64, SettlementError> {
     if requested_amount <= 0 {
         return Err(SettlementError::InvalidFillAmount);
     }
@@ -302,12 +378,48 @@ pub fn create_settlement_order(
         last_fill_ledger: 0,
         min_output: slippage.min_output,
         max_input: slippage.max_input,
+        deadline_ledger,
     };
 
     save_order(env, &order);
     append_user_order(env, &user, order_id);
     emit_order_created(env, order_id, &user, requested_amount);
     Ok(order_id)
+}
+
+/// Cancel an order that has not yet fully settled, failed, or expired (Issue
+/// #1322). Only the order's own `user` may cancel. Previously recorded fills
+/// and `settled_amount` are preserved exactly as they were — cancellation
+/// only blocks any *further* fills from this order's already-consumed state.
+pub fn cancel_settlement_order(
+    env: &Env,
+    order_id: u64,
+    caller: &Address,
+) -> Result<(), SettlementError> {
+    let mut order = load_order(env, order_id)?;
+
+    if *caller != order.user {
+        return Err(SettlementError::Unauthorized);
+    }
+
+    // A deadline that has already passed takes precedence: the order is
+    // already (lazily) expired and cannot be cancelled into a different
+    // closed state — it stays Expired, consistently with `settle_batch`.
+    if !order.is_closed() && order.is_past_deadline(env.ledger().sequence()) {
+        order.status = SettlementStatus::Expired;
+        save_order(env, &order);
+        emit_order_closed(env, order_id, order.status, order.settled_amount);
+        return Err(SettlementError::OrderExpired);
+    }
+
+    if order.is_closed() {
+        return Err(SettlementError::OrderAlreadyClosed);
+    }
+
+    order.status = SettlementStatus::Cancelled;
+    save_order(env, &order);
+    emit_order_closed(env, order_id, order.status, order.settled_amount);
+    Ok(())
 }
 
 /// Record a batch fill against an existing settlement order.
@@ -341,6 +453,18 @@ pub fn settle_batch(
     }
 
     let mut order = load_order(env, order_id)?;
+
+    // ── Expiration (Issue #1322) ────────────────────────────────────────────
+    // Checked before the closed-state check so a deadline that has passed is
+    // reported as `OrderExpired` (and the order transitions to `Expired`)
+    // rather than the generic `OrderAlreadyClosed`. Once here, no fill is
+    // ever recorded and `settled_amount` is left exactly as it was.
+    if !order.is_closed() && order.is_past_deadline(env.ledger().sequence()) {
+        order.status = SettlementStatus::Expired;
+        save_order(env, &order);
+        emit_order_closed(env, order_id, order.status, order.settled_amount);
+        return Err(SettlementError::OrderExpired);
+    }
 
     if order.is_closed() {
         return Err(SettlementError::OrderAlreadyClosed);
@@ -928,6 +1052,155 @@ mod tests {
     }
 
     /// Negative input amounts are rejected as invalid fills.
+    // ── Expiration and cancellation (Issue #1322) ─────────────────────────────
+
+    #[test]
+    fn fill_exactly_at_deadline_boundary_succeeds() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.ledger().with_mut(|l| l.sequence_number = 100);
+            let id = create_settlement_order_with_deadline(
+                &env,
+                user.clone(),
+                1_000_000,
+                permissive_bounds(),
+                150,
+            )
+            .unwrap();
+
+            env.ledger().with_mut(|l| l.sequence_number = 150);
+            let result = settle_batch(&env, id, 1_000_000, 1_000_000, 10_000_000).unwrap();
+            assert_eq!(result.status, SettlementStatus::FullySettled);
+        });
+    }
+
+    #[test]
+    fn fill_past_deadline_expires_order_and_is_rejected() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.ledger().with_mut(|l| l.sequence_number = 100);
+            let id = create_settlement_order_with_deadline(
+                &env,
+                user.clone(),
+                1_000_000,
+                permissive_bounds(),
+                150,
+            )
+            .unwrap();
+
+            env.ledger().with_mut(|l| l.sequence_number = 151);
+            assert_eq!(
+                settle_batch(&env, id, 1_000_000, 1_000_000, 10_000_000),
+                Err(SettlementError::OrderExpired)
+            );
+
+            let order = get_settlement_order(&env, id).unwrap();
+            assert_eq!(order.status, SettlementStatus::Expired);
+            assert_eq!(order.settled_amount, 0, "balances must be unchanged");
+
+            // Expired is terminal: a later attempt (even back within the old
+            // deadline window is impossible since ledgers only move forward)
+            // is rejected as already closed, never replayed into executing.
+            assert_eq!(
+                settle_batch(&env, id, 1_000_000, 1_000_000, 10_000_000),
+                Err(SettlementError::OrderAlreadyClosed)
+            );
+        });
+    }
+
+    #[test]
+    fn invalid_deadline_in_the_past_is_rejected() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.ledger().with_mut(|l| l.sequence_number = 100);
+            assert_eq!(
+                create_settlement_order_with_deadline(
+                    &env,
+                    user.clone(),
+                    1_000_000,
+                    permissive_bounds(),
+                    100,
+                ),
+                Err(SettlementError::InvalidDeadline)
+            );
+            assert_eq!(
+                create_settlement_order_with_deadline(
+                    &env,
+                    user,
+                    1_000_000,
+                    permissive_bounds(),
+                    50,
+                ),
+                Err(SettlementError::InvalidDeadline)
+            );
+        });
+    }
+
+    #[test]
+    fn owner_can_cancel_open_order_preserving_prior_fills() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&cid, || {
+            let id = create_settlement_order(&env, user.clone(), 1_000_000, permissive_bounds())
+                .unwrap();
+            settle_batch(&env, id, 300_000, 300_000, 10_000_000).unwrap();
+
+            cancel_settlement_order(&env, id, &user).unwrap();
+
+            let order = get_settlement_order(&env, id).unwrap();
+            assert_eq!(order.status, SettlementStatus::Cancelled);
+            assert_eq!(order.settled_amount, 300_000, "prior fill must survive");
+        });
+    }
+
+    #[test]
+    fn non_owner_cannot_cancel_order() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        env.as_contract(&cid, || {
+            let id = create_settlement_order(&env, user.clone(), 1_000_000, permissive_bounds())
+                .unwrap();
+            assert_eq!(
+                cancel_settlement_order(&env, id, &stranger),
+                Err(SettlementError::Unauthorized)
+            );
+            let order = get_settlement_order(&env, id).unwrap();
+            assert_eq!(order.status, SettlementStatus::Open);
+        });
+    }
+
+    #[test]
+    fn replay_after_cancellation_is_rejected_with_balances_unchanged() {
+        let (env, cid) = setup();
+        let user = Address::generate(&env);
+        env.as_contract(&cid, || {
+            let id = create_settlement_order(&env, user.clone(), 1_000_000, permissive_bounds())
+                .unwrap();
+            settle_batch(&env, id, 400_000, 400_000, 10_000_000).unwrap();
+            cancel_settlement_order(&env, id, &user).unwrap();
+
+            // Cannot cancel again (replay of the cancellation).
+            assert_eq!(
+                cancel_settlement_order(&env, id, &user),
+                Err(SettlementError::OrderAlreadyClosed)
+            );
+            // Cannot settle again either — the already-consumed state is
+            // frozen, not reopened.
+            assert_eq!(
+                settle_batch(&env, id, 600_000, 600_000, 10_000_000),
+                Err(SettlementError::OrderAlreadyClosed)
+            );
+
+            let order = get_settlement_order(&env, id).unwrap();
+            assert_eq!(order.settled_amount, 400_000);
+            assert_eq!(order.status, SettlementStatus::Cancelled);
+        });
+    }
+
     #[test]
     fn negative_input_amount_is_rejected() {
         let (env, cid) = setup();

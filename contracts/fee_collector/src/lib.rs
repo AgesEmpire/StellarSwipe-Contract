@@ -58,6 +58,21 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_sh
 /// this value is an ordinary fee balance and MUST NOT be sweepable.
 pub const DUST_THRESHOLD: i128 = 1_000;
 
+/// Issue #1451: maximum number of settled fee-collection records retained in
+/// persistent storage. Every successful [`FeeCollector::collect`] call
+/// settles a record of that collection; without a bound, this log would grow
+/// forever and the contract's persistent storage footprint (and the rent it
+/// accrues) would grow without limit. Once this many records exist, the
+/// oldest is archived out (removed from active persistent storage) as the
+/// newest is written, keeping storage bounded regardless of how long the
+/// contract has been live.
+pub const MAX_RETAINED_SETTLED_RECORDS: u32 = 500;
+
+/// Instance key: next sequence number to assign to a settled fee record.
+const SETTLED_NEXT_SEQ_KEY: Symbol = symbol_short!("set_next");
+/// Instance key: sequence number of the oldest retained settled record.
+const SETTLED_HEAD_SEQ_KEY: Symbol = symbol_short!("set_head");
+
     UnknownRevenueSource = 7,
     BucketClosed = 8,
     NoPendingRecipient = 9,
@@ -192,6 +207,61 @@ pub struct PauseChanged {
     pub actor: Address,
 }
 
+/// A single pending rebate claim considered by
+/// [`FeeCollector::preview_fee_distribution`] (issue #1452).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebateClaimInput {
+    pub claimant: Address,
+    pub amount: i128,
+}
+
+/// One claimant's share of a previewed distribution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebateClaimPreview {
+    pub claimant: Address,
+    pub requested: i128,
+    pub payout: i128,
+}
+
+/// Read-only breakdown of how the collector's current balance would be
+/// split across pending rebate claims, without mutating any state
+/// (issue #1452).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeDistributionPreview {
+    /// Collector balance the preview was computed against.
+    pub available_balance: i128,
+    /// Cap applied to the total payout, in basis points of `available_balance`.
+    pub max_rebate_bps: u32,
+    /// Sum of all requested claim amounts.
+    pub total_requested: i128,
+    /// Sum of all computed payouts (<= the bps cap of `available_balance`).
+    pub total_payout: i128,
+    /// Whether `total_requested` exceeded the cap and claims were scaled down.
+    pub cap_applied: bool,
+    /// Per-claimant breakdown, in input order.
+    pub payouts: soroban_sdk::Vec<RebateClaimPreview>,
+}
+
+/// A single settled fee-collection record, archived in a bounded persistent
+/// ring (issue #1451). Indexed by a monotonically increasing sequence number
+/// so consumers can page through the retained window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettledFeeRecord {
+    pub source: Address,
+    pub amount: i128,
+    pub balance_after: i128,
+    pub settled_at_ledger: u32,
+}
+
+/// Storage key for one settled record slot, keyed by its sequence number.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettledRecordKey(pub u32);
+
 #[contract]
 pub struct FeeCollector;
 
@@ -324,13 +394,83 @@ impl FeeCollector {
             (Symbol::new(&env, "fees_collected"), asset.clone(), source.clone()),
             FeesCollected {
                 asset,
-                source,
+                source: source.clone(),
                 amount,
                 balance: new_balance,
             },
         );
 
+        // Issue #1451: archive a settled record for this collection, pruning
+        // the oldest retained record once the bound is exceeded so storage
+        // never grows unbounded.
+        Self::archive_settled_record(&env, source, amount, new_balance);
+
         Ok(new_balance)
+    }
+
+    /// Issue #1451: append a settled fee record to the bounded archive and
+    /// prune the oldest record if the retained window would exceed
+    /// [`MAX_RETAINED_SETTLED_RECORDS`].
+    fn archive_settled_record(env: &Env, source: Address, amount: i128, balance_after: i128) {
+        let next_seq: u32 = env
+            .storage()
+            .instance()
+            .get(&SETTLED_NEXT_SEQ_KEY)
+            .unwrap_or(0);
+        let head_seq: u32 = env
+            .storage()
+            .instance()
+            .get(&SETTLED_HEAD_SEQ_KEY)
+            .unwrap_or(0);
+
+        env.storage().persistent().set(
+            &SettledRecordKey(next_seq),
+            &SettledFeeRecord {
+                source,
+                amount,
+                balance_after,
+                settled_at_ledger: env.ledger().sequence(),
+            },
+        );
+
+        let new_next_seq = next_seq + 1;
+        env.storage()
+            .instance()
+            .set(&SETTLED_NEXT_SEQ_KEY, &new_next_seq);
+
+        let retained_count = new_next_seq - head_seq;
+        if retained_count > MAX_RETAINED_SETTLED_RECORDS {
+            // Archive out (remove) the oldest record to keep the window
+            // bounded. The record remains recoverable from the
+            // `fees_collected` event log for anyone who needs history past
+            // the retained window.
+            env.storage().persistent().remove(&SettledRecordKey(head_seq));
+            env.storage()
+                .instance()
+                .set(&SETTLED_HEAD_SEQ_KEY, &(head_seq + 1));
+        }
+    }
+
+    /// Issue #1451: number of settled fee records currently retained
+    /// in the bounded archive (always <= [`MAX_RETAINED_SETTLED_RECORDS`]).
+    pub fn settled_record_count(env: Env) -> u32 {
+        let next_seq: u32 = env
+            .storage()
+            .instance()
+            .get(&SETTLED_NEXT_SEQ_KEY)
+            .unwrap_or(0);
+        let head_seq: u32 = env
+            .storage()
+            .instance()
+            .get(&SETTLED_HEAD_SEQ_KEY)
+            .unwrap_or(0);
+        next_seq - head_seq
+    }
+
+    /// Issue #1451: fetch one archived settled record by its sequence
+    /// number, or `None` if it was pruned or never existed.
+    pub fn settled_record(env: Env, seq: u32) -> Option<SettledFeeRecord> {
+        env.storage().persistent().get(&SettledRecordKey(seq))
     }
 
     /// Current collector balance. Available while collection is paused.
@@ -378,6 +518,79 @@ impl FeeCollector {
     /// Issue #1248: report whether new fee collection is currently paused.
     pub fn is_collection_paused(env: Env) -> bool {
         env.storage().instance().get(&PAUSED_KEY).unwrap_or(false)
+    }
+
+    /// Issue #1452: read-only preview of how the collector's current
+    /// balance would be split across `claims` if a rebate distribution ran
+    /// right now, capped at `max_rebate_bps` basis points of the balance.
+    ///
+    /// This performs no storage writes and emits no events — it is purely a
+    /// query so operators and UIs can show an accurate fee distribution
+    /// breakdown before anyone actually triggers a payout. Mirrors the
+    /// capping/scaling behavior real distribution logic must use: when the
+    /// sum of requested claims exceeds the cap, every claim is scaled down
+    /// proportionally so payouts sum to (at most) the cap.
+    pub fn preview_fee_distribution(
+        env: Env,
+        max_rebate_bps: u32,
+        claims: soroban_sdk::Vec<RebateClaimInput>,
+    ) -> FeeDistributionPreview {
+        let available_balance = Self::balance(env.clone());
+
+        let total_requested: i128 = claims.iter().map(|c| c.amount).sum();
+
+        if total_requested <= 0 {
+            return FeeDistributionPreview {
+                available_balance,
+                max_rebate_bps,
+                total_requested,
+                total_payout: 0,
+                cap_applied: false,
+                payouts: soroban_sdk::Vec::new(&env),
+            };
+        }
+
+        let cap = available_balance.saturating_mul(max_rebate_bps as i128) / 10_000i128;
+
+        if total_requested <= cap {
+            let mut payouts = soroban_sdk::Vec::new(&env);
+            for claim in claims.iter() {
+                payouts.push_back(RebateClaimPreview {
+                    claimant: claim.claimant.clone(),
+                    requested: claim.amount,
+                    payout: claim.amount,
+                });
+            }
+            return FeeDistributionPreview {
+                available_balance,
+                max_rebate_bps,
+                total_requested,
+                total_payout: total_requested,
+                cap_applied: false,
+                payouts,
+            };
+        }
+
+        let mut payouts = soroban_sdk::Vec::new(&env);
+        let mut total_payout: i128 = 0;
+        for claim in claims.iter() {
+            let adjusted = claim.amount.saturating_mul(cap) / total_requested;
+            total_payout = total_payout.saturating_add(adjusted);
+            payouts.push_back(RebateClaimPreview {
+                claimant: claim.claimant.clone(),
+                requested: claim.amount,
+                payout: adjusted,
+            });
+        }
+
+        FeeDistributionPreview {
+            available_balance,
+            max_rebate_bps,
+            total_requested,
+            total_payout,
+            cap_applied: true,
+            payouts,
+        }
     }
 
     /// Sweep a negligible dust balance to an explicit destination.

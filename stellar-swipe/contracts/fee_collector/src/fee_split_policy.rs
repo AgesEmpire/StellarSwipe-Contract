@@ -10,7 +10,7 @@
 //! provider receives the exact remainder.
 
 use crate::errors::ContractError;
-use soroban_sdk::contracttype;
+use soroban_sdk::{contracttype, Vec};
 
 /// Basis-point total representing 100%.
 pub const BPS_TOTAL: u32 = 10_000;
@@ -65,6 +65,40 @@ pub fn default_policy() -> FeeSplitPolicy {
         protocol_bps: DEFAULT_PROTOCOL_BPS,
         provider_bps: DEFAULT_PROVIDER_BPS,
     }
+}
+
+/// Issue #1449: a single policy revision together with the epoch at which it
+/// becomes (and stays) the active revision, until superseded by a later one.
+///
+/// Revisions are append-only and kept sorted ascending by `effective_epoch`.
+/// A fee calculated for ledger-timestamp epoch `t` must use the *last*
+/// revision whose `effective_epoch <= t` — never the current/latest
+/// revision — so that recomputing a historical fee always reproduces the
+/// policy that was actually in force at that time, even after later policy
+/// changes.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeeSplitPolicyRevision {
+    /// Unix timestamp (seconds) from which this revision is the active one.
+    pub effective_epoch: u64,
+    /// The split weights that apply from `effective_epoch` onward.
+    pub policy: FeeSplitPolicy,
+}
+
+/// Select the policy active at `epoch` from an ascending-by-`effective_epoch`
+/// revision history. Falls back to [`default_policy`] if `revisions` is empty
+/// or every revision's `effective_epoch` is still in the future relative to
+/// `epoch`.
+pub fn policy_at_epoch(revisions: &Vec<FeeSplitPolicyRevision>, epoch: u64) -> FeeSplitPolicy {
+    let mut selected = default_policy();
+    for revision in revisions.iter() {
+        if revision.effective_epoch <= epoch {
+            selected = revision.policy.clone();
+        } else {
+            break;
+        }
+    }
+    selected
 }
 
 #[cfg(test)]

@@ -10,6 +10,15 @@
 //! contracts cannot contaminate accounting or attribution reports. Allowlist
 //! mutations are authorized and evented, and unknown sources are rejected
 //! before any token transfer is attempted.
+//!
+//! Finally, this module tracks collected fee balances independently per asset.
+//! Each asset (identified by its contract address) has its own balance so that
+//! collection, balance queries, and dust handling never mix units across
+//! assets. Deployments that previously stored a single aggregate balance can
+//! migrate it into a chosen asset bucket via [`migrate_aggregate_balance`].
+//! The module also owns the recorded fee balance and the guarded update that
+//! applies collected fees to it. Updates reject non-positive amounts and
+//! arithmetic overflow so that a rejected update never mutates accounting.
 
 use soroban_sdk::{contracttype, symbol_short, Address, Env};
 
@@ -23,6 +32,8 @@ pub enum FeeCacheKey {
     ConfigVersion,
     /// Allowlist entry for an authorized revenue source.
     RevenueSource(Address),
+    /// Recorded fee balance accumulated from collected fees.
+    FeeBalance,
 }
 
 /// Returns the current config version, defaulting to 0 when unset.
@@ -111,6 +122,100 @@ pub fn require_revenue_source(env: &Env, source: &Address) {
     if !is_revenue_source(env, source) {
         panic!("revenue source not allowlisted");
     }
+}
+
+/// Returns the collected fee balance for `asset`, defaulting to 0.
+///
+/// Balances are tracked per asset so that fees denominated in different
+/// Stellar assets are never summed together.
+pub fn get_asset_balance(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&FeeCacheKey::AssetBalance(asset.clone()))
+        .unwrap_or(0)
+}
+
+/// Credits `amount` of `asset` to the asset-scoped fee balance.
+///
+/// Only the balance for `asset` is affected; other assets are untouched.
+pub fn credit_asset_balance(env: &Env, asset: &Address, amount: i128) {
+    let current = get_asset_balance(env, asset);
+    let next = current
+        .checked_add(amount)
+        .expect("asset balance overflow");
+    env.storage()
+        .instance()
+        .set(&FeeCacheKey::AssetBalance(asset.clone()), &next);
+}
+
+/// Returns true when `asset`'s balance is at or below `dust_threshold` and
+/// therefore eligible for dust handling.
+///
+/// Eligibility is evaluated strictly against the selected asset's balance so
+/// that a large balance in one asset cannot mask dust in another.
+pub fn is_dust_eligible(env: &Env, asset: &Address, dust_threshold: i128) -> bool {
+    get_asset_balance(env, asset) <= dust_threshold
+}
+
+/// Deducts `amount` of `asset` from the asset-scoped fee balance.
+///
+/// Panics if `amount` exceeds the balance for `asset`, preventing deductions
+/// from being satisfied by another asset's funds.
+pub fn deduct_asset_balance(env: &Env, asset: &Address, amount: i128) {
+    let current = get_asset_balance(env, asset);
+    if amount > current {
+        panic!("insufficient asset balance");
+    }
+    let next = current - amount;
+    env.storage()
+        .instance()
+        .set(&FeeCacheKey::AssetBalance(asset.clone()), &next);
+}
+
+/// Migrates a legacy aggregate balance into the balance bucket for `asset`.
+///
+/// Existing deployments that stored a single aggregate balance can call this
+/// once to move that value into a chosen asset bucket. The legacy key is
+/// removed so the migration is idempotent; subsequent calls are no-ops.
+pub fn migrate_aggregate_balance(env: &Env, asset: &Address) {
+    let legacy: Option<i128> = env.storage().instance().get(&FeeCacheKey::AggregateBalance);
+    if let Some(amount) = legacy {
+        credit_asset_balance(env, asset, amount);
+        env.storage()
+            .instance()
+            .remove(&FeeCacheKey::AggregateBalance);
+    }
+}
+
+/// Returns the recorded fee balance, defaulting to 0 when unset.
+pub fn get_fee_balance(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&FeeCacheKey::FeeBalance)
+        .unwrap_or(0)
+}
+
+/// Applies a collected fee `amount` to the recorded fee balance.
+///
+/// Rejects non-positive amounts with `"fee amount must be positive"` and
+/// rejects additions that would exceed the supported `i128` balance range with
+/// `"fee balance overflow"`. Both checks run before any storage write, so a
+/// rejected update leaves the recorded balance unchanged.
+pub fn add_fee_balance(env: &Env, amount: i128) {
+    if amount <= 0 {
+        panic!("fee amount must be positive");
+    }
+
+    let current = get_fee_balance(env);
+    let updated = match current.checked_add(amount) {
+        Some(value) => value,
+        None => panic!("fee balance overflow"),
+    };
+
+    env.storage()
+        .instance()
+        .set(&FeeCacheKey::FeeBalance, &updated);
+}
 }
 
 #[cfg(test)]
@@ -210,5 +315,144 @@ mod tests {
         assert!(!is_revenue_source(&env, &source));
 
         require_revenue_source(&env, &source);
+    }
+
+    #[test]
+    fn balances_are_tracked_independently_per_asset() {
+        let env = Env::default();
+        let usdc = Address::generate(&env);
+        let eurc = Address::generate(&env);
+
+        assert_eq!(get_asset_balance(&env, &usdc), 0);
+        assert_eq!(get_asset_balance(&env, &eurc), 0);
+
+        credit_asset_balance(&env, &usdc, 1_000);
+        credit_asset_balance(&env, &eurc, 250);
+
+        // Each asset keeps its own balance; no cross-asset mixing.
+        assert_eq!(get_asset_balance(&env, &usdc), 1_000);
+        assert_eq!(get_asset_balance(&env, &eurc), 250);
+    }
+
+    #[test]
+    fn dust_eligibility_and_deduction_are_asset_scoped() {
+        let env = Env::default();
+        let usdc = Address::generate(&env);
+        let eurc = Address::generate(&env);
+
+        credit_asset_balance(&env, &usdc, 10_000);
+        credit_asset_balance(&env, &eurc, 5);
+
+        // Only the small-balance asset is dust eligible.
+        assert!(!is_dust_eligible(&env, &usdc, 100));
+        assert!(is_dust_eligible(&env, &eurc, 100));
+
+        // Deducting from one asset leaves the other untouched.
+        deduct_asset_balance(&env, &eurc, 5);
+        assert_eq!(get_asset_balance(&env, &eurc), 0);
+        assert_eq!(get_asset_balance(&env, &usdc), 10_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient asset balance")]
+    fn deduction_cannot_borrow_from_another_asset() {
+        let env = Env::default();
+        let usdc = Address::generate(&env);
+        let eurc = Address::generate(&env);
+
+        credit_asset_balance(&env, &usdc, 1_000);
+        // eurc has no balance; a large usdc balance must not cover it.
+        deduct_asset_balance(&env, &eurc, 1);
+    }
+
+    #[test]
+    fn legacy_aggregate_balance_migrates_into_asset_bucket() {
+        let env = Env::default();
+        let usdc = Address::generate(&env);
+
+        env.storage()
+            .instance()
+            .set(&FeeCacheKey::AggregateBalance, &500i128);
+
+        migrate_aggregate_balance(&env, &usdc);
+        assert_eq!(get_asset_balance(&env, &usdc), 500);
+
+        // Migration is idempotent: the legacy key is gone.
+        migrate_aggregate_balance(&env, &usdc);
+        assert_eq!(get_asset_balance(&env, &usdc), 500);
+    }
+
+    #[test]
+    fn positive_amount_updates_balance() {
+        let env = Env::default();
+        assert_eq!(get_fee_balance(&env), 0);
+
+        add_fee_balance(&env, 100);
+        assert_eq!(get_fee_balance(&env), 100);
+
+        add_fee_balance(&env, 50);
+        assert_eq!(get_fee_balance(&env), 150);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee amount must be positive")]
+    fn zero_amount_is_rejected() {
+        let env = Env::default();
+        add_fee_balance(&env, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee amount must be positive")]
+    fn negative_amount_is_rejected() {
+        let env = Env::default();
+        add_fee_balance(&env, -1);
+    }
+
+    #[test]
+    fn rejected_zero_and_negative_leave_balance_unchanged() {
+        let env = Env::default();
+        add_fee_balance(&env, 250);
+
+        let zero = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            add_fee_balance(&env, 0)
+        }));
+        assert!(zero.is_err());
+        assert_eq!(get_fee_balance(&env), 250);
+
+        let negative = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            add_fee_balance(&env, -10)
+        }));
+        assert!(negative.is_err());
+        assert_eq!(get_fee_balance(&env), 250);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee balance overflow")]
+    fn overflow_past_max_is_rejected() {
+        let env = Env::default();
+        env.storage()
+            .instance()
+            .set(&FeeCacheKey::FeeBalance, &i128::MAX);
+
+        add_fee_balance(&env, 1);
+    }
+
+    #[test]
+    fn rejected_overflow_leaves_balance_unchanged() {
+        let env = Env::default();
+        let near_max = i128::MAX - 5;
+        env.storage()
+            .instance()
+            .set(&FeeCacheKey::FeeBalance, &near_max);
+
+        let overflow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            add_fee_balance(&env, 10)
+        }));
+        assert!(overflow.is_err());
+        assert_eq!(get_fee_balance(&env), near_max);
+
+        // A valid addition near the limit still succeeds.
+        add_fee_balance(&env, 5);
+        assert_eq!(get_fee_balance(&env), i128::MAX);
     }
 }

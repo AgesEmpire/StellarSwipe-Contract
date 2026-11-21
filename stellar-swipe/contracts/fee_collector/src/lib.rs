@@ -6,7 +6,8 @@ pub use errors::ContractError;
 /// #1032: configurable protocol/provider fee split policy.
 mod fee_split_policy;
 pub use fee_split_policy::{
-    FeeSplitPolicy, BPS_TOTAL as FEE_SPLIT_BPS_TOTAL, DEFAULT_PROTOCOL_BPS, DEFAULT_PROVIDER_BPS,
+    FeeSplitPolicy, FeeSplitPolicyRevision, BPS_TOTAL as FEE_SPLIT_BPS_TOTAL, DEFAULT_PROTOCOL_BPS,
+    DEFAULT_PROVIDER_BPS,
 };
 
 mod events;
@@ -129,6 +130,54 @@ pub const MAX_BATCH_FEE_SIZE: u32 = 20;
 
 /// Maximum tokens allowed to be audited in a single call.
 pub const MAX_AUDIT_TOKENS: u32 = 20;
+
+/// Issue #1451: maximum number of settled fee-collection records retained in
+/// persistent storage. Every successful [`FeeCollector::collect_fee_with_recovery`]
+/// call settles a record; without a bound this log would grow forever and the
+/// contract's persistent storage footprint (and the rent it accrues) would
+/// grow without limit. Once this many records exist, the oldest is archived
+/// out as the newest is written, keeping storage bounded regardless of how
+/// long the contract has been live. Older history remains recoverable from
+/// the `fees_collected` event log.
+pub const MAX_RETAINED_SETTLED_RECORDS: u32 = 500;
+
+/// Instance key: next sequence number to assign to a settled fee record.
+const SETTLED_NEXT_SEQ_KEY: Symbol = soroban_sdk::symbol_short!("set_next");
+/// Instance key: sequence number of the oldest retained settled record.
+const SETTLED_HEAD_SEQ_KEY: Symbol = soroban_sdk::symbol_short!("set_head");
+
+/// A single settled fee-collection record, archived in a bounded persistent
+/// ring (issue #1451). Indexed by a monotonically increasing sequence number
+/// so consumers can page through the retained window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettledFeeRecord {
+    pub trader: Address,
+    pub token: Address,
+    pub fee_amount: i128,
+    pub treasury_credit: i128,
+    pub settled_at_ledger: u32,
+}
+
+/// Storage key for one settled record slot, keyed by its sequence number.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettledRecordKey(pub u32);
+
+/// Breakdown of how a trade's fee would be split if collected right now
+/// (issue #1452). Mirrors the real distribution math in
+/// [`FeeCollector::collect_fee_with_recovery`] exactly, but performs no
+/// storage writes and emits no events, so operators/UIs can preview the
+/// split before anyone actually submits the trade.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeDistributionPreview {
+    pub fee_amount: i128,
+    pub burn_amount: i128,
+    pub referral_amount: i128,
+    pub revenue_share_amount: i128,
+    pub treasury_credit: i128,
+}
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -724,7 +773,6 @@ impl FeeCollector {
         amount: i128,
         claim_id: String,
     ) -> Result<(), ContractError> {
-        reentrancy::require_not_locked(&env).map_err(|_| ContractError::Unauthorized)?;
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
@@ -740,45 +788,61 @@ impl FeeCollector {
             return Err(ContractError::InvalidAmount);
         }
 
-        if is_insurance_claim_processed(&env, &claim_id) {
-            return Err(ContractError::ClaimAlreadyProcessed);
-        }
+        // Issue #1450: hold the reentrancy lock for the full duration of the
+        // claim-id check, balance debit, and token transfer, instead of only
+        // checking it up front. A merely-checked (never-acquired) guard
+        // would let a reentrant call slip in during the external transfer
+        // below; `guarded` actually sets the lock so any such call is
+        // rejected rather than racing this claim to a double payout.
+        reentrancy::guarded(&env, || {
+            if is_insurance_claim_processed(&env, &claim_id) {
+                return Err(ContractError::ClaimAlreadyProcessed);
+            }
 
-        let cap = get_insurance_payout_cap(&env, &token);
-        if cap > 0 && amount > cap {
-            return Err(ContractError::PayoutExceedsCap);
-        }
+            let cap = get_insurance_payout_cap(&env, &token);
+            if cap > 0 && amount > cap {
+                return Err(ContractError::PayoutExceedsCap);
+            }
 
-        let current_balance = get_insurance_balance(&env, &token);
-        if amount > current_balance {
-            return Err(ContractError::InsufficientInsuranceBalance);
-        }
+            let current_balance = get_insurance_balance(&env, &token);
+            if amount > current_balance {
+                return Err(ContractError::InsufficientInsuranceBalance);
+            }
 
-        let new_balance = current_balance
-            .checked_sub(amount)
-            .ok_or(ContractError::ArithmeticOverflow)?;
-        set_insurance_balance(&env, &token, new_balance);
-        set_insurance_claim_processed(&env, &claim_id, true);
+            let new_balance = current_balance
+                .checked_sub(amount)
+                .ok_or(ContractError::ArithmeticOverflow)?;
 
-        shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
-            &env.current_contract_address(),
-            &recipient,
-            &amount,
-        ))
-        .map_err(ContractError::from)?;
+            // Checks-effects-interactions: the claim is marked processed and
+            // the balance debited *before* the external transfer. If the
+            // transfer fails below, the `?` propagates the error out of this
+            // closure and Soroban rolls back every storage write made during
+            // this invocation (including these two), so the claim is left
+            // exactly as unprocessed as it was before the call — never
+            // debited with no payout, and never payable twice.
+            set_insurance_balance(&env, &token, new_balance);
+            set_insurance_claim_processed(&env, &claim_id, true);
 
-        emit_insurance_payout(
-            &env,
-            EvtInsurancePayout {
-                recipient,
-                token,
-                amount,
-                claim_id,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
+            shared::token_error::map_result(token::Client::new(&env, &token).try_transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &amount,
+            ))
+            .map_err(ContractError::from)?;
 
-        Ok(())
+            emit_insurance_payout(
+                &env,
+                EvtInsurancePayout {
+                    recipient: recipient.clone(),
+                    token: token.clone(),
+                    amount,
+                    claim_id: claim_id.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+
+            Ok(())
+        })
     }
 
     /// Returns the current fee rate in basis points.
@@ -1300,7 +1364,140 @@ impl FeeCollector {
             },
         );
 
+        // Issue #1451: archive a settled record for this collection, pruning
+        // the oldest retained record once the bound is exceeded.
+        Self::archive_settled_record(&env, trader, token, fee_amount, treasury_credit);
+
         Ok(fee_amount)
+    }
+
+    /// Issue #1451: append a settled fee record to the bounded archive and
+    /// prune the oldest record if the retained window would exceed
+    /// [`MAX_RETAINED_SETTLED_RECORDS`].
+    fn archive_settled_record(
+        env: &Env,
+        trader: Address,
+        token: Address,
+        fee_amount: i128,
+        treasury_credit: i128,
+    ) {
+        let next_seq: u32 = env
+            .storage()
+            .instance()
+            .get(&SETTLED_NEXT_SEQ_KEY)
+            .unwrap_or(0);
+        let head_seq: u32 = env
+            .storage()
+            .instance()
+            .get(&SETTLED_HEAD_SEQ_KEY)
+            .unwrap_or(0);
+
+        env.storage().persistent().set(
+            &SettledRecordKey(next_seq),
+            &SettledFeeRecord {
+                trader,
+                token,
+                fee_amount,
+                treasury_credit,
+                settled_at_ledger: env.ledger().sequence(),
+            },
+        );
+
+        let new_next_seq = next_seq + 1;
+        env.storage()
+            .instance()
+            .set(&SETTLED_NEXT_SEQ_KEY, &new_next_seq);
+
+        let retained_count = new_next_seq - head_seq;
+        if retained_count > MAX_RETAINED_SETTLED_RECORDS {
+            env.storage().persistent().remove(&SettledRecordKey(head_seq));
+            env.storage()
+                .instance()
+                .set(&SETTLED_HEAD_SEQ_KEY, &(head_seq + 1));
+        }
+    }
+
+    /// Issue #1451: number of settled fee records currently retained in the
+    /// bounded archive (always <= [`MAX_RETAINED_SETTLED_RECORDS`]).
+    pub fn settled_record_count(env: Env) -> u32 {
+        let next_seq: u32 = env
+            .storage()
+            .instance()
+            .get(&SETTLED_NEXT_SEQ_KEY)
+            .unwrap_or(0);
+        let head_seq: u32 = env
+            .storage()
+            .instance()
+            .get(&SETTLED_HEAD_SEQ_KEY)
+            .unwrap_or(0);
+        next_seq - head_seq
+    }
+
+    /// Issue #1451: fetch one archived settled record by its sequence
+    /// number, or `None` if it was pruned or never existed.
+    pub fn settled_record(env: Env, seq: u32) -> Option<SettledFeeRecord> {
+        env.storage().persistent().get(&SettledRecordKey(seq))
+    }
+
+    /// Issue #1452: read-only preview of how a trade's fee would be split if
+    /// `collect_fee` were called right now, for this `trader`/`token`/
+    /// `trade_amount`. Performs no storage writes and emits no events —
+    /// mirrors the real distribution math in `collect_fee_with_recovery`
+    /// exactly (burn, referral share, revenue share, treasury credit) so
+    /// callers can show an accurate breakdown before submitting the trade.
+    pub fn preview_fee_distribution(
+        env: Env,
+        trader: Address,
+        token: Address,
+        trade_amount: i128,
+    ) -> Result<FeeDistributionPreview, ContractError> {
+        if trade_amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let fee_cache = fee_cache::load_tx_fee_config(&env);
+        let base_rate = rebates::get_fee_rate_for_user(&env, &trader);
+        let fee_rate = fee_cache::effective_fee_rate_cached(&env, base_rate, &token, &fee_cache);
+        let burn_rate = fee_cache.burn_rate;
+
+        let (fee_amount, burn_amount) = fee_and_burn_amounts(trade_amount, fee_rate, burn_rate)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+
+        let distributable = fee_amount
+            .checked_sub(burn_amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        let mut remaining_distributable = distributable;
+
+        let mut referral_amount: i128 = 0;
+        if let Some(_referrer) = get_referrer(&env, &trader) {
+            let referral_bps = get_referral_fee_share_bps(&env);
+            referral_amount = fee_amount
+                .checked_mul(referral_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap_or(0);
+            if referral_amount > remaining_distributable {
+                referral_amount = remaining_distributable;
+            }
+            remaining_distributable = remaining_distributable.saturating_sub(referral_amount);
+        }
+
+        let revenue_share_rate = storage::get_revenue_share_rate_bps(&env);
+        let mut revenue_share_amount = remaining_distributable
+            .checked_mul(revenue_share_rate as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or(0);
+        if revenue_share_amount > remaining_distributable {
+            revenue_share_amount = remaining_distributable;
+        }
+        let treasury_credit = remaining_distributable.saturating_sub(revenue_share_amount);
+
+        Ok(FeeDistributionPreview {
+            fee_amount,
+            burn_amount,
+            referral_amount,
+            revenue_share_amount,
+            treasury_credit,
+        })
     }
 
     fn compute_and_emit_forecast(
@@ -1601,20 +1798,36 @@ impl FeeCollector {
         storage::get_fee_split_policy(&env)
     }
 
-    /// Admin: replace the protocol/provider fee split policy.
+    /// Issue #1449: returns the protocol/provider fee split policy that was
+    /// (or will be) active at the given ledger-timestamp `epoch`, selected
+    /// from the full revision history rather than always the current one.
+    /// Use this to reproduce a historical fee calculation deterministically.
+    pub fn get_fee_split_policy_at(env: Env, epoch: u64) -> FeeSplitPolicy {
+        storage::get_fee_split_policy_at(&env, epoch)
+    }
+
+    /// Admin: add a new protocol/provider fee split policy revision that
+    /// takes effect at `effective_epoch` (issue #1449).
     ///
-    /// `protocol_bps + provider_bps` must equal exactly `10_000`. The previous
-    /// and new policy are recorded on the `FeeSplitPolicyUpdated` event for
-    /// audit.
+    /// `protocol_bps + provider_bps` must equal exactly `10_000`. Revisions
+    /// are append-only and immutable once stored: `effective_epoch` must be
+    /// strictly greater than the most recently stored revision's epoch, so
+    /// a fee can never be allocated using a partially updated policy and
+    /// every historical calculation keeps reproducing the revision that was
+    /// actually active at that time. The previous and new policy are
+    /// recorded on the `FeeSplitPolicyUpdated` event for audit.
     ///
     /// # Errors
     /// - [`ContractError::NotInitialized`] — contract not initialized.
     /// - [`ContractError::Unauthorized`] — caller is not the admin.
     /// - [`ContractError::InvalidFeeConfiguration`] — shares do not sum to 100%.
+    /// - [`ContractError::InvalidEffectiveEpoch`] — `effective_epoch` is not
+    ///   strictly greater than the last stored revision's epoch.
     pub fn set_fee_split_policy(
         env: Env,
         protocol_bps: u32,
         provider_bps: u32,
+        effective_epoch: u64,
     ) -> Result<(), ContractError> {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
@@ -1628,8 +1841,21 @@ impl FeeCollector {
         };
         new_policy.validate()?;
 
+        let history = storage::get_fee_split_policy_history(&env);
+        if let Some(last) = history.last() {
+            if effective_epoch <= last.effective_epoch {
+                return Err(ContractError::InvalidEffectiveEpoch);
+            }
+        }
+
         let old_policy = storage::get_fee_split_policy(&env);
-        storage::set_fee_split_policy(&env, &new_policy);
+        storage::push_fee_split_policy_revision(
+            &env,
+            &fee_split_policy::FeeSplitPolicyRevision {
+                effective_epoch,
+                policy: new_policy.clone(),
+            },
+        );
         emit_fee_split_policy_updated(&env, &old_policy, &new_policy, &admin);
         Ok(())
     }

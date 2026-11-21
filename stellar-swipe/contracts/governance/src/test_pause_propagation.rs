@@ -68,6 +68,7 @@ fn prevent_auto_execution(c: &GovernanceContractClient<'_>, admin: &Address) {
             approval_threshold: 5_000,
             execution_delay: 3_600,
             discussion_duration: 0,
+            veto_window: 0,
         },
     );
 }

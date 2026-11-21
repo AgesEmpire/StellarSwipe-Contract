@@ -30,6 +30,7 @@ mod multisig_approvals;
 mod performance;
 mod provider_onboarding;
 mod providers;
+pub mod provider_status;
 mod query;
 /// Contract-wide cross-contract reentrancy guard (Issue #781).
 mod reentrancy;
@@ -44,6 +45,7 @@ mod stake;
 mod storage_layout_tests;
 mod storage_monitor;
 mod submission;
+pub mod submission_quota;
 mod template_presets;
 mod templates;
 /// Active signal provider cap tests (Issue #743).
@@ -429,6 +431,43 @@ impl SignalRegistry {
             .instance()
             .set(&StorageKey::DailySignalLimit, &limit);
         Ok(())
+    }
+
+    /// Admin: configure bounded ledger-window submission quotas (Issue #1138).
+    pub fn set_submission_quota(
+        env: Env,
+        caller: Address,
+        config: submission_quota::QuotaConfig,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        submission_quota::set_config(&env, &config)
+    }
+
+    /// Returns the configured submission quota, if any.
+    pub fn get_submission_quota(env: Env) -> Option<submission_quota::QuotaConfig> {
+        submission_quota::get_config(&env)
+    }
+
+    /// Returns `(provider_used, global_used)` in the current quota window.
+    pub fn get_submission_quota_usage(env: Env, provider: Address) -> (u32, u32) {
+        submission_quota::usage(&env, &provider)
+    }
+
+    /// Transition a provider's lifecycle status (Issue #1137).
+    /// Returns the previous status.
+    pub fn set_provider_status(
+        env: Env,
+        caller: Address,
+        provider: Address,
+        next: provider_status::ProviderStatus,
+    ) -> Result<provider_status::ProviderStatus, errors::ProviderStatusError> {
+        provider_status::transition(&env, &caller, &provider, next)
+    }
+
+    /// Canonical lifecycle status of `provider` (Issue #1137).
+    pub fn get_provider_status(env: Env, provider: Address) -> provider_status::ProviderStatus {
+        provider_status::get_status(&env, &provider)
     }
 
     /// Returns the current per-provider daily signal creation cap (0 = disabled).
@@ -1268,6 +1307,14 @@ impl SignalRegistry {
             return Err(AdminError::Unauthorized);
         }
 
+        // Issue #1137: canonical lifecycle status must be Active.
+        if !provider_status::can_submit(env, &provider) {
+            return Err(AdminError::Unauthorized);
+        }
+
+        // Issue #1138: ledger-window quotas (read-only check, no writes yet).
+        submission_quota::check(env, &provider)?;
+
         // Verify provider account still exists on Stellar
         if !Self::check_provider_exists(env, &provider) {
             return Err(AdminError::Unauthorized);
@@ -1436,6 +1483,9 @@ impl SignalRegistry {
                 .persistent()
                 .set(&count_key, &current.saturating_add(1));
         }
+
+        // Issue #1138: consume quota only once the submission fully succeeded.
+        submission_quota::consume(env, &provider);
 
         Ok(id)
     }

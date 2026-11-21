@@ -2,6 +2,7 @@
 
 #[allow(deprecated)]
 mod admin;
+pub mod challenge;
 mod conversion;
 // Closes #671 — cross-source price deviation alerting
 mod deviation;
@@ -10,6 +11,8 @@ mod errors;
 #[allow(deprecated)]
 mod events;
 mod external_adapter;
+// Closes #1309, #1311, #1312 — feed publishers, health, atomic batch config
+pub mod feeds;
 mod freshness_policy;
 mod history;
 mod multi_hop;
@@ -22,6 +25,14 @@ mod sdex;
 mod sla;
 mod staleness;
 mod storage;
+#[cfg(test)]
+mod test_feed_bounds;
+#[cfg(test)]
+mod test_feed_canonical;
+#[cfg(test)]
+mod test_feed_movement;
+#[cfg(test)]
+mod test_feed_version;
 mod types;
 
 use errors::OracleError;
@@ -100,6 +111,22 @@ impl OracleContract {
         shared::version::get_contract_version(&env)
     }
 
+    // ── Issue #1334: minimum supported Soroban protocol version ─────────────
+
+    /// Read-only: `(min_supported, current_target)` Soroban protocol
+    /// versions this contract is built and tested against. Deployers call
+    /// this (e.g. via `simulateTransaction`) to reject an incompatible
+    /// network before ever submitting a state-changing invocation.
+    pub fn min_supported_protocol_version(_env: Env) -> (u32, u32) {
+        shared::protocol_version::supported_protocol_range()
+    }
+
+    /// Read-only: whether the network this call is running on meets this
+    /// contract's minimum supported protocol version.
+    pub fn is_protocol_version_supported(env: Env) -> bool {
+        shared::protocol_version::is_protocol_supported(&env)
+    }
+
     /// Admin-only: replace this contract's executable with `new_wasm_hash`
     /// (previously uploaded via `Deployer::upload_contract_wasm`) and record
     /// `new_version` as the contract's version.
@@ -176,6 +203,8 @@ impl OracleContract {
         if price <= 0 {
             return Err(OracleError::InvalidAsset);
         }
+        // #1304: reject economically impossible observations before any state change.
+        feeds::check_bounds(&env, &pair, price)?;
         // #755: single-update deviation circuit breaker check. A deviating
         // update trips the breaker and is rejected (not stored); the call
         // returns Ok so the trip flag persists (an error return would roll
@@ -186,8 +215,73 @@ impl OracleContract {
         storage::set_price(&env, &pair, price);
         storage::add_available_pair(&env, pair.clone());
         history::store_price(&env, &pair, price);
+        feeds::record_round(&env, &pair);
         on_price_update(&env, pair);
         Ok(())
+    }
+
+    // ── Issues #1309 / #1311 / #1312: feed configuration and health ──────────
+
+    /// Admin: atomically configure up to `feeds::MAX_FEED_BATCH` feeds.
+    /// Every entry is validated before any write; on error nothing changes.
+    pub fn configure_feeds(
+        env: Env,
+        admin: Address,
+        entries: Vec<feeds::FeedConfigInput>,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        feeds::configure_batch(&env, &entries)
+    }
+
+    /// Admin: register new feeds. Rejects duplicates under the canonical pair
+    /// identifier; use `configure_feeds` to update an existing feed.
+    pub fn register_feeds(
+        env: Env,
+        admin: Address,
+        entries: Vec<feeds::FeedConfigInput>,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        feeds::register_batch(&env, &entries)
+    }
+
+    pub fn get_feed_config(env: Env, pair: AssetPair) -> Option<feeds::FeedConfig> {
+        feeds::get_config(&env, &pair)
+    }
+
+    /// Read-only: the deterministic identifier used to key this feed.
+    /// Aliased/reversed spellings return the same canonical pair.
+    pub fn get_canonical_pair(env: Env, pair: AssetPair) -> Result<AssetPair, OracleError> {
+        feeds::canonical_pair(&env, &pair)
+    }
+
+    /// Feed owner: delegate submission rights to `publisher`.
+    pub fn add_feed_publisher(
+        env: Env,
+        owner: Address,
+        pair: AssetPair,
+        publisher: Address,
+    ) -> Result<(), OracleError> {
+        owner.require_auth();
+        feeds::add_publisher(&env, &owner, &pair, publisher)
+    }
+
+    /// Feed owner: revoke a delegated publisher.
+    pub fn revoke_feed_publisher(
+        env: Env,
+        owner: Address,
+        pair: AssetPair,
+        publisher: Address,
+    ) -> Result<(), OracleError> {
+        owner.require_auth();
+        feeds::revoke_publisher(&env, &owner, &pair, &publisher)
+    }
+
+    /// Read-only, bounded: status, latest round, last update and health flags
+    /// for one feed. See `feeds` module docs for field semantics.
+    pub fn get_feed_status(env: Env, pair: AssetPair) -> feeds::FeedStatus {
+        feeds::status(&env, &pair)
     }
 
     // ── Issue #755: single-update price-deviation circuit breaker ─────────────
@@ -794,6 +888,20 @@ impl OracleContract {
         Ok(price)
     }
 
+    /// Read the accepted price together with the configuration version that
+    /// produced it (0 when the feed is unconfigured). Consumers can use this
+    /// to attribute a quote to its source set, bounds and breaker policy.
+    pub fn get_price_with_feed_version(
+        env: Env,
+        pair: AssetPair,
+    ) -> Result<(i128, u32), OracleError> {
+        let (price, _) = Self::get_price_with_confidence(env.clone(), pair.clone())?;
+        let version = feeds::get_config(&env, &pair)
+            .map(|cfg| cfg.version)
+            .unwrap_or(0);
+        Ok((price, version))
+    }
+
     pub fn get_price_with_confidence(
         env: Env,
         pair: AssetPair,
@@ -819,6 +927,7 @@ impl OracleContract {
                 source: env.current_contract_address(),
                 confidence: 100,
                 ledger_sequence: env.ledger().sequence(),
+                round_id: feeds::last_round(&env, &pair),
             });
         }
 
@@ -1140,12 +1249,39 @@ impl OracleContract {
     /// currently-fresh sources by more than the configured hard reject
     /// threshold. Existing entries older than the configured staleness
     /// window are dropped before this comparison is made.
+    /// Submit an observation bound to an explicit feed-local round ID
+    /// (Issue #1308). The round must be strictly greater than the highest
+    /// accepted round for `pair`; replays and regressions are rejected with
+    /// [`OracleError::StaleRound`] before the price can change.
+    pub fn submit_pair_price_with_round(
+        env: Env,
+        source: Address,
+        pair: AssetPair,
+        price: i128,
+        confidence: u32,
+        round_id: u64,
+    ) -> Result<(), OracleError> {
+        Self::submit_pair_price_inner(env, source, pair, price, confidence, round_id)
+    }
+
     pub fn submit_pair_price(
         env: Env,
         source: Address,
         pair: AssetPair,
         price: i128,
         confidence: u32,
+    ) -> Result<(), OracleError> {
+        let round_id = feeds::next_round(&env, &pair);
+        Self::submit_pair_price_inner(env, source, pair, price, confidence, round_id)
+    }
+
+    fn submit_pair_price_inner(
+        env: Env,
+        source: Address,
+        pair: AssetPair,
+        price: i128,
+        confidence: u32,
+        round_id: u64,
     ) -> Result<(), OracleError> {
         if admin::is_paused(&env, String::from_str(&env, CAT_ALL)) {
             return Err(OracleError::CircuitBreakerTripped);
@@ -1156,6 +1292,13 @@ impl OracleContract {
         if price <= 0 {
             return Err(OracleError::InvalidPrice);
         }
+        // #1304: bounds are enforced before the observation enters aggregation.
+        feeds::check_bounds(&env, &pair, price)?;
+
+        // #1309: only the feed's owner or delegated publishers may submit.
+        feeds::authorize_publisher(&env, &pair, &source)?;
+        // #1310: a halted feed cannot influence aggregation until it recovers.
+        price_cb::guard_tripped(&env, &pair)?;
 
         let min_confidence = Self::get_min_confidence(env.clone());
         if confidence < min_confidence {
@@ -1213,6 +1356,9 @@ impl OracleContract {
         source_prices.push_back((source.clone(), price));
         deviation::check_deviation(&env, &pair, &source_prices)?;
 
+        // #1308: bind the accepted observation to its feed-local round.
+        feeds::accept_round(&env, &pair, round_id)?;
+
         let new_entry = PriceData {
             asset_pair: pair.clone(),
             price,
@@ -1220,6 +1366,7 @@ impl OracleContract {
             source,
             confidence,
             ledger_sequence,
+            round_id,
         };
         match admission {
             observation::Admission::Append => fresh.push_back(new_entry),
@@ -1337,3 +1484,6 @@ mod test_price_cb;
 
 #[cfg(test)]
 mod test_observation_integrity;
+
+#[cfg(test)]
+mod test_feeds;
