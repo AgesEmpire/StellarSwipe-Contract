@@ -41,6 +41,7 @@
 #![no_std]
 
 mod achievements;
+mod asset_positions;
 mod badges;
 mod exposure_cap;
 mod lifecycle;
@@ -198,6 +199,16 @@ pub enum PortfolioError {
     StaleSnapshotRevision = 4,
     /// Portfolio still has open or closing trades and cannot be closed (#1372).
     UnsettledTrades = 5,
+    /// Asset identifier is malformed (issue #1368).
+    InvalidAssetId = 6,
+    /// A position already exists for the canonical asset key.
+    AssetPositionExists = 7,
+    /// No position exists for the canonical asset key.
+    AssetPositionNotFound = 8,
+    /// Operation id was reused with different parameters (issue #1369).
+    OperationIdConflict = 9,
+    /// Delta would overflow or make the balance negative.
+    InvalidBalanceDelta = 10,
 }
 
 /// A user's position in a single asset. See the [module-level invariants list](self)
@@ -366,6 +377,45 @@ pub struct UserPortfolio;
 
 #[contractimpl]
 impl UserPortfolio {
+    /// Create an asset position under its canonical key (issue #1368).
+    pub fn create_asset_position(
+        env: Env,
+        user: Address,
+        asset: String,
+    ) -> Result<String, PortfolioError> {
+        user.require_auth();
+        asset_positions::create(&env, &user, &asset)
+    }
+
+    pub fn get_asset_position(
+        env: Env,
+        user: Address,
+        asset: String,
+    ) -> Result<Option<i128>, PortfolioError> {
+        asset_positions::get(&env, &user, &asset)
+    }
+
+    pub fn remove_asset_position(
+        env: Env,
+        user: Address,
+        asset: String,
+    ) -> Result<(), PortfolioError> {
+        user.require_auth();
+        asset_positions::remove(&env, &user, &asset)
+    }
+
+    /// Apply a balance delta idempotently by operation id (issue #1369).
+    pub fn update_asset_position(
+        env: Env,
+        user: Address,
+        asset: String,
+        delta: i128,
+        op_id: soroban_sdk::BytesN<32>,
+    ) -> Result<i128, PortfolioError> {
+        user.require_auth();
+        asset_positions::apply_delta(&env, &user, &asset, delta, op_id)
+    }
+
     pub fn get_build_info(env: Env) -> soroban_sdk::Map<soroban_sdk::String, soroban_sdk::String> {
         let mut m = soroban_sdk::Map::new(&env);
         m.set(

@@ -146,17 +146,55 @@ pub fn set_cached_conversion(env: &Env, from: &Asset, to: &Asset, rate: i128) {
     env.storage().temporary().extend_ttl(&key, 60, 60);
 }
 
-// ── Feed decimals ─────────────────────────────────────────────────────────────
+// ── Feed decimals (Issue #1405) ─────────────────────────────────────────────
+
+/// Canonical precision every feed is normalized to before aggregation and
+/// cross-feed conversion.
+pub const CANONICAL_DECIMALS: u32 = 7;
+
+/// Highest native precision a feed may declare. 18 covers every Stellar and
+/// EVM-bridged asset in use while keeping `10^(18 - 7)` rescaling far from the
+/// `i128` limit for realistic prices.
+pub const MAX_FEED_DECIMALS: u32 = 18;
+
+/// Decimal scale metadata for a feed.
+///
+/// A raw stored price `p` represents `p * 10^exponent` units of the quote
+/// asset, so `exponent == -(decimals as i32)`. `canonical_decimals` is the
+/// precision consumers receive from normalized reads.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedScale {
+    pub decimals: u32,
+    pub exponent: i32,
+    pub canonical_decimals: u32,
+    /// `false` when the feed has no explicit configuration and the canonical
+    /// precision is assumed.
+    pub configured: bool,
+}
+
+/// Reject precisions outside `0..=MAX_FEED_DECIMALS`.
+pub fn validate_decimals(decimals: u32) -> Result<(), OracleError> {
+    if decimals > MAX_FEED_DECIMALS {
+        return Err(OracleError::UnsupportedPrecision);
+    }
+    Ok(())
+}
 
 /// Store the native decimal precision for an asset pair.
 /// `decimals` is the number of decimal places in the raw price value
 /// (e.g. 6 for USDC-priced feeds, 7 for XLM-denominated feeds).
-pub fn set_feed_decimals(env: &Env, pair: &AssetPair, decimals: u32) {
+///
+/// # Errors
+/// [`OracleError::UnsupportedPrecision`] when `decimals > MAX_FEED_DECIMALS`.
+pub fn set_feed_decimals(env: &Env, pair: &AssetPair, decimals: u32) -> Result<(), OracleError> {
+    validate_decimals(decimals)?;
     let key = StorageKey::FeedDecimals(pair.clone());
     env.storage().persistent().set(&key, &decimals);
     env.storage()
         .persistent()
         .extend_ttl(&key, DAY_IN_LEDGERS, DAY_IN_LEDGERS);
+    Ok(())
 }
 
 /// Retrieve stored decimal precision for an asset pair.
@@ -167,12 +205,31 @@ pub fn get_feed_decimals(env: &Env, pair: &AssetPair) -> Option<u32> {
         .get(&StorageKey::FeedDecimals(pair.clone()))
 }
 
+/// Native precision of `pair`, defaulting to [`CANONICAL_DECIMALS`].
+pub fn feed_decimals_or_canonical(env: &Env, pair: &AssetPair) -> u32 {
+    get_feed_decimals(env, pair).unwrap_or(CANONICAL_DECIMALS)
+}
+
+/// Full scale metadata (decimals + exponent) for `pair`.
+pub fn get_feed_scale(env: &Env, pair: &AssetPair) -> FeedScale {
+    let configured = get_feed_decimals(env, pair);
+    let decimals = configured.unwrap_or(CANONICAL_DECIMALS);
+    FeedScale {
+        decimals,
+        exponent: -(decimals as i32),
+        canonical_decimals: CANONICAL_DECIMALS,
+        configured: configured.is_some(),
+    }
+}
+
 /// Rescale `raw_price` from `from_decimals` to `to_decimals`.
 ///
 /// Uses integer-only arithmetic to stay inside `no_std`:
 /// - If `to_decimals > from_decimals` the price is multiplied by 10^(diff).
-/// - If `to_decimals < from_decimals` the price is divided by 10^(diff).
-/// - Returns `None` on overflow.
+/// - If `to_decimals < from_decimals` the price is divided by 10^(diff)
+///   (truncating toward zero).
+/// - Returns `None` on overflow, including a scale factor that does not fit
+///   in `i128` (diff > 38).
 pub fn rescale_price(raw_price: i128, from_decimals: u32, to_decimals: u32) -> Option<i128> {
     if from_decimals == to_decimals {
         return Some(raw_price);
@@ -184,11 +241,31 @@ pub fn rescale_price(raw_price: i128, from_decimals: u32, to_decimals: u32) -> O
     } else {
         let diff = from_decimals - to_decimals;
         let factor = pow10(diff)?;
-        Some(raw_price / factor)
+        raw_price.checked_div(factor)
     }
 }
 
+/// Checked normalization between two supported precisions.
+///
+/// # Errors
+/// - [`OracleError::UnsupportedPrecision`] — either side exceeds
+///   [`MAX_FEED_DECIMALS`].
+/// - [`OracleError::ConversionOverflow`] — the rescaled value overflows `i128`.
+pub fn normalize_price_checked(
+    raw_price: i128,
+    from_decimals: u32,
+    to_decimals: u32,
+) -> Result<i128, OracleError> {
+    validate_decimals(from_decimals)?;
+    validate_decimals(to_decimals)?;
+    rescale_price(raw_price, from_decimals, to_decimals).ok_or(OracleError::ConversionOverflow)
+}
+
 fn pow10(exp: u32) -> Option<i128> {
+    // 10^38 is the largest power of ten representable in i128.
+    if exp > 38 {
+        return None;
+    }
     let mut result: i128 = 1;
     for _ in 0..exp {
         result = result.checked_mul(10)?;

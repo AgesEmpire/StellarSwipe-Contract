@@ -79,5 +79,9 @@ path = "tests/integration/test_bridge_authorization_conformance.rs"
 name = "test_stake_vault_token_transfer_failures"
 path = "tests/integration/test_stake_vault_token_transfer_failures.rs"
 
+[[test]]
+name = "test_fixture_builders"
+path = "tests/integration/test_fixture_builders.rs"
+
 [lints]
 workspace = true

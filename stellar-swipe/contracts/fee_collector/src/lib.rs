@@ -3,6 +3,12 @@
 mod errors;
 pub use errors::ContractError;
 
+mod events;
+pub use events::{DeprecatedCall, FeeRateUpdated, TreasuryWithdrawal, WithdrawalQueued};
+
+pub mod distribution;
+pub mod fee_cache;
+pub use distribution::ProviderShare;
 /// #1032: configurable protocol/provider fee split policy.
 mod fee_split_policy;
 pub use fee_split_policy::{
@@ -383,6 +389,7 @@ impl FeeCollector {
         Ok(())
     }
 
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol, Vec};
     /// Returns `true` if `caller` is on the authorized-caller allowlist.
     /// The admin is always implicitly authorized even if not listed here.
     pub fn is_caller_authorized(env: Env, caller: Address) -> bool {
@@ -850,7 +857,7 @@ impl FeeCollector {
         if !is_initialized(&env) {
             return Err(ContractError::NotInitialized);
         }
-        Ok(get_fee_rate(&env))
+        Ok(fee_cache::cached_fee_rate(&env))
     }
 
     /// Admin-only: update the fee rate (in basis points).
@@ -870,6 +877,7 @@ impl FeeCollector {
 
         let old_rate = get_fee_rate(&env);
         set_fee_rate_storage(&env, new_rate_bps);
+        fee_cache::invalidate_fee_cache(&env);
         storage::bump_config_version(&env);
 
         emit_fee_rate_updated(
@@ -928,6 +936,73 @@ impl FeeCollector {
         Ok(())
     }
 
+    // ── Fee distribution ────────────────────────────────────────────────────
+
+    /// Admin-only: configure provider fee shares (bps of epoch fees, sum <= 10_000).
+    pub fn set_provider_shares(env: Env, providers: Vec<ProviderShare>) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        get_admin(&env).require_auth();
+        distribution::set_providers(&env, &providers)
+    }
+
+    /// Admin-only: record a fee collected from a copy-trade execution.
+    pub fn record_fee(env: Env, token: Address, amount: i128) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        get_admin(&env).require_auth();
+        distribution::record_fee(&env, &token, amount)
+    }
+
+    /// Admin-only: close the epoch, crediting providers and retaining the rest in treasury.
+    /// Returns the amount retained by treasury.
+    pub fn close_epoch(env: Env, token: Address) -> Result<i128, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        get_admin(&env).require_auth();
+        distribution::close_epoch(&env, &token)
+    }
+
+    pub fn provider_balance(env: Env, provider: Address, token: Address) -> i128 {
+        distribution::provider_balance(&env, &provider, &token)
+    }
+
+    pub fn epoch_fees(env: Env, token: Address) -> i128 {
+        distribution::epoch_fees(&env, &token)
+    }
+}
+
+// ── Deprecated entry-point compatibility shims ──────────────────────────────
+//
+// Legacy entry points kept so existing integrations keep working across
+// upgrades. Each shim emits a `DeprecatedCall` event naming its replacement
+// and routes to the current implementation. Remove after the deprecation window.
+
+fn warn_deprecated(env: &Env, entry_point: Symbol, replacement: Symbol) {
+    DeprecatedCall { entry_point, replacement }.publish(env);
+}
+
+#[contractimpl]
+impl FeeCollector {
+    /// Deprecated: use `fee_rate`.
+    pub fn get_fee_rate(env: Env) -> Result<u32, ContractError> {
+        warn_deprecated(&env, symbol_short!("get_fee"), symbol_short!("fee_rate"));
+        Self::fee_rate(env)
+    }
+
+    /// Deprecated: use `set_fee_rate`.
+    pub fn update_fee_rate(env: Env, new_rate_bps: u32) -> Result<(), ContractError> {
+        warn_deprecated(&env, symbol_short!("upd_fee"), symbol_short!("set_fee"));
+        Self::set_fee_rate(env, new_rate_bps)
+    }
+
+    /// Deprecated: use `treasury_balance`.
+    pub fn get_treasury_balance(env: Env, token: Address) -> Result<i128, ContractError> {
+        warn_deprecated(&env, symbol_short!("get_trsy"), symbol_short!("trsy_bal"));
+        Self::treasury_balance(env, token)
     /// Admin, or an allowlisted keeper (Issue #813 — see [`Self::authorize_caller`]):
     /// push the current network congestion signal.
     ///
