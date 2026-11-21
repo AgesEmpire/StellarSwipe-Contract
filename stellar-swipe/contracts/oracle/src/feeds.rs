@@ -36,7 +36,7 @@ use core::cmp::Ordering;
 use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env, String, Vec};
 use stellar_swipe_common::{Asset, AssetPair};
 
-use crate::{errors::OracleError, price_cb, staleness};
+use crate::{errors::OracleError, price_cb, staleness, storage::DAY_IN_LEDGERS};
 
 /// Maximum number of feeds in one configuration batch.
 pub const MAX_FEED_BATCH: u32 = 10;
@@ -378,14 +378,29 @@ pub fn last_round(env: &Env, pair: &AssetPair) -> u64 {
         .unwrap_or(0)
 }
 
+/// Issue #1407: `(round_id, accepted_at)` of the latest accepted round for
+/// `pair`, read from the same key `accept_round`/`record_round` write.
+pub fn latest_round(env: &Env, pair: &AssetPair) -> Option<(u64, u64)> {
+    env.storage()
+        .persistent()
+        .get::<_, FeedRound>(&FeedKey::Round(pair.clone()))
+        .map(|r| (r.round, r.updated_at))
+}
+
 fn store_round(env: &Env, pair: &AssetPair, round: u64) {
+    let key = FeedKey::Round(pair.clone());
     env.storage().persistent().set(
-        &FeedKey::Round(pair.clone()),
+        &key,
         &FeedRound {
             round,
             updated_at: env.ledger().timestamp(),
         },
     );
+    // Round identifiers live in persistent storage (never temporary/instance)
+    // so they survive upgrades; keep the entry live alongside the feed.
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, DAY_IN_LEDGERS, DAY_IN_LEDGERS);
 }
 
 /// The next auto-assigned round for `pair`.

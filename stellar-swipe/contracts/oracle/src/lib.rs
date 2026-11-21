@@ -15,6 +15,8 @@ pub mod feed_state;
 // Closes #1309, #1311, #1312 — feed publishers, health, atomic batch config
 pub mod feeds;
 mod freshness_policy;
+// Closes #1406 — per-source heartbeat windows
+mod heartbeat;
 mod history;
 mod multi_hop;
 mod observation;
@@ -49,7 +51,8 @@ use stellar_swipe_common::{
     health_uninitialized, placeholder_admin, Asset, AssetPair, HealthStatus,
 };
 use types::{
-    ConsensusPriceData, ExternalPrice, OracleReputation, PriceData, PriceSubmission, StorageKey,
+    ConsensusPriceData, ExternalPrice, OracleReputation, PriceData, PriceRound, PriceSubmission,
+    StorageKey,
 };
 
 pub use conversion::{convert_to_base, normalize_price, ConversionPath};
@@ -57,7 +60,10 @@ pub use deviation::{check_deviation, get_deviation_threshold, set_deviation_thre
 pub use history::{calculate_twap, get_historical_price, get_twap_deviation, store_price};
 pub use multi_hop::{calculate_multi_hop_price, find_optimal_path, LiquidityPath};
 pub use sla::{get_feed_health, record_update as sla_record_update, set_sla, FeedHealth};
-pub use storage::{get_base_currency, get_price, set_base_currency, set_price};
+pub use storage::{
+    get_base_currency, get_price, set_base_currency, set_price, FeedScale, CANONICAL_DECIMALS,
+    MAX_FEED_DECIMALS,
+};
 
 soroban_sdk::contractmeta!(key = "SourceHash", val = env!("STELLAR_SOURCE_HASH"));
 soroban_sdk::contractmeta!(key = "GitCommit", val = env!("STELLAR_GIT_COMMIT"));
@@ -687,6 +693,14 @@ impl OracleContract {
     ///
     /// `decimals` is the number of fractional digits in the raw stored price
     /// (e.g. 6 for a USDC-denominated feed where 1 USDC is stored as 1_000_000).
+    ///
+    /// Issue #1405: the configured scale is the only precision accepted for
+    /// this feed at ingestion; external reports declaring a different scale
+    /// are rejected.
+    ///
+    /// # Errors
+    /// - [`OracleError::Unauthorized`] — caller is not the admin.
+    /// - [`OracleError::UnsupportedPrecision`] — `decimals > MAX_FEED_DECIMALS`.
     pub fn set_feed_decimals(
         env: Env,
         caller: Address,
@@ -695,8 +709,15 @@ impl OracleContract {
     ) -> Result<(), OracleError> {
         Self::require_admin(&env, &caller)?;
         caller.require_auth();
-        storage::set_feed_decimals(&env, &pair, decimals);
-        Ok(())
+        storage::set_feed_decimals(&env, &pair, decimals)
+    }
+
+    /// Read-only (Issue #1405): the feed's decimal scale metadata — native
+    /// `decimals`, the matching base-10 `exponent` (`-decimals`) and the
+    /// canonical precision normalized reads use. Unconfigured feeds report
+    /// the canonical scale with `configured == false`.
+    pub fn get_feed_scale(env: Env, pair: AssetPair) -> FeedScale {
+        storage::get_feed_scale(&env, &pair)
     }
 
     /// Read-only: return the configured native decimal precision for `pair`.
@@ -716,6 +737,8 @@ impl OracleContract {
     ///
     /// # Errors
     /// - [`OracleError::PriceNotFound`] — no price set for `pair`.
+    /// - [`OracleError::UnsupportedPrecision`] — `target_decimals` exceeds
+    ///   `MAX_FEED_DECIMALS`.
     /// - [`OracleError::ConversionOverflow`] — rescaling would overflow `i128`.
     pub fn get_normalized_price(
         env: Env,
@@ -723,9 +746,71 @@ impl OracleContract {
         target_decimals: u32,
     ) -> Result<i128, OracleError> {
         let raw_price = storage::get_price(&env, &pair)?;
-        let from_decimals = storage::get_feed_decimals(&env, &pair).unwrap_or(7);
-        storage::rescale_price(raw_price, from_decimals, target_decimals)
-            .ok_or(OracleError::ConversionOverflow)
+        let from_decimals = storage::feed_decimals_or_canonical(&env, &pair);
+        storage::normalize_price_checked(raw_price, from_decimals, target_decimals)
+    }
+
+    // ── Issue #1406: per-source heartbeat windows ─────────────────────────────
+
+    /// Admin: set the feed-wide heartbeat (seconds) for `pair`. Observations
+    /// from any source of this feed older than the heartbeat are excluded
+    /// from aggregation. `0` clears the heartbeat.
+    pub fn set_feed_heartbeat(
+        env: Env,
+        admin: Address,
+        pair: AssetPair,
+        heartbeat_secs: u64,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        heartbeat::set_feed_heartbeat(&env, &pair, heartbeat_secs);
+        Ok(())
+    }
+
+    /// Admin: override the heartbeat (seconds) for one `source` of `pair`.
+    /// Takes precedence over the feed-wide heartbeat. `0` clears the override.
+    pub fn set_source_heartbeat(
+        env: Env,
+        admin: Address,
+        pair: AssetPair,
+        source: Address,
+        heartbeat_secs: u64,
+    ) -> Result<(), OracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        heartbeat::set_source_heartbeat(&env, &pair, &source, heartbeat_secs);
+        Ok(())
+    }
+
+    /// Read-only: effective heartbeat for `source` on `pair` (source
+    /// override, then feed default). `None` when no heartbeat applies.
+    pub fn get_source_heartbeat(env: Env, pair: AssetPair, source: Address) -> Option<u64> {
+        heartbeat::get_heartbeat(&env, &pair, &source)
+    }
+
+    // ── Issue #1407: deterministic round identifiers ──────────────────────────
+
+    /// Read-only: the accepted price for `pair` together with the feed-local
+    /// round identifier and the timestamp at which that round was accepted.
+    ///
+    /// The round identifier is strictly increasing within a feed (see
+    /// `feeds::accept_round`), is held in persistent storage so it survives
+    /// contract upgrades, and is only advanced by an accepted observation —
+    /// reading it never changes it. The price goes through the same
+    /// validation as [`Self::get_price`].
+    ///
+    /// # Errors
+    /// - [`OracleError::PriceNotFound`] — no round has been accepted for `pair`.
+    /// - Any error returned by [`Self::get_price`].
+    pub fn get_price_round(env: Env, pair: AssetPair) -> Result<PriceRound, OracleError> {
+        let (round_id, timestamp) =
+            feeds::latest_round(&env, &pair).ok_or(OracleError::PriceNotFound)?;
+        let (price, _) = Self::get_price_with_confidence(env, pair)?;
+        Ok(PriceRound {
+            round_id,
+            price,
+            timestamp,
+        })
     }
 
     fn read_oracles(env: &Env) -> Vec<Address> {
@@ -937,9 +1022,12 @@ impl OracleContract {
         let window = staleness::get_staleness_window(&env, &pair);
         let mut fresh_prices: Vec<PriceData> = Vec::new(&env);
 
-        // 1. Filter stale prices using the configured freshness window (Issue #864).
+        // 1. Filter stale prices using the configured freshness window (Issue #864)
+        //    and drop sources past their heartbeat (Issue #1406).
         for p in prices.iter() {
-            if current_time.saturating_sub(p.timestamp) < window {
+            if current_time.saturating_sub(p.timestamp) < window
+                && heartbeat::is_within_heartbeat(&env, &pair, &p.source, p.timestamp)
+            {
                 fresh_prices.push_back(p);
             }
         }
@@ -1357,10 +1445,15 @@ impl OracleContract {
         let now = env.ledger().timestamp();
         let window = staleness::get_staleness_window(&env, &pair);
 
-        // Drop existing entries outside the freshness window before comparing.
+        // Drop existing entries outside the freshness window, or from sources
+        // past their heartbeat (Issue #1406), before comparing. Expired
+        // observations can neither influence the deviation check nor be
+        // carried into the accepted set.
         let mut fresh: Vec<PriceData> = Vec::new(&env);
         for p in prices.iter() {
-            if now.saturating_sub(p.timestamp) < window {
+            if now.saturating_sub(p.timestamp) < window
+                && heartbeat::is_within_heartbeat(&env, &pair, &p.source, p.timestamp)
+            {
                 fresh.push_back(p);
             }
         }
@@ -1431,7 +1524,17 @@ impl OracleContract {
         let first_pair = prices.get(0).map(|p| p.asset_pair.clone());
         let consensus_price = crate::external_adapter::process_external_prices(&env, prices)?;
         if let Some(pair) = first_pair {
-            storage::set_price(&env, &pair, consensus_price);
+            // #1405: the consensus is in canonical precision; store it in the
+            // feed's native scale so `get_normalized_price` reads it back
+            // with the decimals the feed metadata declares.
+            let native = storage::normalize_price_checked(
+                consensus_price,
+                CANONICAL_DECIMALS,
+                storage::feed_decimals_or_canonical(&env, &pair),
+            )?;
+            storage::set_price(&env, &pair, native);
+            // #1407: every accepted price state gets a new round identifier.
+            feeds::record_round(&env, &pair);
             on_price_update(&env, pair);
         }
 
@@ -1519,3 +1622,6 @@ mod test_observation_integrity;
 
 #[cfg(test)]
 mod test_feeds;
+
+#[cfg(test)]
+mod test_feed_ingestion;

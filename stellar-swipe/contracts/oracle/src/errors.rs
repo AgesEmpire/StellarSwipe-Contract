@@ -93,6 +93,13 @@ pub enum OracleError {
     /// The submitted round ID is a replay or is older than the feed's latest
     /// accepted round (Issue #1308).
     StaleRound = 38,
+    /// A feed or report uses a decimal precision outside the supported range,
+    /// or a report's precision differs from the feed's configured scale
+    /// (Issue #1405).
+    UnsupportedPrecision = 39,
+    /// The observation's source exceeded its configured heartbeat interval,
+    /// so the observation cannot be accepted or aggregated (Issue #1406).
+    HeartbeatExpired = 40,
 }
 
 impl OracleError {
@@ -190,6 +197,12 @@ impl OracleError {
             }
             OracleError::StaleRound => {
                 "observation round is a replay or older than the feed's latest accepted round"
+            }
+            OracleError::UnsupportedPrecision => {
+                "decimal precision is unsupported or differs from the feed's configured scale"
+            }
+            OracleError::HeartbeatExpired => {
+                "observation source exceeded its configured heartbeat interval"
             }
             }
         }
