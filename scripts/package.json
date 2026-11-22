@@ -12,7 +12,9 @@
     "registry": "npx tsx deployment_registry.ts",
     "fund": "npx tsx testnet_utils.ts fund",
     "monitor": "npx tsx monitor.ts",
-    "test:regression": "cd .. && npx tsx --test tests/regression/index.test.ts"
+    "test:regression": "cd .. && npx tsx --test tests/regression/index.test.ts",
+    "notification": "npx tsx notification_service.ts",
+    "notification:test": "npx tsx notification_service.ts test"
   },
   "devDependencies": {
     "@stellar/stellar-sdk": "^13.3.0",
