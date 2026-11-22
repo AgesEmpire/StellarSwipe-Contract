@@ -37,6 +37,48 @@ pub struct SimulationResult {
     pub effects: Vec<SimulationEffect>,
 }
 
+// ── #1430: Governance execution preview types ─────────────────────────────────
+
+/// Outcome of a single precondition check in an execution preview.
+///
+/// **Important**: `passed: true` means the precondition holds *right now*
+/// against current ledger state. It is NOT a guarantee that execution will
+/// succeed at the time `execute_proposal` is eventually called, because state
+/// may change (e.g. treasury balance decreases, veto window closes).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionPreviewOutcome {
+    /// Short name of the precondition being checked, e.g. `"treasury_balance"`,
+    /// `"veto_window_closed"`, `"voting_ended"`.
+    pub check: String,
+    /// `true` when the precondition holds in current ledger state.
+    pub passed: bool,
+    /// Human-readable note explaining the check result or what would block execution.
+    pub note: String,
+}
+
+/// Read-only preview of whether a proposal's action can be executed under
+/// current contract state.
+///
+/// Each `outcomes` entry corresponds to one precondition check. All checks
+/// are always present regardless of pass/fail so callers get a complete picture.
+///
+/// # Disclaimer
+/// A fully-passing preview (`all_pass: true`) reflects current state only.
+/// It is NOT a guarantee of successful execution at a later point.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalExecutionPreview {
+    pub proposal_id: u64,
+    /// Ledger timestamp at which these checks were evaluated.
+    pub evaluated_at: u64,
+    /// All precondition outcomes for this proposal.
+    pub outcomes: Vec<ActionPreviewOutcome>,
+    /// `true` iff every outcome has `passed: true`.
+    /// Explicitly distinguished from "execution will succeed" — see type docs.
+    pub all_pass: bool,
+}
+
 /// One segment of a [`concat_parts`] call: either a static separator/prefix
 /// or a dynamic `soroban_sdk::String` value.
 enum Part<'a> {
@@ -212,10 +254,28 @@ pub const PROPOSAL_ACTION_SCHEMA_VERSION: u32 = 1;
 /// overflow the arithmetic `validate_proposal` performs on them.
 pub const MAX_PARAMETER_VALUE: i128 = 1_000_000_000_000_000_000; // 10^18
 
+// ── #1429: Treasury multi-action proposal limits ─────────────────────────────
+
+/// Maximum number of treasury-spend actions permitted in a single batch
+/// proposal submission. A batch is a `Vec<ProposalType>` validated via
+/// `validate_treasury_action_batch` before any proposal ID is allocated.
+pub const MAX_TREASURY_ACTIONS_PER_BATCH: u32 = 10;
+
+/// Maximum aggregate execution work (sum of spend amounts) permitted across
+/// all treasury actions in a single batch. Prevents a batch from draining
+/// a large fraction of the treasury in one proposal.
+pub const MAX_TREASURY_BATCH_WORK: i128 = 10_000_000;
+
 /// Upper bound on the byte length of any free-text identifier carried by a
 /// proposal action (parameter/feature/contract names, signal text, spend
 /// purpose).
 pub const MAX_ACTION_STRING_LEN: u32 = 256;
+
+// ── #1428: Delegation cycle detection ────────────────────────────────────────
+
+/// Maximum delegation chain depth that cycle detection will traverse.
+/// A chain deeper than this is treated as a cycle to bound traversal work.
+pub const MAX_DELEGATION_DEPTH: u32 = 20;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -598,6 +658,11 @@ pub fn create_proposal(
         }
         hi += 1;
     }
+    // #1427: record the ledger sequence at which this snapshot was taken.
+    // Delegation changes after this sequence cannot affect this proposal's tally.
+    env.storage()
+        .persistent()
+        .set(&StorageKey::VotingCheckpoint(id), &env.ledger().sequence());
     put_vote_snapshots(env, id, &snapshots);
     let now = env.ledger().timestamp();
 
@@ -669,6 +734,14 @@ pub fn get_proposal(env: &Env, proposal_id: u64) -> Result<Proposal, GovernanceE
         .proposals
         .get(proposal_id)
         .ok_or(GovernanceError::ProposalNotFound)
+}
+
+/// #1427: return the ledger sequence at which voting power was snapshotted
+/// for `proposal_id`. Returns `None` for proposals that pre-date this feature.
+pub fn get_voting_checkpoint(env: &Env, proposal_id: u64) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::VotingCheckpoint(proposal_id))
 }
 
 /// #796: `execute_proposal` cannot persist a `status = Expired` write when it
@@ -916,6 +989,137 @@ pub fn simulate_proposal(env: &Env, proposal_id: u64) -> Result<SimulationResult
     );
 
     Ok(result)
+}
+
+/// #1430: read-only execution preview — evaluates every precondition that
+/// `execute_proposal` would check, without performing any writes or transfers.
+///
+/// Returns a [`ProposalExecutionPreview`] listing each check and its current
+/// outcome. `all_pass: true` means every precondition holds *right now*; it
+/// is **not** a guarantee of successful execution at a later time.
+///
+/// No writes are made to storage or token balances.
+pub fn preview_proposal_execution(
+    env: &Env,
+    proposal_id: u64,
+) -> Result<ProposalExecutionPreview, GovernanceError> {
+    let proposal = get_proposal(env, proposal_id)?;
+    let now = env.ledger().timestamp();
+    let mut outcomes: Vec<ActionPreviewOutcome> = Vec::new(env);
+    let mut all_pass = true;
+
+    // Check 1: proposal must be in Succeeded status.
+    {
+        let passed = proposal.status == ProposalStatus::Succeeded;
+        if !passed {
+            all_pass = false;
+        }
+        outcomes.push_back(ActionPreviewOutcome {
+            check: String::from_str(env, "proposal_succeeded"),
+            passed,
+            note: if passed {
+                String::from_str(env, "Proposal is in Succeeded status")
+            } else {
+                String::from_str(env, "Proposal is not in Succeeded status; cannot execute")
+            },
+        });
+    }
+
+    // Check 2: not vetoed.
+    {
+        let passed = proposal.status != ProposalStatus::Vetoed && proposal.vetoed_by.is_none();
+        if !passed {
+            all_pass = false;
+        }
+        outcomes.push_back(ActionPreviewOutcome {
+            check: String::from_str(env, "not_vetoed"),
+            passed,
+            note: if passed {
+                String::from_str(env, "Proposal has not been vetoed")
+            } else {
+                String::from_str(env, "Proposal was vetoed and cannot be executed")
+            },
+        });
+    }
+
+    // Check 3: veto window has closed (now >= veto_ends_at).
+    {
+        let passed = now >= proposal.veto_ends_at;
+        if !passed {
+            all_pass = false;
+        }
+        outcomes.push_back(ActionPreviewOutcome {
+            check: String::from_str(env, "veto_window_closed"),
+            passed,
+            note: if passed {
+                String::from_str(env, "Veto window has closed")
+            } else {
+                String::from_str(env, "Veto window is still open; execution blocked until it closes")
+            },
+        });
+    }
+
+    // Check 4: execution delay has elapsed.
+    {
+        let cfg = get_governance_config(env);
+        let ready = proposal.voting_ends.saturating_add(cfg.execution_delay);
+        let passed = now >= ready;
+        if !passed {
+            all_pass = false;
+        }
+        outcomes.push_back(ActionPreviewOutcome {
+            check: String::from_str(env, "execution_delay_elapsed"),
+            passed,
+            note: if passed {
+                String::from_str(env, "Execution delay has elapsed")
+            } else {
+                String::from_str(env, "Execution delay has not yet elapsed")
+            },
+        });
+    }
+
+    // Check 5: execution deadline has not passed.
+    {
+        let passed = now <= proposal.execution_deadline;
+        if !passed {
+            all_pass = false;
+        }
+        outcomes.push_back(ActionPreviewOutcome {
+            check: String::from_str(env, "within_execution_deadline"),
+            passed,
+            note: if passed {
+                String::from_str(env, "Proposal is within its execution deadline")
+            } else {
+                String::from_str(env, "Execution deadline has passed; proposal has expired")
+            },
+        });
+    }
+
+    // Check 6: action-specific preconditions (treasury balance for TreasurySpend).
+    if let ProposalType::TreasurySpend(_, amount, asset, _) = &proposal.proposal_type {
+        let treasury = get_treasury(env);
+        let bal = treasury.assets.get(asset.clone()).unwrap_or(0);
+        let passed = bal >= *amount;
+        if !passed {
+            all_pass = false;
+        }
+        outcomes.push_back(ActionPreviewOutcome {
+            check: String::from_str(env, "treasury_balance_sufficient"),
+            passed,
+            note: if passed {
+                String::from_str(env, "Treasury holds sufficient balance for this spend")
+            } else {
+                String::from_str(env, "Treasury balance is insufficient for this spend")
+            },
+        });
+    }
+
+    Ok(ProposalExecutionPreview {
+        proposal_id,
+        evaluated_at: now,
+        outcomes,
+        all_pass,
+    })
 }
 
 pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
@@ -1613,6 +1817,37 @@ fn remove_proposal_id(ids: &mut Vec<u64>, target: u64) {
     }
 }
 
+/// #1428: walk the delegation chain starting at `start` and check whether
+/// `candidate` appears anywhere in it, up to [`MAX_DELEGATION_DEPTH`] hops.
+/// Returns `Err(DelegationCycleDetected)` if `candidate` is found in the
+/// chain, or `Err(DelegationChainTooDeep)` if the chain exceeds the depth
+/// bound. Returns `Ok(())` when the chain terminates cleanly.
+fn check_delegation_cycle(
+    env: &Env,
+    state: &DelegationState,
+    start: &Address,
+    candidate: &Address,
+) -> Result<(), GovernanceError> {
+    let mut current = start.clone();
+    let mut depth = 0u32;
+    loop {
+        if depth > MAX_DELEGATION_DEPTH {
+            return Err(GovernanceError::DelegationChainTooDeep);
+        }
+        // Follow the chain: if `current` has an active delegation, step to its delegate.
+        match state.delegations.get(current.clone()) {
+            Some(d) if crate::delegation_expiry::is_live(env, &d) => {
+                if d.delegate == *candidate {
+                    return Err(GovernanceError::DelegationCycleDetected);
+                }
+                current = d.delegate.clone();
+            }
+            _ => return Ok(()),
+        }
+        depth += 1;
+    }
+}
+
 pub fn delegate_voting_power(
     env: &Env,
     delegator: Address,
@@ -1633,6 +1868,11 @@ pub fn delegate_voting_power(
         return Err(GovernanceError::InvalidCommitteeAction);
     }
     crate::delegation_expiry::clear_expiry(env, &delegator);
+
+    // #1428: reject the update if it would form a cycle in the delegation chain.
+    // We walk from `delegate` and check whether `delegator` appears within
+    // MAX_DELEGATION_DEPTH hops. This bounds both cycle detection and chain depth.
+    check_delegation_cycle(env, &state, &delegate, &delegator)?;
 
     let power = get_staked_balance(env, &delegator);
     if power <= 0 {
@@ -1792,6 +2032,44 @@ pub fn validate_no_duplicate_actions(
             return Err(GovernanceError::DuplicateProposalAction);
         }
         seen.push_back(identity);
+        i += 1;
+    }
+    Ok(())
+}
+
+/// #1429: validate a batch of proposal actions against treasury multi-action
+/// limits before any proposal ID is allocated, deposit locked, or treasury
+/// state touched.
+///
+/// Rules enforced:
+/// - The number of `TreasurySpend` actions in `actions` must not exceed
+///   [`MAX_TREASURY_ACTIONS_PER_BATCH`].
+/// - The sum of spend amounts across all `TreasurySpend` actions must not
+///   exceed [`MAX_TREASURY_BATCH_WORK`].
+///
+/// Non-treasury actions are counted against neither limit.
+///
+/// # Errors
+/// - [`GovernanceError::TreasuryBatchTooLarge`] — too many treasury actions.
+/// - [`GovernanceError::TreasuryBatchWorkExceeded`] — aggregate spend too high.
+pub fn validate_treasury_action_batch(
+    _env: &Env,
+    actions: &Vec<ProposalType>,
+) -> Result<(), GovernanceError> {
+    let mut treasury_count: u32 = 0;
+    let mut aggregate_work: i128 = 0;
+    let mut i = 0u32;
+    while i < actions.len() {
+        if let ProposalType::TreasurySpend(_, amount, _, _) = actions.get(i).unwrap() {
+            treasury_count = treasury_count.saturating_add(1);
+            if treasury_count > MAX_TREASURY_ACTIONS_PER_BATCH {
+                return Err(GovernanceError::TreasuryBatchTooLarge);
+            }
+            aggregate_work = aggregate_work.saturating_add(amount);
+            if aggregate_work > MAX_TREASURY_BATCH_WORK {
+                return Err(GovernanceError::TreasuryBatchWorkExceeded);
+            }
+        }
         i += 1;
     }
     Ok(())

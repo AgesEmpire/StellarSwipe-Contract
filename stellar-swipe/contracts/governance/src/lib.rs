@@ -51,6 +51,14 @@ mod test_veto_window;
 mod test_vote_deadline;
 #[cfg(test)]
 mod test_proposal_revisions;
+#[cfg(test)]
+mod test_delegation_cycles;
+#[cfg(test)]
+mod test_voting_checkpoint;
+#[cfg(test)]
+mod test_treasury_batch_limits;
+#[cfg(test)]
+mod test_execution_preview;
 
 use committees::{
     list_committees as list_registered_committees, CommitteeAction, CommitteeElection,
@@ -82,9 +90,11 @@ use proposals::{
     calculate_proposal_statistics, cancel_proposal, configure_governance, create_proposal,
     default_governance_config, effective_status, execute_proposal, expire_proposal,
     finalize_proposal, get_active_proposals, get_all_proposals, get_category_threshold,
-    get_governance_config, get_proposal, get_proposal_status_report, reclaim_expired_proposal,
-    set_category_thresholds, simulate_proposal,
-    withdraw_proposal, Proposal, ProposalStatistics, ProposalStatus, ProposalStatusReport, ProposalType,
+    get_governance_config, get_proposal, get_proposal_status_report, get_voting_checkpoint,
+    preview_proposal_execution, reclaim_expired_proposal,
+    set_category_thresholds, simulate_proposal, validate_treasury_action_batch,
+    withdraw_proposal, ActionPreviewOutcome, Proposal, ProposalExecutionPreview,
+    ProposalStatistics, ProposalStatus, ProposalStatusReport, ProposalType,
     SimulationEffect, SimulationResult, Vote, VoteDelegation, VoteType as GovernanceVoteType,
 };
 pub use proposals::{
@@ -212,6 +222,8 @@ pub enum StorageKey {
     /// Issue #1431: revision version / vote-reset bookkeeping for an amended
     /// proposal. Absent for proposals that were never amended.
     ProposalRevision(u64),
+    /// #1427: ledger sequence at which voting power was frozen for proposal `id`.
+    VotingCheckpoint(u64),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -701,6 +713,16 @@ impl GovernanceContract {
         proposals::validate_no_duplicate_actions(&env, &actions)
     }
 
+    /// #1429: validate a batch of proposal actions against treasury multi-action
+    /// limits (action count and aggregate work). An over-limit batch is rejected
+    /// before any proposal ID is reserved, deposit locked, or treasury state touched.
+    pub fn validate_treasury_batch(
+        env: Env,
+        actions: Vec<ProposalType>,
+    ) -> Result<(), GovernanceError> {
+        proposals::validate_treasury_action_batch(&env, &actions)
+    }
+
     pub fn proposal(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
         require_initialized(&env)?;
         let mut proposal = get_proposal(&env, proposal_id)?;
@@ -892,6 +914,25 @@ impl GovernanceContract {
         proposals::simulate_proposal(&env, proposal_id)
     }
 
+    /// #1430: read-only execution preview. Evaluates every precondition that
+    /// `execute_proposal` would check without writing anything or touching
+    /// token balances. Returns a per-check outcome list and an `all_pass` flag.
+    ///
+    /// # Disclaimer
+    /// `all_pass: true` reflects **current** ledger state only. It is **not**
+    /// a guarantee that execution will succeed at a later point.
+    ///
+    /// # Errors
+    /// - [`GovernanceError::NotInitialized`] — contract not initialized.
+    /// - [`GovernanceError::ProposalNotFound`] — `proposal_id` does not exist.
+    pub fn preview_execution(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<ProposalExecutionPreview, GovernanceError> {
+        require_initialized(&env)?;
+        proposals::preview_proposal_execution(&env, proposal_id)
+    }
+
     pub fn cancel_proposal(
         env: Env,
         proposal_id: u64,
@@ -1020,6 +1061,13 @@ impl GovernanceContract {
     /// Revision bookkeeping for an amended proposal (`None` if never amended).
     pub fn get_proposal_revision(env: Env, proposal_id: u64) -> Option<ProposalRevision> {
         proposal_revisions::get_revision(&env, proposal_id)
+    }
+
+    /// #1427: ledger sequence at which voting power was frozen for `proposal_id`.
+    /// `None` for proposals that pre-date checkpoint recording.
+    pub fn voting_checkpoint(env: Env, proposal_id: u64) -> Option<u32> {
+        require_initialized(&env).ok()?;
+        proposals::get_voting_checkpoint(&env, proposal_id)
     }
 
     // ── Issue #666: Proposal execution payload simulation (dry-run) ───────────
