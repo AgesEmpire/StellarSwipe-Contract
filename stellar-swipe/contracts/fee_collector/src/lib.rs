@@ -59,8 +59,9 @@ use storage::{
     get_last_forecast_day, get_max_rebate_bps, get_monthly_trade_volume,
     get_network_condition_score, get_oracle_contract, get_pending_fees,
     get_provider_payout_currency, get_queued_withdrawal, get_referral_fee_share_bps, get_referrer,
-    get_revenue_share_pool_index, get_treasury_balance, get_volume_discount_config,
-    get_waterfall_config, has_traded, is_authorized_caller, is_initialized,
+    get_reserved_treasury, get_revenue_share_pool_index, get_treasury_balance,
+    get_volume_discount_config, get_waterfall_config, has_traded, is_authorized_caller,
+    is_initialized,
     remove_authorized_caller, remove_failed_fee_collection, remove_from_revenue_share_pool_index,
     remove_monthly_trade_volume, remove_provider_payout_currency, remove_queued_withdrawal,
     set_admin, set_authorized_caller, set_burn_rate as set_burn_rate_storage,
@@ -71,7 +72,7 @@ use storage::{
     set_monthly_trade_volume, set_network_condition_score,
     set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
     set_provider_payout_currency, set_queued_withdrawal, set_referral_fee_share_bps, set_referrer,
-    set_treasury_balance, set_volume_discount_config_storage,
+    set_reserved_treasury, set_treasury_balance, set_volume_discount_config_storage,
     set_waterfall_config as set_waterfall_config_storage, CongestionConfig, CongestionSignal,
     ErrorReport, FailedFeeCollection, FeeOptimizationConfig, FeeSnapshot, ForecastConfigData,
     MonthlyTradeVolume, QueuedWithdrawal, SnapshotEntry, StorageKey, VolumeDiscountConfig,
@@ -478,6 +479,20 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Sym
     }
 
     /// # Summary
+    /// Returns the treasury balance for a token that is not reserved for a
+    /// pending obligation (a queued withdrawal). Only this amount may be
+    /// queued, distributed or otherwise spent.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotInitialized`] if the contract has not been initialized.
+    pub fn available_treasury_balance(env: Env, token: Address) -> Result<i128, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        Ok(available_treasury(&env, &token))
+    }
+
+    /// # Summary
     /// Read-only audit that compares the stored treasury balance against the
     /// contract's actual on-chain token balance for each supplied token.
     ///
@@ -554,13 +569,27 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Sym
         }
         // Validate token metadata before allowing withdrawal.
         Self::validate_token_metadata_for_token(&env, &token)?;
-        if amount > get_treasury_balance(&env, &token) {
+        // The queue slot holds one withdrawal; a new one supersedes it, so its
+        // reservation is not counted against the new request.
+        let superseded = match get_queued_withdrawal(&env) {
+            Some(prev) if prev.token == token => prev.amount,
+            _ => 0,
+        };
+        if amount > available_treasury(&env, &token).saturating_add(superseded) {
             return Err(ContractError::InsufficientTreasuryBalance);
         }
         let queued_at = env.ledger().timestamp();
         let available_at = queued_at
             .checked_add(SECONDS_PER_DAY)
             .ok_or(ContractError::ArithmeticOverflow)?;
+        release_queued_reservation(&env);
+        set_reserved_treasury(
+            &env,
+            &token,
+            get_reserved_treasury(&env, &token)
+                .checked_add(amount)
+                .ok_or(ContractError::ArithmeticOverflow)?,
+        );
         set_queued_withdrawal(
             &env,
             &QueuedWithdrawal {
@@ -648,6 +677,7 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Sym
         .map_err(ContractError::from)?;
 
         set_treasury_balance(&env, &token, new_balance);
+        release_queued_reservation(&env);
         remove_queued_withdrawal(&env);
 
         emit_treasury_withdrawal(
@@ -972,6 +1002,19 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Sym
 
     pub fn epoch_fees(env: Env, token: Address) -> i128 {
         distribution::epoch_fees(&env, &token)
+    }
+}
+
+/// Treasury balance not committed to a pending obligation.
+fn available_treasury(env: &Env, token: &Address) -> i128 {
+    get_treasury_balance(env, token).saturating_sub(get_reserved_treasury(env, token))
+}
+
+/// Releases the reservation held by the queued withdrawal, if any.
+fn release_queued_reservation(env: &Env) {
+    if let Some(queued) = get_queued_withdrawal(env) {
+        let reserved = get_reserved_treasury(env, &queued.token);
+        set_reserved_treasury(env, &queued.token, reserved.saturating_sub(queued.amount));
     }
 }
 
@@ -2206,7 +2249,7 @@ impl FeeCollector {
         let config = get_waterfall_config(&env).ok_or(ContractError::WaterfallNotConfigured)?;
 
         let treasury_bal = get_treasury_balance(&env, &token);
-        if treasury_bal < total_amount {
+        if available_treasury(&env, &token) < total_amount {
             return Err(ContractError::InsufficientTreasuryBalance);
         }
 
