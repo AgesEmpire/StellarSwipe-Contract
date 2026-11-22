@@ -176,17 +176,27 @@ pub fn update_transfer_analytics(
     transfer: &BridgeTransfer,
 ) -> Result<(), String> {
     let mut analytics = get_bridge_analytics(env, bridge_id);
+    let overflow = || String::from_str(env, "Analytics counter overflow");
 
-    analytics.total_transfers += 1;
-    analytics.total_volume += transfer.amount;
-    analytics.total_fees += transfer.fee_paid;
+    // Checked: an overflow returns Err before `store_bridge_analytics`, so
+    // stored aggregates are never partially updated.
+    analytics.total_transfers = analytics.total_transfers.checked_add(1).ok_or_else(overflow)?;
+    analytics.total_volume = analytics
+        .total_volume
+        .checked_add(transfer.amount)
+        .ok_or_else(overflow)?;
+    analytics.total_fees = analytics
+        .total_fees
+        .checked_add(transfer.fee_paid)
+        .ok_or_else(overflow)?;
 
     // Update per-asset volume
     let asset = transfer.stellar_asset.clone();
     let current_asset_volume = analytics.volume_by_asset.get(asset.clone()).unwrap_or(0);
-    analytics
-        .volume_by_asset
-        .set(asset, current_asset_volume + transfer.amount);
+    let new_asset_volume = current_asset_volume
+        .checked_add(transfer.amount)
+        .ok_or_else(overflow)?;
+    analytics.volume_by_asset.set(asset, new_asset_volume);
 
     // Calculate transfer time
     if let Some(completed_at) = transfer.completed_at {
@@ -212,7 +222,7 @@ pub fn update_transfer_analytics(
         &mut analytics.volume_by_period,
         env.ledger().timestamp(),
         transfer.amount,
-    );
+    )?;
 
     store_bridge_analytics(env, bridge_id, &analytics);
 
@@ -224,7 +234,12 @@ fn update_avg_transfer_time(analytics: &mut BridgeAnalytics, new_time: u64) {
     analytics.avg_transfer_time_seconds = (total_time + new_time) / analytics.total_transfers;
 }
 
-fn add_to_time_series(env: &Env, series: &mut TimeSeries, timestamp: u64, value: i128) {
+fn add_to_time_series(
+    env: &Env,
+    series: &mut TimeSeries,
+    timestamp: u64,
+    value: i128,
+) -> Result<(), String> {
     // Basic implementation: if last data point is same day/hour, update it. Else push new.
     let interval_seconds = match series.interval {
         TimeInterval::Hourly => SECONDS_PER_HOUR,
@@ -238,7 +253,10 @@ fn add_to_time_series(env: &Env, series: &mut TimeSeries, timestamp: u64, value:
         let last_idx = series.data_points.len() - 1;
         let mut last_point = series.data_points.get(last_idx).unwrap();
         if last_point.timestamp == period_timestamp {
-            last_point.value += value;
+            last_point.value = last_point
+                .value
+                .checked_add(value)
+                .ok_or_else(|| String::from_str(env, "Analytics counter overflow"))?;
             series.data_points.set(last_idx, last_point);
             updated = true;
         }
@@ -255,6 +273,8 @@ fn add_to_time_series(env: &Env, series: &mut TimeSeries, timestamp: u64, value:
             series.data_points.remove(0);
         }
     }
+
+    Ok(())
 }
 
 pub fn get_bridge_volume_stats(
@@ -317,7 +337,13 @@ pub fn update_validator_analytics(
 ) -> Result<(), String> {
     let mut analytics = get_validator_analytics(env, validator.clone(), bridge_id);
 
-    analytics.total_signatures_provided += 1;
+    let overflow = || String::from_str(env, "Analytics counter overflow");
+
+    // Checked: an overflow returns Err before `store_validator_analytics`.
+    analytics.total_signatures_provided = analytics
+        .total_signatures_provided
+        .checked_add(1)
+        .ok_or_else(overflow)?;
 
     // Calculate response time
     let response_time = signature_time.saturating_sub(transfer_initiated);
@@ -330,9 +356,15 @@ pub fn update_validator_analytics(
 
     // Classify as on-time or late (threshold: 5 minutes)
     if response_time <= 300 {
-        analytics.on_time_signatures += 1;
+        analytics.on_time_signatures = analytics
+            .on_time_signatures
+            .checked_add(1)
+            .ok_or_else(overflow)?;
     } else {
-        analytics.late_signatures += 1;
+        analytics.late_signatures = analytics
+            .late_signatures
+            .checked_add(1)
+            .ok_or_else(overflow)?;
     }
 
     // Update uptime
