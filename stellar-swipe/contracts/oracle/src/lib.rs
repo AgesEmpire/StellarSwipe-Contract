@@ -18,9 +18,13 @@ mod freshness_policy;
 // Closes #1406 — per-source heartbeat windows
 mod heartbeat;
 mod history;
+// Closes #1409 — hysteresis for deviation circuit breakers
+pub mod hysteresis;
 mod multi_hop;
 mod observation;
 mod price_cb;
+// Closes #1410 — source provenance on accepted price rounds
+pub mod provenance;
 pub mod quorum;
 mod reputation;
 mod sdex;
@@ -36,6 +40,11 @@ mod test_feed_canonical;
 mod test_feed_movement;
 #[cfg(test)]
 mod test_feed_version;
+#[cfg(test)]
+// Closes #1403 — upgrade rollback tests for failed post-migration validation
+mod test_upgrade_rollback;
+// Closes #1408 — deterministic tie-breaking for quorum results
+pub mod tie_break;
 mod types;
 
 use errors::OracleError;
