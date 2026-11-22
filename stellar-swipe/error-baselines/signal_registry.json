@@ -208,7 +208,8 @@
       "NothingToRefund": 1711,
       "ArithmeticError": 1712,
       "Unauthorized": 1713,
-      "InvalidConfig": 1714
+      "InvalidConfig": 1714,
+      "NonceReused": 1715
     }
   }
 }

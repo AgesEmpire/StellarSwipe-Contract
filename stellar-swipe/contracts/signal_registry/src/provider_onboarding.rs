@@ -59,6 +59,8 @@ pub enum OnboardingKey {
     Reserves,
     /// Governance-configured onboarding parameters.
     Params,
+    /// Last verification nonce consumed by a provider's application.
+    VerificationNonce(Address),
 }
 
 // ── Rich onboarding pipeline (issues #1017, #1043) ────────────────────────────
@@ -198,6 +200,20 @@ fn set_application(env: &Env, app: &ProviderApplication) {
         .set(&OnboardingKey::Application(app.provider.clone()), app);
 }
 
+/// Last consumed verification nonce for `provider`; `0` if none consumed yet.
+fn get_last_nonce(env: &Env, provider: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&OnboardingKey::VerificationNonce(provider.clone()))
+        .unwrap_or(0)
+}
+
+fn set_last_nonce(env: &Env, provider: &Address, nonce: u64) {
+    env.storage()
+        .persistent()
+        .set(&OnboardingKey::VerificationNonce(provider.clone()), &nonce);
+}
+
 fn get_reserves(env: &Env) -> OnboardingReserves {
     env.storage()
         .persistent()
@@ -302,10 +318,14 @@ pub fn get_onboarding_params(env: &Env) -> Option<OnboardingParams> {
 /// * the pipeline is not configured ([`ObErr::NotConfigured`]);
 /// * validation fails (see [`validate_application`]);
 /// * an application for this provider is already `PendingReview` or `Active`
-///   ([`ObErr::DuplicateApplication`]).
+///   ([`ObErr::DuplicateApplication`]);
+/// * `nonce` is not strictly greater than the provider's last consumed nonce
+///   ([`ObErr::NonceReused`]). Nonces start at `1`.
 ///
 /// A previously `Failed` application is replaced by the new one (the
-/// `attempts` counter carries forward).
+/// `attempts` counter carries forward). The nonce is consumed only when the
+/// application is accepted, so a rejected submission can be corrected and
+/// resubmitted with the same nonce.
 pub fn submit_application(
     env: &Env,
     provider: &Address,
@@ -313,6 +333,7 @@ pub fn submit_application(
     metadata_uri: String,
     collateral: i128,
     fee: i128,
+    nonce: u64,
 ) -> Result<ProviderApplication, ObErr> {
     provider.require_auth();
 
@@ -328,6 +349,10 @@ pub fn submit_application(
         },
         None => 0,
     };
+
+    if nonce <= get_last_nonce(env, provider) {
+        return Err(ObErr::NonceReused);
+    }
 
     // ── Reserve funds into the isolated buckets ──────────────────────────────
     let mut reserves = get_reserves(env);
@@ -350,6 +375,7 @@ pub fn submit_application(
         updated_at: now,
     };
     set_application(env, &app);
+    set_last_nonce(env, provider, nonce);
 
     emit_pipeline(env, symbol_short!("ob_sub"), provider, collateral, fee);
     Ok(app)
