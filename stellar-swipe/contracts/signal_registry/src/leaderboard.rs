@@ -193,7 +193,7 @@ pub fn update_leaderboard_index(env: &Env, provider: Address, stats: &ProviderPe
     // after properly-profiled ones with the same score).
     let registered_at = crate::providers::get_provider_profile(env, &provider)
         .map(|p| p.created_at)
-        .unwrap_or(0);
+        .unwrap_or(u64::MAX);
 
     let entry = IndexEntry {
         provider: provider.clone(),
