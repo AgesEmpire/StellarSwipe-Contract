@@ -263,14 +263,16 @@ impl ArchivalRestoreVerifier {
 
         for record in export.records.iter() {
             let restore_key = DataKey::RestoredState(record.contract_id.clone(), record.key.clone());
-            let stored_value: String = env.storage().instance().get(&restore_key).unwrap_or(String::from_str(env, ""));
-            
-            if stored_value != record.value {
+            // A missing restored entry must not default to "" and pass for an
+            // exported empty value: absence is a mismatch.
+            let stored_value: Option<String> = env.storage().instance().get(&restore_key);
+
+            if stored_value.as_ref() != Some(&record.value) {
                 mismatches.push_back(RestoreMismatch {
                     contract_id: record.contract_id.clone(),
                     key: record.key.clone(),
                     expected: record.value.clone(),
-                    actual: stored_value,
+                    actual: stored_value.unwrap_or(String::from_str(env, "")),
                 });
             } else {
                 verified_count += 1;
