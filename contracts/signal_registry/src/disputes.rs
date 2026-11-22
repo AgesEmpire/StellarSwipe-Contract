@@ -28,6 +28,8 @@ pub enum ContractError {
     DisputeNotFound,
     UnauthorizedProvider,
     ResponseWindowClosed,
+    /// A response was already recorded; a dispute response is write-once.
+    ResponseAlreadySubmitted,
     /// The authenticated caller does not match the address bound to the
     /// operation. Returned when authorization is derived from the
     /// authenticated invocation context rather than caller-supplied metadata.
@@ -76,6 +78,10 @@ pub fn respond_to_dispute<Provider: Clone + PartialEq, Hash: Clone>(
     }
     if now > dispute.filed_at.saturating_add(RESPONSE_WINDOW_SECONDS) {
         return Err(ContractError::ResponseWindowClosed);
+    }
+    // A submitted response is terminal: it cannot be replaced.
+    if dispute.response.is_some() {
+        return Err(ContractError::ResponseAlreadySubmitted);
     }
 
     dispute.response = Some(DisputeResponse {
