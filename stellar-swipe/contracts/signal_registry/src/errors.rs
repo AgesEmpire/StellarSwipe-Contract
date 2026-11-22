@@ -1090,6 +1090,8 @@ const ALL_ERROR_CODES: &[u32] = &[
     DisputeError::AppealAlreadySubmitted as u32,
     DisputeError::AppealNotPending as u32,
     DisputeError::AppealWindowNotElapsed as u32,
+    DisputeError::InvalidEvidenceDigest as u32,
+    DisputeError::InvalidEvidenceDeadline as u32,
     // ProviderOnboardingError (issues #1017, #1043)
     ProviderOnboardingError::NotConfigured as u32,
     ProviderOnboardingError::EmptyProviderId as u32,

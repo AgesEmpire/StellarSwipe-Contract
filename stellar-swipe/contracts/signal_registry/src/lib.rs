@@ -1908,8 +1908,15 @@ impl SignalRegistry {
 
     /// Provider appeals an open community-voting dispute against them (Issue #539).
     /// Only the disputed provider may submit the appeal, and only once per dispute.
-    pub fn submit_dispute_appeal(env: Env, provider: Address) -> Result<(), DisputeError> {
-        submit_appeal(&env, provider)
+    /// `evidence_digest` must be non-zero; `evidence_deadline` must fall within
+    /// (now, now + APPEAL_WINDOW_SECS].
+    pub fn submit_dispute_appeal(
+        env: Env,
+        provider: Address,
+        evidence_digest: BytesN<32>,
+        evidence_deadline: u64,
+    ) -> Result<(), DisputeError> {
+        submit_appeal(&env, provider, evidence_digest, evidence_deadline)
     }
 
     /// Admin decides a pending dispute appeal (admin only). Approving resolves the
