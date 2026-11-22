@@ -1923,7 +1923,7 @@ impl SignalRegistry {
     ) -> Result<(), DisputeError> {
         admin::require_admin(&env, &admin).map_err(|_| DisputeError::Unauthorized)?;
         admin.require_auth();
-        resolve_appeal(&env, provider, approve)
+        resolve_appeal(&env, provider, approve, admin)
     }
 
     /// Auto-rejects a dispute appeal that has sat pending for more than the appeal
@@ -1941,11 +1941,10 @@ impl SignalRegistry {
         admin: Address,
         provider: Address,
         restore: bool,
-    ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &admin)?;
+    ) -> Result<(), DisputeError> {
+        admin::require_admin(&env, &admin).map_err(|_| DisputeError::Unauthorized)?;
         admin.require_auth();
-        resolve_dispute(&env, provider, restore);
-        Ok(())
+        resolve_dispute(&env, provider, restore, admin)
     }
 
     /// Get the current community-voting dispute record for a provider, if any.
