@@ -478,8 +478,9 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Sym
     }
 
     /// # Summary
-    /// Read-only audit that compares the stored treasury balance against the
-    /// contract's actual on-chain token balance for each supplied token.
+    /// Read-only audit that compares the tracked balances (treasury + insurance
+    /// fund + revenue share pool) against the contract's actual on-chain token
+    /// balance for each supplied token. Discrepancies are reported, never corrected.
     ///
     /// Call this off-chain (via `simulateTransaction`) or from monitoring
     /// scripts after unusual activity to detect accounting discrepancies.
@@ -506,7 +507,11 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Sym
         }
         let mut mismatches = Vec::new(&env);
         for token in tokens.iter() {
-            let expected = get_treasury_balance(&env, &token);
+            // Every tracked liability held in this token: treasury, insurance fund,
+            // and revenue share pool. All are single per-token keys, so this stays bounded.
+            let expected = get_treasury_balance(&env, &token)
+                .saturating_add(get_insurance_balance(&env, &token))
+                .saturating_add(storage::get_revenue_share_pool(&env, &token));
             let actual = token::Client::new(&env, &token).balance(&env.current_contract_address());
             if actual != expected {
                 mismatches.push_back(BalanceMismatch {
