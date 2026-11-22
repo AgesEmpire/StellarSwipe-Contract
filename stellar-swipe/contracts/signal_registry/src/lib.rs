@@ -46,11 +46,25 @@ mod storage_layout_tests;
 mod storage_monitor;
 mod submission;
 pub mod submission_quota;
+/// Appeal window for provider suspension decisions (Issue #1420).
+pub mod suspension_appeal;
 mod template_presets;
 mod templates;
 /// Active signal provider cap tests (Issue #743).
 #[cfg(test)]
 mod test_active_signal_cap;
+/// Contest entrant freeze tests (Issue #1421).
+#[cfg(test)]
+mod test_contest_entrants;
+/// Suspension appeal tests (Issue #1420).
+#[cfg(test)]
+mod test_suspension_appeal;
+/// Category-specific submission quota tests (Issue #1422).
+#[cfg(test)]
+mod test_category_quota;
+/// Signal amendment history tests (Issue #1419).
+#[cfg(test)]
+mod test_signal_amendment_history;
 mod test_reputation;
 /// Provider submission cooldown tests (Issue #661).
 #[cfg(test)]
@@ -68,6 +82,7 @@ pub use errors::AdminError;
 pub use expiry::SignalExpiryState;
 pub use migration::{MigrationSnapshot, MigrationVerification, UpgradePreflight, UpgradeReadiness};
 pub use multisig_approvals::CriticalActionPayload;
+pub use suspension_appeal::{AppealOutcome, AppealPolicy, AppealState, SuspensionAppeal};
 pub use types::SignalAction;
 pub use types::{FeeBreakdown, ProviderPerformance, SignalOutcome, SignalStatus};
 /// Re-exported so migration tooling and tests can seed legacy v1 records and
@@ -454,6 +469,35 @@ impl SignalRegistry {
         submission_quota::usage(&env, &provider)
     }
 
+    /// Admin: configure a per-category submission ceiling (Issue #1422).
+    ///
+    /// `category_limit = 0` disables the ceiling for that category.
+    /// When a global `QuotaConfig` is active its `window_ledgers` must match
+    /// the value supplied here, so both quota types share the same window boundary.
+    pub fn set_category_submission_quota(
+        env: Env,
+        caller: Address,
+        category: categories::SignalCategory,
+        config: submission_quota::CategoryQuotaConfig,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        submission_quota::set_category_config(&env, &category, &config)
+    }
+
+    /// Returns the configured per-category submission quota for `category`, if any.
+    pub fn get_category_submission_quota(
+        env: Env,
+        category: categories::SignalCategory,
+    ) -> Option<submission_quota::CategoryQuotaConfig> {
+        submission_quota::get_category_config(&env, &category)
+    }
+
+    /// Returns the number of submissions recorded for `category` in the current window.
+    pub fn get_category_submission_usage(env: Env, category: categories::SignalCategory) -> u32 {
+        submission_quota::category_usage(&env, &category)
+    }
+
     /// Transition a provider's lifecycle status (Issue #1137).
     /// Returns the previous status.
     pub fn set_provider_status(
@@ -468,6 +512,75 @@ impl SignalRegistry {
     /// Canonical lifecycle status of `provider` (Issue #1137).
     pub fn get_provider_status(env: Env, provider: Address) -> provider_status::ProviderStatus {
         provider_status::get_status(&env, &provider)
+    }
+
+    // ── Issue #1420: appeal window for provider suspension decisions ──────────
+
+    /// Admin: configure the appeal window policy (window duration).
+    ///
+    /// `window_secs` must be in
+    /// `[suspension_appeal::MIN_APPEAL_WINDOW_SECS, suspension_appeal::MAX_APPEAL_WINDOW_SECS]`.
+    pub fn set_appeal_policy(
+        env: Env,
+        caller: Address,
+        policy: suspension_appeal::AppealPolicy,
+    ) -> Result<(), AdminError> {
+        admin::require_config_admin(&env, &caller)?;
+        caller.require_auth();
+        suspension_appeal::set_policy(&env, &policy)
+    }
+
+    /// Returns the current appeal policy.
+    pub fn get_appeal_policy(env: Env) -> suspension_appeal::AppealPolicy {
+        suspension_appeal::get_policy(&env)
+    }
+
+    /// Whether `provider` is currently eligible to submit an appeal.
+    pub fn is_appeal_eligible(env: Env, provider: Address) -> bool {
+        suspension_appeal::is_eligible(&env, &provider)
+    }
+
+    /// Suspended provider submits an appeal within the configured window (Issue #1420).
+    ///
+    /// Returns the created `SuspensionAppeal` record.
+    ///
+    /// # Errors
+    /// - `AdminError::Unauthorized` — provider is not suspended.
+    /// - `AdminError::AlreadyApproved` — a prior appeal already exists.
+    pub fn submit_suspension_appeal(
+        env: Env,
+        provider: Address,
+    ) -> Result<suspension_appeal::SuspensionAppeal, AdminError> {
+        suspension_appeal::submit_appeal(&env, &provider)
+    }
+
+    /// Returns the appeal record for `provider`, if one exists.
+    pub fn get_suspension_appeal(
+        env: Env,
+        provider: Address,
+    ) -> Option<suspension_appeal::SuspensionAppeal> {
+        suspension_appeal::get_appeal(&env, &provider)
+    }
+
+    /// Authorized reviewer resolves a pending appeal (Issue #1420).
+    ///
+    /// On approval the provider's status becomes `Active`.
+    /// On denial the provider's status becomes `Banned`.
+    /// Late resolution (past deadline) returns `AdminError::PauseExpired` and
+    /// records the appeal as auto-denied.
+    ///
+    /// # Errors
+    /// - `AdminError::Unauthorized` — caller is not the admin.
+    /// - `AdminError::ProposalNotFound` — no appeal record for this provider.
+    /// - `AdminError::ProposalAlreadyExecuted` — appeal already resolved.
+    /// - `AdminError::PauseExpired` — appeal deadline has passed.
+    pub fn resolve_suspension_appeal(
+        env: Env,
+        reviewer: Address,
+        provider: Address,
+        outcome: suspension_appeal::AppealOutcome,
+    ) -> Result<(), AdminError> {
+        suspension_appeal::resolve_appeal(&env, &reviewer, &provider, outcome)
     }
 
     /// Returns the current per-provider daily signal creation cap (0 = disabled).
@@ -1313,7 +1426,8 @@ impl SignalRegistry {
         }
 
         // Issue #1138: ledger-window quotas (read-only check, no writes yet).
-        submission_quota::check(env, &provider)?;
+        // Issue #1422: also enforces per-category ceilings.
+        submission_quota::check(env, &provider, &category)?;
 
         // Verify provider account still exists on Stellar
         if !Self::check_provider_exists(env, &provider) {
@@ -1484,8 +1598,8 @@ impl SignalRegistry {
                 .set(&count_key, &current.saturating_add(1));
         }
 
-        // Issue #1138: consume quota only once the submission fully succeeded.
-        submission_quota::consume(env, &provider);
+        // Issue #1138 / #1422: consume quota (global + category) only once the submission fully succeeded.
+        submission_quota::consume(env, &provider, &category);
 
         Ok(id)
     }
@@ -3289,6 +3403,16 @@ impl SignalRegistry {
         contests::finalize_contest(&env, contest_id)
     }
 
+    /// Start a contest: capture a deterministic entrant snapshot and freeze
+    /// the participant set so no new entries are accepted (Issue #1421).
+    ///
+    /// Returns the sorted list of entrant addresses recorded in the snapshot.
+    /// The contest must be in `Active` status; calling this twice returns
+    /// `ContestError::AlreadyFinalized`.
+    pub fn start_contest(env: Env, contest_id: u64) -> Result<Vec<Address>, ContestError> {
+        contests::start_contest(&env, contest_id)
+    }
+
     /// Get contest details
     pub fn get_contest(env: Env, contest_id: u64) -> Result<Contest, ContestError> {
         contests::get_contest(&env, contest_id)
@@ -3350,6 +3474,38 @@ impl SignalRegistry {
     /// Get version history for a signal
     pub fn get_signal_history(env: Env, signal_id: u64) -> Vec<SignalVersion> {
         versioning::get_signal_history(&env, signal_id)
+    }
+
+    // ── Issue #1419: immutable amendment revision queries ─────────────────────
+
+    /// Return the `SignalVersion` snapshot for a specific `revision` of `signal_id`.
+    ///
+    /// Revisions are monotonically numbered from `1`.  Returns `None` when no
+    /// snapshot exists for the requested revision.
+    pub fn get_signal_revision(env: Env, signal_id: u64, revision: u32) -> Option<SignalVersion> {
+        versioning::get_revision(&env, signal_id, revision)
+    }
+
+    /// Return the most recently stored amendment snapshot for `signal_id`.
+    ///
+    /// This is the state captured just before the latest amendment was applied.
+    /// Returns `None` if the signal has never been amended.
+    pub fn get_signal_current_revision(env: Env, signal_id: u64) -> Option<SignalVersion> {
+        versioning::get_current_revision(&env, signal_id)
+    }
+
+    /// Return a prior revision bounded by `max_lookback` steps from the current
+    /// latest version (Issue #1419).
+    ///
+    /// `revision` is clamped to `[max(1, latest - max_lookback), latest]`.
+    /// Returns `None` when no snapshot is stored for the clamped revision.
+    pub fn get_signal_prior_revision(
+        env: Env,
+        signal_id: u64,
+        revision: u32,
+        max_lookback: u32,
+    ) -> Option<SignalVersion> {
+        versioning::get_prior_revision(&env, signal_id, revision, max_lookback)
     }
 
     /// Record when a user copies a signal
