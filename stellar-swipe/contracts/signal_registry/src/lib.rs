@@ -1908,8 +1908,15 @@ impl SignalRegistry {
 
     /// Provider appeals an open community-voting dispute against them (Issue #539).
     /// Only the disputed provider may submit the appeal, and only once per dispute.
-    pub fn submit_dispute_appeal(env: Env, provider: Address) -> Result<(), DisputeError> {
-        submit_appeal(&env, provider)
+    /// `evidence_digest` must be non-zero; `evidence_deadline` must fall within
+    /// (now, now + APPEAL_WINDOW_SECS].
+    pub fn submit_dispute_appeal(
+        env: Env,
+        provider: Address,
+        evidence_digest: BytesN<32>,
+        evidence_deadline: u64,
+    ) -> Result<(), DisputeError> {
+        submit_appeal(&env, provider, evidence_digest, evidence_deadline)
     }
 
     /// Admin decides a pending dispute appeal (admin only). Approving resolves the
@@ -1923,7 +1930,7 @@ impl SignalRegistry {
     ) -> Result<(), DisputeError> {
         admin::require_admin(&env, &admin).map_err(|_| DisputeError::Unauthorized)?;
         admin.require_auth();
-        resolve_appeal(&env, provider, approve)
+        resolve_appeal(&env, provider, approve, admin)
     }
 
     /// Auto-rejects a dispute appeal that has sat pending for more than the appeal
@@ -1941,11 +1948,10 @@ impl SignalRegistry {
         admin: Address,
         provider: Address,
         restore: bool,
-    ) -> Result<(), AdminError> {
-        admin::require_admin(&env, &admin)?;
+    ) -> Result<(), DisputeError> {
+        admin::require_admin(&env, &admin).map_err(|_| DisputeError::Unauthorized)?;
         admin.require_auth();
-        resolve_dispute(&env, provider, restore);
-        Ok(())
+        resolve_dispute(&env, provider, restore, admin)
     }
 
     /// Get the current community-voting dispute record for a provider, if any.

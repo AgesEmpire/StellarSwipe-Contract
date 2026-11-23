@@ -10,7 +10,7 @@
 //! `process_appeal_timeout` auto-advances the appeal to `Rejected` so a
 //! dispute can't be left in limbo forever by an unresponsive admin.
 
-use soroban_sdk::{contracterror, contracttype, Address, Env, Map, Symbol, Vec};
+use soroban_sdk::{contracterror, contracttype, Address, BytesN, Env, Map, Symbol, Vec};
 
 /// 10 XLM in stroops = 1 vote unit
 pub const VOTE_POWER_DIVISOR: i128 = 100_000_000;
@@ -63,6 +63,28 @@ pub enum AppealStatus {
     Rejected,
 }
 
+/// Schema version of [`DisputeResolvedEvent`]. Bump on breaking field changes (see docs/events.md).
+pub const DISPUTE_RESOLVED_SCHEMA_VERSION: u32 = 1;
+
+/// Versioned resolution event for indexers. Emitted exactly once when a dispute
+/// moves Open -> Resolved; rejected resolution calls emit nothing.
+/// Disputes are keyed by provider, so the subject is `provider` (no signal id exists on the record).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisputeResolvedEvent {
+    pub schema_version: u32,
+    pub provider: Address,
+    pub opened_at: u64,
+    pub downvote_bps: u32,
+    /// Appeal state at resolution. `Approved` when resolved via an approved appeal.
+    pub appeal_status: AppealStatus,
+    /// Outcome: true when the provider's score was unfrozen and a recovery step applied.
+    pub restored: bool,
+    /// Admin who resolved the dispute.
+    pub resolver: Address,
+    pub resolved_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct DisputeRecord {
@@ -73,6 +95,10 @@ pub struct DisputeRecord {
     pub appeal_status: AppealStatus,
     /// Ledger timestamp the current appeal was submitted at; 0 if none was submitted.
     pub appeal_submitted_at: u64,
+    /// Evidence digest supplied with the current appeal; `None` if none was submitted.
+    pub appeal_evidence_digest: Option<BytesN<32>>,
+    /// Deadline supplied with the current appeal's evidence; 0 if none was submitted.
+    pub appeal_evidence_deadline: u64,
 }
 
 /// Issue #782: renumbered from 1-6, which collided with `AdminError`
@@ -88,6 +114,10 @@ pub enum DisputeError {
     AppealAlreadySubmitted = 1603,
     AppealNotPending = 1604,
     AppealWindowNotElapsed = 1605,
+    /// Evidence digest is the all-zero placeholder rather than a real digest.
+    InvalidEvidenceDigest = 1606,
+    /// Evidence deadline is not in the future or exceeds the appeal window.
+    InvalidEvidenceDeadline = 1607,
 }
 
 #[contracttype]
@@ -251,6 +281,8 @@ fn open_dispute(env: &Env, provider: &Address, downvote_bps: u32) {
         downvote_bps,
         appeal_status: AppealStatus::None,
         appeal_submitted_at: 0,
+        appeal_evidence_digest: None,
+        appeal_evidence_deadline: 0,
     };
     env.storage().persistent().set(&dispute_key, &record);
     env.storage()
@@ -263,23 +295,26 @@ fn open_dispute(env: &Env, provider: &Address, downvote_bps: u32) {
     );
 }
 
-/// Admin resolves a dispute directly. If `restore` is true, score is unfrozen and
+/// Admin resolves an open dispute. If `restore` is true, score is unfrozen and
 /// recovery begins. Any appeal still `Pending` is cleared, since the dispute it was
-/// raised against is being closed out by this call.
-pub fn resolve_dispute(env: &Env, provider: Address, restore: bool) {
+/// raised against is being closed out by this call. Fails without side effects if
+/// the dispute does not exist or is already resolved.
+pub fn resolve_dispute(
+    env: &Env,
+    provider: Address,
+    restore: bool,
+    resolver: Address,
+) -> Result<(), DisputeError> {
     let dispute_key = VotingKey::Dispute(provider.clone());
-    let mut record: DisputeRecord =
-        env.storage()
-            .persistent()
-            .get(&dispute_key)
-            .unwrap_or(DisputeRecord {
-                provider: provider.clone(),
-                opened_at: 0,
-                status: DisputeStatus::Resolved,
-                downvote_bps: 0,
-                appeal_status: AppealStatus::None,
-                appeal_submitted_at: 0,
-            });
+    let mut record: DisputeRecord = env
+        .storage()
+        .persistent()
+        .get(&dispute_key)
+        .ok_or(DisputeError::DisputeNotFound)?;
+
+    if record.status != DisputeStatus::Open {
+        return Err(DisputeError::DisputeNotOpen);
+    }
 
     record.status = DisputeStatus::Resolved;
     if record.appeal_status == AppealStatus::Pending {
@@ -297,13 +332,33 @@ pub fn resolve_dispute(env: &Env, provider: Address, restore: bool) {
 
     env.events().publish(
         (Symbol::new(env, "dispute_resolved"), provider.clone()),
-        restore,
+        DisputeResolvedEvent {
+            schema_version: DISPUTE_RESOLVED_SCHEMA_VERSION,
+            provider: provider.clone(),
+            opened_at: record.opened_at,
+            downvote_bps: record.downvote_bps,
+            appeal_status: record.appeal_status.clone(),
+            restored: restore,
+            resolver,
+            resolved_at: env.ledger().timestamp(),
+        },
     );
+    Ok(())
 }
 
 /// Disputed provider submits an appeal of an open dispute. Only the provider the
 /// dispute was opened against may appeal it, and only once per dispute.
-pub fn submit_appeal(env: &Env, provider: Address) -> Result<(), DisputeError> {
+///
+/// The appeal must carry an explicit evidence digest (never the all-zero
+/// placeholder) and an evidence deadline that is strictly after now and at most
+/// [`APPEAL_WINDOW_SECS`] ahead. Both are stored on the dispute and emitted in
+/// the `appeal_submitted` event.
+pub fn submit_appeal(
+    env: &Env,
+    provider: Address,
+    evidence_digest: BytesN<32>,
+    evidence_deadline: u64,
+) -> Result<(), DisputeError> {
     provider.require_auth();
 
     let dispute_key = VotingKey::Dispute(provider.clone());
@@ -319,14 +374,23 @@ pub fn submit_appeal(env: &Env, provider: Address) -> Result<(), DisputeError> {
     if record.appeal_status != AppealStatus::None {
         return Err(DisputeError::AppealAlreadySubmitted);
     }
+    if evidence_digest.to_array() == [0u8; 32] {
+        return Err(DisputeError::InvalidEvidenceDigest);
+    }
+    let now = env.ledger().timestamp();
+    if evidence_deadline <= now || evidence_deadline > now.saturating_add(APPEAL_WINDOW_SECS) {
+        return Err(DisputeError::InvalidEvidenceDeadline);
+    }
 
     record.appeal_status = AppealStatus::Pending;
-    record.appeal_submitted_at = env.ledger().timestamp();
+    record.appeal_submitted_at = now;
+    record.appeal_evidence_digest = Some(evidence_digest.clone());
+    record.appeal_evidence_deadline = evidence_deadline;
     env.storage().persistent().set(&dispute_key, &record);
 
     env.events().publish(
         (Symbol::new(env, "appeal_submitted"), provider.clone()),
-        record.appeal_submitted_at,
+        (now, evidence_digest, evidence_deadline),
     );
     Ok(())
 }
@@ -334,7 +398,12 @@ pub fn submit_appeal(env: &Env, provider: Address) -> Result<(), DisputeError> {
 /// Admin decides a pending appeal. Approving resolves the dispute in the provider's
 /// favor (score unfrozen and one recovery step applied); rejecting leaves the original
 /// dispute in place for the admin to resolve separately via `resolve_dispute`.
-pub fn resolve_appeal(env: &Env, provider: Address, approve: bool) -> Result<(), DisputeError> {
+pub fn resolve_appeal(
+    env: &Env,
+    provider: Address,
+    approve: bool,
+    resolver: Address,
+) -> Result<(), DisputeError> {
     let dispute_key = VotingKey::Dispute(provider.clone());
     let mut record: DisputeRecord = env
         .storage()
@@ -354,7 +423,7 @@ pub fn resolve_appeal(env: &Env, provider: Address, approve: bool) -> Result<(),
     env.storage().persistent().set(&dispute_key, &record);
 
     if approve {
-        resolve_dispute(env, provider.clone(), true);
+        resolve_dispute(env, provider.clone(), true, resolver)?;
     }
 
     env.events().publish(
@@ -575,7 +644,7 @@ mod tests {
             open_dispute_for(env, cid, &provider);
 
             in_contract(env, cid, |env| {
-                resolve_dispute(env, provider.clone(), true);
+                resolve_dispute(env, provider.clone(), true, Address::generate(env)).unwrap();
             });
 
             in_contract(env, cid, |env| {
@@ -661,7 +730,7 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
 
             in_contract(env, cid, |env| {
                 let dispute = get_dispute(env, &provider).unwrap();
@@ -675,7 +744,7 @@ mod tests {
     fn test_submit_appeal_without_dispute_fails() {
         with_registry(|env, _cid, client, _admin| {
             let provider = Address::generate(env);
-            let result = client.try_submit_dispute_appeal(&provider);
+            let result = client.try_submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
             assert_eq!(result, Err(Ok(DisputeError::DisputeNotFound)));
         });
     }
@@ -686,8 +755,8 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
-            let result = client.try_submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
+            let result = client.try_submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
             assert_eq!(result, Err(Ok(DisputeError::AppealAlreadySubmitted)));
         });
     }
@@ -698,7 +767,7 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
             client.resolve_dispute_appeal(admin, &provider, &true);
 
             in_contract(env, cid, |env| {
@@ -721,7 +790,7 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
             client.resolve_dispute_appeal(admin, &provider, &false);
 
             in_contract(env, cid, |env| {
@@ -729,7 +798,7 @@ mod tests {
                 assert_eq!(dispute.appeal_status, AppealStatus::Rejected);
                 assert_eq!(dispute.status, DisputeStatus::Open);
 
-                resolve_dispute(env, provider.clone(), true);
+                resolve_dispute(env, provider.clone(), true, Address::generate(env)).unwrap();
                 assert_eq!(
                     get_dispute(env, &provider).unwrap().status,
                     DisputeStatus::Resolved
@@ -755,7 +824,7 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
 
             env.ledger()
                 .set_timestamp(env.ledger().timestamp() + APPEAL_WINDOW_SECS - 1);
@@ -770,7 +839,7 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
 
             env.ledger()
                 .set_timestamp(env.ledger().timestamp() + APPEAL_WINDOW_SECS + 1);

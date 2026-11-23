@@ -1788,6 +1788,8 @@ impl StakeVaultContract {
             env.storage()
                 .persistent()
                 .set(&MigrationKey::StakesV2, &stakes);
+            // Settle rewards at the pre-restore weight before the restored balance takes effect.
+            reward_index::on_stake_change(env, &record.provider, restored_balance)?;
 
             if held > 0 {
                 env.storage()
@@ -2846,10 +2848,13 @@ impl StakeVaultContract {
 
         info.balance = info.balance.saturating_sub(own_slash);
         info.last_updated = env.ledger().timestamp();
+        let slashed_balance = info.balance;
         stakes.set(provider.clone(), info);
         env.storage()
             .persistent()
             .set(&MigrationKey::StakesV2, &stakes);
+        // Settle rewards at the pre-slash weight before the reduced balance takes effect.
+        reward_index::on_stake_change(env, &provider, slashed_balance)?;
 
         // ── Slash delegated stakes pro-rata (issue #688) ──────────────────────
         let mut delegated: soroban_sdk::Map<Address, i128> = env

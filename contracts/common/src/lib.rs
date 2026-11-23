@@ -2,6 +2,18 @@
 
 pub mod decimal;
 
+// Issue #1414: epoch-boundary validator-set rotation for the bridge.
+pub mod bridge_epoch_rotation;
+
+// Issue #1413: channel-and-direction scoped replay nonces for the bridge.
+pub mod bridge_channel_nonce;
+
+// Issue #1412: versioned bridge attestation envelopes.
+pub mod bridge_attestation;
+
+// Issue #1411: deterministic multi-hop oracle path selection.
+pub mod oracle_path;
+
 use serde::{Deserialize, Serialize};
 
 /// Error returned when a bounded vector fails validation.

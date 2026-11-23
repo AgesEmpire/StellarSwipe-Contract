@@ -169,13 +169,17 @@ pub fn distribute_validator_rewards(env: &Env, bridge_id: u64) -> Result<(), Str
         return Err(String::from_str(env, "No validators found"));
     }
 
-    let per_validator = validator_share / validators.len() as i128;
+    let count = validators.len() as i128;
+    let per_validator = validator_share / count;
+    // Remainder units go one each to the first validators in set order, so payouts sum to validator_share.
+    let remainder = validator_share % count;
 
     for i in 0..validators.len() {
         let validator: Address = validators.get(i).unwrap();
+        let payout = per_validator + if (i as i128) < remainder { 1 } else { 0 };
         env.events().publish(
             (Symbol::new(env, "validator_reward_dist"), bridge_id),
-            (validator, per_validator),
+            (validator, payout),
         );
     }
 

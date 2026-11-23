@@ -392,7 +392,9 @@
         "DisputeNotOpen": 1602,
         "AppealAlreadySubmitted": 1603,
         "AppealNotPending": 1604,
-        "AppealWindowNotElapsed": 1605
+        "AppealWindowNotElapsed": 1605,
+        "InvalidEvidenceDigest": 1606,
+        "InvalidEvidenceDeadline": 1607
       },
       "ExportError": {
         "UnsupportedFormat": 700,
@@ -444,7 +446,8 @@
         "NothingToRefund": 1711,
         "ArithmeticError": 1712,
         "Unauthorized": 1713,
-        "InvalidConfig": 1714
+        "InvalidConfig": 1714,
+        "NonceReused": 1715
       },
       "SignalCancelError": {
         "NotFound": 1300,

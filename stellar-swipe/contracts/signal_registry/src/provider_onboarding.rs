@@ -45,6 +45,8 @@ pub struct OnboardingRecord {
     pub status: OnboardingStatus,
     /// Ledger timestamp of the most recent state change.
     pub updated_at: u64,
+    /// Exact terms revision the provider last accepted (`0` = none).
+    pub terms_revision: u32,
 }
 
 /// Persistent storage key for onboarding records.
@@ -52,6 +54,8 @@ pub struct OnboardingRecord {
 #[derive(Clone)]
 pub enum OnboardingKey {
     Record(Address),
+    /// Governance-required minimum terms revision (absent = `0`, no policy).
+    RequiredTermsRevision,
     /// Validated onboarding application with reserved collateral / fees
     /// (issues #1017, #1043).
     Application(Address),
@@ -59,6 +63,8 @@ pub enum OnboardingKey {
     Reserves,
     /// Governance-configured onboarding parameters.
     Params,
+    /// Last verification nonce consumed by a provider's application.
+    VerificationNonce(Address),
 }
 
 // ── Rich onboarding pipeline (issues #1017, #1043) ────────────────────────────
@@ -198,6 +204,20 @@ fn set_application(env: &Env, app: &ProviderApplication) {
         .set(&OnboardingKey::Application(app.provider.clone()), app);
 }
 
+/// Last consumed verification nonce for `provider`; `0` if none consumed yet.
+fn get_last_nonce(env: &Env, provider: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&OnboardingKey::VerificationNonce(provider.clone()))
+        .unwrap_or(0)
+}
+
+fn set_last_nonce(env: &Env, provider: &Address, nonce: u64) {
+    env.storage()
+        .persistent()
+        .set(&OnboardingKey::VerificationNonce(provider.clone()), &nonce);
+}
+
 fn get_reserves(env: &Env) -> OnboardingReserves {
     env.storage()
         .persistent()
@@ -302,10 +322,14 @@ pub fn get_onboarding_params(env: &Env) -> Option<OnboardingParams> {
 /// * the pipeline is not configured ([`ObErr::NotConfigured`]);
 /// * validation fails (see [`validate_application`]);
 /// * an application for this provider is already `PendingReview` or `Active`
-///   ([`ObErr::DuplicateApplication`]).
+///   ([`ObErr::DuplicateApplication`]);
+/// * `nonce` is not strictly greater than the provider's last consumed nonce
+///   ([`ObErr::NonceReused`]). Nonces start at `1`.
 ///
 /// A previously `Failed` application is replaced by the new one (the
-/// `attempts` counter carries forward).
+/// `attempts` counter carries forward). The nonce is consumed only when the
+/// application is accepted, so a rejected submission can be corrected and
+/// resubmitted with the same nonce.
 pub fn submit_application(
     env: &Env,
     provider: &Address,
@@ -313,6 +337,7 @@ pub fn submit_application(
     metadata_uri: String,
     collateral: i128,
     fee: i128,
+    nonce: u64,
 ) -> Result<ProviderApplication, ObErr> {
     provider.require_auth();
 
@@ -328,6 +353,10 @@ pub fn submit_application(
         },
         None => 0,
     };
+
+    if nonce <= get_last_nonce(env, provider) {
+        return Err(ObErr::NonceReused);
+    }
 
     // ── Reserve funds into the isolated buckets ──────────────────────────────
     let mut reserves = get_reserves(env);
@@ -350,6 +379,7 @@ pub fn submit_application(
         updated_at: now,
     };
     set_application(env, &app);
+    set_last_nonce(env, provider, nonce);
 
     emit_pipeline(env, symbol_short!("ob_sub"), provider, collateral, fee);
     Ok(app)
@@ -495,9 +525,46 @@ fn emit(env: &Env, topic: Symbol, provider: &Address, status: &OnboardingStatus)
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Register a provider for onboarding review.
+/// Governance: set the minimum terms revision providers must have accepted.
 ///
-/// The provider must authenticate the call.
+/// `0` clears the policy. Providers below this revision cannot register or be
+/// approved until they call [`accept_terms`].
+pub fn set_required_terms_revision(env: &Env, governance: &Address, revision: u32) {
+    governance.require_auth();
+    env.storage()
+        .persistent()
+        .set(&OnboardingKey::RequiredTermsRevision, &revision);
+}
+
+/// Read the governance-required minimum terms revision (`0` = no policy).
+pub fn get_required_terms_revision(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&OnboardingKey::RequiredTermsRevision)
+        .unwrap_or(0)
+}
+
+/// Provider: accept a terms revision. Must be at least the required revision.
+///
+/// `0` is never a valid acceptance (it means "missing").
+pub fn accept_terms(env: &Env, provider: &Address, terms_revision: u32) {
+    provider.require_auth();
+    assert!(terms_revision > 0, "terms revision missing");
+    assert!(
+        terms_revision >= get_required_terms_revision(env),
+        "outdated terms revision"
+    );
+    let mut record = get_record(env, provider).expect("provider not found");
+    record.terms_revision = terms_revision;
+    record.updated_at = env.ledger().timestamp();
+    set_record(env, &record);
+}
+
+/// Register a provider for onboarding review, recording the terms revision
+/// they accepted.
+///
+/// The provider must authenticate the call. Panics if `terms_revision` is
+/// missing (`0`) or below the governance-required revision.
 ///
 /// Registration is **idempotent** (issue #1025): a retry after a partial
 /// submission or network hiccup does not create a second record or re-emit the
@@ -505,7 +572,7 @@ fn emit(env: &Env, topic: Symbol, provider: &Address, status: &OnboardingStatus)
 /// [`OnboardingRecord`] is returned unchanged and no storage mutation occurs.
 /// A rejected provider that wants a fresh review must call
 /// [`request_reverification`] rather than re-registering.
-pub fn register_provider(env: &Env, provider: &Address) -> OnboardingRecord {
+pub fn register_provider(env: &Env, provider: &Address, terms_revision: u32) -> OnboardingRecord {
     provider.require_auth();
 
     // Idempotent retry: the registration already succeeded — return the
@@ -514,10 +581,17 @@ pub fn register_provider(env: &Env, provider: &Address) -> OnboardingRecord {
         return existing;
     }
 
+    assert!(terms_revision > 0, "terms revision missing");
+    assert!(
+        terms_revision >= get_required_terms_revision(env),
+        "outdated terms revision"
+    );
+
     let record = OnboardingRecord {
         provider: provider.clone(),
         status: OnboardingStatus::Pending,
         updated_at: env.ledger().timestamp(),
+        terms_revision,
     };
     set_record(env, &record);
     emit(
@@ -531,12 +605,16 @@ pub fn register_provider(env: &Env, provider: &Address) -> OnboardingRecord {
 
 /// Governance: approve a `Pending` provider.
 ///
-/// `governance` must authenticate the call.
+/// `governance` must authenticate the call. Panics if the provider has not
+/// accepted the currently required terms revision.
 pub fn approve_provider(env: &Env, governance: &Address, provider: &Address) {
     governance.require_auth();
     let mut record = get_record(env, provider).expect("provider not found");
     if record.status != OnboardingStatus::Pending {
         panic!("provider is not pending");
+    }
+    if record.terms_revision < get_required_terms_revision(env) {
+        panic!("provider has not accepted required terms revision");
     }
     record.status = OnboardingStatus::Approved;
     record.updated_at = env.ledger().timestamp();
@@ -637,7 +715,7 @@ mod tests {
     fn register_sets_pending_status() {
         let (e, cid) = env();
         let provider = Address::generate(&e);
-        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider, 1));
         let rec = e
             .as_contract(&cid, || get_onboarding_record(&e, &provider))
             .unwrap();
@@ -649,8 +727,8 @@ mod tests {
     fn register_twice_panics() {
         let (e, cid) = env();
         let provider = Address::generate(&e);
-        e.as_contract(&cid, || register_provider(&e, &provider));
-        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider, 1));
+        e.as_contract(&cid, || register_provider(&e, &provider, 1));
     }
 
     // ── approve ───────────────────────────────────────────────────────────
@@ -660,7 +738,7 @@ mod tests {
         let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider, 1));
         e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
         let rec = e
             .as_contract(&cid, || get_onboarding_record(&e, &provider))
@@ -674,7 +752,7 @@ mod tests {
         let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider, 1));
         e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
         e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
     }
@@ -686,7 +764,7 @@ mod tests {
         let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider, 1));
         e.as_contract(&cid, || reject_provider(&e, &gov, &provider));
         let rec = e
             .as_contract(&cid, || get_onboarding_record(&e, &provider))
@@ -700,7 +778,7 @@ mod tests {
         let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider, 1));
         e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
         e.as_contract(&cid, || reject_provider(&e, &gov, &provider));
     }
@@ -712,7 +790,7 @@ mod tests {
         let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider, 1));
         e.as_contract(&cid, || reject_provider(&e, &gov, &provider));
         e.as_contract(&cid, || request_reverification(&e, &provider));
         let rec = e
@@ -726,7 +804,7 @@ mod tests {
     fn reverification_on_pending_panics() {
         let (e, cid) = env();
         let provider = Address::generate(&e);
-        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider, 1));
         e.as_contract(&cid, || request_reverification(&e, &provider));
     }
 
@@ -736,7 +814,7 @@ mod tests {
         let (e, cid) = env();
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
-        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider, 1));
         e.as_contract(&cid, || approve_provider(&e, &gov, &provider));
         e.as_contract(&cid, || request_reverification(&e, &provider));
     }
@@ -749,7 +827,7 @@ mod tests {
         let provider = Address::generate(&e);
         let gov = Address::generate(&e);
 
-        e.as_contract(&cid, || register_provider(&e, &provider));
+        e.as_contract(&cid, || register_provider(&e, &provider, 1));
         assert_eq!(
             e.as_contract(&cid, || get_onboarding_record(&e, &provider))
                 .unwrap()

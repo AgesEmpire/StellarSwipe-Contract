@@ -106,6 +106,50 @@ pub fn validate_replay_order(events: &[OrderedEvent]) -> Result<(), ReplayError>
     Ok(())
 }
 
+/// Per-stream processing checkpoint. `last_applied` is the highest sequence
+/// for which it and every lower sequence of the stream have been processed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub stream_id: u64,
+    pub last_applied: u64,
+}
+
+/// A sequence that was never observed while a later one was: `expected` is
+/// missing, and `next_seen` is the first later sequence present. Fetch
+/// `expected..next_seen` to recover.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SequenceGap {
+    pub stream_id: u64,
+    pub expected: u64,
+    pub next_seen: u64,
+}
+
+/// Advances `checkpoint` over the events of its stream, in sequence order,
+/// only through the contiguous run starting at `last_applied + 1`. Events at
+/// or below the checkpoint are ignored as already applied. On the first gap the
+/// checkpoint stays at the last contiguous sequence and the gap is returned, so
+/// nothing past an unresolved gap is ever marked processed.
+pub fn advance_checkpoint(
+    checkpoint: &mut Checkpoint,
+    events: &[OrderedEvent],
+) -> Result<u64, SequenceGap> {
+    let mut pending: Vec<u64> = events
+        .iter()
+        .filter(|e| e.stream_id == checkpoint.stream_id && e.sequence > checkpoint.last_applied)
+        .map(|e| e.sequence)
+        .collect();
+    pending.sort_unstable();
+    pending.dedup();
+    for sequence in pending {
+        let expected = checkpoint.last_applied + 1;
+        if sequence != expected {
+            return Err(SequenceGap { stream_id: checkpoint.stream_id, expected, next_seen: sequence });
+        }
+        checkpoint.last_applied = sequence;
+    }
+    Ok(checkpoint.last_applied)
+}
+
 /// Sorts events by (stream_id, sequence) so a batch received in any order
 /// replays deterministically.
 pub fn deterministic_sort(mut events: Vec<OrderedEvent>) -> Vec<OrderedEvent> {
