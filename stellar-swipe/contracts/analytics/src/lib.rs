@@ -13,7 +13,7 @@ pub mod tvl;
 pub mod query_cache;
 
 use query_cache::QueryType;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
 use stellar_swipe_common::SECONDS_PER_WEEK;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -75,6 +75,15 @@ pub struct ProtocolAnalytics {
     pub avg_signal_success_rate: u32,
 }
 
+/// Errors from analytics checkpoint writes.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum CheckpointError {
+    /// Checkpoint is lower than or equal to the stored one (stale/replayed write).
+    Regression = 1,
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -94,6 +103,8 @@ enum DataKey {
     MinSampleSize,
     ProviderReturns(Address),
     ProviderRiskScore(Address),
+    /// Highest analytics checkpoint (event cursor) processed so far.
+    Checkpoint,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -171,6 +182,28 @@ impl AnalyticsContract {
         env.storage()
             .instance()
             .set(&DataKey::CurrentSnapshot, &snapshot);
+    }
+
+    /// Advance the analytics checkpoint. Admin auth required. Must be strictly
+    /// greater than the stored value so delayed writes cannot replay events.
+    pub fn set_checkpoint(env: Env, checkpoint: u64) -> Result<(), CheckpointError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if let Some(current) = env.storage().instance().get::<DataKey, u64>(&DataKey::Checkpoint) {
+            if checkpoint <= current {
+                return Err(CheckpointError::Regression);
+            }
+        }
+        env.storage().instance().set(&DataKey::Checkpoint, &checkpoint);
+        Ok(())
+    }
+
+    pub fn get_checkpoint(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::Checkpoint).unwrap_or(0)
     }
 
     pub fn get_protocol_analytics() -> ProtocolAnalytics {
