@@ -842,6 +842,9 @@ pub enum ProviderOnboardingError {
     Unauthorized = 1713,
     /// Configuration parameter is zero or otherwise outside allowed bounds.
     InvalidConfig = 1714,
+    /// The verification nonce was already consumed by an earlier application
+    /// (or is not greater than the provider's last consumed nonce).
+    NonceReused = 1715,
 }
 
 impl ProviderOnboardingError {
@@ -890,6 +893,9 @@ impl ProviderOnboardingError {
             }
             ProviderOnboardingError::InvalidConfig => {
                 "configuration parameter is zero or outside allowed bounds"
+            }
+            ProviderOnboardingError::NonceReused => {
+                "verification nonce was already consumed or is not greater than the last one"
             }
         }
     }
@@ -1090,6 +1096,8 @@ const ALL_ERROR_CODES: &[u32] = &[
     DisputeError::AppealAlreadySubmitted as u32,
     DisputeError::AppealNotPending as u32,
     DisputeError::AppealWindowNotElapsed as u32,
+    DisputeError::InvalidEvidenceDigest as u32,
+    DisputeError::InvalidEvidenceDeadline as u32,
     // ProviderOnboardingError (issues #1017, #1043)
     ProviderOnboardingError::NotConfigured as u32,
     ProviderOnboardingError::EmptyProviderId as u32,
@@ -1106,6 +1114,7 @@ const ALL_ERROR_CODES: &[u32] = &[
     ProviderOnboardingError::ArithmeticError as u32,
     ProviderOnboardingError::Unauthorized as u32,
     ProviderOnboardingError::InvalidConfig as u32,
+    ProviderOnboardingError::NonceReused as u32,
     // ProviderStatusError
     ProviderStatusError::Unauthorized as u32,
     ProviderStatusError::InvalidTransition as u32,

@@ -10,7 +10,7 @@
 //! `process_appeal_timeout` auto-advances the appeal to `Rejected` so a
 //! dispute can't be left in limbo forever by an unresponsive admin.
 
-use soroban_sdk::{contracterror, contracttype, Address, Env, Map, Symbol, Vec};
+use soroban_sdk::{contracterror, contracttype, Address, BytesN, Env, Map, Symbol, Vec};
 
 /// 10 XLM in stroops = 1 vote unit
 pub const VOTE_POWER_DIVISOR: i128 = 100_000_000;
@@ -95,6 +95,10 @@ pub struct DisputeRecord {
     pub appeal_status: AppealStatus,
     /// Ledger timestamp the current appeal was submitted at; 0 if none was submitted.
     pub appeal_submitted_at: u64,
+    /// Evidence digest supplied with the current appeal; `None` if none was submitted.
+    pub appeal_evidence_digest: Option<BytesN<32>>,
+    /// Deadline supplied with the current appeal's evidence; 0 if none was submitted.
+    pub appeal_evidence_deadline: u64,
 }
 
 /// Issue #782: renumbered from 1-6, which collided with `AdminError`
@@ -110,6 +114,10 @@ pub enum DisputeError {
     AppealAlreadySubmitted = 1603,
     AppealNotPending = 1604,
     AppealWindowNotElapsed = 1605,
+    /// Evidence digest is the all-zero placeholder rather than a real digest.
+    InvalidEvidenceDigest = 1606,
+    /// Evidence deadline is not in the future or exceeds the appeal window.
+    InvalidEvidenceDeadline = 1607,
 }
 
 #[contracttype]
@@ -273,6 +281,8 @@ fn open_dispute(env: &Env, provider: &Address, downvote_bps: u32) {
         downvote_bps,
         appeal_status: AppealStatus::None,
         appeal_submitted_at: 0,
+        appeal_evidence_digest: None,
+        appeal_evidence_deadline: 0,
     };
     env.storage().persistent().set(&dispute_key, &record);
     env.storage()
@@ -338,7 +348,17 @@ pub fn resolve_dispute(
 
 /// Disputed provider submits an appeal of an open dispute. Only the provider the
 /// dispute was opened against may appeal it, and only once per dispute.
-pub fn submit_appeal(env: &Env, provider: Address) -> Result<(), DisputeError> {
+///
+/// The appeal must carry an explicit evidence digest (never the all-zero
+/// placeholder) and an evidence deadline that is strictly after now and at most
+/// [`APPEAL_WINDOW_SECS`] ahead. Both are stored on the dispute and emitted in
+/// the `appeal_submitted` event.
+pub fn submit_appeal(
+    env: &Env,
+    provider: Address,
+    evidence_digest: BytesN<32>,
+    evidence_deadline: u64,
+) -> Result<(), DisputeError> {
     provider.require_auth();
 
     let dispute_key = VotingKey::Dispute(provider.clone());
@@ -354,14 +374,23 @@ pub fn submit_appeal(env: &Env, provider: Address) -> Result<(), DisputeError> {
     if record.appeal_status != AppealStatus::None {
         return Err(DisputeError::AppealAlreadySubmitted);
     }
+    if evidence_digest.to_array() == [0u8; 32] {
+        return Err(DisputeError::InvalidEvidenceDigest);
+    }
+    let now = env.ledger().timestamp();
+    if evidence_deadline <= now || evidence_deadline > now.saturating_add(APPEAL_WINDOW_SECS) {
+        return Err(DisputeError::InvalidEvidenceDeadline);
+    }
 
     record.appeal_status = AppealStatus::Pending;
-    record.appeal_submitted_at = env.ledger().timestamp();
+    record.appeal_submitted_at = now;
+    record.appeal_evidence_digest = Some(evidence_digest.clone());
+    record.appeal_evidence_deadline = evidence_deadline;
     env.storage().persistent().set(&dispute_key, &record);
 
     env.events().publish(
         (Symbol::new(env, "appeal_submitted"), provider.clone()),
-        record.appeal_submitted_at,
+        (now, evidence_digest, evidence_deadline),
     );
     Ok(())
 }
@@ -701,7 +730,7 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
 
             in_contract(env, cid, |env| {
                 let dispute = get_dispute(env, &provider).unwrap();
@@ -715,7 +744,7 @@ mod tests {
     fn test_submit_appeal_without_dispute_fails() {
         with_registry(|env, _cid, client, _admin| {
             let provider = Address::generate(env);
-            let result = client.try_submit_dispute_appeal(&provider);
+            let result = client.try_submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
             assert_eq!(result, Err(Ok(DisputeError::DisputeNotFound)));
         });
     }
@@ -726,8 +755,8 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
-            let result = client.try_submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
+            let result = client.try_submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
             assert_eq!(result, Err(Ok(DisputeError::AppealAlreadySubmitted)));
         });
     }
@@ -738,7 +767,7 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
             client.resolve_dispute_appeal(admin, &provider, &true);
 
             in_contract(env, cid, |env| {
@@ -761,7 +790,7 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
             client.resolve_dispute_appeal(admin, &provider, &false);
 
             in_contract(env, cid, |env| {
@@ -795,7 +824,7 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
 
             env.ledger()
                 .set_timestamp(env.ledger().timestamp() + APPEAL_WINDOW_SECS - 1);
@@ -810,7 +839,7 @@ mod tests {
             let provider = Address::generate(env);
             open_dispute_for(env, cid, &provider);
 
-            client.submit_dispute_appeal(&provider);
+            client.submit_dispute_appeal(&provider, &BytesN::from_array(env, &[1u8; 32]), &(env.ledger().timestamp() + 60));
 
             env.ledger()
                 .set_timestamp(env.ledger().timestamp() + APPEAL_WINDOW_SECS + 1);
