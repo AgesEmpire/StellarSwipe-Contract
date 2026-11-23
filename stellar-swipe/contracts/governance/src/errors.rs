@@ -280,4 +280,12 @@ impl GovernanceError {
     /// An amendment would reset cast votes with less than
     /// `MIN_REVOTE_WINDOW_SECS` of voting time left (Issue #1431).
     pub const RevisionWindowClosed: GovernanceError = GovernanceError::VotingEnded;
+    /// A delegation update was rejected because it would form a cycle (Issue #1428).
+    pub const DelegationCycleDetected: GovernanceError = GovernanceError::InvalidCommitteeAction;
+    /// The delegation chain depth exceeded the maximum traversal bound (Issue #1428).
+    pub const DelegationChainTooDeep: GovernanceError = GovernanceError::InvalidCommitteeAction;
+    /// A treasury batch was rejected because it exceeds `MAX_TREASURY_ACTIONS_PER_BATCH` (Issue #1429).
+    pub const TreasuryBatchTooLarge: GovernanceError = GovernanceError::InvalidAmount;
+    /// A treasury batch was rejected because aggregate spend exceeds `MAX_TREASURY_BATCH_WORK` (Issue #1429).
+    pub const TreasuryBatchWorkExceeded: GovernanceError = GovernanceError::BudgetExceeded;
 }
