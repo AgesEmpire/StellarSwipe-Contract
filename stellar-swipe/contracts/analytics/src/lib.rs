@@ -11,6 +11,12 @@ pub mod risk_score;
 pub mod tvl;
 // Closes #753 — TTL-based result cache for expensive aggregate queries
 pub mod query_cache;
+// Closes #1377 — idempotent event ingestion keyed by canonical event identity
+pub mod ingestion;
+#[cfg(test)]
+mod ingestion_tests;
+// Closes #1378 — half-open `[start, end)` time-window convention
+pub mod window;
 
 use query_cache::QueryType;
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
@@ -232,7 +238,9 @@ impl AnalyticsContract {
             .instance()
             .get::<DataKey, u64>(&DataKey::LastReportTime)
         {
-            if now < last.saturating_add(SECONDS_PER_WEEK) {
+            // Half-open `[last, last + week)` (Issue #1378): callable again at
+            // exactly `last + SECONDS_PER_WEEK`.
+            if !window::has_elapsed(last, SECONDS_PER_WEEK, now) {
                 panic!("weekly health report already emitted this week");
             }
         }
@@ -368,6 +376,45 @@ impl AnalyticsContract {
             None => return false,
         };
         compute_snapshot_checksum(&snapshot) == recorded
+    }
+
+    // ── Issues #1377 / #1378: event ingestion and windowed aggregates ─────────
+
+    /// Admin: ingest one analytics event. Returns `true` if it was counted and
+    /// `false` if the same canonical identity was already ingested with the same
+    /// payload (replay / retry — aggregates unchanged).
+    pub fn ingest_event(
+        env: Env,
+        event: ingestion::AnalyticsEvent,
+    ) -> Result<bool, ingestion::IngestError> {
+        Self::require_admin_ingest(&env)?;
+        ingestion::ingest(&env, &event)
+    }
+
+    /// Admin: ingest a batch of events atomically. Returns how many were newly
+    /// counted; duplicates (within the batch or previously ingested) are skipped.
+    pub fn ingest_events(
+        env: Env,
+        events: soroban_sdk::Vec<ingestion::AnalyticsEvent>,
+    ) -> Result<u32, ingestion::IngestError> {
+        Self::require_admin_ingest(&env)?;
+        ingestion::ingest_batch(&env, &events)
+    }
+
+    /// Whether an event with canonical identity `id` has been ingested.
+    pub fn is_event_ingested(env: Env, id: ingestion::EventIdentity) -> bool {
+        ingestion::is_ingested(&env, &id)
+    }
+
+    /// Totals for events with `start <= timestamp < end` (half-open; see
+    /// [`window`]). Bounds must be multiples of `window::BUCKET_SECONDS` and the
+    /// window may span at most `window::MAX_WINDOW_BUCKETS` buckets.
+    pub fn get_window_aggregate(
+        env: Env,
+        start: u64,
+        end: u64,
+    ) -> Result<ingestion::WindowAggregate, ingestion::IngestError> {
+        ingestion::window_aggregate(&env, start, end)
     }
 
     // ── Issue #673: TVL tracking entrypoints ──────────────────────────────────
@@ -594,6 +641,18 @@ impl AnalyticsContract {
             .expect("not initialized");
         admin.require_auth();
         query_cache::invalidate(&env, query_type);
+    }
+}
+
+impl AnalyticsContract {
+    fn require_admin_ingest(env: &Env) -> Result<(), ingestion::IngestError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ingestion::IngestError::NotInitialized)?;
+        admin.require_auth();
+        Ok(())
     }
 }
 

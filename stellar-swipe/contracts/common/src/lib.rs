@@ -14,10 +14,6 @@ pub mod amm_bridge;
 pub mod apy_math;
 pub mod assets;
 pub mod budget_regression;
-/// Shared test helper asserting a query entrypoint is read-only: no events
-/// published and (optionally) a stable result across repeated calls
-/// (Issue #1336).
-pub mod read_only_check;
 /// Checked-arithmetic wrapper for financial amounts (issue #599).
 pub mod checked_amount;
 /// Oracle price-freshness gating for collateral / health checks (Issue #1031).
@@ -36,6 +32,12 @@ pub mod panic_codes;
 pub mod perf;
 #[allow(deprecated)]
 pub mod rate_limit;
+/// Shared test helper asserting a query entrypoint is read-only: no events
+/// published and (optionally) a stable result across repeated calls
+/// (Issue #1336). Test-only: requires the `testutils` feature because it
+/// reads the host event log via `soroban_sdk::testutils::Events`.
+#[cfg(any(test, feature = "testutils"))]
+pub mod read_only_check;
 #[allow(deprecated)]
 pub mod replay_protection;
 /// Reserve health monitoring event stream (issue #1034).

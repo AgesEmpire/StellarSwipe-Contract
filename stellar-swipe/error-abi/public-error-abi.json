@@ -607,7 +607,18 @@
     "user_portfolio": {
       "PortfolioError": {
         "ExposureCapExceeded": 1,
-        "InvalidCapAmount": 2
+        "InvalidCapAmount": 2,
+        "AssetCapacityReached": 3,
+        "StaleSnapshotRevision": 4,
+        "UnsettledTrades": 5,
+        "InvalidAssetId": 6,
+        "AssetPositionExists": 7,
+        "AssetPositionNotFound": 8,
+        "OperationIdConflict": 9,
+        "InvalidBalanceDelta": 10,
+        "ValuationOverflow": 11,
+        "StaleValuationRound": 12,
+        "UnauthorizedValuationSource": 13
       },
       "PositionError": {
         "PositionAlreadyClosed": 1
