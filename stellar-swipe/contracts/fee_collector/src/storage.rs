@@ -76,6 +76,7 @@ pub enum StorageKey {
     Initialized,
     OracleContract,
     TreasuryBalance(Address),              // persistent, per-token
+    ReservedTreasury(Address),             // persistent, per-token, committed to pending withdrawals
     QueuedWithdrawal,                      // instance, single-slot
     FeeRate,                               // instance, current fee rate in bps
     BurnRate,                              // instance, burn rate in bps
@@ -328,6 +329,28 @@ pub fn set_treasury_balance(env: &Env, token: &Address, balance: i128) {
         StorageTier::Persistent,
         &StorageKey::TreasuryBalance(token.clone()),
         &balance,
+    );
+}
+
+// --- Reserved Treasury ---
+
+/// Treasury balance committed to pending obligations (e.g. a queued withdrawal).
+/// Never spendable by other withdrawals or distributions.
+pub fn get_reserved_treasury(env: &Env, token: &Address) -> i128 {
+    crud_get_or(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::ReservedTreasury(token.clone()),
+        0i128,
+    )
+}
+
+pub fn set_reserved_treasury(env: &Env, token: &Address, amount: i128) {
+    crud_set(
+        env,
+        StorageTier::Persistent,
+        &StorageKey::ReservedTreasury(token.clone()),
+        &amount,
     );
 }
 
