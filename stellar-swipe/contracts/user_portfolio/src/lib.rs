@@ -56,6 +56,7 @@ mod queries;
 mod risk_metrics;
 mod storage;
 mod subscriptions;
+mod valuation;
 mod watchlist;
 
 pub use achievements::{Achievement, AchievementType};
@@ -65,6 +66,7 @@ pub use preferences::{
     HoldDuration, NotificationPrefs, RiskRating, SignalAction, SignalCategory, SignalSummary,
     TradingStyle,
 };
+pub use valuation::ValuationRecord;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
@@ -209,6 +211,12 @@ pub enum PortfolioError {
     OperationIdConflict = 9,
     /// Delta would overflow or make the balance negative.
     InvalidBalanceDelta = 10,
+    /// Summing position values overflowed `i128` (#1376). State is unchanged.
+    ValuationOverflow = 11,
+    /// Valuation `source_round` does not advance past the stored round (#1375).
+    StaleValuationRound = 12,
+    /// Valuation caller is neither the admin nor the configured oracle.
+    UnauthorizedValuationSource = 13,
 }
 
 /// A user's position in a single asset. See the [module-level invariants list](self)
@@ -1390,6 +1398,39 @@ impl UserPortfolio {
     /// Current snapshot revision for `user` (0 if never written).
     pub fn get_snapshot_revision(env: Env, user: Address) -> u64 {
         lifecycle::snapshot_revision(&env, &user)
+    }
+
+    /// Record a new valuation of `user`'s portfolio priced at oracle round
+    /// `source_round` (#1375, #1376).
+    ///
+    /// `caller` must be the admin or the configured oracle and must authorize.
+    /// `position_values` are summed with checked arithmetic.
+    ///
+    /// Errors (state unchanged on every error):
+    /// - `StaleValuationRound` if `source_round` is not strictly greater than
+    ///   the stored round (lower and repeated rounds are rejected; round 0 is
+    ///   never accepted).
+    /// - `ValuationOverflow` if the sum leaves the `i128` range.
+    /// - `UnauthorizedValuationSource` if `caller` is not admin or oracle.
+    pub fn update_valuation(
+        env: Env,
+        caller: Address,
+        user: Address,
+        source_round: u64,
+        position_values: Vec<i128>,
+    ) -> Result<ValuationRecord, PortfolioError> {
+        caller.require_auth();
+        let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        let oracle: Option<Address> = env.storage().instance().get(&DataKey::Oracle);
+        if admin.as_ref() != Some(&caller) && oracle.as_ref() != Some(&caller) {
+            return Err(PortfolioError::UnauthorizedValuationSource);
+        }
+        valuation::update_valuation(&env, &user, source_round, &position_values)
+    }
+
+    /// Latest accepted valuation for `user`, if any (#1375).
+    pub fn get_valuation(env: Env, user: Address) -> Option<ValuationRecord> {
+        valuation::get_valuation(&env, &user)
     }
 
     /// Distinct assets currently held in active positions (#1370).

@@ -91,4 +91,6 @@ pub enum DataKey {
     UserAssetPositionCount(Address, u32),
     /// Monotonic revision of a user's portfolio snapshot (#1371).
     SnapshotRevision(Address),
+    /// Latest accepted portfolio valuation with its source round (#1375).
+    PortfolioValuation(Address),
 }

@@ -87,7 +87,9 @@ pub fn read(env: &Env, query_type: QueryType) -> Option<i128> {
 
     if let Some(cached) = entry {
         let now = env.ledger().timestamp();
-        if now.saturating_sub(cached.cached_at) < ttl {
+        // Half-open `[cached_at, cached_at + ttl)` (Issue #1378): a hit strictly
+        // before the deadline, a miss from the deadline onward.
+        if !crate::window::has_elapsed(cached.cached_at, ttl, now) {
             return Some(cached.value); // Cache hit within TTL.
         }
         // TTL elapsed — fall through as a miss; caller will recompute.

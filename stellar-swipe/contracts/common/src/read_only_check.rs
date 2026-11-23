@@ -30,6 +30,7 @@
 //! let result = assert_no_events_published(&env, || client.get_signal(&signal_id));
 //! ```
 
+use soroban_sdk::testutils::Events as _;
 use soroban_sdk::Env;
 
 /// Invokes `f` and asserts that it published no events, i.e. that `f` is
