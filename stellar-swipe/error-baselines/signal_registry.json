@@ -191,7 +191,9 @@
       "DisputeNotOpen": 1602,
       "AppealAlreadySubmitted": 1603,
       "AppealNotPending": 1604,
-      "AppealWindowNotElapsed": 1605
+      "AppealWindowNotElapsed": 1605,
+      "InvalidEvidenceDigest": 1606,
+      "InvalidEvidenceDeadline": 1607
     },
     "ProviderOnboardingError": {
       "NotConfigured": 1700,
