@@ -655,10 +655,13 @@ impl SignalRegistry {
 
     /// Purge expired tombstones in a bounded, idempotent batch.
     ///
-    /// Only the admin may call this. At most `max_entries` tombstones are
-    /// examined per call, and only those whose retention window has elapsed
-    /// are removed. Re-running is safe: already-purged tombstones are simply
-    /// skipped.
+    /// Only the admin may call this. The provider batch may not exceed
+    /// `max_entries` (itself capped at [`MAX_TOMBSTONE_PURGE`]); oversized
+    /// batches are rejected before any write. Because every supplied provider
+    /// fits within the budget, the purged set and count are the same for any
+    /// ordering of `providers`. Only tombstones whose retention window has
+    /// elapsed are removed. Re-running is safe: already-purged tombstones are
+    /// simply skipped.
     pub fn purge_expired_tombstones(
         env: Env,
         providers: Vec<Address>,
@@ -673,12 +676,12 @@ impl SignalRegistry {
         if max_entries == 0 || max_entries > MAX_TOMBSTONE_PURGE {
             return Err(SignalError::InvalidBatchSize);
         }
+        if providers.len() > max_entries {
+            return Err(SignalError::InvalidBatchSize);
+        }
         let now = env.ledger().timestamp();
         let mut purged: u32 = 0;
         for provider in providers.iter() {
-            if purged >= max_entries {
-                break;
-            }
             let tomb_key = (TOMBSTONE_KEY, provider.clone());
             if let Some(tombstone) = env
                 .storage()
