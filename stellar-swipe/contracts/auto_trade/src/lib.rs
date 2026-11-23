@@ -6,6 +6,12 @@ use soroban_sdk::{
 
 mod admin;
 mod advanced_risk;
+/// Issue #511: standardized error handling with category hierarchy, recovery
+/// strategies, automatic retry logic, and graceful degradation.
+pub mod error_handling;
+/// Issue #513: automated upgrade testing framework — pre-upgrade checks,
+/// state migration validation, version compatibility, and rollback checkpoints.
+pub mod upgrade_testing;
 #[cfg(feature = "testutils")]
 pub mod amm_bridge;
 #[cfg(not(feature = "testutils"))]
@@ -351,6 +357,106 @@ impl AutoTradeContract {
         shared::version::set_contract_version(&env, new_version);
         shared::version::emit_contract_upgraded(&env, current_version, new_version);
         Ok(())
+    }
+
+    // ── Issue #511: Error handling and recovery ───────────────────────────────
+
+    /// Query accumulated error metrics (attempt counts per category).
+    pub fn get_error_metrics(env: Env) -> error_handling::ErrorMetrics {
+        error_handling::get_error_metrics(&env)
+    }
+
+    /// Reset error metrics to zero (admin only).
+    pub fn reset_error_metrics(env: Env, caller: Address) -> Result<(), AutoTradeError> {
+        error_handling::reset_error_metrics(&env, &caller)
+    }
+
+    /// Classify `err_code` into its broad error category.
+    pub fn categorize_error(env: Env, err_code: u32) -> error_handling::ErrorCategory {
+        // Best-effort: map numeric code back to a known variant.
+        // Unknown codes are treated as Permanent.
+        let _ = env;
+        match err_code {
+            40 => error_handling::ErrorCategory::Transient, // OracleUnavailable
+            6  => error_handling::ErrorCategory::Transient, // InsufficientLiquidity
+            47 => error_handling::ErrorCategory::Transient, // SystemError
+            1 | 17 | 18 | 25 | 26 | 27 | 23 | 33 | 39
+               => error_handling::ErrorCategory::Validation,
+            2 | 14 => error_handling::ErrorCategory::Authorization,
+            16 | 8 | 7 | 11 | 34
+               => error_handling::ErrorCategory::State,
+            _  => error_handling::ErrorCategory::Permanent,
+        }
+    }
+
+    /// Enter degraded mode (admin only) with the given reason string.
+    pub fn enter_degraded_mode(
+        env: Env,
+        caller: Address,
+        reason: String,
+    ) -> Result<(), AutoTradeError> {
+        admin::require_admin(&env, &caller)?;
+        error_handling::enter_degraded_mode(&env, reason);
+        Ok(())
+    }
+
+    /// Exit degraded mode (admin only).
+    pub fn exit_degraded_mode(env: Env, caller: Address) -> Result<(), AutoTradeError> {
+        admin::require_admin(&env, &caller)?;
+        error_handling::exit_degraded_mode(&env);
+        Ok(())
+    }
+
+    /// Returns `true` when the contract is in degraded mode.
+    pub fn is_degraded(env: Env) -> bool {
+        error_handling::is_degraded(&env)
+    }
+
+    /// Full degraded-mode state, or `None` if operating normally.
+    pub fn get_degraded_state(
+        env: Env,
+    ) -> Option<error_handling::DegradedModeState> {
+        error_handling::get_degraded_state(&env)
+    }
+
+    // ── Issue #513: Automated upgrade testing ─────────────────────────────────
+
+    /// Capture a rollback checkpoint before an upgrade (admin only).
+    pub fn record_rollback_checkpoint(
+        env: Env,
+        caller: Address,
+        previous_wasm_hash: BytesN<32>,
+    ) -> Result<upgrade_testing::RollbackCheckpoint, AutoTradeError> {
+        upgrade_testing::record_rollback_checkpoint(&env, &caller, previous_wasm_hash)
+    }
+
+    /// Retrieve the last rollback checkpoint, or `None` if none was recorded.
+    pub fn get_rollback_checkpoint(env: Env) -> Option<upgrade_testing::RollbackCheckpoint> {
+        upgrade_testing::get_rollback_checkpoint(&env)
+    }
+
+    /// Run all pre-upgrade checks and return a detailed report (admin only).
+    ///
+    /// Must return `all_passed = true` before `upgrade()` is called.
+    pub fn run_pre_upgrade_checks(
+        env: Env,
+        caller: Address,
+        target_version: u32,
+        descriptors: Vec<upgrade_testing::StorageKeyDescriptor>,
+        min_caller_version: Option<u32>,
+    ) -> Result<upgrade_testing::UpgradeCheckReport, AutoTradeError> {
+        upgrade_testing::run_pre_upgrade_checks(
+            &env,
+            &caller,
+            target_version,
+            descriptors,
+            min_caller_version,
+        )
+    }
+
+    /// Retrieve the last pre-upgrade check report.
+    pub fn get_last_upgrade_report(env: Env) -> Option<upgrade_testing::UpgradeCheckReport> {
+        upgrade_testing::get_last_upgrade_report(&env)
     }
 
     /// Pause a category (admin or guardian)

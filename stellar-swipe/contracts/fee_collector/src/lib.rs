@@ -16,6 +16,13 @@ pub use fee_split_policy::{
     DEFAULT_PROVIDER_BPS,
 };
 
+/// Issue #512: dynamic fee optimization based on real-time network conditions,
+/// transaction volumes, and fee tiers.
+pub mod fee_optimization;
+pub use fee_optimization::{
+    FeeBreakdown, FeeOptimizerConfig, FeeTier, NetworkConditions,
+};
+
 mod events;
 mod fee_cache;
 pub mod volatility;
@@ -2712,5 +2719,86 @@ impl FeeCollector {
             admin,
             initialized_at: 0,
         }
+    }
+
+    // ── Issue #512: Dynamic fee optimization ──────────────────────────────────
+
+    /// Predict the effective fee in basis points for `tier` and `trade_volume`
+    /// given the current network conditions.  Read-only: does not alter state.
+    pub fn predict_fee(
+        env: Env,
+        tier: fee_optimization::FeeTier,
+        trade_volume: u64,
+    ) -> fee_optimization::FeeBreakdown {
+        fee_optimization::predict_fee(&env, tier, trade_volume)
+    }
+
+    /// Calculate and record the fee for a trade, updating epoch volume.
+    pub fn calculate_and_record_fee(
+        env: Env,
+        tier: fee_optimization::FeeTier,
+        trade_volume: u64,
+    ) -> fee_optimization::FeeBreakdown {
+        fee_optimization::calculate_fee(&env, tier, trade_volume, true)
+    }
+
+    /// Admin: update the fee optimizer configuration.
+    pub fn set_fee_optimizer_config(
+        env: Env,
+        caller: Address,
+        new_config: fee_optimization::FeeOptimizerConfig,
+    ) -> Result<fee_optimization::FeeOptimizerConfig, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        fee_optimization::update_config(&env, &caller, new_config)
+    }
+
+    /// Retrieve the current fee optimizer configuration.
+    pub fn get_fee_optimizer_config(env: Env) -> fee_optimization::FeeOptimizerConfig {
+        fee_optimization::get_config(&env)
+    }
+
+    /// Admin: push a new network-condition snapshot for fee calculation.
+    pub fn push_network_conditions(
+        env: Env,
+        caller: Address,
+        conditions: fee_optimization::NetworkConditions,
+    ) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let stored_admin = get_admin(&env);
+        if caller != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+        caller.require_auth();
+        fee_optimization::update_network_conditions(&env, conditions)
+    }
+
+    /// Retrieve the latest network conditions pushed to the optimizer.
+    pub fn get_optimizer_network_conditions(
+        env: Env,
+    ) -> Option<fee_optimization::NetworkConditions> {
+        fee_optimization::get_network_conditions(&env)
+    }
+
+    /// Current accumulated epoch volume (denominated in protocol base units).
+    pub fn get_epoch_volume(env: Env) -> u64 {
+        fee_optimization::get_epoch_volume(&env)
+    }
+
+    /// Admin: reset the epoch volume counter (call at the start of each new epoch).
+    pub fn reset_epoch_volume(env: Env, caller: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let stored_admin = get_admin(&env);
+        if caller != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+        caller.require_auth();
+        fee_optimization::reset_epoch_volume(&env);
+        Ok(())
     }
 }
