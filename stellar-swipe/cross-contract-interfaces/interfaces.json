@@ -1,0 +1,48 @@
+{
+  "interfaces": {
+    "oracle/PriceOracleClient": {
+      "methods": {
+        "add_price_source": "fn add_price_source(e: Env, source: Address, weight: u32)",
+        "get_price": "fn get_price(e: Env, pair: AssetPair) -> i128",
+        "get_price_with_confidence": "fn get_price_with_confidence(e: Env, pair: AssetPair) -> (i128, u32)",
+        "remove_price_source": "fn remove_price_source(e: Env, source: Address)",
+        "update_price": "fn update_price(e: Env, pair: AssetPair, price: i128, source_name: String, confidence: u32)"
+      },
+      "types": {},
+      "unresolved": []
+    },
+    "shared/CrossContractMessageReceiverClient": {
+      "methods": {
+        "receive_message": "fn receive_message(env: Env, message: CrossContractMessage) -> Result<MessageStatus, CrossContractError>"
+      },
+      "types": {
+        "CrossContractError": "#[contracterror] #[derive(Copy, Clone, Debug, Eq, PartialEq)] #[repr(u32)] pub enum CrossContractError { UnauthorizedSigner = 1, UnauthorizedCaller = 2, InvalidPayload = 3, InvalidMessage = 4, MessageNotFound = 5, VersionMismatch = 6, CallDepthExceeded = 7, ContractHashMismatch = 8, AlreadyDelivered = 9, CallerNotRegistered = 10, CallerNotAllowed = 11, }",
+        "CrossContractMessage": "#[contracttype] #[derive(Clone, Debug)] pub struct CrossContractMessage { pub id: u64, pub source_contract: Address, pub target_contract: Address, pub operation: String, pub payload: Bytes, pub callback_required: bool, pub status: MessageStatus, pub created_at: u64, pub last_updated_at: u64, }",
+        "MessageStatus": "#[contracttype] #[derive(Clone, Debug, PartialEq, Eq)] pub enum MessageStatus { Pending, Delivered, Failed, Rejected, }"
+      },
+      "unresolved": []
+    },
+    "shared/CrossContractVersionClient": {
+      "methods": {
+        "get_contract_version": "fn get_contract_version(env: Env) -> u32"
+      },
+      "types": {},
+      "unresolved": []
+    },
+    "shared/PausableClient": {
+      "methods": {
+        "apply_governance_pause": "fn apply_governance_pause(env: Env, paused: bool)"
+      },
+      "types": {},
+      "unresolved": []
+    },
+    "shared/PausableScopedClient": {
+      "methods": {
+        "apply_governance_pause_scope": "fn apply_governance_pause_scope(env: Env, paused: bool, scope: u32)"
+      },
+      "types": {},
+      "unresolved": []
+    }
+  },
+  "schema_version": 1
+}

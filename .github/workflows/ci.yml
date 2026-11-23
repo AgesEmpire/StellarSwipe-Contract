@@ -264,6 +264,22 @@ jobs:
             echo "Please commit the updated stellar-swipe/interface-baselines/*.json files."
           fi
 
+      # Dependents compile against the #[contractclient] interfaces they call.
+      # Each trait's method signatures and referenced serialized types are
+      # diffed against stellar-swipe/cross-contract-interfaces/interfaces.json.
+      # Removed or changed signatures fail (exit 1); additive drift also fails
+      # (exit 2) so the committed artifact always reflects the source.
+      - name: Check cross-contract interface artifacts
+        run: |
+          python3 stellar-swipe/scripts/check_cross_contract_interfaces.py
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "ERROR: cross-contract interface check failed — see output above." >&2
+            echo "  If the change is intentional, regenerate and commit:" >&2
+            echo "    python3 stellar-swipe/scripts/check_cross_contract_interfaces.py --update" >&2
+            exit 1
+          fi
+
       # Release WASM (workspace [profile.release]) + stellar contract optimize
       # Prebuilt release binary — avoids compiling libdbus-sys from source via cargo install
       - name: Install Stellar CLI

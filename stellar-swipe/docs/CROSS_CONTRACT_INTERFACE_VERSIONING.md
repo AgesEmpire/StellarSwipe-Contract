@@ -19,3 +19,17 @@ Cross-contract callers should treat the callee interface as a versioned API.
 ## Compatibility rule
 
 For now, compatibility is an exact match on the interface version. If a callee changes its interface, the caller must be updated explicitly.
+
+## Interface artifacts (CI)
+
+`stellar-swipe/cross-contract-interfaces/interfaces.json` records the method signatures of every `#[contractclient]` trait in the workspace, plus the `#[contracttype]` / `#[contracterror]` definitions those signatures use. `stellar-swipe/scripts/check_cross_contract_interfaces.py` regenerates that view from source and diffs it against the committed file:
+
+- Removed or changed signatures and serialized types fail the build. Restore the old signature, or bump the version and update every dependent caller.
+- Added methods, types or clients also fail until the artifact is regenerated, so the committed file never drifts from source.
+- Types whose name is defined more than once in a crate are listed under `unresolved` and are not diffed.
+
+Regenerate after an intentional change with:
+
+```bash
+python3 stellar-swipe/scripts/check_cross_contract_interfaces.py --update
+```
