@@ -63,6 +63,28 @@ pub enum AppealStatus {
     Rejected,
 }
 
+/// Schema version of [`DisputeResolvedEvent`]. Bump on breaking field changes (see docs/events.md).
+pub const DISPUTE_RESOLVED_SCHEMA_VERSION: u32 = 1;
+
+/// Versioned resolution event for indexers. Emitted exactly once when a dispute
+/// moves Open -> Resolved; rejected resolution calls emit nothing.
+/// Disputes are keyed by provider, so the subject is `provider` (no signal id exists on the record).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisputeResolvedEvent {
+    pub schema_version: u32,
+    pub provider: Address,
+    pub opened_at: u64,
+    pub downvote_bps: u32,
+    /// Appeal state at resolution. `Approved` when resolved via an approved appeal.
+    pub appeal_status: AppealStatus,
+    /// Outcome: true when the provider's score was unfrozen and a recovery step applied.
+    pub restored: bool,
+    /// Admin who resolved the dispute.
+    pub resolver: Address,
+    pub resolved_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct DisputeRecord {
@@ -273,25 +295,26 @@ fn open_dispute(env: &Env, provider: &Address, downvote_bps: u32) {
     );
 }
 
-/// Admin resolves a dispute directly. If `restore` is true, score is unfrozen and
+/// Admin resolves an open dispute. If `restore` is true, score is unfrozen and
 /// recovery begins. Any appeal still `Pending` is cleared, since the dispute it was
-/// raised against is being closed out by this call.
-pub fn resolve_dispute(env: &Env, provider: Address, restore: bool) {
+/// raised against is being closed out by this call. Fails without side effects if
+/// the dispute does not exist or is already resolved.
+pub fn resolve_dispute(
+    env: &Env,
+    provider: Address,
+    restore: bool,
+    resolver: Address,
+) -> Result<(), DisputeError> {
     let dispute_key = VotingKey::Dispute(provider.clone());
-    let mut record: DisputeRecord =
-        env.storage()
-            .persistent()
-            .get(&dispute_key)
-            .unwrap_or(DisputeRecord {
-                provider: provider.clone(),
-                opened_at: 0,
-                status: DisputeStatus::Resolved,
-                downvote_bps: 0,
-                appeal_status: AppealStatus::None,
-                appeal_submitted_at: 0,
-                appeal_evidence_digest: None,
-                appeal_evidence_deadline: 0,
-            });
+    let mut record: DisputeRecord = env
+        .storage()
+        .persistent()
+        .get(&dispute_key)
+        .ok_or(DisputeError::DisputeNotFound)?;
+
+    if record.status != DisputeStatus::Open {
+        return Err(DisputeError::DisputeNotOpen);
+    }
 
     record.status = DisputeStatus::Resolved;
     if record.appeal_status == AppealStatus::Pending {
@@ -309,8 +332,18 @@ pub fn resolve_dispute(env: &Env, provider: Address, restore: bool) {
 
     env.events().publish(
         (Symbol::new(env, "dispute_resolved"), provider.clone()),
-        restore,
+        DisputeResolvedEvent {
+            schema_version: DISPUTE_RESOLVED_SCHEMA_VERSION,
+            provider: provider.clone(),
+            opened_at: record.opened_at,
+            downvote_bps: record.downvote_bps,
+            appeal_status: record.appeal_status.clone(),
+            restored: restore,
+            resolver,
+            resolved_at: env.ledger().timestamp(),
+        },
     );
+    Ok(())
 }
 
 /// Disputed provider submits an appeal of an open dispute. Only the provider the
@@ -365,7 +398,12 @@ pub fn submit_appeal(
 /// Admin decides a pending appeal. Approving resolves the dispute in the provider's
 /// favor (score unfrozen and one recovery step applied); rejecting leaves the original
 /// dispute in place for the admin to resolve separately via `resolve_dispute`.
-pub fn resolve_appeal(env: &Env, provider: Address, approve: bool) -> Result<(), DisputeError> {
+pub fn resolve_appeal(
+    env: &Env,
+    provider: Address,
+    approve: bool,
+    resolver: Address,
+) -> Result<(), DisputeError> {
     let dispute_key = VotingKey::Dispute(provider.clone());
     let mut record: DisputeRecord = env
         .storage()
@@ -385,7 +423,7 @@ pub fn resolve_appeal(env: &Env, provider: Address, approve: bool) -> Result<(),
     env.storage().persistent().set(&dispute_key, &record);
 
     if approve {
-        resolve_dispute(env, provider.clone(), true);
+        resolve_dispute(env, provider.clone(), true, resolver)?;
     }
 
     env.events().publish(
@@ -606,7 +644,7 @@ mod tests {
             open_dispute_for(env, cid, &provider);
 
             in_contract(env, cid, |env| {
-                resolve_dispute(env, provider.clone(), true);
+                resolve_dispute(env, provider.clone(), true, Address::generate(env)).unwrap();
             });
 
             in_contract(env, cid, |env| {
@@ -760,7 +798,7 @@ mod tests {
                 assert_eq!(dispute.appeal_status, AppealStatus::Rejected);
                 assert_eq!(dispute.status, DisputeStatus::Open);
 
-                resolve_dispute(env, provider.clone(), true);
+                resolve_dispute(env, provider.clone(), true, Address::generate(env)).unwrap();
                 assert_eq!(
                     get_dispute(env, &provider).unwrap().status,
                     DisputeStatus::Resolved

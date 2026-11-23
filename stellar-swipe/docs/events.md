@@ -224,6 +224,23 @@ Emitted when a provider's reputation score changes after a signal outcome.
 | `old_score` | `u32` | Previous score |
 | `new_score` | `u32` | Updated score |
 
+### `dispute_resolved` (schema_version 1)
+Emitted exactly once when a community-voting dispute moves from Open to Resolved, whether
+by a direct admin resolution or an approved appeal. Rejected resolution calls (no dispute,
+or dispute already resolved) emit nothing. Topics: `(dispute_resolved, provider)`.
+Replaces the previous bare-`bool` body. Disputes are keyed by provider and carry no signal id.
+
+| Field | Type | Description |
+|---|---|---|
+| `schema_version` | `u32` | `1` |
+| `provider` | `Address` | Disputed provider (dispute subject) |
+| `opened_at` | `u64` | Ledger timestamp the dispute was opened |
+| `downvote_bps` | `u32` | Downvote share (bps) that opened the dispute |
+| `appeal_status` | `AppealStatus` | Appeal state at resolution (`None`, `Approved`, `Rejected`) |
+| `restored` | `bool` | `true` if the score was unfrozen and a recovery step applied |
+| `resolver` | `Address` | Admin who resolved the dispute |
+| `resolved_at` | `u64` | Ledger timestamp of resolution |
+
 ---
 
 ## Governance (`governance`)
