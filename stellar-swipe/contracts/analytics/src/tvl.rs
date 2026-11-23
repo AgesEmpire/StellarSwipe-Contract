@@ -39,6 +39,10 @@ pub const BASE_DECIMALS: u32 = 7;
 pub enum TvlError {
     /// The conversion or aggregation arithmetic overflowed.
     Overflow = 1,
+    /// The stored snapshot's schema revision is not supported by this build.
+    /// Updates are refused so the aggregate is never written in a layout
+    /// this code does not understand (Issue #1381).
+    UnsupportedSchemaRevision = 2,
 }
 
 /// Converts `raw_amount`, denominated in an asset with `asset_decimals`
@@ -129,6 +133,10 @@ fn save(env: &Env, snapshot: &TvlSnapshot) {
 /// the caller holds a raw, asset-native amount that still needs converting.
 pub fn apply_delta(env: &Env, source: TvlSource, delta: i128) -> Result<(), TvlError> {
     let mut snap = load(env);
+    // Refuse to fold deltas into a revision we cannot interpret (Issue #1381).
+    if snap.schema_version != TVL_SNAPSHOT_SCHEMA_VERSION {
+        return Err(TvlError::UnsupportedSchemaRevision);
+    }
 
     match source {
         TvlSource::StakeVault => {
