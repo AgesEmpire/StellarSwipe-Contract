@@ -78,10 +78,6 @@ pub enum OracleError {
     /// the configured deviation bound and no fallback set resolved the
     /// conflict (Issue #1122).
     ConflictingObservations = 33,
-    /// The feed is not in the `Active` lifecycle state (Issue #1307).
-    FeedNotActive = 34,
-    /// The requested feed lifecycle transition is not allowed (Issue #1307).
-    InvalidFeedTransition = 35,
     /// Feed configuration batch is empty or exceeds `MAX_FEED_BATCH` (Issue #1312).
     InvalidFeedBatch = 34,
     /// A feed configuration entry is invalid or duplicated (Issue #1312).
@@ -100,6 +96,10 @@ pub enum OracleError {
     /// The observation's source exceeded its configured heartbeat interval,
     /// so the observation cannot be accepted or aggregated (Issue #1406).
     HeartbeatExpired = 40,
+    /// The feed is not in the `Active` lifecycle state (Issue #1307).
+    FeedNotActive = 41,
+    /// The requested feed lifecycle transition is not allowed (Issue #1307).
+    InvalidFeedTransition = 42,
 }
 
 impl OracleError {
@@ -204,6 +204,9 @@ impl OracleError {
             OracleError::HeartbeatExpired => {
                 "observation source exceeded its configured heartbeat interval"
             }
+            OracleError::FeedNotActive => "the feed is not in the active lifecycle state",
+            OracleError::InvalidFeedTransition => {
+                "the requested feed lifecycle transition is not allowed"
             }
         }
     }

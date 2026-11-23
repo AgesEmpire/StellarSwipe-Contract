@@ -27,7 +27,7 @@
 //! and streak counter are stored in instance storage (small, frequently
 //! accessed). Trip state is a boolean under the same namespace.
 
-use soroban_sdk::{contracttype, symbol_short, Env};
+use soroban_sdk::{contracttype, symbol_short, Env, Symbol};
 use stellar_swipe_common::AssetPair;
 
 use crate::errors::OracleError;
@@ -209,8 +209,13 @@ pub fn check_and_trip(env: &Env, pair: &AssetPair, new_price: i128) -> Result<bo
         clear(env, pair);
         #[allow(deprecated)]
         env.events().publish(
-            (symbol_short!("oracle"), symbol_short!("hyst_recov")),
-            (pair.clone(), new_price, cfg.recovery_bps, cfg.healthy_rounds),
+            (symbol_short!("oracle"), Symbol::new(env, "hyst_recov")),
+            (
+                pair.clone(),
+                new_price,
+                cfg.recovery_bps,
+                cfg.healthy_rounds,
+            ),
         );
         return Ok(false);
     }
@@ -230,7 +235,7 @@ pub fn reset(env: &Env, pair: &AssetPair) {
     clear(env, pair);
     #[allow(deprecated)]
     env.events().publish(
-        (symbol_short!("oracle"), symbol_short!("hyst_reset")),
+        (symbol_short!("oracle"), Symbol::new(env, "hyst_reset")),
         pair.clone(),
     );
 }

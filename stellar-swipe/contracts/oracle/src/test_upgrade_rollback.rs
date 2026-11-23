@@ -25,7 +25,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype,
+    contract, contracterror, contractimpl, contracttype,
     testutils::{Address as _, Ledger as _},
     Address, Env, String, Vec,
 };
@@ -92,10 +92,12 @@ impl V1 {
 // V2 — the upgraded contract with post-migration validation
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
 pub enum MigrateError {
-    ValidationFailed,
-    AlreadyMigrated,
+    AlreadyMigrated = 1,
+    ValidationFailed = 2,
 }
 
 #[contract]
@@ -116,7 +118,7 @@ impl V2 {
     ///
     /// Pass `fail_validation = true` to inject a failure after the writes,
     /// simulating a broken migration.
-    pub fn migrate(env: Env, ids: Vec<u32>, fail_validation: bool) -> Result<(), u32> {
+    pub fn migrate(env: Env, ids: Vec<u32>, fail_validation: bool) -> Result<(), MigrateError> {
         // Guard idempotency.
         if env
             .storage()
@@ -124,7 +126,7 @@ impl V2 {
             .get::<_, bool>(&Key::MigrationDone)
             .unwrap_or(false)
         {
-            return Err(1); // AlreadyMigrated
+            return Err(MigrateError::AlreadyMigrated);
         }
 
         // Step 1: bump schema version.
@@ -150,7 +152,7 @@ impl V2 {
         if fail_validation {
             // Validation failure: returning Err causes Soroban to roll back
             // ALL writes above (schema version + transformed data).
-            return Err(2); // ValidationFailed
+            return Err(MigrateError::ValidationFailed);
         }
 
         // Commit migration marker.

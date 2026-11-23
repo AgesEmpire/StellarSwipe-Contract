@@ -173,24 +173,20 @@ fn sources_lt(env: &Env, a: &Vec<Address>, b: &Vec<Address>) -> bool {
 /// Compare two addresses by their `to_string` representation.
 /// Soroban addresses serialize to a stable Strkey string; lexicographic
 /// comparison on that string is deterministic and map-iteration-independent.
-fn addr_lt(env: &Env, a: &Address, b: &Address) -> bool {
+/// Longest strkey an `Address` renders to (G... and C... addresses are 56 characters).
+const ADDR_STRKEY_MAX_LEN: usize = 56;
+
+fn addr_lt(_env: &Env, a: &Address, b: &Address) -> bool {
     let sa = a.to_string();
     let sb = b.to_string();
-    // Compare byte by byte up to the shorter length.
-    let la = sa.len();
-    let lb = sb.len();
-    let min_len = la.min(lb);
-    for i in 0..min_len {
-        let ba = sa.get_unchecked(i);
-        let bb = sb.get_unchecked(i);
-        if ba < bb {
-            return true;
-        }
-        if ba > bb {
-            return false;
-        }
-    }
-    la < lb
+    // Strkey addresses are 56 ASCII bytes; slices compare byte by byte, then by length.
+    let mut ba = [0u8; ADDR_STRKEY_MAX_LEN];
+    let mut bb = [0u8; ADDR_STRKEY_MAX_LEN];
+    let la = sa.len() as usize;
+    let lb = sb.len() as usize;
+    sa.copy_into_slice(&mut ba[..la]);
+    sb.copy_into_slice(&mut bb[..lb]);
+    ba[..la] < bb[..lb]
 }
 
 fn addr_gt(env: &Env, a: &Address, b: &Address) -> bool {
