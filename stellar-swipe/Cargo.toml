@@ -15,6 +15,7 @@ members = [
   "contracts/integration_tests",
   "contracts/bridge",
   "contracts/stake_vault_kani",
+  "contracts/token_vault",
 ]
 
 [workspace.dependencies]
