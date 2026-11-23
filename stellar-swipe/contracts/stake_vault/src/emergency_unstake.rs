@@ -222,7 +222,7 @@ pub fn approve(
 
     // Expire stale requests.
     let now = env.ledger().timestamp();
-    if cfg.timeout_secs > 0 && now > req.requested_at.saturating_add(cfg.timeout_secs) {
+    if cfg.timeout_secs > 0 && now >= req.requested_at.saturating_add(cfg.timeout_secs) {
         remove_request(env, staker);
         return Err(StakeVaultError::EmergencyRequestExpired);
     }
@@ -257,7 +257,7 @@ pub fn expire_request(env: &Env, staker: &Address) -> Result<(), StakeVaultError
     let req = get_request(env, staker).ok_or(StakeVaultError::EmergencyRequestNotFound)?;
 
     let now = env.ledger().timestamp();
-    if cfg.timeout_secs == 0 || now <= req.requested_at.saturating_add(cfg.timeout_secs) {
+    if cfg.timeout_secs == 0 || now < req.requested_at.saturating_add(cfg.timeout_secs) {
         return Err(StakeVaultError::EmergencyRequestNotExpired);
     }
 
