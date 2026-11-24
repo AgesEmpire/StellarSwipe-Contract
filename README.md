@@ -70,3 +70,6 @@
 
 <!-- handsoff-issue-1511 -->
 - #1511: Add Contract Pause and Unpause Mechanism
+
+<!-- handsoff-issue-1521 -->
+- #1521: Implement Multi-Hop Swap Router Function
