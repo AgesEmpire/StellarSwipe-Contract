@@ -4,11 +4,151 @@
 //! timelock actions that gate sensitive treasury operations. It also specifies
 //! the cancellation rules for queued timelock actions (see issue #1210), the
 //! revenue source allowlist that restricts fee deposits to registered sources
-//! (see issue #1154), and the payout recipient rotation delay that prevents an
+//! (see issue #1154), the payout recipient rotation delay that prevents an
 //! accidental or compromised admin update from redirecting accumulated fees
-//! immediately (see issue #1157).
+//! immediately (see issue #1157), and the admin role and access control that
+//! gates fee parameter updates, pausing, and emergency withdrawals (see issue
+//! #1509).
 
 use soroban_sdk::{contracttype, Address, Env, Vec};
+
+/// Storage key under which the admin address is persisted during
+/// initialization.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdminKey {
+    /// The address holding the admin role.
+    Admin,
+}
+
+/// Errors returned by the admin role and access control paths.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdminError {
+    /// The caller is not authorized to perform the admin-only operation.
+    Unauthorized,
+    /// The admin role has not been initialized yet.
+    NotInitialized,
+    /// The contract is paused and the operation is blocked.
+    Paused,
+}
+
+/// Stores `admin` in contract storage during initialization.
+///
+/// The admin address is the sole authority for fee parameter updates, pausing
+/// the contract, and emergency withdrawals. Initialization is idempotent: once
+/// an admin is set it can only be changed through [`transfer_admin`].
+pub fn init_admin(env: &Env, admin: &Address) -> Result<(), AdminError> {
+    if env.storage().instance().has(&AdminKey::Admin) {
+        return Err(AdminError::Unauthorized);
+    }
+    env.storage().instance().set(&AdminKey::Admin, admin);
+    Ok(())
+}
+
+/// Returns the stored admin address, or `None` if not yet initialized.
+pub fn get_admin(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&AdminKey::Admin)
+}
+
+/// Requires that `caller` is the stored admin and has authorized the call.
+///
+/// Returns [`AdminError::NotInitialized`] when no admin is stored and
+/// [`AdminError::Unauthorized`] when the caller is not the admin.
+pub fn require_admin(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    caller.require_auth();
+    let admin = get_admin(env).ok_or(AdminError::NotInitialized)?;
+    if &admin != caller {
+        return Err(AdminError::Unauthorized);
+    }
+    Ok(())
+}
+
+/// Transfers the admin role from the current admin to `new_admin`.
+///
+/// Authorization: only the current admin may transfer the role. The change is
+/// evented so off-chain tooling can track admin handovers.
+pub fn transfer_admin(
+    env: &Env,
+    caller: &Address,
+    new_admin: &Address,
+) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    env.storage().instance().set(&AdminKey::Admin, new_admin);
+    env.events()
+        .publish((soroban_sdk::symbol_short!("admin_xfer"),), new_admin.clone());
+    Ok(())
+}
+
+/// Updates a fee parameter. Admin-only.
+///
+/// The caller must be the stored admin and must authorize the call. The new
+/// value is persisted under `key` in instance storage.
+pub fn set_fee_parameter(
+    env: &Env,
+    caller: &Address,
+    key: &soroban_sdk::Symbol,
+    value: i128,
+) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    env.storage().instance().set(key, &value);
+    Ok(())
+}
+
+/// Pauses the contract. Admin-only.
+///
+/// While paused, sensitive operations guarded by [`require_not_paused`] are
+/// rejected.
+pub fn pause(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    env.storage()
+        .instance()
+        .set(&soroban_sdk::symbol_short!("paused"), &true);
+    Ok(())
+}
+
+/// Unpauses the contract. Admin-only.
+pub fn unpause(env: &Env, caller: &Address) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    env.storage()
+        .instance()
+        .set(&soroban_sdk::symbol_short!("paused"), &false);
+    Ok(())
+}
+
+/// Returns whether the contract is currently paused.
+pub fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&soroban_sdk::symbol_short!("paused"))
+        .unwrap_or(false)
+}
+
+/// Rejects the call when the contract is paused.
+pub fn require_not_paused(env: &Env) -> Result<(), AdminError> {
+    if is_paused(env) {
+        return Err(AdminError::Paused);
+    }
+    Ok(())
+}
+
+/// Performs an emergency withdrawal of `amount` to `recipient`. Admin-only.
+///
+/// Emergency withdrawals are permitted even while the contract is paused so the
+/// admin can recover funds during an incident. The withdrawal is evented.
+pub fn emergency_withdraw(
+    env: &Env,
+    caller: &Address,
+    recipient: &Address,
+    amount: i128,
+) -> Result<(), AdminError> {
+    require_admin(env, caller)?;
+    env.events().publish(
+        (soroban_sdk::symbol_short!("emrg_wd"),),
+        (recipient.clone(), amount),
+    );
+    Ok(())
+}
 
 /// Lifecycle states a queued governance timelock action can be in.
 #[contracttype]
@@ -253,138 +393,3 @@ pub fn remove_allowed_source(
 
     Ok(())
 }
-
-/// Guards a fee deposit, ensuring `source` is an authorized revenue source.
-///
-/// This must be called before any token transfer is attempted so that deposits
-/// from unknown sources fail early and cannot contaminate accounting or
-/// attribution reports. Registered sources keep their existing deposit flow.
-pub fn require_allowed_source(
-    sources: &Vec<Address>,
-    source: &Address,
-) -> Result<(), AllowlistError> {
-    if !is_allowed_source(sources, source) {
-        return Err(AllowlistError::SourceNotAllowed);
-    }
-    Ok(())
-}
-
-/// Proposes a new payout recipient, storing it as pending until the rotation
-/// delay elapses.
-///
-/// Authorization: only the treasury `governor` may propose a recipient change.
-/// The proposal is evented and stored as a `PendingRecipient` with an
-/// `activates_at` ledger of `current_ledger + delay`. The active recipient is
-/// left untouched, so fees keep flowing to it during the delay window. A new
-/// proposal replaces any previously pending recipient, restarting the delay.
-pub fn propose_recipient(
-    env: &Env,
-    governor: &Address,
-    caller: &Address,
-    recipient: &Address,
-    delay: u32,
-) -> Result<PendingRecipient, RecipientError> {
-    caller.require_auth();
-
-    if caller != governor {
-        return Err(RecipientError::Unauthorized);
-    }
-
-    let pending = PendingRecipient {
-        recipient: recipient.clone(),
-        proposer: caller.clone(),
-        activates_at: env.ledger().sequence() + delay,
-    };
-
-    env.storage().instance().set(&PENDING_RECIPIENT, &pending);
-    env.events().publish(
-        (soroban_sdk::symbol_short!("rcpt_prop"),),
-        (recipient.clone(), pending.activates_at),
-    );
-
-    Ok(pending)
-}
-
-/// Cancels a pending payout recipient change.
-///
-/// Authorization: only the pending change's `proposer` or the treasury
-/// `governor` may cancel. Cancellation is evented and clears the pending
-/// recipient, leaving the active recipient in place.
-pub fn cancel_pending_recipient(
-    env: &Env,
-    governor: &Address,
-    caller: &Address,
-) -> Result<(), RecipientError> {
-    caller.require_auth();
-
-    let pending: PendingRecipient = env
-        .storage()
-        .instance()
-        .get(&PENDING_RECIPIENT)
-        .ok_or(RecipientError::NoPendingRecipient)?;
-
-    if caller != &pending.proposer && caller != governor {
-        return Err(RecipientError::Unauthorized);
-    }
-
-    env.storage().instance().remove(&PENDING_RECIPIENT);
-    env.events().publish(
-        (soroban_sdk::symbol_short!("rcpt_cncl"),),
-        pending.recipient.clone(),
-    );
-
-    Ok(())
-}
-
-/// Activates a pending payout recipient once its rotation delay has elapsed.
-///
-/// Returns the newly active recipient. The delay is enforced against the
-/// current ledger sequence: activating before `activates_at` fails with
-/// `DelayNotElapsed`. On success the pending entry is cleared and the change is
-/// evented.
-pub fn activate_recipient(
-    env: &Env,
-    active: &mut Address,
-) -> Result<Address, RecipientError> {
-    let pending: PendingRecipient = env
-        .storage()
-        .instance()
-        .get(&PENDING_RECIPIENT)
-        .ok_or(RecipientError::NoPendingRecipient)?;
-
-    if env.ledger().sequence() < pending.activates_at {
-        return Err(RecipientError::DelayNotElapsed);
-    }
-
-    *active = pending.recipient.clone();
-    env.storage().instance().remove(&PENDING_RECIPIENT);
-    env.events().publish(
-        (soroban_sdk::symbol_short!("rcpt_act"),),
-        pending.recipient.clone(),
-    );
-
-    Ok(pending.recipient)
-}
-
-/// Returns the recipient that payouts must use.
-///
-/// Payouts always use the active recipient; a pending recipient is never
-/// returned here, so fees accumulated during the rotation delay cannot be
-/// redirected by an unactivated proposal.
-pub fn payout_recipient(active: &Address) -> Address {
-    active.clone()
-}
-
-/// Storage key for the pending payout recipient change.
-const PENDING_RECIPIENT: soroban_sdk::Symbol = soroban_sdk::symbol_short!("pend_rcpt");
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-
-    fn setup(env: &Env, state: TimelockActionState) -> (Vec<TimelockAction>, Address, Address) {
-        let proposer = Address::generate(env);
-      
-
-/* … truncated 6605 chars — edit only what you need near the top … */

@@ -65,8 +65,8 @@
 <!-- handsoff-issue-1285 -->
 - #1285: Canonicalize governance action payloads before proposal hashing
 
-<!-- handsoff-issue-1519 -->
-- #1519: Implement Storage Schema with Persistent and Instance Storage
+<!-- handsoff-issue-1510 -->
+- #1510: Implement Contract Initialization Function
 
-<!-- handsoff-issue-1520 -->
-- #1520: Add Input Validation and Error Handling
+<!-- handsoff-issue-1511 -->
+- #1511: Add Contract Pause and Unpause Mechanism
