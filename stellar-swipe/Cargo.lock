@@ -1718,6 +1718,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "token_vault"
+version = "0.0.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "trade_executor"
 version = "0.0.0"
 dependencies = [

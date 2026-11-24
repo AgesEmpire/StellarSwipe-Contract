@@ -430,3 +430,33 @@ jobs:
             echo "INFO: New ABI exports detected; baseline files updated."
             echo "Please commit the updated stellar-swipe/abi-baselines/*.json files."
           fi
+
+  # Issue #1527: dedicated build and test jobs for the Soroban contracts.
+  build:
+    name: Build contracts (WASM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stellar-swipe
+      - name: Build token_vault to WASM
+        working-directory: stellar-swipe
+        run: cargo build -p token_vault --target wasm32-unknown-unknown --release
+
+  test:
+    name: Unit and integration tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stellar-swipe
+      - name: Run token_vault unit and integration tests
+        working-directory: stellar-swipe
+        run: cargo test -p token_vault
