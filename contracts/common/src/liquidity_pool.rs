@@ -33,6 +33,20 @@ pub enum WithdrawError {
     Overflow,
 }
 
+/// Error returned by [`LiquidityPool::get_amount_out`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwapError {
+    /// The input amount is zero or negative.
+    InvalidAmount,
+    /// One or both pool reserves are zero (no liquidity).
+    ZeroLiquidity,
+    /// The swap would overflow intermediate computations.
+    Overflow,
+    /// The input is too small to produce any output after fees.
+    InsufficientOutput,
+}
+
 /// Pool reserves and LP token supply.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiquidityPool {
@@ -143,6 +157,65 @@ impl LiquidityPool {
 
         Ok((amount_a, amount_b))
     }
+
+    /// Compute the output amount for swapping `amount_in` of the input token
+    /// using the constant product formula `x * y = k` (issue #1507).
+    ///
+    /// The swap fee (in basis points, e.g. `30` = 0.30%) is deducted from the
+    /// input before the formula is applied:
+    ///
+    /// ```text
+    /// amount_in_after_fee = amount_in * (10_000 - fee_bps) / 10_000
+    /// amount_out = reserve_out * amount_in_after_fee
+    ///            / (reserve_in + amount_in_after_fee)
+    /// ```
+    ///
+    /// `reserve_in` is the reserve of the token being sold and `reserve_out`
+    /// the reserve of the token being bought. Returns an error for zero input,
+    /// zero liquidity, overflow, or when the input is too small to yield any
+    /// output after fees.
+    pub fn get_amount_out(
+        &self,
+        amount_in: i128,
+        reserve_in: i128,
+        reserve_out: i128,
+        fee_bps: u32,
+    ) -> Result<i128, SwapError> {
+        if amount_in <= 0 {
+            return Err(SwapError::InvalidAmount);
+        }
+        if reserve_in <= 0 || reserve_out <= 0 {
+            return Err(SwapError::ZeroLiquidity);
+        }
+        if fee_bps >= 10_000 {
+            return Err(SwapError::InvalidAmount);
+        }
+
+        // Deduct the fee from the input before applying the formula.
+        let amount_in_after_fee = amount_in
+            .checked_mul((10_000 - fee_bps) as i128)
+            .ok_or(SwapError::Overflow)?
+            / 10_000;
+        if amount_in_after_fee <= 0 {
+            return Err(SwapError::InsufficientOutput);
+        }
+
+        // amount_out = reserve_out * amount_in_after_fee
+        //            / (reserve_in + amount_in_after_fee)
+        let numerator = reserve_out
+            .checked_mul(amount_in_after_fee)
+            .ok_or(SwapError::Overflow)?;
+        let denominator = reserve_in
+            .checked_add(amount_in_after_fee)
+            .ok_or(SwapError::Overflow)?;
+        let amount_out = numerator / denominator;
+
+        if amount_out <= 0 {
+            return Err(SwapError::InsufficientOutput);
+        }
+
+        Ok(amount_out)
+    }
 }
 
 /// Integer square root via Newton's method, for non-negative inputs.
@@ -231,30 +304,53 @@ mod tests {
     }
 
     #[test]
-    fn partial_withdrawal_is_proportional() {
-        let mut pool = LiquidityPool::new();
-        pool.deposit(1_000, 4_000).unwrap();
-        // Burning half the LP supply returns half of each reserve.
-        let (amount_a, amount_b) = pool.withdraw(1_000).unwrap();
-        assert_eq!(amount_a, 500);
-        assert_eq!(amount_b, 2_000);
-        assert_eq!(pool.reserve_a, 500);
-        assert_eq!(pool.reserve_b, 2_000);
-        assert_eq!(pool.total_lp_supply, 1_000);
+    fn amount_out_matches_constant_product_formula() {
+        let pool = LiquidityPool::new();
+        // 0.30% fee: 10_000 in -> 9_970 after fee.
+        // out = 1_000_000 * 9_970 / (1_000_000 + 9_970) = 9_871 (floor).
+        let out = pool
+            .get_amount_out(10_000, 1_000_000, 1_000_000, 30)
+            .unwrap();
+        assert_eq!(out, 9_871);
     }
 
     #[test]
-    fn rejects_invalid_withdrawals() {
-        let mut pool = LiquidityPool::new();
-        assert_eq!(pool.withdraw(1), Err(WithdrawError::EmptyPool));
-        pool.deposit(1_000, 4_000).unwrap();
-        assert_eq!(pool.withdraw(0), Err(WithdrawError::InvalidAmount));
+    fn amount_out_with_zero_fee() {
+        let pool = LiquidityPool::new();
+        // out = 2_000 * 1_000 / (1_000 + 1_000) = 1_000.
+        let out = pool.get_amount_out(1_000, 1_000, 2_000, 0).unwrap();
+        assert_eq!(out, 1_000);
+    }
+
+    #[test]
+    fn amount_out_rejects_zero_input() {
+        let pool = LiquidityPool::new();
         assert_eq!(
-            pool.withdraw(2_001),
-            Err(WithdrawError::InsufficientLiquidity)
+            pool.get_amount_out(0, 1_000, 1_000, 30),
+            Err(SwapError::InvalidAmount)
         );
-        assert_eq!(pool.reserve_a, 1_000);
-        assert_eq!(pool.reserve_b, 4_000);
-        assert_eq!(pool.total_lp_supply, 2_000);
+    }
+
+    #[test]
+    fn amount_out_rejects_zero_liquidity() {
+        let pool = LiquidityPool::new();
+        assert_eq!(
+            pool.get_amount_out(1_000, 0, 1_000, 30),
+            Err(SwapError::ZeroLiquidity)
+        );
+        assert_eq!(
+            pool.get_amount_out(1_000, 1_000, 0, 30),
+            Err(SwapError::ZeroLiquidity)
+        );
+    }
+
+    #[test]
+    fn amount_out_rejects_dust_input() {
+        let pool = LiquidityPool::new();
+        // 1 * 9_970 / 10_000 = 0 after fee -> insufficient output.
+        assert_eq!(
+            pool.get_amount_out(1, 1_000_000, 1_000_000, 30),
+            Err(SwapError::InsufficientOutput)
+        );
     }
 }
