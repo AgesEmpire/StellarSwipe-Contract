@@ -73,3 +73,6 @@
 
 <!-- handsoff-issue-1521 -->
 - #1521: Implement Multi-Hop Swap Router Function
+
+<!-- handsoff-issue-1523 -->
+- #1523: Add Contract Upgrade Mechanism via Soroban WASM Hash
