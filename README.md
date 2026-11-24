@@ -67,3 +67,6 @@
 
 <!-- handsoff-issue-1519 -->
 - #1519: Implement Storage Schema with Persistent and Instance Storage
+
+<!-- handsoff-issue-1520 -->
+- #1520: Add Input Validation and Error Handling
