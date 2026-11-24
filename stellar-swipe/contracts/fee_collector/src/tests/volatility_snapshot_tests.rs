@@ -223,7 +223,7 @@ fn test_batch_snapshot_exceeds_limit_returns_error() {
     }
 
     let result = client.try_batch_snapshot(&tokens);
-    assert_eq!(result, Err(Ok(ContractError::IterationLimitExceeded)));
+    assert_eq!(result.err(), Some(Ok(ContractError::IterationLimitExceeded)));
 }
 
 #[test]
@@ -235,7 +235,7 @@ fn test_batch_snapshot_not_initialized_returns_error() {
     let client = FeeCollectorClient::new(&env, &id);
 
     let result = client.try_batch_snapshot(&soroban_sdk::Vec::new(&env));
-    assert_eq!(result, Err(Ok(ContractError::NotInitialized)));
+    assert_eq!(result.err(), Some(Ok(ContractError::NotInitialized)));
 }
 
 // ── Issue 4: Event schema versioning ─────────────────────────────────────────

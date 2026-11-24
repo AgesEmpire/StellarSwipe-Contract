@@ -49,7 +49,7 @@ fn invalid_input_failures_are_validation_category() {
 
     // Fee split shares that do not sum to 100%.
     let err = client
-        .try_set_fee_split_policy(&4_000, &4_000)
+        .try_set_fee_split_policy(&4_000, &4_000, &0)
         .err()
         .unwrap()
         .unwrap();

@@ -1,12 +1,6 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
-};
-
-use crate::{set_treasury_balance, ContractError, FeeCollector, FeeCollectorClient};
     contract, contractimpl,
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
@@ -2355,6 +2349,12 @@ fn test_rebate_cap_second_claim_uses_remaining_headroom() {
     let claimed_a = client.claim_fees(&provider_a, &token);
     assert_eq!(claimed_a, 600); // under cap
 
+    let claimed_b = client.claim_fees(&provider_b, &token);
+    assert_eq!(claimed_b, 200); // only headroom remaining (800 - 600 = 200)
+
+    assert_eq!(TokenClient::new(&env, &token).balance(&provider_a), 600);
+    assert_eq!(TokenClient::new(&env, &token).balance(&provider_b), 200);
+}
 
 // ---------------------------------------------------------------------------
 // Fee distribution end-to-end (#939)
@@ -2434,9 +2434,4 @@ fn test_deprecated_shims_route_to_current_impl() {
     assert_eq!(client.try_update_fee_rate(&1_000u32), Err(Ok(ContractError::FeeRateTooHigh)));
 
     assert_eq!(client.get_treasury_balance(&token), client.treasury_balance(&token));
-    let claimed_b = client.claim_fees(&provider_b, &token);
-    assert_eq!(claimed_b, 200); // only headroom remaining (800 - 600 = 200)
-
-    assert_eq!(TokenClient::new(&env, &token).balance(&provider_a), 600);
-    assert_eq!(TokenClient::new(&env, &token).balance(&provider_b), 200);
 }

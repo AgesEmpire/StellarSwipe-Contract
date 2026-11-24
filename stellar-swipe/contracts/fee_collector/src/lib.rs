@@ -4,7 +4,7 @@ mod errors;
 pub use errors::ContractError;
 
 mod events;
-pub use events::{DeprecatedCall, FeeRateUpdated, TreasuryWithdrawal, WithdrawalQueued};
+pub use events::DeprecatedCall;
 
 pub mod distribution;
 pub mod fee_cache;
@@ -23,8 +23,6 @@ pub use fee_optimization::{
     FeeBreakdown, FeeOptimizerConfig, FeeTier, NetworkConditions,
 };
 
-mod events;
-mod fee_cache;
 pub mod volatility;
 pub use volatility::{VolatilityBand, VolatilityBandConfig};
 
@@ -92,8 +90,8 @@ pub use storage::{
 };
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, token, Address, BytesN, Env, IntoVal,
-    String, Symbol, Val, Vec,
+    contract, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, BytesN,
+    Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 use shared::errors::{ErrorCategory, RecoveryStrategy};
@@ -397,7 +395,6 @@ impl FeeCollector {
         Ok(())
     }
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol, Vec};
     /// Returns `true` if `caller` is on the authorized-caller allowlist.
     /// The admin is always implicitly authorized even if not listed here.
     pub fn is_caller_authorized(env: Env, caller: Address) -> bool {
@@ -1058,6 +1055,8 @@ impl FeeCollector {
     pub fn get_treasury_balance(env: Env, token: Address) -> Result<i128, ContractError> {
         warn_deprecated(&env, symbol_short!("get_trsy"), symbol_short!("trsy_bal"));
         Self::treasury_balance(env, token)
+    }
+
     /// Admin, or an allowlisted keeper (Issue #813 — see [`Self::authorize_caller`]):
     /// push the current network congestion signal.
     ///

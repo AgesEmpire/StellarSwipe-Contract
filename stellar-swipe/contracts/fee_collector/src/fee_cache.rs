@@ -4,7 +4,7 @@
 //! config write calls [`invalidate_fee_cache`], which bumps the version and
 //! drops the entry, so stale rates can never be served after a rate change.
 
-use soroban_sdk::{contracttype, Env};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 
 use crate::storage::get_fee_rate;
 
@@ -55,55 +55,8 @@ pub fn invalidate_fee_cache(env: &Env) {
     env.storage().instance().remove(&FeeCacheKey::Entry);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{FeeCollector, FeeCollectorClient};
-    use soroban_sdk::{testutils::Address as _, Address};
+// ── Transaction-scoped fee configuration cache for the `collect_fee` hot path ──
 
-    #[test]
-    fn test_cache_invalidated_on_fee_rate_change() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(FeeCollector, ());
-        let client = FeeCollectorClient::new(&env, &id);
-        client.initialize(&Address::generate(&env));
-
-        // (a) populate cache
-        assert_eq!(client.fee_rate(), 30);
-        env.as_contract(&id, || {
-            let entry: FeeCacheEntry = env.storage().instance().get(&FeeCacheKey::Entry).unwrap();
-            assert_eq!(entry.rate_bps, 30);
-        });
-
-        // (b) change rate
-        client.set_fee_rate(&75u32);
-
-        // (c) new rate returned, not the stale cached one
-        assert_eq!(client.fee_rate(), 75);
-        env.as_contract(&id, || assert_eq!(config_version(&env), 1));
-    }
-
-    #[test]
-    fn test_cache_hit_between_config_changes() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(FeeCollector, ());
-        let client = FeeCollectorClient::new(&env, &id);
-        client.initialize(&Address::generate(&env));
-        client.fee_rate();
-
-        // Bypass the setter: cache must still serve the cached value.
-        env.as_contract(&id, || {
-            crate::storage::set_fee_rate(&env, 99);
-            assert_eq!(cached_fee_rate(&env), 30);
-            invalidate_fee_cache(&env);
-            assert_eq!(cached_fee_rate(&env), 99);
-        });
-    }
-//! Transaction-scoped fee configuration cache for `collect_fee` hot path.
-
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 use stellar_swipe_common::perf::tx_cache_or_compute;
 
 use crate::storage::{
@@ -182,4 +135,52 @@ pub fn effective_fee_rate_cached(
 /// No-op placeholder for batch settlement: volume oracle flush deferred to keeper.
 pub fn defer_volume_record(_env: &Env, _trader: &Address, _asset: &Asset, _amount: i128) {
     // Intentionally empty — batch fee settlement can aggregate off-chain.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FeeCollector, FeeCollectorClient};
+    use soroban_sdk::{testutils::Address as _, Address};
+
+    #[test]
+    fn test_cache_invalidated_on_fee_rate_change() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(FeeCollector, ());
+        let client = FeeCollectorClient::new(&env, &id);
+        client.initialize(&Address::generate(&env));
+
+        // (a) populate cache
+        assert_eq!(client.fee_rate(), 30);
+        env.as_contract(&id, || {
+            let entry: FeeCacheEntry = env.storage().instance().get(&FeeCacheKey::Entry).unwrap();
+            assert_eq!(entry.rate_bps, 30);
+        });
+
+        // (b) change rate
+        client.set_fee_rate(&75u32);
+
+        // (c) new rate returned, not the stale cached one
+        assert_eq!(client.fee_rate(), 75);
+        env.as_contract(&id, || assert_eq!(config_version(&env), 1));
+    }
+
+    #[test]
+    fn test_cache_hit_between_config_changes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(FeeCollector, ());
+        let client = FeeCollectorClient::new(&env, &id);
+        client.initialize(&Address::generate(&env));
+        client.fee_rate();
+
+        // Bypass the setter: cache must still serve the cached value.
+        env.as_contract(&id, || {
+            crate::storage::set_fee_rate(&env, 99);
+            assert_eq!(cached_fee_rate(&env), 30);
+            invalidate_fee_cache(&env);
+            assert_eq!(cached_fee_rate(&env), 99);
+        });
+    }
 }
