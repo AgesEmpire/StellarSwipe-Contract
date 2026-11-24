@@ -1,9 +1,9 @@
-//! Liquidity pool deposit logic (issue #1505).
+//! Liquidity pool deposit and withdrawal logic (issues #1505, #1506).
 //!
-//! Provides a `deposit()` entry point that accepts token A and token B
-//! amounts, mints LP tokens proportional to the depositor's pool share, and
-//! updates the pool reserves. The math is kept in a small, storage-agnostic
-//! struct so it can be unit tested without a Soroban host.
+//! Provides `deposit()` and `withdraw()` entry points that accept token A and
+//! token B amounts, mint/burn LP tokens proportional to the depositor's pool
+//! share, and update the pool reserves. The math is kept in a small,
+//! storage-agnostic struct so it can be unit tested without a Soroban host.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,20 @@ pub enum DepositError {
     Overflow,
     /// The deposit is too small to mint any LP tokens.
     ZeroLiquidityMinted,
+}
+
+/// Error returned by [`LiquidityPool::withdraw`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WithdrawError {
+    /// The requested LP token amount is zero or negative.
+    InvalidAmount,
+    /// The pool has no LP tokens outstanding.
+    EmptyPool,
+    /// The caller does not hold enough LP tokens to burn.
+    InsufficientLiquidity,
+    /// The withdrawal would overflow the returned amounts.
+    Overflow,
 }
 
 /// Pool reserves and LP token supply.
@@ -92,6 +106,43 @@ impl LiquidityPool {
 
         Ok(minted)
     }
+
+    /// Burn `lp_amount` LP tokens and withdraw the caller's proportional share
+    /// of the pool reserves.
+    ///
+    /// The returned amounts are computed from the current reserves:
+    /// `amount_a = lp_amount * reserve_a / total_lp_supply` and likewise for
+    /// token B. Reserves and the LP supply are decremented in place on success.
+    ///
+    /// Returns the `(amount_a, amount_b)` withdrawn from the pool.
+    pub fn withdraw(&mut self, lp_amount: i128) -> Result<(i128, i128), WithdrawError> {
+        if lp_amount <= 0 {
+            return Err(WithdrawError::InvalidAmount);
+        }
+        if self.total_lp_supply == 0 {
+            return Err(WithdrawError::EmptyPool);
+        }
+        if lp_amount > self.total_lp_supply {
+            return Err(WithdrawError::InsufficientLiquidity);
+        }
+
+        // Proportional amounts from current reserves.
+        let amount_a = lp_amount
+            .checked_mul(self.reserve_a)
+            .ok_or(WithdrawError::Overflow)?
+            / self.total_lp_supply;
+        let amount_b = lp_amount
+            .checked_mul(self.reserve_b)
+            .ok_or(WithdrawError::Overflow)?
+            / self.total_lp_supply;
+
+        // Decrement reserves and LP supply only after all checks pass.
+        self.reserve_a -= amount_a;
+        self.reserve_b -= amount_b;
+        self.total_lp_supply -= lp_amount;
+
+        Ok((amount_a, amount_b))
+    }
 }
 
 /// Integer square root via Newton's method, for non-negative inputs.
@@ -162,6 +213,46 @@ mod tests {
         pool.deposit(1_000, 4_000).unwrap();
         // 1 * 2000 / 1000 = 2, 1 * 2000 / 4000 = 0 -> min is 0.
         assert_eq!(pool.deposit(1, 1), Err(DepositError::ZeroLiquidityMinted));
+        assert_eq!(pool.reserve_a, 1_000);
+        assert_eq!(pool.reserve_b, 4_000);
+        assert_eq!(pool.total_lp_supply, 2_000);
+    }
+
+    #[test]
+    fn full_withdrawal_returns_all_reserves() {
+        let mut pool = LiquidityPool::new();
+        pool.deposit(1_000, 4_000).unwrap();
+        let (amount_a, amount_b) = pool.withdraw(2_000).unwrap();
+        assert_eq!(amount_a, 1_000);
+        assert_eq!(amount_b, 4_000);
+        assert_eq!(pool.reserve_a, 0);
+        assert_eq!(pool.reserve_b, 0);
+        assert_eq!(pool.total_lp_supply, 0);
+    }
+
+    #[test]
+    fn partial_withdrawal_is_proportional() {
+        let mut pool = LiquidityPool::new();
+        pool.deposit(1_000, 4_000).unwrap();
+        // Burning half the LP supply returns half of each reserve.
+        let (amount_a, amount_b) = pool.withdraw(1_000).unwrap();
+        assert_eq!(amount_a, 500);
+        assert_eq!(amount_b, 2_000);
+        assert_eq!(pool.reserve_a, 500);
+        assert_eq!(pool.reserve_b, 2_000);
+        assert_eq!(pool.total_lp_supply, 1_000);
+    }
+
+    #[test]
+    fn rejects_invalid_withdrawals() {
+        let mut pool = LiquidityPool::new();
+        assert_eq!(pool.withdraw(1), Err(WithdrawError::EmptyPool));
+        pool.deposit(1_000, 4_000).unwrap();
+        assert_eq!(pool.withdraw(0), Err(WithdrawError::InvalidAmount));
+        assert_eq!(
+            pool.withdraw(2_001),
+            Err(WithdrawError::InsufficientLiquidity)
+        );
         assert_eq!(pool.reserve_a, 1_000);
         assert_eq!(pool.reserve_b, 4_000);
         assert_eq!(pool.total_lp_supply, 2_000);
