@@ -73,3 +73,6 @@
 
 <!-- handsoff-issue-1513 -->
 - #1513: Add Event Emission for Swap, Deposit, and Withdraw
+
+<!-- handsoff-issue-1514 -->
+- #1514: Implement LP Token Minting and Burning Logic
