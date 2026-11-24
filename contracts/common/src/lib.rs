@@ -1,5 +1,7 @@
 //! Common types and helpers shared across contracts.
 
+#![no_std]
+
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
 /// Maximum number of holdings returned in a single page.
