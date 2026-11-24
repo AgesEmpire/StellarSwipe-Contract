@@ -634,7 +634,7 @@ pub fn create_proposal(
     validate_proposal(env, &proposal_type)?;
     validate_execution_payload(&proposal_type, &execution_payload)?;
     // #1286: duplicate detection runs before any ID / deposit / snapshot work.
-    let actions: Vec<ProposalType> = Vec::from_slice(env, &[proposal_type.clone()]);
+    let actions: Vec<ProposalType> = Vec::from_slice(env, core::slice::from_ref(&proposal_type));
     validate_no_duplicate_actions(env, &actions)?;
 
     let mut state = get_proposals_state(env);

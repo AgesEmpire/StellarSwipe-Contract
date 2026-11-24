@@ -115,7 +115,7 @@ fn rejected_delegation_leaves_existing_state_intact() {
     // Alice's delegation to Bob must still be active.
     let vp = c.effective_voting_power(&bob);
     assert!(
-        vp.unwrap_or(0) > 5_000,
+        vp > 5_000,
         "Bob's voting power must still include Alice's delegated stake after rejected cycle attempt"
     );
 }
@@ -156,6 +156,6 @@ fn valid_chain_is_accepted() {
     c.delegate_voting_power(&bob, &carol);
 
     // Carol's effective power includes her own + Bob's delegated (which includes Alice's).
-    let carol_power = c.effective_voting_power(&carol).unwrap_or(0);
+    let carol_power = c.effective_voting_power(&carol);
     assert!(carol_power > 5_000, "Carol must have more than her own stake");
 }

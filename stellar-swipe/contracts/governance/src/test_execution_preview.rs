@@ -189,7 +189,7 @@ fn preview_does_not_mutate_storage_or_balances() {
     );
 
     // Staked balance must be unchanged.
-    let staked = c.staked_balance(&r.community_rewards).unwrap();
+    let staked = c.staked_balance(&r.community_rewards);
     assert_eq!(staked, 10_000, "staked balance must not change after preview");
 
     // evaluated_at must be populated.
@@ -219,7 +219,11 @@ fn preview_always_includes_standard_checks() {
     );
 
     let preview = c.preview_execution(&pid);
-    let check_names: Vec<String> = preview.outcomes.iter().map(|o| o.check.clone()).collect();
+    let check_names: std::vec::Vec<String> = preview
+        .outcomes
+        .iter()
+        .map(|o| o.check.clone())
+        .collect();
 
     for expected in &[
         "proposal_succeeded",
