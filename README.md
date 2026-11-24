@@ -67,3 +67,6 @@
 
 <!-- handsoff-issue-1510 -->
 - #1510: Implement Contract Initialization Function
+
+<!-- handsoff-issue-1511 -->
+- #1511: Add Contract Pause and Unpause Mechanism
