@@ -70,3 +70,6 @@
 
 <!-- handsoff-issue-1511 -->
 - #1511: Add Contract Pause and Unpause Mechanism
+
+<!-- handsoff-issue-1513 -->
+- #1513: Add Event Emission for Swap, Deposit, and Withdraw
