@@ -27,6 +27,14 @@ path = "tests/token_transfer_authorization.rs"
 name = "token_response_compatibility"
 path = "tests/token_response_compatibility.rs"
 
+[[test]]
+name = "swap"
+path = "tests/swap.rs"
+
+[[test]]
+name = "liquidity_deposit_withdrawal"
+path = "tests/liquidity_deposit_withdrawal.rs"
+
 [[bench]]
 name = "batch_authorization"
 harness = false
