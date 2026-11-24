@@ -219,11 +219,8 @@ fn preview_always_includes_standard_checks() {
     );
 
     let preview = c.preview_execution(&pid);
-    let check_names: std::vec::Vec<String> = preview
-        .outcomes
-        .iter()
-        .map(|o| o.check.clone())
-        .collect();
+    let check_names: std::vec::Vec<String> =
+        preview.outcomes.iter().map(|o| o.check.clone()).collect();
 
     for expected in &[
         "proposal_succeeded",
