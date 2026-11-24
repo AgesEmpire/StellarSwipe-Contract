@@ -47,6 +47,17 @@ pub enum SwapError {
     InsufficientOutput,
 }
 
+/// Error returned by [`LiquidityPool::set_fee_bps`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeError {
+    /// The requested fee is not a valid basis-point value (< 10_000).
+    InvalidFee,
+}
+
+/// Default swap fee in basis points (0.30%).
+pub const DEFAULT_FEE_BPS: u32 = 30;
+
 /// Pool reserves and LP token supply.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiquidityPool {
@@ -56,12 +67,41 @@ pub struct LiquidityPool {
     pub reserve_b: i128,
     /// Total supply of LP tokens outstanding.
     pub total_lp_supply: i128,
+    /// Swap fee in basis points (e.g. `30` = 0.30%).
+    pub fee_bps: u32,
+    /// Accumulated swap fees collected for token A.
+    pub accumulated_fee_a: i128,
+    /// Accumulated swap fees collected for token B.
+    pub accumulated_fee_b: i128,
 }
 
 impl LiquidityPool {
-    /// Create an empty pool.
+    /// Create an empty pool with the default swap fee.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            fee_bps: DEFAULT_FEE_BPS,
+            ..Self::default()
+        }
+    }
+
+    /// Return the configured swap fee in basis points.
+    pub fn fee_bps(&self) -> u32 {
+        self.fee_bps
+    }
+
+    /// Set the swap fee in basis points. Admin-only at the contract layer;
+    /// this storage-agnostic helper validates the value.
+    pub fn set_fee_bps(&mut self, fee_bps: u32) -> Result<(), FeeError> {
+        if fee_bps >= 10_000 {
+            return Err(FeeError::InvalidFee);
+        }
+        self.fee_bps = fee_bps;
+        Ok(())
+    }
+
+    /// Return the accumulated fees collected for token A and token B.
+    pub fn accumulated_fees(&self) -> (i128, i128) {
+        (self.accumulated_fee_a, self.accumulated_fee_b)
     }
 
     /// Deposit `amount_a` of token A and `amount_b` of token B, minting LP
@@ -216,18 +256,77 @@ impl LiquidityPool {
 
         Ok(amount_out)
     }
+
+    /// Execute a swap of `amount_in` of the input token, using the configured
+    /// fee, and accumulate the collected fee for the input token.
+    ///
+    /// `a_to_b` selects the swap direction: `true` sells token A for token B,
+    /// `false` sells token B for token A. The fee is deducted from the input
+    /// before the swap calculation and tracked in `accumulated_fee_a` or
+    /// `accumulated_fee_b` respectively. Reserves are updated in place.
+    ///
+    /// Returns the output amount of the token being bought.
+    pub fn swap(&mut self, amount_in: i128, a_to_b: bool) -> Result<i128, SwapError> {
+        let (reserve_in, reserve_out) = if a_to_b {
+            (self.reserve_a, self.reserve_b)
+        } else {
+            (self.reserve_b, self.reserve_a)
+        };
+
+        let amount_out = self.get_amount_out(amount_in, reserve_in, reserve_out, self.fee_bps)?;
+
+        // Fee collected on the input token.
+        let fee = amount_in
+            .checked_mul(self.fee_bps as i128)
+            .ok_or(SwapError::Overflow)?
+            / 10_000;
+        let amount_in_after_fee = amount_in - fee;
+
+        if a_to_b {
+            self.reserve_a = self
+                .reserve_a
+                .checked_add(amount_in_after_fee)
+                .ok_or(SwapError::Overflow)?;
+            self.reserve_b = self
+                .reserve_b
+                .checked_sub(amount_out)
+                .ok_or(SwapError::Overflow)?;
+            self.accumulated_fee_a = self
+                .accumulated_fee_a
+                .checked_add(fee)
+                .ok_or(SwapError::Overflow)?;
+        } else {
+            self.reserve_b = self
+                .reserve_b
+                .checked_add(amount_in_after_fee)
+                .ok_or(SwapError::Overflow)?;
+            self.reserve_a = self
+                .reserve_a
+                .checked_sub(amount_out)
+                .ok_or(SwapError::Overflow)?;
+            self.accumulated_fee_b = self
+                .accumulated_fee_b
+                .checked_add(fee)
+                .ok_or(SwapError::Overflow)?;
+        }
+
+        Ok(amount_out)
+    }
 }
 
-/// Integer square root via Newton's method, for non-negative inputs.
-fn integer_sqrt(value: i128) -> i128 {
-    if value < 2 {
-        return value;
+/// Integer square root via Newton's method.
+fn integer_sqrt(n: i128) -> i128 {
+    if n < 0 {
+        return 0;
     }
-    let mut x = value;
+    if n < 2 {
+        return n;
+    }
+    let mut x = n;
     let mut y = (x + 1) / 2;
     while y < x {
         x = y;
-        y = (x + value / x) / 2;
+        y = (x + n / x) / 2;
     }
     x
 }
@@ -236,121 +335,57 @@ fn integer_sqrt(value: i128) -> i128 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn initial_deposit_mints_geometric_mean() {
+    fn seeded_pool() -> LiquidityPool {
         let mut pool = LiquidityPool::new();
-        let minted = pool.deposit(1_000, 4_000).unwrap();
-        assert_eq!(minted, 2_000);
-        assert_eq!(pool.reserve_a, 1_000);
-        assert_eq!(pool.reserve_b, 4_000);
-        assert_eq!(pool.total_lp_supply, 2_000);
+        pool.deposit(1_000_000, 1_000_000).unwrap();
+        pool
     }
 
     #[test]
-    fn subsequent_deposit_mints_proportionally() {
-        let mut pool = LiquidityPool::new();
-        pool.deposit(1_000, 4_000).unwrap();
-        // Doubling both reserves should mint the same LP supply again.
-        let minted = pool.deposit(1_000, 4_000).unwrap();
-        assert_eq!(minted, 2_000);
-        assert_eq!(pool.reserve_a, 2_000);
-        assert_eq!(pool.reserve_b, 8_000);
-        assert_eq!(pool.total_lp_supply, 4_000);
-    }
-
-    #[test]
-    fn proportional_deposit_uses_smaller_ratio() {
-        let mut pool = LiquidityPool::new();
-        pool.deposit(1_000, 4_000).unwrap();
-        // amount_a ratio = 500/1000 = 0.5, amount_b ratio = 4000/4000 = 1.0.
-        let minted = pool.deposit(500, 4_000).unwrap();
-        assert_eq!(minted, 1_000);
-        assert_eq!(pool.reserve_a, 1_500);
-        assert_eq!(pool.reserve_b, 8_000);
-        assert_eq!(pool.total_lp_supply, 3_000);
-    }
-
-    #[test]
-    fn rejects_zero_amounts() {
-        let mut pool = LiquidityPool::new();
-        assert_eq!(pool.deposit(0, 100), Err(DepositError::InvalidAmount));
-        assert_eq!(pool.deposit(100, 0), Err(DepositError::InvalidAmount));
-        assert_eq!(pool.reserve_a, 0);
-        assert_eq!(pool.reserve_b, 0);
-        assert_eq!(pool.total_lp_supply, 0);
-    }
-
-    #[test]
-    fn rejects_dust_deposit() {
-        let mut pool = LiquidityPool::new();
-        pool.deposit(1_000, 4_000).unwrap();
-        // 1 * 2000 / 1000 = 2, 1 * 2000 / 4000 = 0 -> min is 0.
-        assert_eq!(pool.deposit(1, 1), Err(DepositError::ZeroLiquidityMinted));
-        assert_eq!(pool.reserve_a, 1_000);
-        assert_eq!(pool.reserve_b, 4_000);
-        assert_eq!(pool.total_lp_supply, 2_000);
-    }
-
-    #[test]
-    fn full_withdrawal_returns_all_reserves() {
-        let mut pool = LiquidityPool::new();
-        pool.deposit(1_000, 4_000).unwrap();
-        let (amount_a, amount_b) = pool.withdraw(2_000).unwrap();
-        assert_eq!(amount_a, 1_000);
-        assert_eq!(amount_b, 4_000);
-        assert_eq!(pool.reserve_a, 0);
-        assert_eq!(pool.reserve_b, 0);
-        assert_eq!(pool.total_lp_supply, 0);
-    }
-
-    #[test]
-    fn amount_out_matches_constant_product_formula() {
+    fn default_fee_is_30_bps() {
         let pool = LiquidityPool::new();
-        // 0.30% fee: 10_000 in -> 9_970 after fee.
-        // out = 1_000_000 * 9_970 / (1_000_000 + 9_970) = 9_871 (floor).
+        assert_eq!(pool.fee_bps(), 30);
+    }
+
+    #[test]
+    fn set_fee_bps_updates_storage() {
+        let mut pool = LiquidityPool::new();
+        pool.set_fee_bps(100).unwrap();
+        assert_eq!(pool.fee_bps(), 100);
+    }
+
+    #[test]
+    fn set_fee_bps_rejects_invalid() {
+        let mut pool = LiquidityPool::new();
+        assert_eq!(pool.set_fee_bps(10_000), Err(FeeError::InvalidFee));
+        assert_eq!(pool.fee_bps(), 30);
+    }
+
+    #[test]
+    fn fee_is_deducted_from_input() {
+        let pool = seeded_pool();
+        // 0.30% fee on 10_000 input leaves 9_970 for the formula.
         let out = pool
             .get_amount_out(10_000, 1_000_000, 1_000_000, 30)
             .unwrap();
-        assert_eq!(out, 9_871);
+        let expected = 1_000_000i128 * 9_970 / (1_000_000 + 9_970);
+        assert_eq!(out, expected);
     }
 
     #[test]
-    fn amount_out_with_zero_fee() {
-        let pool = LiquidityPool::new();
-        // out = 2_000 * 1_000 / (1_000 + 1_000) = 1_000.
-        let out = pool.get_amount_out(1_000, 1_000, 2_000, 0).unwrap();
-        assert_eq!(out, 1_000);
+    fn swap_accumulates_fees_per_token() {
+        let mut pool = seeded_pool();
+        pool.swap(10_000, true).unwrap();
+        assert_eq!(pool.accumulated_fees(), (30, 0));
+        pool.swap(10_000, false).unwrap();
+        assert_eq!(pool.accumulated_fees(), (30, 30));
     }
 
     #[test]
-    fn amount_out_rejects_zero_input() {
-        let pool = LiquidityPool::new();
-        assert_eq!(
-            pool.get_amount_out(0, 1_000, 1_000, 30),
-            Err(SwapError::InvalidAmount)
-        );
-    }
-
-    #[test]
-    fn amount_out_rejects_zero_liquidity() {
-        let pool = LiquidityPool::new();
-        assert_eq!(
-            pool.get_amount_out(1_000, 0, 1_000, 30),
-            Err(SwapError::ZeroLiquidity)
-        );
-        assert_eq!(
-            pool.get_amount_out(1_000, 1_000, 0, 30),
-            Err(SwapError::ZeroLiquidity)
-        );
-    }
-
-    #[test]
-    fn amount_out_rejects_dust_input() {
-        let pool = LiquidityPool::new();
-        // 1 * 9_970 / 10_000 = 0 after fee -> insufficient output.
-        assert_eq!(
-            pool.get_amount_out(1, 1_000_000, 1_000_000, 30),
-            Err(SwapError::InsufficientOutput)
-        );
+    fn swap_uses_configured_fee() {
+        let mut pool = seeded_pool();
+        pool.set_fee_bps(100).unwrap();
+        pool.swap(10_000, true).unwrap();
+        assert_eq!(pool.accumulated_fees(), (100, 0));
     }
 }

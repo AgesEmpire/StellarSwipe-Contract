@@ -32,6 +32,10 @@ name = "swap"
 path = "tests/swap.rs"
 
 [[test]]
+name = "swap_fee"
+path = "tests/swap_fee.rs"
+
+[[test]]
 name = "liquidity_deposit_withdrawal"
 path = "tests/liquidity_deposit_withdrawal.rs"
 
