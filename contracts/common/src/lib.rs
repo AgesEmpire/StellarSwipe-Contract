@@ -2,7 +2,7 @@
 
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, Env, Vec};
+use soroban_sdk::{contracttype, token, Address, Env, Vec};
 
 /// Maximum number of holdings returned in a single page.
 pub const MAX_HOLDINGS_PAGE_SIZE: u32 = 50;
@@ -86,4 +86,54 @@ pub fn paginate_holdings(
         holdings: page,
         next_cursor,
     })
+}
+
+/// Error returned when a token swap cannot be completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwapError {
+    /// The requested input amount is not positive.
+    InvalidAmount,
+    /// The realized output is below the caller's minimum received amount.
+    SlippageExceeded,
+}
+
+/// Executes a token swap: pulls `amount` of `token_in` from `from` and sends
+/// `amount_out` of `token_out` to `to`.
+///
+/// Slippage protection is enforced by requiring `amount_out >= min_received`;
+/// otherwise the call fails with [`SwapError::SlippageExceeded`] before any
+/// funds move. On success a `swap` event is emitted with the swap details.
+///
+/// The caller is responsible for computing `amount_out` (e.g. via an oracle or
+/// AMM quote) and for ensuring the contract holds enough `token_out`.
+pub fn swap(
+    env: &Env,
+    from: &Address,
+    to: &Address,
+    token_in: &Address,
+    token_out: &Address,
+    amount: i128,
+    amount_out: i128,
+    min_received: i128,
+) -> Result<i128, SwapError> {
+    if amount <= 0 {
+        return Err(SwapError::InvalidAmount);
+    }
+
+    if amount_out < min_received {
+        return Err(SwapError::SlippageExceeded);
+    }
+
+    let token_in_client = token::Client::new(env, token_in);
+    let token_out_client = token::Client::new(env, token_out);
+
+    token_in_client.transfer(from, &env.current_contract_address(), &amount);
+    token_out_client.transfer(&env.current_contract_address(), to, &amount_out);
+
+    env.events().publish(
+        (soroban_sdk::symbol_short!("swap"), from.clone()),
+        (token_in.clone(), token_out.clone(), amount, amount_out),
+    );
+
+    Ok(amount_out)
 }
