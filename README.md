@@ -76,3 +76,6 @@
 
 <!-- handsoff-issue-1514 -->
 - #1514: Implement LP Token Minting and Burning Logic
+
+<!-- handsoff-issue-1516 -->
+- #1516: Implement Deadline Parameter for Swap Transactions
