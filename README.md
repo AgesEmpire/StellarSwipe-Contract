@@ -70,3 +70,12 @@
 
 <!-- handsoff-issue-1511 -->
 - #1511: Add Contract Pause and Unpause Mechanism
+
+<!-- handsoff-issue-1513 -->
+- #1513: Add Event Emission for Swap, Deposit, and Withdraw
+
+<!-- handsoff-issue-1514 -->
+- #1514: Implement LP Token Minting and Burning Logic
+
+<!-- handsoff-issue-1516 -->
+- #1516: Implement Deadline Parameter for Swap Transactions
