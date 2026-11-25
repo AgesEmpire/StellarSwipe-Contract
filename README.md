@@ -79,3 +79,9 @@
 
 <!-- handsoff-issue-1516 -->
 - #1516: Implement Deadline Parameter for Swap Transactions
+
+<!-- handsoff-issue-1521 -->
+- #1521: Implement Multi-Hop Swap Router Function
+
+<!-- handsoff-issue-1523 -->
+- #1523: Add Contract Upgrade Mechanism via Soroban WASM Hash
