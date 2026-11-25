@@ -4,7 +4,8 @@
 The liquidity pool contract manages pooled reserves and share accounting for
 liquidity providers. This document summarizes the contract's administrative
 controls, including the pause/unpause mechanism used for emergency actions,
-the price oracle view function, and the liquidity deposit flow.
+the price oracle view function, and the minimum liquidity lock applied on the
+first deposit.
 
 ## Administrative Controls
 
@@ -47,6 +48,23 @@ contract continues from the exact state prior to pausing.
 - **Tests:** Unit tests verify that LP tokens are minted proportionally to the
   deposited amounts and that pool reserves and total LP supply are updated
   correctly in storage after each deposit.
+
+## Minimum Liquidity Lock
+
+### `MINIMUM_LIQUIDITY`
+- **Purpose:** A fixed, protocol-level constant of LP tokens that is
+  permanently locked on the very first deposit to prevent pool manipulation
+  and division-by-zero errors.
+- **First deposit:** When the total LP supply is zero, the contract mints
+  `MINIMUM_LIQUIDITY` LP tokens to the zero address and mints the remainder to
+  the depositor.
+- **Subsequent deposits:** Once liquidity exists, deposits use the standard
+  proportional formula based on the existing reserves and total LP supply.
+- **Non-withdrawable:** The locked minimum liquidity is held by the zero
+  address and cannot be withdrawn by any user, so the pool can never be fully
+  drained and the total supply never returns to zero.
+- **Tests:** Unit tests confirm that the minimum liquidity is locked on the
+  first deposit and that it is not withdrawable.
 
 ## Price Oracle
 
